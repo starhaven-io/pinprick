@@ -24,7 +24,7 @@ permissions: {}
 jobs:
   scan:
     name: Scan
-    runs-on: ubuntu-slim
+    runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:

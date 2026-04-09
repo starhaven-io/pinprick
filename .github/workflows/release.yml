@@ -21,10 +21,10 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-slim
+            runner: ubuntu-latest
             artifact: pinprick-linux-amd64
           - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-slim
+            runner: ubuntu-latest
             artifact: pinprick-linux-arm64
             cross: true
           - target: aarch64-apple-darwin
