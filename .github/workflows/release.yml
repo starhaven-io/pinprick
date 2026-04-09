@@ -16,29 +16,61 @@ permissions: {}
 jobs:
   build:
     name: Build (${{ matrix.target }})
+    environment:
+      name: release
+      deployment: false
     strategy:
       fail-fast: false
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
-            artifact: pinprick-linux-amd64
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-latest
-            artifact: pinprick-linux-arm64
             cross: true
           - target: aarch64-apple-darwin
             runner: macos-26
-            artifact: pinprick-darwin-arm64
+            sign: true
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
       attestations: write # required to generate build provenance attestations
       id-token: write # required to generate build provenance attestations
+    env:
+      TEMPORARY_KEYCHAIN_FILE: "pinprick_signing.keychain-db"
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
+
+      - name: Extract version
+        id: version
+        run: |
+          VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+
+      - name: Create and unlock temporary macOS keychain
+        if: matrix.sign
+        run: |
+          TEMPORARY_KEYCHAIN_PASSWORD="$(openssl rand -base64 20)"
+          TEMPORARY_KEYCHAIN_PATH="${RUNNER_TEMP}/${TEMPORARY_KEYCHAIN_FILE}"
+          security create-keychain -p "${TEMPORARY_KEYCHAIN_PASSWORD}" "${TEMPORARY_KEYCHAIN_PATH}"
+          security set-keychain-settings -lut 21600 "${TEMPORARY_KEYCHAIN_PATH}"
+          security unlock-keychain -p "${TEMPORARY_KEYCHAIN_PASSWORD}" "${TEMPORARY_KEYCHAIN_PATH}"
+
+      - name: Import certificate into keychain
+        if: matrix.sign
+        env:
+          DEVELOPER_ID_CERTIFICATE: ${{ secrets.DEVELOPER_ID_CERTIFICATE }}
+          DEVELOPER_ID_CERTIFICATE_PASSWORD: ${{ secrets.DEVELOPER_ID_CERTIFICATE_PASSWORD }}
+        run: |
+          echo -n "${DEVELOPER_ID_CERTIFICATE}" | base64 --decode --output="${RUNNER_TEMP}/certificate.p12"
+          security import "${RUNNER_TEMP}/certificate.p12" \
+            -k "${RUNNER_TEMP}/${TEMPORARY_KEYCHAIN_FILE}" \
+            -P "${DEVELOPER_ID_CERTIFICATE_PASSWORD}" \
+            -t cert -f pkcs12 -A
+          rm -f "${RUNNER_TEMP}/certificate.p12"
+          security list-keychain -d user -s "${RUNNER_TEMP}/${TEMPORARY_KEYCHAIN_FILE}"
 
       - name: Install cross-compilation toolchain
         if: matrix.cross
@@ -59,26 +91,62 @@ jobs:
           fi
           cargo build --release --target "${TARGET}"
 
+      - name: Codesign binary
+        if: matrix.sign
+        env:
+          TARGET: ${{ matrix.target }}
+          DEVELOPMENT_TEAM: ${{ secrets.DEVELOPMENT_TEAM }}
+        run: |
+          codesign --sign "Developer ID Application: Patrick Linnane (${DEVELOPMENT_TEAM})" \
+            --options runtime \
+            "target/${TARGET}/release/pinprick"
+
+      - name: Notarize binary
+        if: matrix.sign
+        env:
+          TARGET: ${{ matrix.target }}
+          APPLE_ID: ${{ secrets.NOTARIZATION_APPLE_ID }}
+          NOTARIZATION_PASSWORD: ${{ secrets.NOTARIZATION_PASSWORD }}
+          DEVELOPMENT_TEAM: ${{ secrets.DEVELOPMENT_TEAM }}
+        run: |
+          mkdir -p "${RUNNER_TEMP}/notarize-staging"
+          cp "target/${TARGET}/release/pinprick" "${RUNNER_TEMP}/notarize-staging/"
+          ditto -c -k "${RUNNER_TEMP}/notarize-staging" "${RUNNER_TEMP}/pinprick-notarize.zip"
+          xcrun notarytool submit "${RUNNER_TEMP}/pinprick-notarize.zip" \
+            --apple-id "${APPLE_ID}" \
+            --team-id "${DEVELOPMENT_TEAM}" \
+            --password "${NOTARIZATION_PASSWORD}" \
+            --wait
+
+      - name: Clean up temporary keychain
+        if: always() && matrix.sign
+        run: |
+          if [[ -f "${RUNNER_TEMP}/${TEMPORARY_KEYCHAIN_FILE}" ]]; then
+            security delete-keychain "${RUNNER_TEMP}/${TEMPORARY_KEYCHAIN_FILE}"
+          fi
+
       - name: Package
         env:
           TARGET: ${{ matrix.target }}
-          ARTIFACT: ${{ matrix.artifact }}
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
+          ARTIFACT="pinprick-${VERSION}-${TARGET}"
           mkdir -p staging
           cp "target/${TARGET}/release/pinprick" staging/
           cp LICENSE staging/
           tar czf "${ARTIFACT}.tar.gz" -C staging .
+          echo "ARTIFACT=${ARTIFACT}" >> "${GITHUB_ENV}"
 
       - name: Generate build provenance
         uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4.1.0
         with:
-          subject-path: "${{ matrix.artifact }}.tar.gz"
+          subject-path: "${{ env.ARTIFACT }}.tar.gz"
 
       - name: Upload artifact
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
-          name: ${{ matrix.artifact }}
-          path: "${{ matrix.artifact }}.tar.gz"
+          name: ${{ env.ARTIFACT }}
+          path: "${{ env.ARTIFACT }}.tar.gz"
 
   release:
     name: Release
@@ -91,7 +159,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Extract version from Cargo.toml
+      - name: Extract version
         id: version
         run: |
           VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
