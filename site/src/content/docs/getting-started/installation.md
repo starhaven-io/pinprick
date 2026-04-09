@@ -3,6 +3,12 @@ title: Installation
 description: How to install pinprick.
 ---
 
+## Homebrew
+
+```bash
+brew install p-linnane/tap/pinprick
+```
+
 ## From source
 
 ```bash

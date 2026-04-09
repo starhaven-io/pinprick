@@ -15,6 +15,12 @@ pinprick picks up where static analysis leaves off. SHA-pinning actions is table
 
 ## Installation
 
+### Homebrew
+
+```bash
+brew install p-linnane/tap/pinprick
+```
+
 ### From source
 
 ```bash
