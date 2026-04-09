@@ -46,14 +46,14 @@ jobs:
 
           # Rust changes: lint + test
           if echo "${CHANGED}" | grep -qE '\.rs$|^Cargo\.(toml|lock)$|^clippy\.toml$|^rustfmt\.toml$'; then
-            MATRIX+=',{"name":"Lint","check":"lint","runner":"ubuntu-slim"}'
-            MATRIX+=',{"name":"Test (Linux)","check":"test","runner":"ubuntu-slim"}'
+            MATRIX+=',{"name":"Lint","check":"lint","runner":"ubuntu-latest"}'
+            MATRIX+=',{"name":"Test (Linux)","check":"test","runner":"ubuntu-latest"}'
             MATRIX+=',{"name":"Test (macOS)","check":"test","runner":"macos-26"}'
           fi
 
           # Audited-actions changes: verify all entries
           if echo "${CHANGED}" | grep -qE '^audited-actions/'; then
-            MATRIX+=',{"name":"Verify Audited Actions","check":"verify-audited","runner":"ubuntu-slim"}'
+            MATRIX+=',{"name":"Verify Audited Actions","check":"verify-audited","runner":"ubuntu-latest"}'
           fi
 
           # Site or audited-actions changes: format check + build
