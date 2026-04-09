@@ -26,8 +26,7 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
           - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-latest
-            cross: true
+            runner: ubuntu-22.04-arm
           - target: aarch64-apple-darwin
             runner: macos-26
             sign: true
@@ -72,24 +71,10 @@ jobs:
           rm -f "${RUNNER_TEMP}/certificate.p12"
           security list-keychain -d user -s "${RUNNER_TEMP}/${TEMPORARY_KEYCHAIN_FILE}"
 
-      - name: Install cross-compilation toolchain
-        if: matrix.cross
-        env:
-          TARGET: ${{ matrix.target }}
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
-          rustup target add "${TARGET}"
-
       - name: Build
         env:
           TARGET: ${{ matrix.target }}
-          CROSS: ${{ matrix.cross }}
-        run: |
-          if [[ "${CROSS}" == "true" ]]; then
-            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
-          fi
-          cargo build --release --target "${TARGET}"
+        run: cargo build --release --target "${TARGET}"
 
       - name: Codesign binary
         if: matrix.sign

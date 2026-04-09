@@ -44,10 +44,11 @@ jobs:
 
           CHANGED=$(git diff --name-only "${BASE_SHA}...HEAD")
 
-          # Rust changes: lint + test
-          if echo "${CHANGED}" | grep -qE '\.rs$|^Cargo\.(toml|lock)$|^clippy\.toml$|^rustfmt\.toml$'; then
+          # Rust or build workflow changes: lint + test
+          if echo "${CHANGED}" | grep -qE '\.rs$|^Cargo\.(toml|lock)$|^clippy\.toml$|^rustfmt\.toml$|^\.github/workflows/(ci|release)\.yml$'; then
             MATRIX+=',{"name":"Lint","check":"lint","runner":"ubuntu-latest"}'
             MATRIX+=',{"name":"Test (Linux)","check":"test","runner":"ubuntu-latest"}'
+            MATRIX+=',{"name":"Test (Linux ARM)","check":"test","runner":"ubuntu-22.04-arm"}'
             MATRIX+=',{"name":"Test (macOS)","check":"test","runner":"macos-26"}'
           fi
 
