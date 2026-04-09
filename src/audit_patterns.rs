@@ -1,0 +1,592 @@
+use regex::Regex;
+use std::sync::LazyLock;
+
+#[derive(Debug, Clone)]
+pub enum Severity {
+    High,
+    Medium,
+    Low,
+}
+
+#[derive(Debug, Clone)]
+pub enum Category {
+    DockerUnpinned,
+    JavaScriptFetch,
+    PythonFetch,
+    ShellFetch,
+}
+
+pub struct Pattern {
+    pub regex: &'static LazyLock<Regex>,
+    pub severity: Severity,
+    pub category: Category,
+    pub description: &'static str,
+}
+
+// ── Shell patterns (for run: blocks and action.yml) ─────────────────────────
+
+macro_rules! re {
+    ($name:ident, $pattern:expr) => {
+        pub static $name: LazyLock<Regex> = LazyLock::new(|| Regex::new($pattern).unwrap());
+    };
+}
+
+re!(SH_CURL_LATEST, r#"curl\b.*[/=]latest[/\s"]"#);
+re!(SH_WGET_LATEST, r#"wget\b.*[/=]latest[/\s"]"#);
+re!(SH_GH_RELEASE_LATEST, r"gh\s+release\s+download\s");
+re!(SH_CURL_UNVERSIONED, r#"curl\b.*https?://[^\s"']+"#);
+re!(SH_WGET_UNVERSIONED, r#"wget\b.*https?://[^\s"']+"#);
+re!(
+    SH_PIP_UNVERSIONED,
+    r"pip3?\s+install\s+[a-zA-Z][a-zA-Z0-9_-]*\s*$"
+);
+re!(SH_NPM_UNVERSIONED, r"npm\s+install\s+[a-zA-Z@][^\s]*$");
+re!(SH_GO_INSTALL_LATEST, r"go\s+install\s+\S+@latest");
+re!(
+    SH_IWR_LATEST,
+    r#"(?i)(Invoke-WebRequest|iwr|Invoke-RestMethod|irm)\b.*[/=]latest[/\s"]"#
+);
+re!(
+    SH_IWR_UNVERSIONED,
+    r#"(?i)(Invoke-WebRequest|iwr|Invoke-RestMethod|irm)\b.*https?://[^\s"']+"#
+);
+
+pub static SHELL_PATTERNS: LazyLock<Vec<Pattern>> = LazyLock::new(|| {
+    vec![
+        Pattern {
+            regex: &SH_CURL_LATEST,
+            severity: Severity::High,
+            category: Category::ShellFetch,
+            description: "curl fetching from a 'latest' URL — can change without notice",
+        },
+        Pattern {
+            regex: &SH_WGET_LATEST,
+            severity: Severity::High,
+            category: Category::ShellFetch,
+            description: "wget fetching from a 'latest' URL — can change without notice",
+        },
+        Pattern {
+            regex: &SH_GO_INSTALL_LATEST,
+            severity: Severity::Medium,
+            category: Category::ShellFetch,
+            description: "go install @latest — not version-pinned",
+        },
+        Pattern {
+            regex: &SH_IWR_LATEST,
+            severity: Severity::High,
+            category: Category::ShellFetch,
+            description: "PowerShell fetching from a 'latest' URL — can change without notice",
+        },
+        Pattern {
+            regex: &SH_PIP_UNVERSIONED,
+            severity: Severity::Low,
+            category: Category::ShellFetch,
+            description: "pip install without version pin",
+        },
+        Pattern {
+            regex: &SH_NPM_UNVERSIONED,
+            severity: Severity::Low,
+            category: Category::ShellFetch,
+            description: "npm install without version pin",
+        },
+    ]
+});
+
+// Patterns that are only flagged if the URL is unversioned
+pub static SHELL_URL_PATTERNS: LazyLock<Vec<Pattern>> = LazyLock::new(|| {
+    vec![
+        Pattern {
+            regex: &SH_CURL_UNVERSIONED,
+            severity: Severity::Medium,
+            category: Category::ShellFetch,
+            description: "curl fetching URL without version pinning",
+        },
+        Pattern {
+            regex: &SH_WGET_UNVERSIONED,
+            severity: Severity::Medium,
+            category: Category::ShellFetch,
+            description: "wget fetching URL without version pinning",
+        },
+        Pattern {
+            regex: &SH_IWR_UNVERSIONED,
+            severity: Severity::Medium,
+            category: Category::ShellFetch,
+            description: "PowerShell fetching URL without version pinning",
+        },
+    ]
+});
+
+// ── JavaScript patterns ─────────────────────────────────────────────────────
+
+re!(JS_FETCH_LATEST, r#"fetch\s*\(.*[/=]latest[/\s"']"#);
+re!(JS_AXIOS_LATEST, r#"axios\.\w+\s*\(.*[/=]latest[/\s"']"#);
+re!(JS_GOT_LATEST, r#"got\s*\(.*[/=]latest[/\s"']"#);
+re!(JS_HTTP_LATEST, r#"https?\.get\s*\(.*[/=]latest[/\s"']"#);
+re!(JS_EXEC_CURL, r"exec\w*\s*\(.*\bcurl\b");
+re!(JS_CHILD_PROC_CURL, r"child_process.*\bcurl\b");
+re!(JS_FETCH_URL, r#"fetch\s*\(\s*["'`]https?://"#);
+re!(JS_AXIOS_URL, r#"axios\.\w+\s*\(\s*["'`]https?://"#);
+
+pub static JS_PATTERNS: LazyLock<Vec<Pattern>> = LazyLock::new(|| {
+    vec![
+        Pattern {
+            regex: &JS_FETCH_LATEST,
+            severity: Severity::High,
+            category: Category::JavaScriptFetch,
+            description: "fetch() with 'latest' URL — runtime supply chain risk",
+        },
+        Pattern {
+            regex: &JS_AXIOS_LATEST,
+            severity: Severity::High,
+            category: Category::JavaScriptFetch,
+            description: "axios request to 'latest' URL",
+        },
+        Pattern {
+            regex: &JS_GOT_LATEST,
+            severity: Severity::High,
+            category: Category::JavaScriptFetch,
+            description: "got() request to 'latest' URL",
+        },
+        Pattern {
+            regex: &JS_HTTP_LATEST,
+            severity: Severity::High,
+            category: Category::JavaScriptFetch,
+            description: "http.get() to 'latest' URL",
+        },
+        Pattern {
+            regex: &JS_EXEC_CURL,
+            severity: Severity::High,
+            category: Category::JavaScriptFetch,
+            description: "exec() shelling out to curl — runtime fetch bypasses pinning",
+        },
+        Pattern {
+            regex: &JS_CHILD_PROC_CURL,
+            severity: Severity::High,
+            category: Category::JavaScriptFetch,
+            description: "child_process curl — runtime fetch bypasses pinning",
+        },
+    ]
+});
+
+pub static JS_URL_PATTERNS: LazyLock<Vec<Pattern>> = LazyLock::new(|| {
+    vec![
+        Pattern {
+            regex: &JS_FETCH_URL,
+            severity: Severity::Medium,
+            category: Category::JavaScriptFetch,
+            description: "fetch() to external URL without version pinning",
+        },
+        Pattern {
+            regex: &JS_AXIOS_URL,
+            severity: Severity::Medium,
+            category: Category::JavaScriptFetch,
+            description: "axios request to external URL without version pinning",
+        },
+    ]
+});
+
+// ── Docker patterns ─────────────────────────────────────────────────────────
+
+re!(DOCKER_FROM_LATEST, r"(?i)^FROM\s+\S+:latest\b");
+re!(
+    DOCKER_FROM_UNTAGGED,
+    r"(?i)^FROM\s+[a-z][a-z0-9._/-]*(\s|$)"
+);
+re!(DOCKER_FROM_DIGEST, r"(?i)^FROM\s+\S+@sha256:");
+re!(DOCKER_RUN_CURL, r"(?i)^RUN\b.*\bcurl\b");
+re!(DOCKER_RUN_WGET, r"(?i)^RUN\b.*\bwget\b");
+
+pub static DOCKER_PATTERNS: LazyLock<Vec<Pattern>> = LazyLock::new(|| {
+    vec![
+        Pattern {
+            regex: &DOCKER_FROM_LATEST,
+            severity: Severity::High,
+            category: Category::DockerUnpinned,
+            description: "FROM :latest — image not pinned to specific version",
+        },
+        Pattern {
+            regex: &DOCKER_FROM_UNTAGGED,
+            severity: Severity::High,
+            category: Category::DockerUnpinned,
+            description: "FROM without tag — implicitly pulls :latest",
+        },
+        Pattern {
+            regex: &DOCKER_RUN_CURL,
+            severity: Severity::Medium,
+            category: Category::DockerUnpinned,
+            description: "curl in Dockerfile RUN — check URL is versioned",
+        },
+        Pattern {
+            regex: &DOCKER_RUN_WGET,
+            severity: Severity::Medium,
+            category: Category::DockerUnpinned,
+            description: "wget in Dockerfile RUN — check URL is versioned",
+        },
+    ]
+});
+
+// ── Python patterns ─────────────────────────────────────────────────────────
+
+re!(
+    PY_URLLIB_LATEST,
+    r#"urllib\.request\.urlopen\s*\(.*[/=]latest[/\s"']"#
+);
+re!(
+    PY_REQUESTS_LATEST,
+    r#"requests\.(get|post|head)\s*\(.*[/=]latest[/\s"']"#
+);
+re!(PY_SUBPROCESS_CURL, r"subprocess\b.*\bcurl\b");
+re!(PY_SUBPROCESS_WGET, r"subprocess\b.*\bwget\b");
+re!(
+    PY_URLLIB_URL,
+    r#"urllib\.request\.urlopen\s*\(\s*["']https?://"#
+);
+re!(
+    PY_REQUESTS_URL,
+    r#"requests\.(get|post|head)\s*\(\s*["']https?://"#
+);
+
+pub static PY_PATTERNS: LazyLock<Vec<Pattern>> = LazyLock::new(|| {
+    vec![
+        Pattern {
+            regex: &PY_URLLIB_LATEST,
+            severity: Severity::High,
+            category: Category::PythonFetch,
+            description: "urllib fetching from a 'latest' URL",
+        },
+        Pattern {
+            regex: &PY_REQUESTS_LATEST,
+            severity: Severity::High,
+            category: Category::PythonFetch,
+            description: "requests library fetching from a 'latest' URL",
+        },
+        Pattern {
+            regex: &PY_SUBPROCESS_CURL,
+            severity: Severity::High,
+            category: Category::PythonFetch,
+            description: "subprocess shelling out to curl — runtime fetch bypasses pinning",
+        },
+        Pattern {
+            regex: &PY_SUBPROCESS_WGET,
+            severity: Severity::High,
+            category: Category::PythonFetch,
+            description: "subprocess shelling out to wget — runtime fetch bypasses pinning",
+        },
+    ]
+});
+
+pub static PY_URL_PATTERNS: LazyLock<Vec<Pattern>> = LazyLock::new(|| {
+    vec![
+        Pattern {
+            regex: &PY_URLLIB_URL,
+            severity: Severity::Medium,
+            category: Category::PythonFetch,
+            description: "urllib fetching external URL without version pinning",
+        },
+        Pattern {
+            regex: &PY_REQUESTS_URL,
+            severity: Severity::Medium,
+            category: Category::PythonFetch,
+            description: "requests library fetching external URL without version pinning",
+        },
+    ]
+});
+
+// ── Checksum verification ───────────────────────────────────────────────────
+
+re!(
+    CHECKSUM_VERIFY,
+    r"(?i)(sha256sum|sha512sum|shasum|openssl\s+dgst|gpg\s+--verify|Get-FileHash)"
+);
+
+/// Check if a line contains a checksum verification command.
+pub fn has_checksum_verify(line: &str) -> bool {
+    CHECKSUM_VERIFY.is_match(line)
+}
+
+// ── URL version detection ───────────────────────────────────────────────────
+
+static VERSION_SEGMENT: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"[/=]v?\d+(\.\d+)+[/\s"]"#).unwrap());
+
+/// Check if a URL-like string contains a version segment.
+pub fn url_has_version(s: &str) -> bool {
+    VERSION_SEGMENT.is_match(s)
+}
+
+/// Extract the first URL from a line.
+pub fn extract_url(line: &str) -> Option<&str> {
+    static URL_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r#"https?://[^\s"'`)>]+"#).unwrap());
+    URL_RE.find(line).map(|m| m.as_str())
+}
+
+/// Check if a `gh release download` line has a version tag argument.
+/// `gh release download v1.2.3 --pattern ...` is pinned.
+/// `gh release download --pattern ...` grabs latest.
+pub fn gh_release_has_tag(line: &str) -> bool {
+    static GH_RELEASE_TAG: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"gh\s+release\s+download\s+v?\d").unwrap());
+    GH_RELEASE_TAG.is_match(line)
+}
+
+pub fn category_str(c: &Category) -> &'static str {
+    match c {
+        Category::DockerUnpinned => "docker_unpinned",
+        Category::JavaScriptFetch => "javascript_fetch",
+        Category::PythonFetch => "python_fetch",
+        Category::ShellFetch => "shell_fetch",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── url_has_version ─────────────────────────────────────────────────
+
+    #[test]
+    fn versioned_download_url() {
+        assert!(url_has_version(
+            "https://github.com/nicklockwood/SwiftFormat/releases/download/0.55.8/swiftformat"
+        ));
+    }
+
+    #[test]
+    fn versioned_with_v_prefix() {
+        assert!(url_has_version(
+            "https://example.com/releases/download/v2.8.1/tool.tar.xz"
+        ));
+    }
+
+    #[test]
+    fn unversioned_latest_url() {
+        assert!(!url_has_version(
+            "https://github.com/aquasecurity/trivy/releases/latest/download/trivy.tar.gz"
+        ));
+    }
+
+    #[test]
+    fn unversioned_api_url() {
+        assert!(!url_has_version("https://api.example.com/data"));
+    }
+
+    #[test]
+    fn single_number_not_version() {
+        // A single number segment like /v4/ is not multi-component, so not matched
+        assert!(!url_has_version("https://example.com/v4/resource"));
+    }
+
+    // ── extract_url ─────────────────────────────────────────────────────
+
+    #[test]
+    fn extract_url_from_curl() {
+        let line = r#"curl -L "https://example.com/file.tar.gz" -o out"#;
+        assert_eq!(extract_url(line), Some("https://example.com/file.tar.gz"));
+    }
+
+    #[test]
+    fn extract_url_single_quotes() {
+        let line = "wget 'https://example.com/file'";
+        assert_eq!(extract_url(line), Some("https://example.com/file"));
+    }
+
+    #[test]
+    fn no_url() {
+        assert!(extract_url("echo hello world").is_none());
+    }
+
+    // ── Shell patterns ──────────────────────────────────────────────────
+
+    #[test]
+    fn curl_latest_detected() {
+        assert!(
+            SH_CURL_LATEST.is_match(
+                r#"curl -L "https://github.com/owner/repo/releases/latest/download/tool""#
+            )
+        );
+    }
+
+    #[test]
+    fn curl_versioned_not_flagged_as_latest() {
+        assert!(
+            !SH_CURL_LATEST.is_match(
+                r#"curl -L "https://github.com/owner/repo/releases/download/v1.2.3/tool""#
+            )
+        );
+    }
+
+    #[test]
+    fn wget_latest_detected() {
+        assert!(
+            SH_WGET_LATEST.is_match(r#"wget "https://example.com/releases/latest/tool.tar.gz""#)
+        );
+    }
+
+    #[test]
+    fn gh_release_download_unversioned() {
+        assert!(SH_GH_RELEASE_LATEST.is_match("gh release download --pattern '*.tar.gz'"));
+        assert!(!gh_release_has_tag(
+            "gh release download --pattern '*.tar.gz'"
+        ));
+    }
+
+    #[test]
+    fn gh_release_download_versioned() {
+        assert!(SH_GH_RELEASE_LATEST.is_match("gh release download v1.2.3 --pattern '*.tar.gz'"));
+        assert!(gh_release_has_tag(
+            "gh release download v1.2.3 --pattern '*.tar.gz'"
+        ));
+    }
+
+    #[test]
+    fn go_install_latest_detected() {
+        assert!(
+            SH_GO_INSTALL_LATEST
+                .is_match("go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest")
+        );
+    }
+
+    #[test]
+    fn go_install_versioned_not_flagged() {
+        assert!(
+            !SH_GO_INSTALL_LATEST
+                .is_match("go install github.com/golangci/golangci-lint/cmd/golangci-lint@v1.55.0")
+        );
+    }
+
+    // ── JavaScript patterns ─────────────────────────────────────────────
+
+    #[test]
+    fn js_fetch_latest_detected() {
+        assert!(
+            JS_FETCH_LATEST
+                .is_match(r#"fetch("https://api.github.com/repos/o/r/releases/latest")"#)
+        );
+    }
+
+    #[test]
+    fn js_exec_curl_detected() {
+        assert!(JS_EXEC_CURL.is_match(r#"exec("curl -L https://example.com")"#));
+    }
+
+    // ── Docker patterns ─────────────────────────────────────────────────
+
+    #[test]
+    fn docker_from_latest_detected() {
+        assert!(DOCKER_FROM_LATEST.is_match("FROM ubuntu:latest"));
+        assert!(DOCKER_FROM_LATEST.is_match("FROM node:latest AS builder"));
+    }
+
+    #[test]
+    fn docker_from_untagged_detected() {
+        assert!(DOCKER_FROM_UNTAGGED.is_match("FROM ubuntu AS builder"));
+        assert!(DOCKER_FROM_UNTAGGED.is_match("FROM node "));
+    }
+
+    #[test]
+    fn docker_from_tagged_not_untagged() {
+        assert!(!DOCKER_FROM_UNTAGGED.is_match("FROM ubuntu:22.04"));
+        assert!(!DOCKER_FROM_UNTAGGED.is_match("FROM ubuntu:latest"));
+        assert!(!DOCKER_FROM_UNTAGGED.is_match(
+            "FROM ubuntu@sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abcd"
+        ));
+    }
+
+    #[test]
+    fn docker_from_pinned_not_flagged() {
+        assert!(!DOCKER_FROM_LATEST.is_match("FROM ubuntu:22.04"));
+        assert!(DOCKER_FROM_DIGEST.is_match(
+            "FROM ubuntu@sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abcd"
+        ));
+    }
+
+    #[test]
+    fn docker_run_curl_detected() {
+        assert!(DOCKER_RUN_CURL.is_match("RUN curl -L https://example.com/install.sh | bash"));
+    }
+
+    // ── PowerShell patterns ────────────────────────────────────────────
+
+    #[test]
+    fn powershell_iwr_latest_detected() {
+        assert!(
+            SH_IWR_LATEST
+                .is_match(r#"Invoke-WebRequest "https://example.com/releases/latest/tool""#)
+        );
+    }
+
+    #[test]
+    fn powershell_irm_latest_detected() {
+        assert!(SH_IWR_LATEST.is_match(r#"irm "https://example.com/releases/latest/tool""#));
+    }
+
+    #[test]
+    fn powershell_iwr_versioned_not_latest() {
+        assert!(
+            !SH_IWR_LATEST.is_match(
+                r#"Invoke-WebRequest "https://example.com/releases/download/v1.2.3/tool""#
+            )
+        );
+    }
+
+    // ── Python patterns ────────────────────────────────────────────────
+
+    #[test]
+    fn python_requests_latest_detected() {
+        assert!(
+            PY_REQUESTS_LATEST
+                .is_match(r#"requests.get("https://example.com/releases/latest/tool")"#)
+        );
+    }
+
+    #[test]
+    fn python_urllib_latest_detected() {
+        assert!(
+            PY_URLLIB_LATEST
+                .is_match(r#"urllib.request.urlopen("https://example.com/releases/latest/tool")"#)
+        );
+    }
+
+    #[test]
+    fn python_subprocess_curl_detected() {
+        assert!(PY_SUBPROCESS_CURL.is_match(r#"subprocess.run(["curl", "-L", url])"#));
+    }
+
+    #[test]
+    fn python_requests_versioned_not_latest() {
+        assert!(
+            !PY_REQUESTS_LATEST
+                .is_match(r#"requests.get("https://example.com/releases/download/v1.2.3/tool")"#)
+        );
+    }
+
+    // ── Checksum verification ──────────────────────────────────────────
+
+    #[test]
+    fn checksum_sha256sum_detected() {
+        assert!(has_checksum_verify("sha256sum --check checksums.txt"));
+    }
+
+    #[test]
+    fn checksum_openssl_detected() {
+        assert!(has_checksum_verify("openssl dgst -sha256 file.tar.gz"));
+    }
+
+    #[test]
+    fn checksum_gpg_detected() {
+        assert!(has_checksum_verify("gpg --verify file.sig file.tar.gz"));
+    }
+
+    #[test]
+    fn checksum_powershell_detected() {
+        assert!(has_checksum_verify(
+            "Get-FileHash -Algorithm SHA256 file.tar.gz"
+        ));
+    }
+
+    #[test]
+    fn no_checksum() {
+        assert!(!has_checksum_verify("echo done"));
+    }
+}

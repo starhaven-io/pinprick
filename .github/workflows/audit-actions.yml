@@ -1,0 +1,157 @@
+name: Audit Actions
+
+on:
+  schedule:
+    - cron: "23 7 * * 1"
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: "Log what would be added without committing"
+        required: true
+        default: true
+        type: boolean
+
+defaults:
+  run:
+    shell: bash -xeuo pipefail {0}
+
+concurrency:
+  group: audit-actions
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  scan:
+    name: Scan
+    runs-on: ubuntu-slim
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Build pinprick
+        run: cargo build --release
+
+      - name: Scan for new releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DRY_RUN: ${{ inputs.dry-run || 'false' }}
+        run: |
+          UPDATED=0
+          for JSON_FILE in audited-actions/*/*.json; do
+            [[ "${JSON_FILE}" == *.json ]] || continue
+            OWNER=$(basename "$(dirname "${JSON_FILE}")")
+            REPO=$(basename "${JSON_FILE}" .json)
+            echo "--- ${OWNER}/${REPO} ---"
+
+            LATEST=$(gh api "repos/${OWNER}/${REPO}/releases/latest" --jq '.tag_name' 2>/dev/null || echo "")
+            if [[ -z "${LATEST}" ]]; then
+              echo "  No releases found, skipping"
+              continue
+            fi
+
+            LATEST_SHA=$(gh api "repos/${OWNER}/${REPO}/git/ref/tags/${LATEST}" --jq '.object.sha' 2>/dev/null || echo "")
+            if [[ -z "${LATEST_SHA}" ]]; then
+              echo "  Could not resolve ${LATEST}, skipping"
+              continue
+            fi
+
+            OBJ_TYPE=$(gh api "repos/${OWNER}/${REPO}/git/ref/tags/${LATEST}" --jq '.object.type' 2>/dev/null || echo "commit")
+            if [[ "${OBJ_TYPE}" == "tag" ]]; then
+              LATEST_SHA=$(gh api "repos/${OWNER}/${REPO}/git/tags/${LATEST_SHA}" --jq '.object.sha' 2>/dev/null || echo "${LATEST_SHA}")
+            fi
+
+            if jq -e ".[] | select(.sha == \"${LATEST_SHA}\")" "${JSON_FILE}" > /dev/null 2>&1; then
+              echo "  ${LATEST} already audited"
+              continue
+            fi
+
+            echo "  New release: ${LATEST} (${LATEST_SHA:0:8})"
+
+            TMPDIR=$(mktemp -d)
+            mkdir -p "${TMPDIR}/.github/workflows"
+            cat > "${TMPDIR}/.github/workflows/test.yml" <<YAML
+          name: test
+          on: push
+          jobs:
+            test:
+              runs-on: ubuntu-latest
+              steps:
+                - uses: ${OWNER}/${REPO}@${LATEST_SHA} # ${LATEST}
+          YAML
+
+            if ./target/release/pinprick --json audit "${TMPDIR}" 2>/dev/null; then
+              echo "  Clean — adding ${LATEST}"
+              if [[ "${DRY_RUN}" == "false" ]]; then
+                jq ". += [{\"sha\": \"${LATEST_SHA}\", \"tag\": \"${LATEST}\"}]" "${JSON_FILE}" > "${JSON_FILE}.tmp"
+                mv "${JSON_FILE}.tmp" "${JSON_FILE}"
+                UPDATED=1
+              fi
+            else
+              echo "  Findings detected — skipping ${LATEST}"
+            fi
+            rm -rf "${TMPDIR}"
+          done
+
+          echo "updated=${UPDATED}" >> "${GITHUB_OUTPUT}"
+        id: scan
+
+      - name: Upload results
+        if: steps.scan.outputs.updated == '1'
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: audited-actions
+          path: audited-actions/
+
+  update:
+    name: Update
+    needs: scan
+    if: needs.scan.result == 'success' && !inputs.dry-run
+    runs-on: ubuntu-slim
+    permissions:
+      contents: write # required to push branch
+      pull-requests: write # required to create PR
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up authenticated remote
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+        run: git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${REPOSITORY}.git"
+
+      - name: Download results
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: audited-actions
+          path: audited-actions/
+
+      - name: Check for changes
+        id: diff
+        run: |
+          if git diff --quiet audited-actions/; then
+            echo "changed=false" >> "${GITHUB_OUTPUT}"
+          else
+            echo "changed=true" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Create PR
+        if: steps.diff.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BRANCH="chore/audited-actions-update-$(date +%Y%m%d)"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "${BRANCH}"
+          git add audited-actions/
+          git commit -m "chore(audited-actions): update scanned actions"
+          git push -u origin "${BRANCH}"
+          gh pr create \
+            --title "chore(audited-actions): update scanned actions" \
+            --body "Automated scan found new clean releases for tracked actions."

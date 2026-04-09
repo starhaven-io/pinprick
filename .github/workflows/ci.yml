@@ -1,0 +1,249 @@
+name: CI
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+
+defaults:
+  run:
+    shell: bash -xeuo pipefail {0}
+
+concurrency:
+  group: "ci-${{ github.ref }}"
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  generate-matrix:
+    name: Generate matrix
+    runs-on: ubuntu-slim
+    permissions:
+      contents: read
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Generate CI matrix
+        id: matrix
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          EVENT_ACTION: ${{ github.event.action }}
+        run: |
+          MATRIX='[{"name":"Conventional Commits","check":"commits","runner":"ubuntu-slim","fetch_depth":"0"}'
+
+          # For title/body edits, only recheck conventional commits
+          if [[ "${EVENT_ACTION}" == "edited" ]]; then
+            echo "matrix=${MATRIX}]" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          CHANGED=$(git diff --name-only "${BASE_SHA}...HEAD")
+
+          # Rust changes: lint + test
+          if echo "${CHANGED}" | grep -qE '\.rs$|^Cargo\.(toml|lock)$|^clippy\.toml$|^rustfmt\.toml$'; then
+            MATRIX+=',{"name":"Lint","check":"lint","runner":"ubuntu-slim"}'
+            MATRIX+=',{"name":"Test (Linux)","check":"test","runner":"ubuntu-slim"}'
+            MATRIX+=',{"name":"Test (macOS)","check":"test","runner":"macos-26"}'
+          fi
+
+          # Audited-actions changes: verify all entries
+          if echo "${CHANGED}" | grep -qE '^audited-actions/'; then
+            MATRIX+=',{"name":"Verify Audited Actions","check":"verify-audited","runner":"ubuntu-slim"}'
+          fi
+
+          # Site or audited-actions changes: format check + build
+          if echo "${CHANGED}" | grep -qE '^site/|^audited-actions/'; then
+            MATRIX+=',{"name":"Site","check":"site","runner":"ubuntu-slim"}'
+          fi
+
+          # Workflow changes: Actions security audit
+          if echo "${CHANGED}" | grep -qE '^\.github/workflows/'; then
+            MATRIX+=',{"name":"zizmor","check":"zizmor","runner":"ubuntu-latest"}'
+          fi
+
+          echo "matrix=${MATRIX}]" >> "${GITHUB_OUTPUT}"
+
+  check:
+    name: ${{ matrix.name }}
+    needs: generate-matrix
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      pull-requests: read # required to fetch PR commits for conventional commit validation
+      security-events: write # required for zizmor SARIF upload
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.generate-matrix.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: ${{ matrix.fetch_depth || 1 }}
+          persist-credentials: false
+
+      # --- Conventional Commits ---
+
+      - name: Check PR title
+        if: matrix.check == 'commits'
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          PATTERN='^(feat|fix|docs|style|refactor|perf|test|build|ci|chore)(\(.+\))?: .+'
+          if [[ ! "${PR_TITLE}" =~ ${PATTERN} ]]; then
+            echo "::error::PR title '${PR_TITLE}' does not follow Conventional Commits."
+            echo ""
+            echo "Expected format: <type>(<scope>): <description>"
+            echo ""
+            echo "Types: feat, fix, docs, style, refactor, perf, test, build, ci, chore"
+            echo ""
+            echo "Examples:"
+            echo "  feat(audit): add Docker FROM pattern detection"
+            echo "  fix(pin): handle annotated tags correctly"
+            echo "  ci: add clippy workflow"
+            exit 1
+          fi
+
+      - name: Check commit messages
+        if: matrix.check == 'commits'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          PATTERN='^(feat|fix|docs|style|refactor|perf|test|build|ci|chore)(\(.+\))?: .+'
+          FAILED=0
+          while IFS= read -r LINE; do
+            SHA="${LINE%% *}"
+            MSG="${LINE#* }"
+            if [[ "${MSG}" == Merge\ * ]]; then
+              continue
+            fi
+            if [[ ! "${MSG}" =~ ${PATTERN} ]]; then
+              echo "::error::Commit ${SHA} does not follow Conventional Commits: '${MSG}'"
+              FAILED=1
+            fi
+          done < <(git log --format="%h %s" "${BASE_SHA}..${HEAD_SHA}")
+
+          if [[ "${FAILED}" -eq 1 ]]; then
+            echo ""
+            echo "All commit messages must follow: <type>(<scope>): <description>"
+            echo "Types: feat, fix, docs, style, refactor, perf, test, build, ci, chore"
+            exit 1
+          fi
+
+      # --- Lint ---
+
+      - name: Add Clippy and Rustfmt
+        if: matrix.check == 'lint'
+        run: rustup component add clippy rustfmt
+
+      - name: Install typos-cli
+        if: matrix.check == 'lint'
+        run: cargo install typos-cli --locked
+
+      - name: Clippy
+        if: matrix.check == 'lint'
+        run: cargo clippy -- -D warnings
+
+      - name: Rustfmt
+        if: matrix.check == 'lint'
+        run: cargo fmt -- --check
+
+      - name: Typos
+        if: matrix.check == 'lint'
+        run: typos
+
+      # --- Test ---
+
+      - name: Test
+        if: matrix.check == 'test'
+        run: cargo test
+
+      # --- Site ---
+
+      - name: Setup Node
+        if: matrix.check == 'site'
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+        with:
+          node-version: 24
+
+      - name: Install site dependencies
+        if: matrix.check == 'site'
+        working-directory: site
+        run: npm ci
+
+      - name: Check formatting
+        if: matrix.check == 'site'
+        working-directory: site
+        run: npm run format:check
+
+      - name: Build site
+        if: matrix.check == 'site'
+        working-directory: site
+        run: npm run build
+
+      # --- Verify Audited Actions ---
+
+      - name: Build pinprick
+        if: matrix.check == 'verify-audited'
+        run: cargo build --release
+
+      - name: Verify audited-actions entries
+        if: matrix.check == 'verify-audited'
+        run: |
+          FAILED=0
+          for JSON_FILE in audited-actions/*/*.json; do
+            [[ "${JSON_FILE}" == *.json ]] || continue
+            OWNER=$(basename "$(dirname "${JSON_FILE}")")
+            REPO=$(basename "${JSON_FILE}" .json)
+            echo "--- ${OWNER}/${REPO} ---"
+
+            ENTRIES=$(jq -c '.[]' "${JSON_FILE}")
+            while IFS= read -r ENTRY; do
+              SHA=$(echo "${ENTRY}" | jq -r '.sha')
+              TAG=$(echo "${ENTRY}" | jq -r '.tag')
+              echo "  Verifying ${TAG} (${SHA:0:8})..."
+
+              TMPDIR=$(mktemp -d)
+              mkdir -p "${TMPDIR}/.github/workflows"
+              cat > "${TMPDIR}/.github/workflows/test.yml" <<YAML
+          name: test
+          on: push
+          jobs:
+            test:
+              runs-on: ubuntu-latest
+              steps:
+                - uses: ${OWNER}/${REPO}@${SHA} # ${TAG}
+          YAML
+
+              if ! ./target/release/pinprick --json audit "${TMPDIR}" 2>/dev/null; then
+                echo "::error::${OWNER}/${REPO}@${SHA} (${TAG}) has audit findings"
+                FAILED=1
+              fi
+              rm -rf "${TMPDIR}"
+            done <<< "${ENTRIES}"
+          done
+          exit "${FAILED}"
+
+      # --- zizmor ---
+
+      - name: Run zizmor
+        if: matrix.check == 'zizmor'
+        uses: zizmorcore/zizmor-action@71321a20a9ded102f6e9ce5718a2fcec2c4f70d8 # v0.5.2
+        with:
+          persona: pedantic
+
+  conclusion:
+    name: conclusion
+    needs: check
+    runs-on: ubuntu-slim
+    if: always()
+    steps:
+      - name: Result
+        env:
+          CHECK_RESULT: ${{ needs.check.result }}
+        run: test "${CHECK_RESULT}" = "success"

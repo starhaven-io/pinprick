@@ -1,0 +1,8 @@
+# Build
+/target
+
+# Claude Code
+.claude/
+
+# macOS
+.DS_Store

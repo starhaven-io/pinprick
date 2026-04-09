@@ -1,0 +1,130 @@
+name: Release
+
+on:
+  workflow_dispatch:
+
+defaults:
+  run:
+    shell: bash -xeuo pipefail {0}
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-slim
+            artifact: pinprick-linux-amd64
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-slim
+            artifact: pinprick-linux-arm64
+            cross: true
+          - target: aarch64-apple-darwin
+            runner: macos-26
+            artifact: pinprick-darwin-arm64
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      attestations: write # required to generate build provenance attestations
+      id-token: write # required to generate build provenance attestations
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install cross-compilation toolchain
+        if: matrix.cross
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          rustup target add "${TARGET}"
+
+      - name: Build
+        env:
+          TARGET: ${{ matrix.target }}
+          CROSS: ${{ matrix.cross }}
+        run: |
+          if [[ "${CROSS}" == "true" ]]; then
+            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+          fi
+          cargo build --release --target "${TARGET}"
+
+      - name: Package
+        env:
+          TARGET: ${{ matrix.target }}
+          ARTIFACT: ${{ matrix.artifact }}
+        run: |
+          mkdir -p staging
+          cp "target/${TARGET}/release/pinprick" staging/
+          cp LICENSE staging/
+          tar czf "${ARTIFACT}.tar.gz" -C staging .
+
+      - name: Generate build provenance
+        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4.1.0
+        with:
+          subject-path: "${{ matrix.artifact }}.tar.gz"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: ${{ matrix.artifact }}
+          path: "${{ matrix.artifact }}.tar.gz"
+
+  release:
+    name: Release
+    needs: build
+    runs-on: ubuntu-slim
+    permissions:
+      contents: write # required to create tags and GitHub releases
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Extract version from Cargo.toml
+        id: version
+        run: |
+          VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          if [[ -z "${VERSION}" ]]; then
+            echo "::error::Could not extract version from Cargo.toml"
+            exit 1
+          fi
+          echo "tag=v${VERSION}" >> "${GITHUB_OUTPUT}"
+
+      - name: Create tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          COMMIT_SHA: ${{ github.sha }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          gh api "repos/${REPOSITORY}/git/refs" \
+            -f "ref=refs/tags/${TAG}" \
+            -f "sha=${COMMIT_SHA}"
+
+      - name: Download artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: artifacts
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          gh release create "${TAG}" \
+            --repo "${REPOSITORY}" \
+            --title "${TAG}" \
+            --generate-notes \
+            artifacts/**/*.tar.gz

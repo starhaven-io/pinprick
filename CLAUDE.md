@@ -1,0 +1,116 @@
+# pinprick — Claude Project Context
+
+pinprick is a CLI tool for GitHub Actions supply chain security. It pins action references to full SHAs, checks for updates, and audits pinned actions for runtime fetch patterns that bypass pinning (e.g., `curl ... latest`).
+
+## Project overview
+
+- **Language:** Rust (2024 edition)
+- **Platform:** macOS, Linux
+- **Architecture:** Single binary CLI with four subcommands (`audit`, `completions`, `pin`, `update`)
+- **License:** AGPL-3.0-only
+- **Dependencies:** clap (CLI), tokio (async), reqwest (HTTP), serde/serde_yml (parsing), regex (pattern matching)
+
+## Repository structure
+
+```
+pinprick/
+├── Cargo.toml
+├── build.rs                  # Embeds audited-actions/ into binary at compile time
+├── src/
+│   ├── main.rs              # Entry point, clap CLI definition, command dispatch
+│   ├── audit.rs             # Audit command: scan workflows + action source for runtime fetches
+│   ├── audit_patterns.rs    # Compiled regex patterns for shell/JS/Docker fetch detection
+│   ├── audited_actions.rs   # Layered lookup: bundled → local cache → remote → GitHub API
+│   ├── auth.rs              # GitHub token resolution (GITHUB_TOKEN env → gh auth token fallback)
+│   ├── config.rs            # TOML config file loading (.pinprick.toml, ~/.config/pinprick/)
+│   ├── github.rs            # GitHub API client (tag→SHA, releases, file trees)
+│   ├── output.rs            # Human-readable (colored) and --json output formatting
+│   ├── pin.rs               # Pin command: resolve tags to SHAs, rewrite files
+│   ├── update.rs            # Update command: check pinned actions for newer releases
+│   └── workflow.rs           # Regex-based uses: line scanning, ActionRef types
+├── audited-actions/          # Pre-audited action SHAs (bundled into binary)
+├── site/                     # Astro Starlight docs site (pinprick.rs)
+├── justfile                  # Task runner (build, test, lint, check)
+├── rustfmt.toml              # Rustfmt configuration (2024 style edition)
+├── .github/
+│   ├── workflows/           # CI, CodeQL, zizmor, release, deploy-site
+│   ├── dependabot.yml       # Dependabot for GitHub Actions, Cargo, and npm
+│   └── FUNDING.yml
+└── .gitignore
+```
+
+## Architecture
+
+### Commands
+
+- `pinprick pin [PATH]` — Scan `.github/workflows/*.yml`, resolve action tag refs to full SHAs via GitHub API, rewrite files with `@sha # tag` format. Skips already-pinned (SHA) refs. Warns on branch refs (`@main`) and sliding tags (`@v4`), resolving sliding tags to exact versions.
+- `pinprick update [PATH] [--apply]` — Check SHA-pinned actions for newer releases. Dry-run by default, `--apply` to write changes.
+- `pinprick audit [PATH]` — Scan for runtime fetch patterns that bypass pinning. Without a GitHub token, scans only local `run:` blocks. With a token, also fetches and scans action source code (JS/TS, Python, Dockerfiles, action.yml).
+- `pinprick completions <SHELL>` — Generate shell completions for bash, zsh, fish, etc.
+
+### Global flags
+
+- `--json` — Output as JSON for CI integration
+- `--color auto|always|never` — Control color output
+- `--version` / `-V` — Print version
+
+### YAML handling
+
+**Critical design decision:** workflow files are never round-tripped through a YAML parser for writing. `uses:` lines have a rigid single-line format — regex capture groups replace the ref while preserving leading whitespace, indentation, and surrounding comments. `serde_yaml` is only used for read-only extraction of `run:` block contents during audit.
+
+### GitHub auth
+
+1. `GITHUB_TOKEN` environment variable (checked first)
+2. `gh auth token` CLI fallback
+3. Graceful degradation: `pin` and `update` require a token; `audit` works without one (reduced coverage)
+
+### Audit patterns
+
+Five categories of runtime fetch detection:
+- **Shell:** `curl`/`wget`/`gh release download` with unversioned URLs, `go install @latest`, unpinned `pip`/`npm` installs
+- **PowerShell:** `Invoke-WebRequest`/`iwr`/`Invoke-RestMethod`/`irm` with unversioned URLs
+- **JavaScript:** `fetch()`/`axios`/`got`/`http.get` with unversioned URLs, `exec()`/`child_process` shelling out to curl
+- **Python:** `urllib.request.urlopen`/`requests.get` with unversioned URLs, `subprocess` shelling out to curl/wget
+- **Docker:** `FROM :latest` or no tag, `curl`/`wget` in `RUN` instructions
+
+URL "versioned" heuristic: a URL is considered versioned if any path segment matches `v?\d+(\.\d+)+`.
+
+Checksum verification: findings followed within 3 lines by `sha256sum`, `shasum`, `openssl dgst`, `gpg --verify`, or `Get-FileHash` are downgraded one severity level.
+
+### Exit codes
+
+- `0` — clean (no findings, no pending updates)
+- `1` — findings present (audit) or updates available (update dry-run)
+- `2` — error
+
+## Code style and conventions
+
+- `cargo clippy` with zero warnings
+- `cargo fmt` for formatting
+- No unnecessary abstractions — flat module structure, no nested directories
+- `thiserror` for typed errors in library code, `anyhow` for context-rich error propagation in commands
+- `LazyLock` for compiled regex constants
+
+## CI workflows (.github/workflows/)
+
+- **audit-actions.yml** — Weekly scan of tracked actions for new releases, automated PRs for clean entries
+- **ci.yml** — Dynamic matrix PR checks: conventional commits, clippy + rustfmt + typos, cargo test, site format + build, audited-actions verification, zizmor
+- **codeql.yml** — CodeQL security analysis on push to main
+- **deploy-site.yml** — Build and deploy Astro site to Cloudflare Workers
+- **release.yml** — Manual dispatch: build cross-platform binaries (linux-amd64, linux-arm64, darwin-arm64), create GitHub release with build provenance attestations
+- **zizmor.yml** — GitHub Actions security audit on push to main
+
+## Commit conventions
+
+Conventional Commits format: `type(scope): description`
+
+Common types: `feat`, `fix`, `refactor`, `docs`, `ci`, `chore`
+
+All commits must:
+- Use `git commit -s` for DCO sign-off
+- Include a `Co-authored-by: Claude Opus 4.6 (1M context) <noreply@anthropic.com>` trailer when authored with Claude
+
+## Git workflow
+
+- Never commit directly to main — always create a feature branch and open a PR
+- PR descriptions should contain only a summary of the changes — no test plan sections, no bot attribution, no "Generated with Claude Code" footers
