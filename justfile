@@ -40,6 +40,61 @@ fmt:
 typos:
     typos
 
+# Audited Actions
+
+# Add a new audited action by resolving its latest release and verifying it is clean
+add-action owner_repo:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    OWNER_REPO="{{ owner_repo }}"
+    if [[ "$OWNER_REPO" != */* ]]; then
+        echo "error: expected OWNER/REPO, got '$OWNER_REPO'" >&2
+        exit 2
+    fi
+    OWNER="${OWNER_REPO%/*}"
+    REPO="${OWNER_REPO#*/}"
+
+    echo "--- ${OWNER_REPO} ---"
+
+    LATEST=$(gh api "repos/${OWNER}/${REPO}/releases/latest" --jq '.tag_name')
+    if [[ -z "$LATEST" ]]; then
+        echo "error: no releases found for ${OWNER_REPO}" >&2
+        exit 1
+    fi
+    echo "  latest release: $LATEST"
+
+    LATEST_SHA=$(gh api "repos/${OWNER}/${REPO}/git/ref/tags/${LATEST}" --jq '.object.sha')
+    OBJ_TYPE=$(gh api "repos/${OWNER}/${REPO}/git/ref/tags/${LATEST}" --jq '.object.type')
+    if [[ "$OBJ_TYPE" == "tag" ]]; then
+        LATEST_SHA=$(gh api "repos/${OWNER}/${REPO}/git/tags/${LATEST_SHA}" --jq '.object.sha')
+    fi
+    echo "  resolved sha: ${LATEST_SHA:0:8}"
+
+    TMPDIR=$(mktemp -d)
+    trap 'rm -rf "$TMPDIR"' EXIT
+    mkdir -p "$TMPDIR/.github/workflows"
+    cat > "$TMPDIR/.github/workflows/test.yml" <<YAML
+    name: test
+    on: push
+    jobs:
+      test:
+        runs-on: ubuntu-latest
+        steps:
+          - uses: ${OWNER}/${REPO}@${LATEST_SHA} # ${LATEST}
+    YAML
+
+    cargo run --release --quiet -- --json audit "$TMPDIR"
+
+    FILE="audited-actions/${OWNER}/${REPO}.json"
+    mkdir -p "$(dirname "$FILE")"
+    [[ -f "$FILE" ]] || echo "[]" > "$FILE"
+    jq -r --arg sha "$LATEST_SHA" --arg tag "$LATEST" '
+      (if any(.[]; .sha == $sha) then . else [{sha: $sha, tag: $tag}] + . end) as $u |
+      "[\n" + ([$u[] | "  { \"sha\": \"\(.sha)\", \"tag\": \"\(.tag)\" }"] | join(",\n")) + "\n]"
+    ' "$FILE" > "$FILE.tmp"
+    command mv "$FILE.tmp" "$FILE"
+    echo "  wrote ${FILE}"
+
 # Site
 
 # Build the site
