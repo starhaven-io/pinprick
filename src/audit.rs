@@ -46,7 +46,16 @@ impl AuditCollector {
     }
 }
 
-pub async fn run(repo_root: &Path, json: bool, verbose: bool, config: &Config) -> Result<ExitCode> {
+pub async fn run(
+    repo_root: &Path,
+    json: bool,
+    sarif: bool,
+    verbose: bool,
+    config: &Config,
+) -> Result<ExitCode> {
+    // Machine-readable formats must keep stdout clean.
+    let quiet = json || sarif;
+
     let token = auth::resolve_token().await;
     let client = token.as_ref().map(|t| GitHubClient::new(t.clone()));
     let had_token = client.is_some();
@@ -58,7 +67,7 @@ pub async fn run(repo_root: &Path, json: bool, verbose: bool, config: &Config) -
 
     for file in &files {
         let display_name = workflow::display_path(file, repo_root);
-        if !json {
+        if !quiet {
             eprint!("Scanning {display_name}...");
         }
 
@@ -67,7 +76,7 @@ pub async fn run(repo_root: &Path, json: bool, verbose: bool, config: &Config) -
             scan_shell_content(content, &display_name, *line_offset, "", &mut collector);
         }
 
-        if !json {
+        if !quiet {
             eprintln!(" done");
         }
 
@@ -80,7 +89,7 @@ pub async fn run(repo_root: &Path, json: bool, verbose: bool, config: &Config) -
                 }
 
                 if config.is_action_ignored(&action.owner_repo()) {
-                    if !json {
+                    if !quiet {
                         eprintln!(
                             "  {}@{} ignored",
                             action.full_name(),
@@ -94,7 +103,7 @@ pub async fn run(repo_root: &Path, json: bool, verbose: bool, config: &Config) -
                     .check(&action.owner, &action.repo, &action.ref_string)
                     .await
                 {
-                    if !json {
+                    if !quiet {
                         eprintln!(
                             "  {}@{} audited",
                             action.full_name(),
@@ -104,7 +113,7 @@ pub async fn run(repo_root: &Path, json: bool, verbose: bool, config: &Config) -
                     continue;
                 }
 
-                if !json {
+                if !quiet {
                     eprint!(
                         "  Fetching {}@{}...",
                         action.full_name(),
@@ -115,8 +124,16 @@ pub async fn run(repo_root: &Path, json: bool, verbose: bool, config: &Config) -
                 let findings_before = collector.findings.len();
                 match scan_action_source(client, action, &mut collector).await {
                     Ok(()) => {
-                        if !json {
+                        if !quiet {
                             eprintln!(" done");
+                        }
+                        // Tag every finding produced by this remote scan with the
+                        // workflow file and `uses:` line that loaded the action, so
+                        // downstream consumers (e.g. SARIF) can anchor the result
+                        // inside the scanning repo.
+                        for finding in collector.findings.iter_mut().skip(findings_before) {
+                            finding.workflow_file = Some(display_name.clone());
+                            finding.workflow_line = Some(action.line_number);
                         }
                         if collector.findings.len() == findings_before
                             && action.ref_type == workflow::RefType::Sha
@@ -131,7 +148,7 @@ pub async fn run(repo_root: &Path, json: bool, verbose: bool, config: &Config) -
                         }
                     }
                     Err(e) => {
-                        if !json {
+                        if !quiet {
                             eprintln!(" failed");
                         }
                         eprintln!("warning: could not scan {}: {e}", action.full_name());
@@ -141,7 +158,7 @@ pub async fn run(repo_root: &Path, json: bool, verbose: bool, config: &Config) -
         }
     }
 
-    if !json && !files.is_empty() {
+    if !quiet && !files.is_empty() {
         eprintln!();
     }
 
@@ -165,7 +182,9 @@ pub async fn run(repo_root: &Path, json: bool, verbose: bool, config: &Config) -
         had_token,
     };
 
-    if json {
+    if sarif {
+        report.print_sarif();
+    } else if json {
         report.print_json();
     } else {
         report.print_human(verbose);
@@ -257,6 +276,8 @@ fn scan_shell_content(
                 line: Some(line_num),
                 pattern_matched: line.trim().to_string(),
                 description: "gh release download without pinned version".to_string(),
+                workflow_file: None,
+                workflow_line: None,
             });
         }
     }
@@ -426,6 +447,8 @@ fn check_url_patterns(
                 line: Some(line_num),
                 pattern_matched: line.trim().to_string(),
                 description: pattern.description.to_string(),
+                workflow_file: None,
+                workflow_line: None,
             });
         }
     }
@@ -449,6 +472,8 @@ fn check_patterns(
                 line: Some(line_num),
                 pattern_matched: line.trim().to_string(),
                 description: pattern.description.to_string(),
+                workflow_file: None,
+                workflow_line: None,
             });
         }
     }
