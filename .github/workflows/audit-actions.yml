@@ -5,6 +5,11 @@ on:
     - cron: "23 7 * * 1"
   workflow_dispatch:
     inputs:
+      action:
+        description: "Add a new action (OWNER/REPO). Leave empty for a full scan."
+        required: false
+        default: ""
+        type: string
       dry-run:
         description: "Log what would be added without committing"
         required: true
@@ -39,10 +44,22 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           DRY_RUN: ${{ inputs.dry-run || 'false' }}
+          INPUT_ACTION: ${{ inputs.action }}
         run: |
           UPDATED=0
-          for JSON_FILE in audited-actions/*/*.json; do
-            [[ "${JSON_FILE}" == *.json ]] || continue
+          if [[ -n "${INPUT_ACTION}" ]]; then
+            if [[ "${INPUT_ACTION}" != */* ]]; then
+              echo "error: expected OWNER/REPO, got '${INPUT_ACTION}'" >&2
+              exit 1
+            fi
+            STUB="audited-actions/${INPUT_ACTION}.json"
+            mkdir -p "$(dirname "${STUB}")"
+            [[ -f "${STUB}" ]] || echo "[]" > "${STUB}"
+            SCAN_FILES=("${STUB}")
+          else
+            SCAN_FILES=(audited-actions/*/*.json)
+          fi
+          for JSON_FILE in "${SCAN_FILES[@]}"; do
             OWNER=$(basename "$(dirname "${JSON_FILE}")")
             REPO=$(basename "${JSON_FILE}" .json)
             echo "--- ${OWNER}/${REPO} ---"
