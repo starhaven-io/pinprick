@@ -170,7 +170,7 @@ jobs:
         with:
           path: artifacts
 
-      - name: Create release
+      - name: Create release with generated notes
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPOSITORY: ${{ github.repository }}
@@ -181,3 +181,20 @@ jobs:
             --title "${TAG}" \
             --generate-notes \
             artifacts/**/*.tar.gz
+          gh release view "${TAG}" \
+            --repo "${REPOSITORY}" \
+            --json body \
+            --jq '.body' > "${RUNNER_TEMP}/raw_notes.md"
+
+      - name: Format release notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          python3 scripts/format-release-notes.py \
+            "${RUNNER_TEMP}/raw_notes.md" "${TAG}" \
+            > "${RUNNER_TEMP}/formatted_notes.md"
+          gh release edit "${TAG}" \
+            --repo "${REPOSITORY}" \
+            --notes-file "${RUNNER_TEMP}/formatted_notes.md"
