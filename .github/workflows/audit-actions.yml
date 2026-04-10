@@ -86,7 +86,10 @@ jobs:
             if ./target/release/pinprick --json audit "${TMPDIR}" 2>/dev/null; then
               echo "  Clean — adding ${LATEST}"
               if [[ "${DRY_RUN}" == "false" ]]; then
-                jq ". += [{\"sha\": \"${LATEST_SHA}\", \"tag\": \"${LATEST}\"}]" "${JSON_FILE}" > "${JSON_FILE}.tmp"
+                jq -r --arg sha "${LATEST_SHA}" --arg tag "${LATEST}" '
+                  (if any(.[]; .sha == $sha) then . else [{sha: $sha, tag: $tag}] + . end) as $u |
+                  "[\n" + ([$u[] | "  { \"sha\": \"\(.sha)\", \"tag\": \"\(.tag)\" }"] | join(",\n")) + "\n]"
+                ' "${JSON_FILE}" > "${JSON_FILE}.tmp"
                 mv "${JSON_FILE}.tmp" "${JSON_FILE}"
                 UPDATED=1
               fi
