@@ -156,6 +156,10 @@ jobs:
       - name: Check for changes
         id: diff
         run: |
+          # -N stages untracked files as intent-to-add so `git diff` sees them
+          # as full-content additions; required for the dispatch-add path that
+          # creates brand-new audited-actions/OWNER/REPO.json files.
+          git add -N audited-actions/
           if git diff --quiet audited-actions/; then
             echo "changed=false" >> "${GITHUB_OUTPUT}"
           else
