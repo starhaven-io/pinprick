@@ -54,6 +54,10 @@ enum Command {
         /// passed the version check (useful for CI audit logs)
         #[arg(short, long)]
         verbose: bool,
+
+        /// Output findings as SARIF 2.1.0 (for github/codeql-action/upload-sarif)
+        #[arg(long, conflicts_with = "json")]
+        sarif: bool,
     },
     /// Generate shell completions
     Completions {
@@ -89,9 +93,13 @@ async fn main() -> ExitCode {
     }
 
     let result = match &cli.command {
-        Command::Audit { path, verbose } => {
+        Command::Audit {
+            path,
+            verbose,
+            sarif,
+        } => {
             let config = config::Config::load(path);
-            audit::run(path, cli.json, *verbose, &config).await
+            audit::run(path, cli.json, *sarif, *verbose, &config).await
         }
         Command::Completions { shell } => {
             clap_complete::generate(
