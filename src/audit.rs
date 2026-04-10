@@ -13,16 +13,46 @@ use crate::audited_actions::AuditedActions;
 use crate::auth;
 use crate::config::Config;
 use crate::github::GitHubClient;
-use crate::output::{self, AuditFinding, AuditReport};
+use crate::output::{self, AuditFinding, AuditMatch, AuditReport};
 use crate::workflow::{self, ActionRef};
 
-pub async fn run(repo_root: &Path, json: bool, config: &Config) -> Result<ExitCode> {
+/// Accumulates findings and (when verbose) allowed matches during a scan.
+///
+/// `push_allowed` is a no-op when `verbose` is false, so callers can record
+/// matches unconditionally without caring about the flag.
+pub struct AuditCollector {
+    pub findings: Vec<AuditFinding>,
+    pub allowed: Vec<AuditMatch>,
+    pub verbose: bool,
+}
+
+impl AuditCollector {
+    pub fn new(verbose: bool) -> Self {
+        Self {
+            findings: Vec::new(),
+            allowed: Vec::new(),
+            verbose,
+        }
+    }
+
+    pub fn push_finding(&mut self, finding: AuditFinding) {
+        self.findings.push(finding);
+    }
+
+    pub fn push_allowed(&mut self, allowed: AuditMatch) {
+        if self.verbose {
+            self.allowed.push(allowed);
+        }
+    }
+}
+
+pub async fn run(repo_root: &Path, json: bool, verbose: bool, config: &Config) -> Result<ExitCode> {
     let token = auth::resolve_token().await;
     let client = token.as_ref().map(|t| GitHubClient::new(t.clone()));
     let had_token = client.is_some();
 
     let files = workflow::find_workflows(repo_root)?;
-    let mut findings: Vec<AuditFinding> = Vec::new();
+    let mut collector = AuditCollector::new(verbose);
     let mut scanned_actions: HashSet<String> = HashSet::new();
     let mut audited = AuditedActions::new(config.fetch_remote);
 
@@ -34,7 +64,7 @@ pub async fn run(repo_root: &Path, json: bool, config: &Config) -> Result<ExitCo
 
         let run_blocks = extract_run_blocks(file)?;
         for (line_offset, content) in &run_blocks {
-            scan_shell_content(content, &display_name, *line_offset, "", &mut findings);
+            scan_shell_content(content, &display_name, *line_offset, "", &mut collector);
         }
 
         if !json {
@@ -82,13 +112,13 @@ pub async fn run(repo_root: &Path, json: bool, config: &Config) -> Result<ExitCo
                     );
                 }
 
-                let findings_before = findings.len();
-                match scan_action_source(client, action, &mut findings).await {
+                let findings_before = collector.findings.len();
+                match scan_action_source(client, action, &mut collector).await {
                     Ok(()) => {
                         if !json {
                             eprintln!(" done");
                         }
-                        if findings.len() == findings_before
+                        if collector.findings.len() == findings_before
                             && action.ref_type == workflow::RefType::Sha
                         {
                             let tag = action.tag_comment.as_deref().unwrap_or(&action.ref_string);
@@ -115,27 +145,30 @@ pub async fn run(repo_root: &Path, json: bool, config: &Config) -> Result<ExitCo
         eprintln!();
     }
 
-    findings.retain(|f| {
+    collector.findings.retain(|f| {
         config.meets_severity(&f.severity) && !config.is_pattern_ignored(&f.description)
     });
 
-    findings.sort_by_key(|f| match f.severity.as_str() {
-        "high" => 0,
-        "medium" => 1,
-        _ => 2,
-    });
+    collector
+        .findings
+        .sort_by_key(|f| match f.severity.as_str() {
+            "high" => 0,
+            "medium" => 1,
+            _ => 2,
+        });
 
-    let has_findings = !findings.is_empty();
+    let has_findings = !collector.findings.is_empty();
     let report = AuditReport {
         actions_scanned: scanned_actions.len(),
-        findings,
+        findings: collector.findings,
+        allowed: collector.allowed,
         had_token,
     };
 
     if json {
         report.print_json();
     } else {
-        report.print_human();
+        report.print_human(verbose);
     }
 
     if has_findings {
@@ -189,10 +222,10 @@ fn scan_shell_content(
     source_file: &str,
     base_line: usize,
     action_name: &str,
-    findings: &mut Vec<AuditFinding>,
+    collector: &mut AuditCollector,
 ) {
     let lines: Vec<&str> = content.lines().collect();
-    let findings_before = findings.len();
+    let findings_before = collector.findings.len();
 
     for (i, line) in lines.iter().enumerate() {
         let line_num = base_line + i;
@@ -203,7 +236,7 @@ fn scan_shell_content(
             source_file,
             line_num,
             action_name,
-            findings,
+            collector,
         );
 
         check_url_patterns(
@@ -212,11 +245,11 @@ fn scan_shell_content(
             source_file,
             line_num,
             action_name,
-            findings,
+            collector,
         );
 
         if SH_GH_RELEASE_LATEST.is_match(line) && !gh_release_has_tag(line) {
-            findings.push(AuditFinding {
+            collector.push_finding(AuditFinding {
                 severity: output::severity_str(&audit_patterns::Severity::Medium).to_string(),
                 category: category_str(&audit_patterns::Category::ShellFetch).to_string(),
                 action: action_name.to_string(),
@@ -229,7 +262,7 @@ fn scan_shell_content(
     }
 
     // Downgrade severity for findings followed by checksum verification
-    for finding in findings.iter_mut().skip(findings_before) {
+    for finding in collector.findings.iter_mut().skip(findings_before) {
         if let Some(finding_line) = finding.line {
             let rel = finding_line.saturating_sub(base_line);
             for offset in 1..=3 {
@@ -258,7 +291,7 @@ fn scan_js_content(
     content: &str,
     source_file: &str,
     action_name: &str,
-    findings: &mut Vec<AuditFinding>,
+    collector: &mut AuditCollector,
 ) {
     for (i, line) in content.lines().enumerate() {
         let line_num = i + 1;
@@ -275,7 +308,7 @@ fn scan_js_content(
                     source_file,
                     line_num,
                     action_name,
-                    findings,
+                    collector,
                 );
                 check_url_patterns(
                     &JS_URL_PATTERNS,
@@ -283,7 +316,7 @@ fn scan_js_content(
                     source_file,
                     line_num,
                     action_name,
-                    findings,
+                    collector,
                 );
             }
         } else {
@@ -293,7 +326,7 @@ fn scan_js_content(
                 source_file,
                 line_num,
                 action_name,
-                findings,
+                collector,
             );
             check_url_patterns(
                 &JS_URL_PATTERNS,
@@ -301,7 +334,7 @@ fn scan_js_content(
                 source_file,
                 line_num,
                 action_name,
-                findings,
+                collector,
             );
         }
     }
@@ -311,7 +344,7 @@ fn scan_py_content(
     content: &str,
     source_file: &str,
     action_name: &str,
-    findings: &mut Vec<AuditFinding>,
+    collector: &mut AuditCollector,
 ) {
     for (i, line) in content.lines().enumerate() {
         let line_num = i + 1;
@@ -322,7 +355,7 @@ fn scan_py_content(
             source_file,
             line_num,
             action_name,
-            findings,
+            collector,
         );
         check_url_patterns(
             &PY_URL_PATTERNS,
@@ -330,7 +363,7 @@ fn scan_py_content(
             source_file,
             line_num,
             action_name,
-            findings,
+            collector,
         );
     }
 }
@@ -339,7 +372,7 @@ fn scan_dockerfile_content(
     content: &str,
     source_file: &str,
     action_name: &str,
-    findings: &mut Vec<AuditFinding>,
+    collector: &mut AuditCollector,
 ) {
     for (i, line) in content.lines().enumerate() {
         let line_num = i + 1;
@@ -354,7 +387,7 @@ fn scan_dockerfile_content(
             source_file,
             line_num,
             action_name,
-            findings,
+            collector,
         );
     }
 }
@@ -365,14 +398,27 @@ fn check_url_patterns(
     source_file: &str,
     line_num: usize,
     action_name: &str,
-    findings: &mut Vec<AuditFinding>,
+    collector: &mut AuditCollector,
 ) {
     for pattern in patterns {
-        if pattern.regex.is_match(line)
-            && let Some(url) = extract_url(line)
-            && !url_has_version(url)
-        {
-            findings.push(AuditFinding {
+        if !pattern.regex.is_match(line) {
+            continue;
+        }
+        let Some(url) = extract_url(line) else {
+            continue;
+        };
+        if url_has_version(url) {
+            collector.push_allowed(AuditMatch {
+                severity: output::severity_str(&pattern.severity).to_string(),
+                category: category_str(&pattern.category).to_string(),
+                action: action_name.to_string(),
+                source_file: source_file.to_string(),
+                line: Some(line_num),
+                pattern_matched: line.trim().to_string(),
+                reason: "versioned URL".to_string(),
+            });
+        } else {
+            collector.push_finding(AuditFinding {
                 severity: output::severity_str(&pattern.severity).to_string(),
                 category: category_str(&pattern.category).to_string(),
                 action: action_name.to_string(),
@@ -391,11 +437,11 @@ fn check_patterns(
     source_file: &str,
     line_num: usize,
     action_name: &str,
-    findings: &mut Vec<AuditFinding>,
+    collector: &mut AuditCollector,
 ) {
     for pattern in patterns {
         if pattern.regex.is_match(line) {
-            findings.push(AuditFinding {
+            collector.push_finding(AuditFinding {
                 severity: output::severity_str(&pattern.severity).to_string(),
                 category: category_str(&pattern.category).to_string(),
                 action: action_name.to_string(),
@@ -411,7 +457,7 @@ fn check_patterns(
 async fn scan_action_source(
     client: &GitHubClient,
     action: &ActionRef,
-    findings: &mut Vec<AuditFinding>,
+    collector: &mut AuditCollector,
 ) -> Result<()> {
     let action_name = format!("{}@{}", action.full_name(), short_sha(&action.ref_string));
     let tree = client
@@ -460,14 +506,14 @@ async fn scan_action_source(
 
         if is_action_yml {
             if let Ok(yaml) = serde_norway::from_str::<Value>(&content) {
-                scan_action_yml_runs(&yaml, &source_label, &action_name, findings);
+                scan_action_yml_runs(&yaml, &source_label, &action_name, collector);
             }
         } else if is_js {
-            scan_js_content(&content, &source_label, &action_name, findings);
+            scan_js_content(&content, &source_label, &action_name, collector);
         } else if is_py {
-            scan_py_content(&content, &source_label, &action_name, findings);
+            scan_py_content(&content, &source_label, &action_name, collector);
         } else if is_dockerfile {
-            scan_dockerfile_content(&content, &source_label, &action_name, findings);
+            scan_dockerfile_content(&content, &source_label, &action_name, collector);
         }
     }
 
@@ -478,7 +524,7 @@ fn scan_action_yml_runs(
     yaml: &Value,
     source_file: &str,
     action_name: &str,
-    findings: &mut Vec<AuditFinding>,
+    collector: &mut AuditCollector,
 ) {
     // runs.steps[].run (composite actions)
     if let Some(steps) = yaml
@@ -488,7 +534,7 @@ fn scan_action_yml_runs(
     {
         for step in steps {
             if let Some(run) = step.get("run").and_then(|r| r.as_str()) {
-                scan_shell_content(run, source_file, 0, action_name, findings);
+                scan_shell_content(run, source_file, 0, action_name, collector);
             }
         }
     }
@@ -499,10 +545,114 @@ fn scan_action_yml_runs(
         .and_then(|r| r.get("args"))
         .and_then(|a| a.as_str())
     {
-        scan_shell_content(args, source_file, 0, action_name, findings);
+        scan_shell_content(args, source_file, 0, action_name, collector);
     }
 }
 
 fn short_sha(sha: &str) -> &str {
     if sha.len() >= 8 { &sha[..8] } else { sha }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn collector_drops_allowed_when_not_verbose() {
+        let mut c = AuditCollector::new(false);
+        c.push_allowed(AuditMatch {
+            severity: "medium".into(),
+            category: "shell_fetch".into(),
+            action: String::new(),
+            source_file: "test".into(),
+            line: Some(1),
+            pattern_matched: "curl https://example.com/v1.2.3/foo".into(),
+            reason: "versioned URL".into(),
+        });
+        assert!(c.allowed.is_empty());
+    }
+
+    #[test]
+    fn collector_keeps_allowed_when_verbose() {
+        let mut c = AuditCollector::new(true);
+        c.push_allowed(AuditMatch {
+            severity: "medium".into(),
+            category: "shell_fetch".into(),
+            action: String::new(),
+            source_file: "test".into(),
+            line: Some(1),
+            pattern_matched: "curl https://example.com/v1.2.3/foo".into(),
+            reason: "versioned URL".into(),
+        });
+        assert_eq!(c.allowed.len(), 1);
+    }
+
+    #[test]
+    fn shell_scan_unversioned_curl_is_finding() {
+        let mut c = AuditCollector::new(true);
+        scan_shell_content(
+            "curl -L https://example.com/install.sh -o foo",
+            "test.sh",
+            1,
+            "",
+            &mut c,
+        );
+        assert_eq!(c.findings.len(), 1);
+        assert!(c.allowed.is_empty());
+    }
+
+    #[test]
+    fn shell_scan_versioned_curl_is_allowed_in_verbose() {
+        let mut c = AuditCollector::new(true);
+        scan_shell_content(
+            "curl -L https://example.com/releases/v1.2.3/foo.tar.gz -o foo",
+            "test.sh",
+            1,
+            "",
+            &mut c,
+        );
+        assert!(c.findings.is_empty());
+        assert_eq!(c.allowed.len(), 1);
+        assert_eq!(c.allowed[0].reason, "versioned URL");
+    }
+
+    #[test]
+    fn shell_scan_versioned_curl_drops_allowed_when_not_verbose() {
+        let mut c = AuditCollector::new(false);
+        scan_shell_content(
+            "curl -L https://example.com/releases/v1.2.3/foo.tar.gz -o foo",
+            "test.sh",
+            1,
+            "",
+            &mut c,
+        );
+        assert!(c.findings.is_empty());
+        assert!(c.allowed.is_empty());
+    }
+
+    #[test]
+    fn js_scan_versioned_fetch_is_allowed() {
+        let mut c = AuditCollector::new(true);
+        scan_js_content(
+            r#"const r = await fetch("https://example.com/api/1.2.3/data");"#,
+            "test.js",
+            "",
+            &mut c,
+        );
+        assert!(c.findings.is_empty());
+        assert_eq!(c.allowed.len(), 1);
+    }
+
+    #[test]
+    fn js_scan_unversioned_fetch_is_finding() {
+        let mut c = AuditCollector::new(true);
+        scan_js_content(
+            r#"const r = await fetch("https://example.com/api/data");"#,
+            "test.js",
+            "",
+            &mut c,
+        );
+        assert_eq!(c.findings.len(), 1);
+        assert!(c.allowed.is_empty());
+    }
 }

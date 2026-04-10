@@ -49,6 +49,11 @@ enum Command {
         /// Repository root
         #[arg(default_value = ".")]
         path: PathBuf,
+
+        /// Show every matched outbound-call pattern, including ones that
+        /// passed the version check (useful for CI audit logs)
+        #[arg(short, long)]
+        verbose: bool,
     },
     /// Generate shell completions
     Completions {
@@ -84,9 +89,9 @@ async fn main() -> ExitCode {
     }
 
     let result = match &cli.command {
-        Command::Audit { path } => {
+        Command::Audit { path, verbose } => {
             let config = config::Config::load(path);
-            audit::run(path, cli.json, &config).await
+            audit::run(path, cli.json, *verbose, &config).await
         }
         Command::Completions { shell } => {
             clap_complete::generate(

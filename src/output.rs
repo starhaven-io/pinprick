@@ -171,26 +171,26 @@ pub struct AuditFinding {
 }
 
 #[derive(Serialize)]
+pub struct AuditMatch {
+    pub severity: String,
+    pub category: String,
+    pub action: String,
+    pub source_file: String,
+    pub line: Option<usize>,
+    pub pattern_matched: String,
+    pub reason: String,
+}
+
+#[derive(Serialize)]
 pub struct AuditReport {
     pub findings: Vec<AuditFinding>,
+    pub allowed: Vec<AuditMatch>,
     pub actions_scanned: usize,
     pub had_token: bool,
 }
 
 impl AuditReport {
-    pub fn print_human(&self) {
-        if self.findings.is_empty() {
-            println!("No runtime fetch risks found.");
-            if !self.had_token {
-                println!(
-                    "{}",
-                    "Note: no GitHub token available — only local workflow run: blocks were scanned."
-                        .dimmed()
-                );
-            }
-            return;
-        }
-
+    pub fn print_human(&self, verbose: bool) {
         for f in &self.findings {
             let sev = match f.severity.as_str() {
                 "high" => "HIGH".red().bold(),
@@ -212,26 +212,55 @@ impl AuditReport {
             println!();
         }
 
-        let high = self
-            .findings
-            .iter()
-            .filter(|f| f.severity == "high")
-            .count();
-        let med = self
-            .findings
-            .iter()
-            .filter(|f| f.severity == "medium")
-            .count();
-        let low = self.findings.iter().filter(|f| f.severity == "low").count();
+        if verbose && !self.allowed.is_empty() {
+            println!("{}", "Allowed (matched but passed check):".dimmed());
+            for m in &self.allowed {
+                let location = match m.line {
+                    Some(n) => format!("{}:{n}", m.source_file),
+                    None => m.source_file.clone(),
+                };
+                println!("{}   {}", "OK".green().bold(), location.bold());
+                if !m.action.is_empty() {
+                    println!("      action: {}", m.action.cyan());
+                }
+                println!("      {}", m.pattern_matched.dimmed());
+                println!("      reason: {}", m.reason.dimmed());
+                println!();
+            }
+        }
 
-        println!(
-            "{} finding{} ({} high, {} medium, {} low)",
-            self.findings.len(),
-            if self.findings.len() == 1 { "" } else { "s" },
-            high,
-            med,
-            low
-        );
+        if self.findings.is_empty() {
+            println!("No runtime fetch risks found.");
+        } else {
+            let high = self
+                .findings
+                .iter()
+                .filter(|f| f.severity == "high")
+                .count();
+            let med = self
+                .findings
+                .iter()
+                .filter(|f| f.severity == "medium")
+                .count();
+            let low = self.findings.iter().filter(|f| f.severity == "low").count();
+
+            println!(
+                "{} finding{} ({} high, {} medium, {} low)",
+                self.findings.len(),
+                if self.findings.len() == 1 { "" } else { "s" },
+                high,
+                med,
+                low
+            );
+        }
+
+        if verbose && !self.allowed.is_empty() {
+            println!(
+                "{} allowed match{}",
+                self.allowed.len(),
+                if self.allowed.len() == 1 { "" } else { "es" }
+            );
+        }
 
         if !self.had_token {
             println!(
