@@ -247,6 +247,7 @@ re!(
 re!(DOCKER_FROM_DIGEST, r"(?i)^FROM\s+\S+@sha256:");
 re!(DOCKER_RUN_CURL, r"(?i)^RUN\b.*\bcurl\b");
 re!(DOCKER_RUN_WGET, r"(?i)^RUN\b.*\bwget\b");
+re!(DOCKER_ADD_URL, r"(?i)^ADD\b[^#]*\bhttps?://\S+");
 
 pub static DOCKER_PATTERNS: LazyLock<Vec<Pattern>> = LazyLock::new(|| {
     vec![
@@ -275,6 +276,15 @@ pub static DOCKER_PATTERNS: LazyLock<Vec<Pattern>> = LazyLock::new(|| {
             description: "wget in Dockerfile RUN — check URL is versioned",
         },
     ]
+});
+
+pub static DOCKER_URL_PATTERNS: LazyLock<Vec<Pattern>> = LazyLock::new(|| {
+    vec![Pattern {
+        regex: &DOCKER_ADD_URL,
+        severity: Severity::Medium,
+        category: Category::DockerUnpinned,
+        description: "Dockerfile ADD with URL source — build-time fetch bypasses pinning",
+    }]
 });
 
 // ── Python patterns ─────────────────────────────────────────────────────────
@@ -704,6 +714,30 @@ mod tests {
     #[test]
     fn docker_run_curl_detected() {
         assert!(DOCKER_RUN_CURL.is_match("RUN curl -L https://example.com/install.sh | bash"));
+    }
+
+    #[test]
+    fn docker_add_url_detected() {
+        assert!(DOCKER_ADD_URL.is_match("ADD https://example.com/install.tar.gz /tmp/"));
+        assert!(DOCKER_ADD_URL.is_match("ADD http://example.com/foo.zip /opt/"));
+    }
+
+    #[test]
+    fn docker_add_url_with_chown_detected() {
+        assert!(
+            DOCKER_ADD_URL.is_match("ADD --chown=user:group https://example.com/tool.tgz /opt/")
+        );
+    }
+
+    #[test]
+    fn docker_add_local_not_matched() {
+        assert!(!DOCKER_ADD_URL.is_match("ADD ./local.tar.gz /opt/"));
+        assert!(!DOCKER_ADD_URL.is_match("ADD context/* /app/"));
+    }
+
+    #[test]
+    fn docker_add_case_insensitive() {
+        assert!(DOCKER_ADD_URL.is_match("add https://example.com/tool.tgz /opt/"));
     }
 
     // ── PowerShell patterns ────────────────────────────────────────────

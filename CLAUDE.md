@@ -72,7 +72,7 @@ Six categories of runtime fetch detection:
 - **PowerShell:** `Invoke-WebRequest`/`iwr`/`Invoke-RestMethod`/`irm` with unversioned URLs
 - **JavaScript:** `fetch()`/`axios`/`got`/`http.get` with unversioned URLs, `exec()`/`child_process` shelling out to curl
 - **Python:** `urllib.request.urlopen`/`requests.get` with unversioned URLs, `subprocess` shelling out to curl/wget
-- **Docker:** `FROM :latest` or no tag, `curl`/`wget` in `RUN` instructions (escalated to high when piped to a shell)
+- **Docker:** `FROM :latest` or no tag, `curl`/`wget` in `RUN` instructions (escalated to high when piped to a shell), `ADD` with an `http(s)://` URL source (subject to versioning + data-format exemption via the URL-check path)
 
 Pipe-to-shell pre-empts the other shell/Docker patterns so each line emits a single finding. It also reuses the existing `ShellFetch` SARIF category/rule id to keep downstream configs stable.
 

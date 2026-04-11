@@ -356,6 +356,23 @@ RUN wget https://example.com/tool
 
 Not flagged: a `curl` line followed within 3 lines by a checksum command, which is downgraded to low.
 
+### ADD with a URL source
+
+**Severity:** Medium
+
+Dockerfile's `ADD` instruction accepts an `http://` or `https://` URL as its source, which is downloaded at build time. Unlike `COPY`, it can reach the network.
+
+```dockerfile
+ADD https://example.com/install.tar.gz /tmp/
+ADD --chown=user:group https://example.com/tool.tgz /opt/
+```
+
+Not flagged:
+
+- Versioned URL: `ADD https://example.com/releases/download/v1.2.3/install.tar.gz /tmp/`
+- Data-format URL: `ADD https://example.com/config.json /etc/` — see [Data-format exemption](#data-format-exemption).
+- Local source: `ADD ./local.tar.gz /tmp/`
+
 ## Versioned URL heuristic
 
 A URL is considered _versioned_ if it contains a path segment matching `v?\d+(\.\d+)+` between `/` or `=` boundaries:

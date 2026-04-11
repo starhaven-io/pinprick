@@ -5,9 +5,10 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use crate::audit_patterns::{
-    self, DOCKER_PATTERNS, JS_PATTERNS, JS_URL_PATTERNS, PY_PATTERNS, PY_URL_PATTERNS, Pattern,
-    SH_GH_RELEASE_LATEST, SHELL_PATTERNS, SHELL_PIPE_PATTERNS, SHELL_URL_PATTERNS, category_str,
-    extract_url, gh_release_has_tag, has_checksum_verify, url_has_version, url_is_data_format,
+    self, DOCKER_PATTERNS, DOCKER_URL_PATTERNS, JS_PATTERNS, JS_URL_PATTERNS, PY_PATTERNS,
+    PY_URL_PATTERNS, Pattern, SH_GH_RELEASE_LATEST, SHELL_PATTERNS, SHELL_PIPE_PATTERNS,
+    SHELL_URL_PATTERNS, category_str, extract_url, gh_release_has_tag, has_checksum_verify,
+    url_has_version, url_is_data_format,
 };
 use crate::audited_actions::AuditedActions;
 use crate::auth;
@@ -457,6 +458,15 @@ fn scan_dockerfile_content(
             action_name,
             collector,
         );
+
+        check_url_patterns(
+            &DOCKER_URL_PATTERNS,
+            line,
+            source_file,
+            line_num,
+            action_name,
+            collector,
+        );
     }
 }
 
@@ -814,6 +824,60 @@ mod tests {
         assert_eq!(c.findings.len(), 1);
         assert_eq!(c.findings[0].severity, "high");
         assert!(c.findings[0].description.contains("piped to shell"));
+    }
+
+    #[test]
+    fn dockerfile_scan_add_unversioned_url_is_finding() {
+        let mut c = AuditCollector::new(false);
+        scan_dockerfile_content(
+            "FROM ubuntu:22.04\nADD https://example.com/install.tar.gz /tmp/\n",
+            "Dockerfile",
+            "",
+            &mut c,
+        );
+        assert_eq!(c.findings.len(), 1);
+        assert_eq!(c.findings[0].severity, "medium");
+        assert!(c.findings[0].description.contains("ADD with URL source"));
+    }
+
+    #[test]
+    fn dockerfile_scan_add_versioned_url_is_allowed() {
+        let mut c = AuditCollector::new(true);
+        scan_dockerfile_content(
+            "FROM ubuntu:22.04\nADD https://example.com/releases/download/v1.2.3/install.tar.gz /tmp/\n",
+            "Dockerfile",
+            "",
+            &mut c,
+        );
+        assert!(c.findings.is_empty());
+        assert_eq!(c.allowed.len(), 1);
+        assert_eq!(c.allowed[0].reason, "versioned URL");
+    }
+
+    #[test]
+    fn dockerfile_scan_add_data_format_url_is_allowed() {
+        let mut c = AuditCollector::new(true);
+        scan_dockerfile_content(
+            "FROM ubuntu:22.04\nADD https://example.com/config.json /etc/\n",
+            "Dockerfile",
+            "",
+            &mut c,
+        );
+        assert!(c.findings.is_empty());
+        assert_eq!(c.allowed.len(), 1);
+        assert_eq!(c.allowed[0].reason, "data format URL");
+    }
+
+    #[test]
+    fn dockerfile_scan_add_local_src_not_flagged() {
+        let mut c = AuditCollector::new(false);
+        scan_dockerfile_content(
+            "FROM ubuntu:22.04\nADD ./local.tar.gz /tmp/\n",
+            "Dockerfile",
+            "",
+            &mut c,
+        );
+        assert!(c.findings.is_empty());
     }
 
     #[test]

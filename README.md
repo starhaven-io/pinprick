@@ -120,6 +120,7 @@ Without a GitHub token, audit scans local `run:` blocks only. With a token (via 
 | Docker | `FROM :latest` or untagged | High |
 | Docker | `RUN curl`/`wget` piped to a shell | High |
 | Docker | `curl`/`wget` in `RUN` instructions | Medium |
+| Docker | `ADD` with an `http(s)://` URL source | Medium |
 
 Pipe-to-shell is flagged even when the URL is versioned — a piped payload is never written to disk, so it cannot be checksum-verified and the versioned path pins the URL but not the content.
 
