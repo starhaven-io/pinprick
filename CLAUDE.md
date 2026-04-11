@@ -66,16 +66,19 @@ pinprick/
 
 ### Audit patterns
 
-Five categories of runtime fetch detection:
+Six categories of runtime fetch detection:
+- **Pipe-to-shell:** `curl`/`wget` piped into `sh`/`bash`/`python`, `bash <(curl …)` process substitution, `bash -c "$(curl …)"` / `eval "$(…)"` command substitution, PowerShell `iex (iwr …)` / `Invoke-Expression (… DownloadString …)`. Flagged high severity regardless of URL versioning.
 - **Shell:** `curl`/`wget`/`gh release download` with unversioned URLs, `go install @latest`, unpinned `pip`/`npm` installs
 - **PowerShell:** `Invoke-WebRequest`/`iwr`/`Invoke-RestMethod`/`irm` with unversioned URLs
 - **JavaScript:** `fetch()`/`axios`/`got`/`http.get` with unversioned URLs, `exec()`/`child_process` shelling out to curl
 - **Python:** `urllib.request.urlopen`/`requests.get` with unversioned URLs, `subprocess` shelling out to curl/wget
-- **Docker:** `FROM :latest` or no tag, `curl`/`wget` in `RUN` instructions
+- **Docker:** `FROM :latest` or no tag, `curl`/`wget` in `RUN` instructions (escalated to high when piped to a shell)
+
+Pipe-to-shell pre-empts the other shell/Docker patterns so each line emits a single finding. It also reuses the existing `ShellFetch` SARIF category/rule id to keep downstream configs stable.
 
 URL "versioned" heuristic: a URL is considered versioned if any path segment matches `v?\d+(\.\d+)+`.
 
-Checksum verification: findings followed within 3 lines by `sha256sum`, `shasum`, `openssl dgst`, `gpg --verify`, or `Get-FileHash` are downgraded one severity level.
+Checksum verification: findings followed within 3 lines by `sha256sum`, `shasum`, `openssl dgst`, `gpg --verify`, or `Get-FileHash` are downgraded one severity level. Pipe-to-shell findings are exempt — the piped payload is never written to disk, so a nearby checksum command cannot verify it.
 
 ### Exit codes
 

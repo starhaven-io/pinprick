@@ -14,19 +14,23 @@ pinprick audit /path/to/repo
 
 ### Shell (in `run:` blocks and `action.yml`)
 
-| Pattern                                    | Severity |
-| ------------------------------------------ | -------- |
-| `curl`/`wget` to `/latest/` URLs           | High     |
-| `curl`/`wget` to unversioned URLs          | Medium   |
-| `gh release download` without a pinned tag | Medium   |
-| `go install @latest`                       | Medium   |
-| `pip install` without version pin          | Low      |
-| `npm install` without version pin          | Low      |
+| Pattern                                               | Severity |
+| ----------------------------------------------------- | -------- |
+| `curl`/`wget` piped to `sh`/`bash`/`python` (any URL) | High     |
+| `bash <(curl ...)` process substitution               | High     |
+| `bash -c "$(curl ...)"` / `eval "$(curl ...)"`        | High     |
+| `curl`/`wget` to `/latest/` URLs                      | High     |
+| `curl`/`wget` to unversioned URLs                     | Medium   |
+| `gh release download` without a pinned tag            | Medium   |
+| `go install @latest`                                  | Medium   |
+| `pip install` without version pin                     | Low      |
+| `npm install` without version pin                     | Low      |
 
 ### PowerShell (in `run:` blocks)
 
 | Pattern                                                                 | Severity |
 | ----------------------------------------------------------------------- | -------- |
+| `iex`/`Invoke-Expression` on fetched content (`iex (iwr ...)`)          | High     |
 | `Invoke-WebRequest`/`iwr`/`Invoke-RestMethod`/`irm` to `/latest/` URLs  | High     |
 | `Invoke-WebRequest`/`iwr`/`Invoke-RestMethod`/`irm` to unversioned URLs | Medium   |
 
@@ -53,12 +57,15 @@ Minified bundles (`dist/index.js`) are split on `;` and scanned statement-by-sta
 | Pattern                                | Severity                 |
 | -------------------------------------- | ------------------------ |
 | `FROM image:latest` or untagged `FROM` | High                     |
+| `RUN curl`/`wget` piped to a shell     | High                     |
 | `curl`/`wget` in `RUN` instructions    | Medium                   |
 | `FROM image@sha256:...`                | Skipped (already pinned) |
 
 ### Checksum verification
 
 Findings followed within 3 lines by a checksum verification command (`sha256sum`, `shasum`, `openssl dgst`, `gpg --verify`, `Get-FileHash`) are downgraded one severity level. The fetch is still flagged, but verified downloads are less risky.
+
+Pipe-to-shell findings are **not** downgraded by a following checksum command — the piped payload is never written to disk, so a checksum line nearby cannot cover it.
 
 ## Audited actions list
 

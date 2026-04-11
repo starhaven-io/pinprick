@@ -6,8 +6,8 @@ use std::process::ExitCode;
 
 use crate::audit_patterns::{
     self, DOCKER_PATTERNS, JS_PATTERNS, JS_URL_PATTERNS, PY_PATTERNS, PY_URL_PATTERNS, Pattern,
-    SH_GH_RELEASE_LATEST, SHELL_PATTERNS, SHELL_URL_PATTERNS, category_str, extract_url,
-    gh_release_has_tag, has_checksum_verify, url_has_version,
+    SH_GH_RELEASE_LATEST, SHELL_PATTERNS, SHELL_PIPE_PATTERNS, SHELL_URL_PATTERNS, category_str,
+    extract_url, gh_release_has_tag, has_checksum_verify, url_has_version,
 };
 use crate::audited_actions::AuditedActions;
 use crate::auth;
@@ -244,10 +244,33 @@ fn scan_shell_content(
     collector: &mut AuditCollector,
 ) {
     let lines: Vec<&str> = content.lines().collect();
+
+    // Pipe-to-shell pass runs first so its findings land before `findings_before`
+    // and escape the checksum downgrade loop below.
+    let mut pipe_shell_lines: HashSet<usize> = HashSet::new();
+    for (i, line) in lines.iter().enumerate() {
+        let line_num = base_line + i;
+        let before = collector.findings.len();
+        check_patterns(
+            &SHELL_PIPE_PATTERNS,
+            line,
+            source_file,
+            line_num,
+            action_name,
+            collector,
+        );
+        if collector.findings.len() > before {
+            pipe_shell_lines.insert(line_num);
+        }
+    }
+
     let findings_before = collector.findings.len();
 
     for (i, line) in lines.iter().enumerate() {
         let line_num = base_line + i;
+        if pipe_shell_lines.contains(&line_num) {
+            continue;
+        }
 
         check_patterns(
             &SHELL_PATTERNS,
@@ -282,7 +305,8 @@ fn scan_shell_content(
         }
     }
 
-    // Downgrade severity for findings followed by checksum verification
+    // Downgrade severity for findings followed by checksum verification.
+    // Pipe-shell findings sit below `findings_before`, so they are exempt.
     for finding in collector.findings.iter_mut().skip(findings_before) {
         if let Some(finding_line) = finding.line {
             let rel = finding_line.saturating_sub(base_line);
@@ -395,10 +419,33 @@ fn scan_dockerfile_content(
     action_name: &str,
     collector: &mut AuditCollector,
 ) {
-    for (i, line) in content.lines().enumerate() {
+    let lines: Vec<&str> = content.lines().collect();
+
+    // Escalate `RUN curl ... | sh` from medium (DOCKER_RUN_CURL) to high.
+    let mut pipe_shell_lines: HashSet<usize> = HashSet::new();
+    for (i, line) in lines.iter().enumerate() {
+        let line_num = i + 1;
+        let before = collector.findings.len();
+        check_patterns(
+            &SHELL_PIPE_PATTERNS,
+            line,
+            source_file,
+            line_num,
+            action_name,
+            collector,
+        );
+        if collector.findings.len() > before {
+            pipe_shell_lines.insert(line_num);
+        }
+    }
+
+    for (i, line) in lines.iter().enumerate() {
         let line_num = i + 1;
 
         if audit_patterns::DOCKER_FROM_DIGEST.is_match(line) {
+            continue;
+        }
+        if pipe_shell_lines.contains(&line_num) {
             continue;
         }
 
@@ -679,5 +726,83 @@ mod tests {
         );
         assert_eq!(c.findings.len(), 1);
         assert!(c.allowed.is_empty());
+    }
+
+    #[test]
+    fn shell_scan_pipe_to_sh_versioned_still_high() {
+        let mut c = AuditCollector::new(true);
+        scan_shell_content(
+            "curl -sSL https://example.com/releases/download/v1.2.3/install.sh | sh",
+            "test.sh",
+            1,
+            "",
+            &mut c,
+        );
+        assert_eq!(c.findings.len(), 1, "expected exactly one finding");
+        assert_eq!(c.findings[0].severity, "high");
+        assert!(c.findings[0].description.contains("piped to shell"));
+        assert!(c.allowed.is_empty());
+    }
+
+    #[test]
+    fn shell_scan_pipe_to_sh_not_downgraded_by_checksum() {
+        let mut c = AuditCollector::new(false);
+        scan_shell_content(
+            "curl -sSL https://example.com/install.sh | sh\nsha256sum -c checksums.txt",
+            "test.sh",
+            1,
+            "",
+            &mut c,
+        );
+        assert_eq!(c.findings.len(), 1);
+        assert_eq!(c.findings[0].severity, "high");
+        assert!(
+            !c.findings[0].description.contains("checksum verified"),
+            "pipe-shell must not be downgraded by a nearby checksum"
+        );
+    }
+
+    #[test]
+    fn shell_scan_pipe_to_sh_deduplicates_with_latest_pattern() {
+        let mut c = AuditCollector::new(false);
+        scan_shell_content(
+            "curl -L https://example.com/releases/latest/install.sh | sh",
+            "test.sh",
+            1,
+            "",
+            &mut c,
+        );
+        assert_eq!(c.findings.len(), 1);
+        assert_eq!(c.findings[0].severity, "high");
+        assert!(c.findings[0].description.contains("piped to shell"));
+    }
+
+    #[test]
+    fn shell_scan_proc_sub_is_finding() {
+        let mut c = AuditCollector::new(false);
+        scan_shell_content(
+            "bash <(curl -L https://example.com/install.sh)",
+            "test.sh",
+            1,
+            "",
+            &mut c,
+        );
+        assert_eq!(c.findings.len(), 1);
+        assert_eq!(c.findings[0].severity, "high");
+        assert!(c.findings[0].description.contains("process substitution"));
+    }
+
+    #[test]
+    fn dockerfile_scan_pipe_shell_escalates_to_high() {
+        let mut c = AuditCollector::new(false);
+        scan_dockerfile_content(
+            "FROM ubuntu:22.04\nRUN curl -sSL https://example.com/install.sh | sh\n",
+            "Dockerfile",
+            "",
+            &mut c,
+        );
+        assert_eq!(c.findings.len(), 1);
+        assert_eq!(c.findings[0].severity, "high");
+        assert!(c.findings[0].description.contains("piped to shell"));
     }
 }

@@ -51,6 +51,23 @@ re!(
     r#"(?i)(Invoke-WebRequest|iwr|Invoke-RestMethod|irm)\b.*https?://[^\s"']+"#
 );
 
+re!(
+    SH_PIPE_SHELL,
+    r"(?i)\b(curl|wget)\b[^|]*\|\s*(?:sudo\s+)?(bash|sh|zsh|dash|ash|ksh|fish|python3?)\b"
+);
+re!(
+    SH_PROC_SUB_FETCH,
+    r"(?i)\b(bash|sh|zsh|dash|ash|ksh|fish|python3?)\s+<\(\s*(curl|wget)\b"
+);
+re!(
+    SH_CMD_SUB_FETCH,
+    r#"(?i)\b(bash|sh|zsh|eval)\b[^"']*["']?\$\(\s*(curl|wget)\b"#
+);
+re!(
+    SH_IEX_FETCH,
+    r"(?i)\b(iex|Invoke-Expression)\b.*\b(iwr|Invoke-WebRequest|Invoke-RestMethod|irm|DownloadString)\b"
+);
+
 pub static SHELL_PATTERNS: LazyLock<Vec<Pattern>> = LazyLock::new(|| {
     vec![
         Pattern {
@@ -112,6 +129,38 @@ pub static SHELL_URL_PATTERNS: LazyLock<Vec<Pattern>> = LazyLock::new(|| {
             severity: Severity::Medium,
             category: Category::ShellFetch,
             description: "PowerShell fetching URL without version pinning",
+        },
+    ]
+});
+
+// Scanned before (and pre-empt) the regular shell patterns so `curl ... | sh`
+// produces a single high-severity finding. Not subject to checksum downgrade —
+// a piped payload is never written to disk and cannot be verified.
+pub static SHELL_PIPE_PATTERNS: LazyLock<Vec<Pattern>> = LazyLock::new(|| {
+    vec![
+        Pattern {
+            regex: &SH_PIPE_SHELL,
+            severity: Severity::High,
+            category: Category::ShellFetch,
+            description: "fetch piped to shell — payload not written to disk, cannot be checksummed",
+        },
+        Pattern {
+            regex: &SH_PROC_SUB_FETCH,
+            severity: Severity::High,
+            category: Category::ShellFetch,
+            description: "shell reading fetched content via process substitution — bypasses pinning",
+        },
+        Pattern {
+            regex: &SH_CMD_SUB_FETCH,
+            severity: Severity::High,
+            category: Category::ShellFetch,
+            description: "shell executing fetched content via command substitution — bypasses pinning",
+        },
+        Pattern {
+            regex: &SH_IEX_FETCH,
+            severity: Severity::High,
+            category: Category::ShellFetch,
+            description: "PowerShell Invoke-Expression on fetched content — bypasses pinning",
         },
     ]
 });
@@ -559,6 +608,104 @@ mod tests {
             !PY_REQUESTS_LATEST
                 .is_match(r#"requests.get("https://example.com/releases/download/v1.2.3/tool")"#)
         );
+    }
+
+    // ── Pipe-to-shell patterns ─────────────────────────────────────────
+
+    #[test]
+    fn pipe_shell_curl_to_sh() {
+        assert!(SH_PIPE_SHELL.is_match("curl -sSL https://example.com/install.sh | sh"));
+    }
+
+    #[test]
+    fn pipe_shell_curl_to_sudo_bash() {
+        assert!(SH_PIPE_SHELL.is_match("curl -fsSL https://example.com/install.sh | sudo bash"));
+    }
+
+    #[test]
+    fn pipe_shell_wget_to_sh_with_args() {
+        assert!(
+            SH_PIPE_SHELL.is_match("wget -qO- https://example.com/install.sh | sh -s -- --yes")
+        );
+    }
+
+    #[test]
+    fn pipe_shell_curl_to_python3() {
+        assert!(SH_PIPE_SHELL.is_match("curl https://example.com/get.py | python3"));
+    }
+
+    #[test]
+    fn pipe_shell_versioned_url_still_matches() {
+        assert!(
+            SH_PIPE_SHELL
+                .is_match("curl -sSL https://example.com/releases/download/v1.2.3/install.sh | sh")
+        );
+    }
+
+    #[test]
+    fn pipe_shell_tee_not_matched() {
+        assert!(!SH_PIPE_SHELL.is_match("curl https://example.com/file.sh | tee out.sh"));
+    }
+
+    #[test]
+    fn pipe_shell_jq_not_matched() {
+        assert!(!SH_PIPE_SHELL.is_match("curl https://api.example.com/data | jq ."));
+    }
+
+    #[test]
+    fn proc_sub_bash_curl_matched() {
+        assert!(SH_PROC_SUB_FETCH.is_match("bash <(curl https://example.com/install.sh)"));
+    }
+
+    #[test]
+    fn proc_sub_sh_wget_matched() {
+        assert!(SH_PROC_SUB_FETCH.is_match("sh <(wget -qO- https://example.com/install.sh)"));
+    }
+
+    #[test]
+    fn proc_sub_not_fetch_not_matched() {
+        assert!(!SH_PROC_SUB_FETCH.is_match("bash <(cat local.sh)"));
+    }
+
+    #[test]
+    fn cmd_sub_bash_c_curl_matched() {
+        assert!(
+            SH_CMD_SUB_FETCH.is_match(r#"bash -c "$(curl -fsSL https://example.com/install.sh)""#)
+        );
+    }
+
+    #[test]
+    fn cmd_sub_eval_wget_matched() {
+        assert!(SH_CMD_SUB_FETCH.is_match(r#"eval "$(wget -qO- https://example.com/install.sh)""#));
+    }
+
+    #[test]
+    fn cmd_sub_local_not_matched() {
+        assert!(!SH_CMD_SUB_FETCH.is_match(r#"bash -c "$(pwd)""#));
+    }
+
+    #[test]
+    fn iex_iwr_matched() {
+        assert!(SH_IEX_FETCH.is_match("iex (iwr https://example.com/install.ps1)"));
+    }
+
+    #[test]
+    fn iex_downloadstring_matched() {
+        assert!(SH_IEX_FETCH.is_match(
+            r#"Invoke-Expression ((New-Object Net.WebClient).DownloadString("https://example.com/install.ps1"))"#
+        ));
+    }
+
+    #[test]
+    fn iex_invoke_restmethod_matched() {
+        assert!(
+            SH_IEX_FETCH.is_match("iex (Invoke-RestMethod -Uri https://example.com/install.ps1)")
+        );
+    }
+
+    #[test]
+    fn iex_without_fetch_not_matched() {
+        assert!(!SH_IEX_FETCH.is_match("iex $scriptBlock"));
     }
 
     // ── Checksum verification ──────────────────────────────────────────

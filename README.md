@@ -105,6 +105,9 @@ Without a GitHub token, audit scans local `run:` blocks only. With a token (via 
 
 | Category | Examples | Severity |
 |----------|----------|----------|
+| Pipe-to-shell | `curl`/`wget` piped to `sh`/`bash`/`python` (any URL) | High |
+| Pipe-to-shell | `bash <(curl ...)`, `bash -c "$(curl ...)"`, `eval "$(curl ...)"` | High |
+| Pipe-to-shell | PowerShell `iex (iwr ...)` / `Invoke-Expression (... DownloadString ...)` | High |
 | Shell | `curl`/`wget` to `/latest/` URLs | High |
 | Shell | `curl`/`wget` to unversioned URLs | Medium |
 | Shell | `go install @latest`, unpinned `pip`/`npm` | Low–Medium |
@@ -115,9 +118,12 @@ Without a GitHub token, audit scans local `run:` blocks only. With a token (via 
 | Python | `requests.get`/`urllib` to `/latest/` URLs | High |
 | Python | `subprocess` shelling out to `curl`/`wget` | High |
 | Docker | `FROM :latest` or untagged | High |
+| Docker | `RUN curl`/`wget` piped to a shell | High |
 | Docker | `curl`/`wget` in `RUN` instructions | Medium |
 
-Findings followed by checksum verification (`sha256sum`, `gpg --verify`, etc.) within 3 lines are downgraded one severity level.
+Pipe-to-shell is flagged even when the URL is versioned — a piped payload is never written to disk, so it cannot be checksum-verified and the versioned path pins the URL but not the content.
+
+Findings followed by checksum verification (`sha256sum`, `gpg --verify`, etc.) within 3 lines are downgraded one severity level. Pipe-to-shell findings are exempt.
 
 ## Exit codes
 
