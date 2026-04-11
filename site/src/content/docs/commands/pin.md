@@ -6,7 +6,8 @@ description: Resolve action tag references to full SHAs.
 Scan `.github/workflows/*.yml` files and resolve action tag references to full SHA-pinned references.
 
 ```bash
-pinprick pin
+pinprick pin                # write changes in place
+pinprick pin --dry-run      # preview without writing
 pinprick pin /path/to/repo
 ```
 
@@ -18,6 +19,7 @@ pinprick pin /path/to/repo
 - Branch refs (e.g., `@main`) are flagged — pin to a SHA manually
 - Annotated tags are followed to their underlying commit SHA
 - Files are rewritten in-place with `@sha # tag` format, preserving all comments and formatting
+- `--dry-run` prints the same preview without touching any files and exits 1 when there are unpinned actions — useful for CI gating
 
 ## Example
 

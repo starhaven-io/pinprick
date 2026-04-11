@@ -69,6 +69,11 @@ enum Command {
         /// Repository root
         #[arg(default_value = ".")]
         path: PathBuf,
+
+        /// Preview changes without writing files. Exits 1 when there are
+        /// unpinned actions — useful for CI gating.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Check for updates to pinned actions
     Update {
@@ -115,7 +120,7 @@ async fn main() -> ExitCode {
             );
             return ExitCode::SUCCESS;
         }
-        Command::Pin { path } => pin::run(path, cli.json).await,
+        Command::Pin { path, dry_run } => pin::run(path, cli.json, *dry_run).await,
         Command::Update { path, apply, only } => {
             update::run(path, *apply, cli.json, only.as_deref()).await
         }

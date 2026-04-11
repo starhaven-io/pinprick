@@ -27,6 +27,7 @@ pub struct PinSkip {
 pub struct PinReport {
     pub pinned: Vec<PinResult>,
     pub skipped: Vec<PinSkip>,
+    pub applied: bool,
 }
 
 impl PinReport {
@@ -71,8 +72,9 @@ impl PinReport {
 
         let total_files: std::collections::HashSet<&str> =
             self.pinned.iter().map(|p| p.file.as_str()).collect();
+        let verb = if self.applied { "Pinned" } else { "Would pin" };
         println!(
-            "Pinned {} action{} across {} file{}{}",
+            "{verb} {} action{} across {} file{}{}",
             self.pinned.len(),
             if self.pinned.len() == 1 { "" } else { "s" },
             total_files.len(),
@@ -83,6 +85,9 @@ impl PinReport {
                 format!(" ({} skipped)", self.skipped.len())
             }
         );
+        if !self.applied && !self.pinned.is_empty() {
+            println!("Run without {} to write changes.", "--dry-run".bold());
+        }
     }
 
     pub fn print_json(&self) {
