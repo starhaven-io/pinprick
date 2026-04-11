@@ -432,4 +432,79 @@ The exemption applies only to the _unversioned-URL_ rules — the same scope as 
 
 ## Suppressing findings
 
-Use `.pinprick.toml` to suppress by action or by description substring. See [Config File](/configuration/config-file).
+When a finding is intentional and you want `pinprick audit` to stop flagging it, reach for the tightest mechanism that covers the case. Each mechanism lives in [`.pinprick.toml`](/configuration/config-file), is visible in code review, and applies across the whole repo.
+
+There are two distinct outcomes to be aware of:
+
+- **Allowed match** — the rule still matched, but the finding is recorded as allowed instead of emitted. Visible under `--verbose` with a reason, so a reviewer auditing the audit can still see what fired. Used by [`trusted-hosts`](#trusted-hosts), [`extra-data-formats`](#extra-data-formats), the [versioned-URL heuristic](#versioned-url-heuristic), the [data-format exemption](#data-format-exemption), and the [audited-actions list](/commands/audit#audited-actions-list).
+- **Removed finding** — the finding is dropped from the report entirely and is not visible under `--verbose`. Used by [`ignore.patterns`](#ignorepatterns), [`ignore.actions`](#ignoreactions), and [`severity`](#severity-threshold).
+
+Prefer _allowed match_ mechanisms when you can — they preserve the audit trail.
+
+### `trusted-hosts`
+
+Allowlist a URL host. Any `curl`/`wget`/`fetch` to that host becomes an allowed match instead of a finding.
+
+```toml
+trusted-hosts = ["artifacts.example.com"]
+```
+
+Use this when you operate an internal artifact server and control what lives at `https://artifacts.example.com/`. Covers the unversioned-URL rules for shell, JavaScript, Python, and Docker `ADD`. See [Trusted hosts exemption](#trusted-hosts-exemption) for what it does _not_ cover (pipe-to-shell, `/latest/` URLs, package-manager installs).
+
+### `extra-data-formats`
+
+Allowlist a file extension. Unversioned URL fetches ending in that extension become allowed matches.
+
+```toml
+extra-data-formats = ["proto", "graphql"]
+```
+
+Use this when you regularly fetch a schema, config, or data file format that isn't in [pinprick's built-in data-format list](#data-format-exemption). The fetched bytes have to be consumed as data, not executed — the exemption is wrong if you're fetching an `install.proto` that happens to be a shell script.
+
+### `ignore.patterns`
+
+Drop any finding whose description contains a given substring.
+
+```toml
+[ignore]
+patterns = [
+  "pip install without version pin",
+]
+```
+
+Use this to silence a specific _rule_ across all actions. Matches by substring against the rule's description — so `"pip install"` silences the pip rule, `"unversioned URL"` silences every unversioned-URL rule. Findings matching a suppressed pattern are removed entirely, not visible under `--verbose`.
+
+Prefer `extra-data-formats` or `trusted-hosts` when they fit — those keep the audit trail; this one doesn't.
+
+### `ignore.actions`
+
+Skip an action entirely. The action's source code is never fetched, never scanned, and never counted in the "audited" total — it shows up on its own as `ignored` in the per-line output and the summary.
+
+```toml
+[ignore]
+actions = [
+  "actions/checkout",
+]
+```
+
+Matches by prefix against `owner/repo`, so `"actions/checkout"` matches every `actions/checkout@anything`. Use this when you've manually reviewed an action and decided it's out of scope — e.g. an action maintained by your own org that you already security-review separately. The blast radius is the entire action, so use sparingly.
+
+### `severity` threshold
+
+Raise the minimum severity that gets reported.
+
+```toml
+severity = "medium"
+```
+
+Accepts `"low"`, `"medium"`, or `"high"`. Findings below the threshold are removed from the report. Useful in CI when you want the audit to fail on real risks (high and medium) but not on hygiene issues (unpinned `pip install`, etc.). Not a targeted suppression — it silences _every_ finding below the bar.
+
+### Why there's no inline comment syntax
+
+pinprick deliberately does not read `# pinprick: ignore`-style inline comments. All suppression lives in `.pinprick.toml` so silencing is explicit, auditable in one place, and does not travel with copy-pasted code from another repo. If a specific line in a workflow needs to bypass a finding, your options are:
+
+1. Rewrite the line to avoid the pattern (pin the URL to a version, add a checksum check, etc.).
+2. Add a targeted allowlist entry in `.pinprick.toml` using the mechanisms above.
+3. Raise the `severity` threshold if the finding is structurally low-value.
+
+The trade-off is intentional: a little more friction for the edge case, in exchange for no per-line escape hatch that a malicious or careless commit could hide in a workflow.
