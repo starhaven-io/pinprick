@@ -273,6 +273,7 @@ fn scan_shell_content(
             continue;
         }
 
+        let before = collector.findings.len();
         check_patterns(
             &SHELL_PATTERNS,
             line,
@@ -281,15 +282,21 @@ fn scan_shell_content(
             action_name,
             collector,
         );
+        let shell_matched = collector.findings.len() > before;
 
-        check_url_patterns(
-            &SHELL_URL_PATTERNS,
-            line,
-            source_file,
-            line_num,
-            action_name,
-            collector,
-        );
+        // A `/latest/` URL already triggers the high-severity SH_*_LATEST rule
+        // in SHELL_PATTERNS. Running SHELL_URL_PATTERNS on the same line would
+        // re-flag it as a medium unversioned URL — duplicate noise.
+        if !shell_matched {
+            check_url_patterns(
+                &SHELL_URL_PATTERNS,
+                line,
+                source_file,
+                line_num,
+                action_name,
+                collector,
+            );
+        }
 
         if SH_GH_RELEASE_LATEST.is_match(line) && !gh_release_has_tag(line) {
             collector.push_finding(AuditFinding {
@@ -691,6 +698,49 @@ mod tests {
         );
         assert_eq!(c.findings.len(), 1);
         assert!(c.allowed.is_empty());
+    }
+
+    #[test]
+    fn shell_scan_latest_curl_emits_single_high_finding() {
+        let mut c = AuditCollector::new(true);
+        scan_shell_content(
+            "curl -L https://example.com/releases/latest/install.sh -o foo",
+            "test.sh",
+            1,
+            "",
+            &mut c,
+        );
+        assert_eq!(c.findings.len(), 1);
+        assert_eq!(c.findings[0].severity, "high");
+        assert!(c.findings[0].description.contains("'latest' URL"));
+    }
+
+    #[test]
+    fn shell_scan_latest_wget_emits_single_high_finding() {
+        let mut c = AuditCollector::new(false);
+        scan_shell_content(
+            "wget https://example.com/releases/latest/tool.tar.gz",
+            "test.sh",
+            1,
+            "",
+            &mut c,
+        );
+        assert_eq!(c.findings.len(), 1);
+        assert_eq!(c.findings[0].severity, "high");
+    }
+
+    #[test]
+    fn shell_scan_latest_iwr_emits_single_high_finding() {
+        let mut c = AuditCollector::new(false);
+        scan_shell_content(
+            r#"Invoke-WebRequest "https://example.com/releases/latest/tool""#,
+            "test.sh",
+            1,
+            "",
+            &mut c,
+        );
+        assert_eq!(c.findings.len(), 1);
+        assert_eq!(c.findings[0].severity, "high");
     }
 
     #[test]
