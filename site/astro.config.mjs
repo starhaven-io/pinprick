@@ -49,6 +49,10 @@ export default defineConfig({
             { label: 'Audited Actions', slug: 'configuration/audited-actions' },
           ],
         },
+        {
+          label: 'Reference',
+          items: [{ label: 'Detections', slug: 'reference/detections' }],
+        },
       ],
     }),
   ],
