@@ -366,6 +366,25 @@ pub fn url_has_version(s: &str) -> bool {
     VERSION_SEGMENT.is_match(s)
 }
 
+/// File extensions whose contents are parsed as data rather than executed.
+/// Fetches to these are downgraded to allowed matches.
+const DATA_FORMAT_EXTENSIONS: &[&str] = &[
+    "json", "jsonl", "ndjson", "yaml", "yml", "toml", "xml", "csv", "tsv", "txt", "md", "rst",
+];
+
+/// Check if a URL's path ends with a known data-format extension.
+pub fn url_is_data_format(url: &str) -> bool {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    let last = path.rsplit('/').next().unwrap_or("");
+    let Some(dot) = last.rfind('.') else {
+        return false;
+    };
+    let ext = &last[dot + 1..];
+    DATA_FORMAT_EXTENSIONS
+        .iter()
+        .any(|e| ext.eq_ignore_ascii_case(e))
+}
+
 /// Extract the first URL from a line.
 pub fn extract_url(line: &str) -> Option<&str> {
     static URL_RE: LazyLock<Regex> =
@@ -427,6 +446,97 @@ mod tests {
     fn single_number_not_version() {
         // A single number segment like /v4/ is not multi-component, so not matched
         assert!(!url_has_version("https://example.com/v4/resource"));
+    }
+
+    // ── url_is_data_format ──────────────────────────────────────────────
+
+    #[test]
+    fn data_format_json() {
+        assert!(url_is_data_format(
+            "https://formulae.brew.sh/api/analytics/install/homebrew-core/30d.json"
+        ));
+    }
+
+    #[test]
+    fn data_format_yaml() {
+        assert!(url_is_data_format("https://example.com/config.yaml"));
+        assert!(url_is_data_format("https://example.com/config.yml"));
+    }
+
+    #[test]
+    fn data_format_toml() {
+        assert!(url_is_data_format("https://example.com/settings.toml"));
+    }
+
+    #[test]
+    fn data_format_csv_tsv_xml() {
+        assert!(url_is_data_format("https://example.com/data.csv"));
+        assert!(url_is_data_format("https://example.com/data.tsv"));
+        assert!(url_is_data_format("https://example.com/data.xml"));
+    }
+
+    #[test]
+    fn data_format_markdown() {
+        assert!(url_is_data_format(
+            "https://raw.githubusercontent.com/owner/repo/main/README.md"
+        ));
+    }
+
+    #[test]
+    fn data_format_case_insensitive() {
+        assert!(url_is_data_format("https://example.com/DATA.JSON"));
+    }
+
+    #[test]
+    fn data_format_with_query_string() {
+        assert!(url_is_data_format(
+            "https://example.com/data.json?cache=false"
+        ));
+    }
+
+    #[test]
+    fn data_format_with_fragment() {
+        assert!(url_is_data_format("https://example.com/doc.md#section"));
+    }
+
+    #[test]
+    fn data_format_jsonl_ndjson() {
+        assert!(url_is_data_format("https://example.com/events.jsonl"));
+        assert!(url_is_data_format("https://example.com/events.ndjson"));
+    }
+
+    #[test]
+    fn not_data_format_shell_script() {
+        assert!(!url_is_data_format("https://example.com/install.sh"));
+    }
+
+    #[test]
+    fn not_data_format_archive() {
+        assert!(!url_is_data_format("https://example.com/tool.tar.gz"));
+        assert!(!url_is_data_format("https://example.com/bundle.zip"));
+    }
+
+    #[test]
+    fn not_data_format_executable() {
+        assert!(!url_is_data_format("https://example.com/tool.exe"));
+        assert!(!url_is_data_format("https://example.com/tool"));
+    }
+
+    #[test]
+    fn not_data_format_html() {
+        assert!(!url_is_data_format("https://example.com/page.html"));
+    }
+
+    #[test]
+    fn not_data_format_no_extension() {
+        assert!(!url_is_data_format("https://api.github.com/user"));
+    }
+
+    #[test]
+    fn not_data_format_path_ends_with_dot_in_earlier_segment() {
+        assert!(!url_is_data_format(
+            "https://example.com/v1.2.3/config/settings"
+        ));
     }
 
     // ── extract_url ─────────────────────────────────────────────────────

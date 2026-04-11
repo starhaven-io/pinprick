@@ -78,6 +78,8 @@ Pipe-to-shell pre-empts the other shell/Docker patterns so each line emits a sin
 
 URL "versioned" heuristic: a URL is considered versioned if any path segment matches `v?\d+(\.\d+)+`.
 
+Data-format exemption: unversioned-URL rules (shell, JS, Python) do **not** fire when the URL's path ends in a data-format extension (`.json`/`.jsonl`/`.ndjson`, `.yaml`/`.yml`/`.toml`, `.csv`/`.tsv`/`.xml`, `.txt`/`.md`/`.rst`). Matches are recorded as allowed (visible under `--verbose`) with reason `data format URL`. Applies only to the unversioned-URL rules — `/latest/` URLs, pipe-to-shell, and `gh release download` without a tag still fire regardless of extension. `.html` and `.svg` are intentionally excluded because both can carry embedded scripts.
+
 Checksum verification: findings followed within 3 lines by `sha256sum`, `shasum`, `openssl dgst`, `gpg --verify`, or `Get-FileHash` are downgraded one severity level. Pipe-to-shell findings are exempt — the piped payload is never written to disk, so a nearby checksum command cannot verify it.
 
 ### Exit codes

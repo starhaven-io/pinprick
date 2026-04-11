@@ -7,7 +7,7 @@ use std::process::ExitCode;
 use crate::audit_patterns::{
     self, DOCKER_PATTERNS, JS_PATTERNS, JS_URL_PATTERNS, PY_PATTERNS, PY_URL_PATTERNS, Pattern,
     SH_GH_RELEASE_LATEST, SHELL_PATTERNS, SHELL_PIPE_PATTERNS, SHELL_URL_PATTERNS, category_str,
-    extract_url, gh_release_has_tag, has_checksum_verify, url_has_version,
+    extract_url, gh_release_has_tag, has_checksum_verify, url_has_version, url_is_data_format,
 };
 use crate::audited_actions::AuditedActions;
 use crate::auth;
@@ -485,6 +485,16 @@ fn check_url_patterns(
                 pattern_matched: line.trim().to_string(),
                 reason: "versioned URL".to_string(),
             });
+        } else if url_is_data_format(url) {
+            collector.push_allowed(AuditMatch {
+                severity: output::severity_str(&pattern.severity).to_string(),
+                category: category_str(&pattern.category).to_string(),
+                action: action_name.to_string(),
+                source_file: source_file.to_string(),
+                line: Some(line_num),
+                pattern_matched: line.trim().to_string(),
+                reason: "data format URL".to_string(),
+            });
         } else {
             collector.push_finding(AuditFinding {
                 severity: output::severity_str(&pattern.severity).to_string(),
@@ -804,5 +814,76 @@ mod tests {
         assert_eq!(c.findings.len(), 1);
         assert_eq!(c.findings[0].severity, "high");
         assert!(c.findings[0].description.contains("piped to shell"));
+    }
+
+    #[test]
+    fn shell_scan_data_format_url_is_allowed_not_finding() {
+        // Real Homebrew/core workflow line — regression anchor.
+        let mut c = AuditCollector::new(true);
+        scan_shell_content(
+            r#"DATA_30="$(curl -s https://formulae.brew.sh/api/analytics/install/homebrew-core/30d.json)""#,
+            "test.sh",
+            1,
+            "",
+            &mut c,
+        );
+        assert!(c.findings.is_empty());
+        assert_eq!(c.allowed.len(), 1);
+        assert_eq!(c.allowed[0].reason, "data format URL");
+    }
+
+    #[test]
+    fn shell_scan_data_format_url_dropped_without_verbose() {
+        let mut c = AuditCollector::new(false);
+        scan_shell_content(
+            "curl -s https://example.com/config.yaml -o config.yaml",
+            "test.sh",
+            1,
+            "",
+            &mut c,
+        );
+        assert!(c.findings.is_empty());
+        assert!(c.allowed.is_empty());
+    }
+
+    #[test]
+    fn shell_scan_non_data_url_still_flagged() {
+        let mut c = AuditCollector::new(false);
+        scan_shell_content(
+            "curl -L https://example.com/install.sh -o install.sh",
+            "test.sh",
+            1,
+            "",
+            &mut c,
+        );
+        assert_eq!(c.findings.len(), 1);
+    }
+
+    #[test]
+    fn js_scan_data_format_url_is_allowed() {
+        let mut c = AuditCollector::new(true);
+        scan_js_content(
+            r#"const r = await fetch("https://example.com/config.json");"#,
+            "test.js",
+            "",
+            &mut c,
+        );
+        assert!(c.findings.is_empty());
+        assert_eq!(c.allowed.len(), 1);
+        assert_eq!(c.allowed[0].reason, "data format URL");
+    }
+
+    #[test]
+    fn py_scan_data_format_url_is_allowed() {
+        let mut c = AuditCollector::new(true);
+        scan_py_content(
+            r#"r = requests.get("https://example.com/data.json")"#,
+            "test.py",
+            "",
+            &mut c,
+        );
+        assert!(c.findings.is_empty());
+        assert_eq!(c.allowed.len(), 1);
+        assert_eq!(c.allowed[0].reason, "data format URL");
     }
 }

@@ -123,6 +123,8 @@ Without a GitHub token, audit scans local `run:` blocks only. With a token (via 
 
 Pipe-to-shell is flagged even when the URL is versioned — a piped payload is never written to disk, so it cannot be checksum-verified and the versioned path pins the URL but not the content.
 
+Unversioned-URL rules don't fire when the URL's path ends in a data-format extension (`.json`, `.yaml`, `.toml`, `.csv`, etc.) — the payload is consumed as data, not executed. These matches are only visible under `--verbose`.
+
 Findings followed by checksum verification (`sha256sum`, `gpg --verify`, etc.) within 3 lines are downgraded one severity level. Pipe-to-shell findings are exempt.
 
 ## Exit codes
