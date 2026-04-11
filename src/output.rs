@@ -204,6 +204,32 @@ pub struct AuditReport {
     pub allowed: Vec<AuditMatch>,
     pub actions_scanned: usize,
     pub had_token: bool,
+    /// Number of actions whose SHA matched the bundled list.
+    #[serde(default)]
+    pub audited_bundled: usize,
+    /// Number of actions whose SHA matched the local cache.
+    #[serde(default)]
+    pub audited_local_cache: usize,
+    /// Number of actions whose SHA matched the remote pinprick.rs list.
+    #[serde(default)]
+    pub audited_remote: usize,
+    /// Number of SHA- or tag-pinned actions that were fetched and scanned
+    /// fresh (not in any audited-actions list).
+    #[serde(default)]
+    pub scanned_fresh: usize,
+    /// Number of branch refs (`@main`) that were scanned at current tip.
+    /// Not a durable audit — the content can change on the next fetch,
+    /// and `pinprick pin` cannot auto-resolve these.
+    #[serde(default)]
+    pub scanned_unpinned_branch: usize,
+    /// Number of sliding tags (`@v4`) that were scanned at current tip.
+    /// Not a durable audit — the tag can be retargeted, but `pinprick pin`
+    /// can resolve these to exact SHAs.
+    #[serde(default)]
+    pub scanned_unpinned_sliding: usize,
+    /// Number of actions skipped by `ignore.actions` in the config.
+    #[serde(default)]
+    pub ignored: usize,
 }
 
 impl AuditReport {
@@ -271,6 +297,10 @@ impl AuditReport {
             );
         }
 
+        for line in self.audit_summary_lines() {
+            println!("{line}");
+        }
+
         if verbose && !self.allowed.is_empty() {
             println!(
                 "{} allowed match{}",
@@ -285,6 +315,98 @@ impl AuditReport {
                 "Note: no GitHub token — action source code was not scanned.".dimmed()
             );
         }
+    }
+
+    /// Build the summary of how actions were audited. Up to four lines,
+    /// each omitted when its count is zero:
+    ///
+    /// 1. `Audited N actions: X bundled, Y local cache, Z pinprick.rs, W scanned fresh.`
+    /// 2. `N sliding tags scanned. Run `pinprick pin` to resolve.`
+    /// 3. `M branch refs scanned. Pin to a SHA manually.`
+    /// 4. `K actions ignored per config.`
+    fn audit_summary_lines(&self) -> Vec<String> {
+        let trusted_total = self.audited_bundled
+            + self.audited_local_cache
+            + self.audited_remote
+            + self.scanned_fresh;
+        let unpinned_total = self.scanned_unpinned_branch + self.scanned_unpinned_sliding;
+        if trusted_total == 0 && unpinned_total == 0 && self.ignored == 0 {
+            return Vec::new();
+        }
+
+        let mut lines = Vec::new();
+
+        if trusted_total > 0 {
+            let mut parts: Vec<String> = Vec::new();
+            if self.audited_bundled > 0 {
+                parts.push(format!("{} bundled", self.audited_bundled));
+            }
+            if self.audited_local_cache > 0 {
+                parts.push(format!("{} local cache", self.audited_local_cache));
+            }
+            if self.audited_remote > 0 {
+                parts.push(format!("{} pinprick.rs", self.audited_remote));
+            }
+            if self.scanned_fresh > 0 {
+                parts.push(
+                    format!("{} scanned fresh", self.scanned_fresh)
+                        .blue()
+                        .to_string(),
+                );
+            }
+            lines.push(format!(
+                "{} {} action{}: {}.",
+                "Audited".green(),
+                trusted_total,
+                if trusted_total == 1 { "" } else { "s" },
+                parts.join(", ")
+            ));
+        }
+
+        if self.scanned_unpinned_sliding > 0 {
+            lines.push(
+                format!(
+                    "{} sliding tag{} scanned. Run `pinprick pin` to resolve.",
+                    self.scanned_unpinned_sliding,
+                    if self.scanned_unpinned_sliding == 1 {
+                        ""
+                    } else {
+                        "s"
+                    }
+                )
+                .yellow()
+                .to_string(),
+            );
+        }
+
+        if self.scanned_unpinned_branch > 0 {
+            lines.push(
+                format!(
+                    "{} branch ref{} scanned. Pin to a SHA manually.",
+                    self.scanned_unpinned_branch,
+                    if self.scanned_unpinned_branch == 1 {
+                        ""
+                    } else {
+                        "s"
+                    }
+                )
+                .yellow()
+                .to_string(),
+            );
+        }
+
+        if self.ignored > 0 {
+            lines.push(
+                format!(
+                    "{} action{} ignored per config.",
+                    self.ignored,
+                    if self.ignored == 1 { "" } else { "s" }
+                )
+                .dimmed()
+                .to_string(),
+            );
+        }
+        lines
     }
 
     pub fn print_json(&self) {
@@ -545,6 +667,13 @@ mod sarif_tests {
             allowed: vec![],
             actions_scanned: 0,
             had_token: false,
+            audited_bundled: 0,
+            audited_local_cache: 0,
+            audited_remote: 0,
+            scanned_fresh: 0,
+            scanned_unpinned_branch: 0,
+            scanned_unpinned_sliding: 0,
+            ignored: 0,
         }
     }
 
@@ -663,5 +792,212 @@ mod sarif_tests {
         let v = sarif(vec![]);
         let results = v["runs"][0]["results"].as_array().unwrap();
         assert!(results.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod audit_summary_tests {
+    use super::*;
+
+    fn empty_report() -> AuditReport {
+        AuditReport {
+            findings: vec![],
+            allowed: vec![],
+            actions_scanned: 0,
+            had_token: true,
+            audited_bundled: 0,
+            audited_local_cache: 0,
+            audited_remote: 0,
+            scanned_fresh: 0,
+            scanned_unpinned_branch: 0,
+            scanned_unpinned_sliding: 0,
+            ignored: 0,
+        }
+    }
+
+    fn lines_without_ansi(r: &AuditReport) -> Vec<String> {
+        colored::control::set_override(false);
+        let out = r.audit_summary_lines();
+        colored::control::unset_override();
+        out
+    }
+
+    #[test]
+    fn empty_report_produces_no_summary() {
+        let r = empty_report();
+        assert!(lines_without_ansi(&r).is_empty());
+    }
+
+    #[test]
+    fn only_bundled() {
+        let r = AuditReport {
+            audited_bundled: 5,
+            ..empty_report()
+        };
+        assert_eq!(
+            lines_without_ansi(&r),
+            vec!["Audited 5 actions: 5 bundled."]
+        );
+    }
+
+    #[test]
+    fn mixed_sources() {
+        let r = AuditReport {
+            audited_bundled: 5,
+            audited_local_cache: 2,
+            scanned_fresh: 1,
+            ..empty_report()
+        };
+        assert_eq!(
+            lines_without_ansi(&r),
+            vec!["Audited 8 actions: 5 bundled, 2 local cache, 1 scanned fresh."]
+        );
+    }
+
+    #[test]
+    fn all_four_sources() {
+        let r = AuditReport {
+            audited_bundled: 3,
+            audited_local_cache: 2,
+            audited_remote: 1,
+            scanned_fresh: 4,
+            ..empty_report()
+        };
+        assert_eq!(
+            lines_without_ansi(&r),
+            vec!["Audited 10 actions: 3 bundled, 2 local cache, 1 pinprick.rs, 4 scanned fresh."]
+        );
+    }
+
+    #[test]
+    fn ignored_only_emits_only_ignored_line() {
+        let r = AuditReport {
+            ignored: 2,
+            ..empty_report()
+        };
+        assert_eq!(
+            lines_without_ansi(&r),
+            vec!["2 actions ignored per config."]
+        );
+    }
+
+    #[test]
+    fn mixed_sources_plus_ignored() {
+        let r = AuditReport {
+            audited_bundled: 4,
+            ignored: 1,
+            ..empty_report()
+        };
+        assert_eq!(
+            lines_without_ansi(&r),
+            vec![
+                "Audited 4 actions: 4 bundled.",
+                "1 action ignored per config.",
+            ]
+        );
+    }
+
+    #[test]
+    fn single_action_singular_plural() {
+        let r = AuditReport {
+            audited_bundled: 1,
+            ..empty_report()
+        };
+        assert_eq!(lines_without_ansi(&r), vec!["Audited 1 action: 1 bundled."]);
+    }
+
+    #[test]
+    fn sliding_tag_only_suggests_pinprick_pin() {
+        let r = AuditReport {
+            scanned_unpinned_sliding: 1,
+            ..empty_report()
+        };
+        assert_eq!(
+            lines_without_ansi(&r),
+            vec!["1 sliding tag scanned. Run `pinprick pin` to resolve."]
+        );
+    }
+
+    #[test]
+    fn branch_ref_only_says_pin_manually() {
+        let r = AuditReport {
+            scanned_unpinned_branch: 1,
+            ..empty_report()
+        };
+        assert_eq!(
+            lines_without_ansi(&r),
+            vec!["1 branch ref scanned. Pin to a SHA manually."]
+        );
+    }
+
+    #[test]
+    fn unpinned_and_pinned_are_split() {
+        let r = AuditReport {
+            audited_bundled: 3,
+            scanned_unpinned_sliding: 2,
+            ..empty_report()
+        };
+        assert_eq!(
+            lines_without_ansi(&r),
+            vec![
+                "Audited 3 actions: 3 bundled.",
+                "2 sliding tags scanned. Run `pinprick pin` to resolve.",
+            ]
+        );
+    }
+
+    #[test]
+    fn branch_and_sliding_are_separate_lines() {
+        let r = AuditReport {
+            scanned_unpinned_branch: 1,
+            scanned_unpinned_sliding: 2,
+            ..empty_report()
+        };
+        assert_eq!(
+            lines_without_ansi(&r),
+            vec![
+                "2 sliding tags scanned. Run `pinprick pin` to resolve.",
+                "1 branch ref scanned. Pin to a SHA manually.",
+            ]
+        );
+    }
+
+    #[test]
+    fn scanned_fresh_does_not_include_unpinned() {
+        let r = AuditReport {
+            scanned_fresh: 2,
+            scanned_unpinned_sliding: 1,
+            ..empty_report()
+        };
+        assert_eq!(
+            lines_without_ansi(&r),
+            vec![
+                "Audited 2 actions: 2 scanned fresh.",
+                "1 sliding tag scanned. Run `pinprick pin` to resolve.",
+            ]
+        );
+    }
+
+    #[test]
+    fn all_categories_populated() {
+        let r = AuditReport {
+            audited_bundled: 5,
+            audited_local_cache: 2,
+            audited_remote: 1,
+            scanned_fresh: 3,
+            scanned_unpinned_sliding: 2,
+            scanned_unpinned_branch: 1,
+            ignored: 1,
+            ..empty_report()
+        };
+        assert_eq!(
+            lines_without_ansi(&r),
+            vec![
+                "Audited 11 actions: 5 bundled, 2 local cache, 1 pinprick.rs, 3 scanned fresh.",
+                "2 sliding tags scanned. Run `pinprick pin` to resolve.",
+                "1 branch ref scanned. Pin to a SHA manually.",
+                "1 action ignored per config.",
+            ]
+        );
     }
 }

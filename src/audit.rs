@@ -10,12 +10,13 @@ use crate::audit_patterns::{
     SHELL_URL_PATTERNS, category_str, extract_url, gh_release_has_tag, has_checksum_verify,
     url_has_version,
 };
-use crate::audited_actions::AuditedActions;
+use crate::audited_actions::{AuditSource, AuditedActions};
 use crate::auth;
 use crate::config::Config;
 use crate::github::GitHubClient;
 use crate::output::{self, AuditFinding, AuditMatch, AuditReport};
 use crate::workflow::{self, ActionRef};
+use colored::Colorize;
 
 /// Accumulates findings and (when verbose) allowed matches during a scan.
 ///
@@ -65,11 +66,18 @@ pub async fn run(
     let mut collector = AuditCollector::new(verbose);
     let mut scanned_actions: HashSet<String> = HashSet::new();
     let mut audited = AuditedActions::new(config.fetch_remote);
+    let mut audited_bundled = 0usize;
+    let mut audited_local_cache = 0usize;
+    let mut audited_remote = 0usize;
+    let mut scanned_fresh = 0usize;
+    let mut scanned_unpinned_branch = 0usize;
+    let mut scanned_unpinned_sliding = 0usize;
+    let mut ignored = 0usize;
 
     for file in &files {
         let display_name = workflow::display_path(file, repo_root);
         if !quiet {
-            eprint!("Scanning {display_name}...");
+            eprintln!("Scanning {display_name}");
         }
 
         let run_blocks = extract_run_blocks(file)?;
@@ -84,10 +92,6 @@ pub async fn run(
             );
         }
 
-        if !quiet {
-            eprintln!(" done");
-        }
-
         if let Some(client) = &client {
             let actions = workflow::scan_workflow(file)?;
             for action in &actions {
@@ -97,11 +101,13 @@ pub async fn run(
                 }
 
                 if config.is_action_ignored(&action.owner_repo()) {
+                    ignored += 1;
                     if !quiet {
                         eprintln!(
-                            "  {}@{} ignored",
+                            "  {}@{} {}",
                             action.full_name(),
-                            short_sha(&action.ref_string)
+                            short_sha(&action.ref_string),
+                            "ignored".dimmed()
                         );
                     }
                     continue;
@@ -111,30 +117,60 @@ pub async fn run(
                     .check(&action.owner, &action.repo, &action.ref_string)
                     .await
                 {
+                    match source {
+                        AuditSource::Bundled => audited_bundled += 1,
+                        AuditSource::LocalCache => audited_local_cache += 1,
+                        AuditSource::Remote => audited_remote += 1,
+                    }
                     if !quiet {
                         eprintln!(
-                            "  {}@{} audited ({})",
+                            "  {}@{} {} ({})",
                             action.full_name(),
                             short_sha(&action.ref_string),
+                            "audited".green(),
                             source.label()
                         );
                     }
                     continue;
                 }
 
+                let pinned = matches!(
+                    action.ref_type,
+                    workflow::RefType::Sha | workflow::RefType::Tag
+                );
+
                 if !quiet {
-                    eprint!(
-                        "  Fetching {}@{}...",
-                        action.full_name(),
-                        short_sha(&action.ref_string)
-                    );
+                    if pinned {
+                        eprintln!(
+                            "  {} {}@{}",
+                            "Fetching".blue(),
+                            action.full_name(),
+                            short_sha(&action.ref_string)
+                        );
+                    } else {
+                        eprintln!(
+                            "  {} {}@{} {}",
+                            "Fetching".blue(),
+                            action.full_name(),
+                            short_sha(&action.ref_string),
+                            "(unpinned)".yellow()
+                        );
+                    }
                 }
 
                 let findings_before = collector.findings.len();
                 match scan_action_source(client, action, &mut collector, config).await {
                     Ok(()) => {
-                        if !quiet {
-                            eprintln!(" done");
+                        match action.ref_type {
+                            workflow::RefType::Sha | workflow::RefType::Tag => {
+                                scanned_fresh += 1;
+                            }
+                            workflow::RefType::SlidingTag => {
+                                scanned_unpinned_sliding += 1;
+                            }
+                            workflow::RefType::Branch => {
+                                scanned_unpinned_branch += 1;
+                            }
                         }
                         // Tag every finding produced by this remote scan with the
                         // workflow file and `uses:` line that loaded the action, so
@@ -157,9 +193,6 @@ pub async fn run(
                         }
                     }
                     Err(e) => {
-                        if !quiet {
-                            eprintln!(" failed");
-                        }
                         eprintln!("warning: could not scan {}: {e}", action.full_name());
                     }
                 }
@@ -189,6 +222,13 @@ pub async fn run(
         findings: collector.findings,
         allowed: collector.allowed,
         had_token,
+        audited_bundled,
+        audited_local_cache,
+        audited_remote,
+        scanned_fresh,
+        scanned_unpinned_branch,
+        scanned_unpinned_sliding,
+        ignored,
     };
 
     if sarif {

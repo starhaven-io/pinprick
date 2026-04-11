@@ -44,12 +44,32 @@ When no GitHub token is available, audit scans only workflow `run:` blocks. Acti
 
 ```
 $ pinprick audit
-Scanning .github/workflows/ci.yml... done
+Scanning .github/workflows/ci.yml
   actions/checkout@de0fac2e audited (bundled)
   actions/upload-artifact@bbbca2dd audited (bundled)
-Scanning .github/workflows/release.yml... done
+Scanning .github/workflows/release.yml
   actions/attest@59d89421 audited (bundled)
   rust-lang/crates-io-auth-action@bbd81622 audited (local cache)
+  Fetching Homebrew/actions/setup-homebrew@main (unpinned)
 
 No runtime fetch risks found.
+Audited 4 actions: 3 bundled, 1 local cache.
+1 branch ref scanned. Pin to a SHA manually.
 ```
+
+If the workflow uses sliding tags like `@v4` instead of branch refs, the summary suggests the auto-fix:
+
+```
+1 sliding tag scanned. Run `pinprick pin` to resolve.
+```
+
+`pinprick pin` can auto-resolve sliding tags to exact SHAs. Branch refs (`@main`) require manual pinning because there's no version target to resolve to.
+
+Per-action status is colored by semantic category, not by source, so a clean audit looks like a wall of uniform green with only the exceptions popping out:
+
+- **`audited`** — green. Matched an entry in the bundled list, local cache, or `pinprick.rs` list. No network work needed.
+- **`Fetching`** / **`scanned fresh`** — blue. pinprick fetched the action source over the network and scanned it fresh this run.
+- **`(unpinned)`** / **`unpinned ref scanned`** — yellow. The ref is a branch (`@main`) or sliding tag (`@v4`) — pinprick scans the current tip but the trust does not carry across runs because the content can change.
+- **`ignored`** — dimmed. Skipped per `ignore.actions` in `.pinprick.toml`.
+
+The summary at the end is up to three lines: the audited total (durably trusted), a separate unpinned line if any branch/sliding-tag refs were scanned, and an ignored line if any config-driven skips were applied.
