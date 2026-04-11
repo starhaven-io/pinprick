@@ -102,7 +102,7 @@ Checksum verification: findings followed within 3 lines by `sha256sum`, `shasum`
 - **ci.yml** — Dynamic matrix PR checks: conventional commits, clippy + rustfmt + typos, cargo test, site format + build, audited-actions verification, zizmor
 - **codeql.yml** — CodeQL security analysis on push to main
 - **deploy-site.yml** — Build and deploy Astro site to Cloudflare Workers
-- **release.yml** — Manual dispatch: build cross-platform binaries (linux-amd64, linux-arm64, darwin-arm64), create GitHub release with build provenance attestations
+- **release.yml** — Manual dispatch: build cross-platform binaries (linux-amd64, linux-arm64, darwin-arm64), create GitHub release with build provenance attestations, publish the crate to crates.io
 - **zizmor.yml** — GitHub Actions security audit on push to main
 
 ## Commit conventions

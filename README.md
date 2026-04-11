@@ -21,15 +21,23 @@ pinprick picks up where static analysis leaves off. SHA-pinning actions is table
 brew install p-linnane/tap/pinprick
 ```
 
-### From source
+### crates.io
 
 ```bash
-cargo install --git https://github.com/p-linnane/pinprick
+cargo install pinprick
 ```
 
 ### From releases
 
 Download a prebuilt binary from [GitHub Releases](https://github.com/p-linnane/pinprick/releases).
+
+### From git (unreleased HEAD)
+
+To try unreleased changes from `main`:
+
+```bash
+cargo install --git https://github.com/p-linnane/pinprick
+```
 
 ## Usage
 
