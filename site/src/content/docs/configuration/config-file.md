@@ -19,6 +19,11 @@ fetch-remote = true
 # Minimum severity to report: "low", "medium", or "high" (default: "low")
 severity = "medium"
 
+# Additional file extensions to treat as data formats, beyond the built-in set
+# (see the Detections reference for the full built-in list). Case-insensitive;
+# leading dots are optional.
+extra-data-formats = ["proto", "graphql"]
+
 # Suppress specific findings
 [ignore]
 # Skip audit for these actions entirely
@@ -39,6 +44,16 @@ When enabled, pinprick fetches the community audited-actions list from `pinprick
 ### `severity`
 
 Filter findings by minimum severity. Set to `"medium"` to hide low-severity findings like unpinned `pip install`, or `"high"` to only see the most critical patterns.
+
+### `extra-data-formats`
+
+A list of file extensions to append to pinprick's built-in [data-format exemption](/reference/detections#data-format-exemption) set. Useful if you regularly fetch protocol schemas (`.proto`, `.graphql`), infrastructure definitions (`.tf`, `.hcl`), or any other non-executable asset format that's not in the default list.
+
+```toml
+extra-data-formats = ["proto", "graphql", "tf", "hcl"]
+```
+
+Matching is case-insensitive. Leading dots are stripped (`".proto"` and `"proto"` behave identically). The configured extensions are _added_ to the built-in set, not replacing it.
 
 ### `ignore.actions`
 

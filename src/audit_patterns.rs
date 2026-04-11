@@ -382,14 +382,20 @@ const DATA_FORMAT_EXTENSIONS: &[&str] = &[
     "json", "jsonl", "ndjson", "yaml", "yml", "toml", "xml", "csv", "tsv", "txt", "md", "rst",
 ];
 
-/// Check if a URL's path ends with a known data-format extension.
-pub fn url_is_data_format(url: &str) -> bool {
+/// Extract the filename extension from a URL's path. Query strings and
+/// fragments are stripped. Returns `None` if the final path segment has no dot.
+pub fn url_extension(url: &str) -> Option<&str> {
     let path = url.split(['?', '#']).next().unwrap_or(url);
     let last = path.rsplit('/').next().unwrap_or("");
-    let Some(dot) = last.rfind('.') else {
+    let dot = last.rfind('.')?;
+    Some(&last[dot + 1..])
+}
+
+/// Check if a URL's path ends with a known data-format extension.
+pub fn url_is_data_format(url: &str) -> bool {
+    let Some(ext) = url_extension(url) else {
         return false;
     };
-    let ext = &last[dot + 1..];
     DATA_FORMAT_EXTENSIONS
         .iter()
         .any(|e| ext.eq_ignore_ascii_case(e))
@@ -456,6 +462,42 @@ mod tests {
     fn single_number_not_version() {
         // A single number segment like /v4/ is not multi-component, so not matched
         assert!(!url_has_version("https://example.com/v4/resource"));
+    }
+
+    // ── url_extension ───────────────────────────────────────────────────
+
+    #[test]
+    fn url_extension_simple() {
+        assert_eq!(url_extension("https://example.com/data.json"), Some("json"));
+    }
+
+    #[test]
+    fn url_extension_strips_query_string() {
+        assert_eq!(
+            url_extension("https://example.com/data.json?cache=false"),
+            Some("json")
+        );
+    }
+
+    #[test]
+    fn url_extension_strips_fragment() {
+        assert_eq!(
+            url_extension("https://example.com/doc.md#section"),
+            Some("md")
+        );
+    }
+
+    #[test]
+    fn url_extension_no_extension() {
+        assert_eq!(url_extension("https://api.github.com/user"), None);
+    }
+
+    #[test]
+    fn url_extension_dot_only_in_earlier_segment() {
+        assert_eq!(
+            url_extension("https://example.com/v1.2.3/config/settings"),
+            None
+        );
     }
 
     // ── url_is_data_format ──────────────────────────────────────────────

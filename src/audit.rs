@@ -8,7 +8,7 @@ use crate::audit_patterns::{
     self, DOCKER_PATTERNS, DOCKER_URL_PATTERNS, JS_PATTERNS, JS_URL_PATTERNS, PY_PATTERNS,
     PY_URL_PATTERNS, Pattern, SH_GH_RELEASE_LATEST, SHELL_PATTERNS, SHELL_PIPE_PATTERNS,
     SHELL_URL_PATTERNS, category_str, extract_url, gh_release_has_tag, has_checksum_verify,
-    url_has_version, url_is_data_format,
+    url_has_version,
 };
 use crate::audited_actions::AuditedActions;
 use crate::auth;
@@ -74,7 +74,14 @@ pub async fn run(
 
         let run_blocks = extract_run_blocks(file)?;
         for (line_offset, content) in &run_blocks {
-            scan_shell_content(content, &display_name, *line_offset, "", &mut collector);
+            scan_shell_content(
+                content,
+                &display_name,
+                *line_offset,
+                "",
+                &mut collector,
+                config,
+            );
         }
 
         if !quiet {
@@ -123,7 +130,7 @@ pub async fn run(
                 }
 
                 let findings_before = collector.findings.len();
-                match scan_action_source(client, action, &mut collector).await {
+                match scan_action_source(client, action, &mut collector, config).await {
                     Ok(()) => {
                         if !quiet {
                             eprintln!(" done");
@@ -243,6 +250,7 @@ fn scan_shell_content(
     base_line: usize,
     action_name: &str,
     collector: &mut AuditCollector,
+    config: &Config,
 ) {
     let lines: Vec<&str> = content.lines().collect();
 
@@ -295,6 +303,7 @@ fn scan_shell_content(
                 line_num,
                 action_name,
                 collector,
+                config,
             );
         }
 
@@ -345,6 +354,7 @@ fn scan_js_content(
     source_file: &str,
     action_name: &str,
     collector: &mut AuditCollector,
+    config: &Config,
 ) {
     for (i, line) in content.lines().enumerate() {
         let line_num = i + 1;
@@ -370,6 +380,7 @@ fn scan_js_content(
                     line_num,
                     action_name,
                     collector,
+                    config,
                 );
             }
         } else {
@@ -388,6 +399,7 @@ fn scan_js_content(
                 line_num,
                 action_name,
                 collector,
+                config,
             );
         }
     }
@@ -398,6 +410,7 @@ fn scan_py_content(
     source_file: &str,
     action_name: &str,
     collector: &mut AuditCollector,
+    config: &Config,
 ) {
     for (i, line) in content.lines().enumerate() {
         let line_num = i + 1;
@@ -417,6 +430,7 @@ fn scan_py_content(
             line_num,
             action_name,
             collector,
+            config,
         );
     }
 }
@@ -426,6 +440,7 @@ fn scan_dockerfile_content(
     source_file: &str,
     action_name: &str,
     collector: &mut AuditCollector,
+    config: &Config,
 ) {
     let lines: Vec<&str> = content.lines().collect();
 
@@ -473,6 +488,7 @@ fn scan_dockerfile_content(
             line_num,
             action_name,
             collector,
+            config,
         );
     }
 }
@@ -484,6 +500,7 @@ fn check_url_patterns(
     line_num: usize,
     action_name: &str,
     collector: &mut AuditCollector,
+    config: &Config,
 ) {
     for pattern in patterns {
         if !pattern.regex.is_match(line) {
@@ -502,7 +519,7 @@ fn check_url_patterns(
                 pattern_matched: line.trim().to_string(),
                 reason: "versioned URL".to_string(),
             });
-        } else if url_is_data_format(url) {
+        } else if config.is_data_format_exempt(url) {
             collector.push_allowed(AuditMatch {
                 severity: output::severity_str(&pattern.severity).to_string(),
                 category: category_str(&pattern.category).to_string(),
@@ -557,6 +574,7 @@ async fn scan_action_source(
     client: &GitHubClient,
     action: &ActionRef,
     collector: &mut AuditCollector,
+    config: &Config,
 ) -> Result<()> {
     let action_name = format!("{}@{}", action.full_name(), short_sha(&action.ref_string));
     let tree = client
@@ -605,14 +623,14 @@ async fn scan_action_source(
 
         if is_action_yml {
             if let Ok(yaml) = serde_norway::from_str::<Value>(&content) {
-                scan_action_yml_runs(&yaml, &source_label, &action_name, collector);
+                scan_action_yml_runs(&yaml, &source_label, &action_name, collector, config);
             }
         } else if is_js {
-            scan_js_content(&content, &source_label, &action_name, collector);
+            scan_js_content(&content, &source_label, &action_name, collector, config);
         } else if is_py {
-            scan_py_content(&content, &source_label, &action_name, collector);
+            scan_py_content(&content, &source_label, &action_name, collector, config);
         } else if is_dockerfile {
-            scan_dockerfile_content(&content, &source_label, &action_name, collector);
+            scan_dockerfile_content(&content, &source_label, &action_name, collector, config);
         }
     }
 
@@ -624,6 +642,7 @@ fn scan_action_yml_runs(
     source_file: &str,
     action_name: &str,
     collector: &mut AuditCollector,
+    config: &Config,
 ) {
     // runs.steps[].run (composite actions)
     if let Some(steps) = yaml
@@ -633,7 +652,7 @@ fn scan_action_yml_runs(
     {
         for step in steps {
             if let Some(run) = step.get("run").and_then(|r| r.as_str()) {
-                scan_shell_content(run, source_file, 0, action_name, collector);
+                scan_shell_content(run, source_file, 0, action_name, collector, config);
             }
         }
     }
@@ -644,7 +663,7 @@ fn scan_action_yml_runs(
         .and_then(|r| r.get("args"))
         .and_then(|a| a.as_str())
     {
-        scan_shell_content(args, source_file, 0, action_name, collector);
+        scan_shell_content(args, source_file, 0, action_name, collector, config);
     }
 }
 
@@ -655,6 +674,9 @@ fn short_sha(sha: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::LazyLock;
+
+    static DEFAULT_CONFIG: LazyLock<Config> = LazyLock::new(Config::default);
 
     #[test]
     fn collector_drops_allowed_when_not_verbose() {
@@ -695,6 +717,7 @@ mod tests {
             1,
             "",
             &mut c,
+            &DEFAULT_CONFIG,
         );
         assert_eq!(c.findings.len(), 1);
         assert!(c.allowed.is_empty());
@@ -709,6 +732,7 @@ mod tests {
             1,
             "",
             &mut c,
+            &DEFAULT_CONFIG,
         );
         assert_eq!(c.findings.len(), 1);
         assert_eq!(c.findings[0].severity, "high");
@@ -724,6 +748,7 @@ mod tests {
             1,
             "",
             &mut c,
+            &DEFAULT_CONFIG,
         );
         assert_eq!(c.findings.len(), 1);
         assert_eq!(c.findings[0].severity, "high");
@@ -738,6 +763,7 @@ mod tests {
             1,
             "",
             &mut c,
+            &DEFAULT_CONFIG,
         );
         assert_eq!(c.findings.len(), 1);
         assert_eq!(c.findings[0].severity, "high");
@@ -752,6 +778,7 @@ mod tests {
             1,
             "",
             &mut c,
+            &DEFAULT_CONFIG,
         );
         assert!(c.findings.is_empty());
         assert_eq!(c.allowed.len(), 1);
@@ -767,6 +794,7 @@ mod tests {
             1,
             "",
             &mut c,
+            &DEFAULT_CONFIG,
         );
         assert!(c.findings.is_empty());
         assert!(c.allowed.is_empty());
@@ -780,6 +808,7 @@ mod tests {
             "test.js",
             "",
             &mut c,
+            &DEFAULT_CONFIG,
         );
         assert!(c.findings.is_empty());
         assert_eq!(c.allowed.len(), 1);
@@ -793,6 +822,7 @@ mod tests {
             "test.js",
             "",
             &mut c,
+            &DEFAULT_CONFIG,
         );
         assert_eq!(c.findings.len(), 1);
         assert!(c.allowed.is_empty());
@@ -807,6 +837,7 @@ mod tests {
             1,
             "",
             &mut c,
+            &DEFAULT_CONFIG,
         );
         assert_eq!(c.findings.len(), 1, "expected exactly one finding");
         assert_eq!(c.findings[0].severity, "high");
@@ -823,6 +854,7 @@ mod tests {
             1,
             "",
             &mut c,
+            &DEFAULT_CONFIG,
         );
         assert_eq!(c.findings.len(), 1);
         assert_eq!(c.findings[0].severity, "high");
@@ -841,6 +873,7 @@ mod tests {
             1,
             "",
             &mut c,
+            &DEFAULT_CONFIG,
         );
         assert_eq!(c.findings.len(), 1);
         assert_eq!(c.findings[0].severity, "high");
@@ -856,6 +889,7 @@ mod tests {
             1,
             "",
             &mut c,
+            &DEFAULT_CONFIG,
         );
         assert_eq!(c.findings.len(), 1);
         assert_eq!(c.findings[0].severity, "high");
@@ -870,6 +904,7 @@ mod tests {
             "Dockerfile",
             "",
             &mut c,
+            &DEFAULT_CONFIG,
         );
         assert_eq!(c.findings.len(), 1);
         assert_eq!(c.findings[0].severity, "high");
@@ -884,6 +919,7 @@ mod tests {
             "Dockerfile",
             "",
             &mut c,
+            &DEFAULT_CONFIG,
         );
         assert_eq!(c.findings.len(), 1);
         assert_eq!(c.findings[0].severity, "medium");
@@ -898,6 +934,7 @@ mod tests {
             "Dockerfile",
             "",
             &mut c,
+            &DEFAULT_CONFIG,
         );
         assert!(c.findings.is_empty());
         assert_eq!(c.allowed.len(), 1);
@@ -912,6 +949,7 @@ mod tests {
             "Dockerfile",
             "",
             &mut c,
+            &DEFAULT_CONFIG,
         );
         assert!(c.findings.is_empty());
         assert_eq!(c.allowed.len(), 1);
@@ -926,6 +964,7 @@ mod tests {
             "Dockerfile",
             "",
             &mut c,
+            &DEFAULT_CONFIG,
         );
         assert!(c.findings.is_empty());
     }
@@ -940,6 +979,7 @@ mod tests {
             1,
             "",
             &mut c,
+            &DEFAULT_CONFIG,
         );
         assert!(c.findings.is_empty());
         assert_eq!(c.allowed.len(), 1);
@@ -955,6 +995,7 @@ mod tests {
             1,
             "",
             &mut c,
+            &DEFAULT_CONFIG,
         );
         assert!(c.findings.is_empty());
         assert!(c.allowed.is_empty());
@@ -969,6 +1010,7 @@ mod tests {
             1,
             "",
             &mut c,
+            &DEFAULT_CONFIG,
         );
         assert_eq!(c.findings.len(), 1);
     }
@@ -981,6 +1023,7 @@ mod tests {
             "test.js",
             "",
             &mut c,
+            &DEFAULT_CONFIG,
         );
         assert!(c.findings.is_empty());
         assert_eq!(c.allowed.len(), 1);
@@ -995,9 +1038,48 @@ mod tests {
             "test.py",
             "",
             &mut c,
+            &DEFAULT_CONFIG,
         );
         assert!(c.findings.is_empty());
         assert_eq!(c.allowed.len(), 1);
         assert_eq!(c.allowed[0].reason, "data format URL");
+    }
+
+    #[test]
+    fn shell_scan_honors_extra_data_formats() {
+        let config = Config {
+            extra_data_formats: vec!["proto".to_string()],
+            ..Config::default()
+        };
+        let mut c = AuditCollector::new(true);
+        scan_shell_content(
+            "curl -sSL https://example.com/api.proto -o schema.proto",
+            "test.sh",
+            1,
+            "",
+            &mut c,
+            &config,
+        );
+        assert!(c.findings.is_empty());
+        assert_eq!(c.allowed.len(), 1);
+        assert_eq!(c.allowed[0].reason, "data format URL");
+    }
+
+    #[test]
+    fn shell_scan_non_configured_extension_still_flagged() {
+        let config = Config {
+            extra_data_formats: vec!["proto".to_string()],
+            ..Config::default()
+        };
+        let mut c = AuditCollector::new(false);
+        scan_shell_content(
+            "curl -L https://example.com/install.sh -o install.sh",
+            "test.sh",
+            1,
+            "",
+            &mut c,
+            &config,
+        );
+        assert_eq!(c.findings.len(), 1);
     }
 }

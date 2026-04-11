@@ -406,6 +406,8 @@ Matching is case-insensitive. Query strings (`?foo=bar`) and fragments (`#sectio
 
 The exemption applies only to the _unversioned-URL_ rules. `/latest/` URLs, pipe-to-shell, and `gh release download` without a tag still fire regardless of extension, because the risk there is about the _path_ being mutable, not about what the bytes decode to.
 
+The list can be extended via `extra-data-formats` in [`.pinprick.toml`](/configuration/config-file#extra-data-formats) to add project-specific extensions (e.g., `.proto`, `.graphql`).
+
 ## Suppressing findings
 
 Use `.pinprick.toml` to suppress by action or by description substring. See [Config File](/configuration/config-file).
