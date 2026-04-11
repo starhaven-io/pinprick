@@ -7,7 +7,7 @@ use crate::github::GitHubClient;
 use crate::output::{PinReport, PinResult, PinSkip};
 use crate::workflow::{self, RefType};
 
-pub async fn run(repo_root: &Path, json: bool) -> Result<ExitCode> {
+pub async fn run(repo_root: &Path, json: bool, dry_run: bool) -> Result<ExitCode> {
     let token = auth::require_token().await?;
     let client = GitHubClient::new(token);
 
@@ -15,6 +15,7 @@ pub async fn run(repo_root: &Path, json: bool) -> Result<ExitCode> {
     let mut report = PinReport {
         pinned: Vec::new(),
         skipped: Vec::new(),
+        applied: !dry_run,
     };
 
     for file in &files {
@@ -99,7 +100,7 @@ pub async fn run(repo_root: &Path, json: bool) -> Result<ExitCode> {
             }
         }
 
-        if !replacements.is_empty() {
+        if !dry_run && !replacements.is_empty() {
             workflow::rewrite_actions(file, &replacements)?;
         }
     }
@@ -110,5 +111,9 @@ pub async fn run(repo_root: &Path, json: bool) -> Result<ExitCode> {
         report.print_human();
     }
 
-    Ok(ExitCode::SUCCESS)
+    if dry_run && !report.pinned.is_empty() {
+        Ok(ExitCode::from(1))
+    } else {
+        Ok(ExitCode::SUCCESS)
+    }
 }
