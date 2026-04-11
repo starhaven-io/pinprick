@@ -79,6 +79,11 @@ enum Command {
         /// Apply updates (default is dry-run)
         #[arg(long)]
         apply: bool,
+
+        /// Only check actions whose owner/repo contains this substring
+        /// (e.g., `actions/checkout`, `actions/` for the whole org)
+        #[arg(long, value_name = "PATTERN")]
+        only: Option<String>,
     },
 }
 
@@ -111,7 +116,9 @@ async fn main() -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Command::Pin { path } => pin::run(path, cli.json).await,
-        Command::Update { path, apply } => update::run(path, *apply, cli.json).await,
+        Command::Update { path, apply, only } => {
+            update::run(path, *apply, cli.json, only.as_deref()).await
+        }
     };
 
     match result {

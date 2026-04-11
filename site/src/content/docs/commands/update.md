@@ -6,8 +6,10 @@ description: Check pinned actions for newer releases.
 Check SHA-pinned actions for newer releases and optionally update them.
 
 ```bash
-pinprick update            # dry-run (show available updates)
-pinprick update --apply    # write updates to files
+pinprick update                       # dry-run (show available updates)
+pinprick update --apply               # write updates to files
+pinprick update --only actions/       # only check actions in the `actions/` org
+pinprick update --only actions/checkout
 pinprick update /path/to/repo
 ```
 
@@ -18,6 +20,18 @@ pinprick update /path/to/repo
 - Compares version numbers numerically — suggests the latest release regardless of major version
 - Dry-run by default — shows what would change without writing files
 - Exit code 1 when updates are available (useful in CI)
+
+## Filtering with `--only`
+
+`--only <pattern>` restricts the scan to actions whose `owner/repo` _contains_ the pattern as a substring. Useful in CI pipelines that bump one action at a time, or to scope an update to a single org:
+
+```bash
+pinprick update --only actions/checkout    # exactly this action
+pinprick update --only actions/            # all actions/* repos
+pinprick update --only aws                 # any repo with "aws" in owner/repo
+```
+
+Matching is case-sensitive. Matching is against `owner/repo` only — subpaths are not considered.
 
 ## Example
 
