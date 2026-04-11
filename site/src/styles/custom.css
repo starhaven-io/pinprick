@@ -27,3 +27,22 @@
   --sl-color-gray-6: #f8f8f8;
   --sl-color-black: #ffffff;
 }
+
+/* Version badge in the header, rendered by src/components/SocialIcons.astro */
+.version-badge {
+  font-size: 0.75rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  color: var(--sl-color-gray-3);
+  text-decoration: none;
+  padding: 0.2rem 0.5rem;
+  border: 1px solid var(--sl-color-gray-5);
+  border-radius: 0.25rem;
+  margin-right: 0.5rem;
+  transition:
+    color 0.2s,
+    border-color 0.2s;
+}
+.version-badge:hover {
+  color: var(--sl-color-white);
+  border-color: var(--sl-color-gray-3);
+}
