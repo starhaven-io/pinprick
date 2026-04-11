@@ -37,8 +37,8 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Cache cargo (release)
-        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+      - name: Restore cargo cache (debug)
+        uses: actions/cache/restore@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
         with:
           path: |
             ~/.cargo/bin/
@@ -46,11 +46,11 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-release-
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-debug-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-${{ runner.arch }}-cargo-debug-
 
       - name: Build pinprick
-        run: cargo build --release
+        run: cargo build
 
       - name: Scan for new releases
         env:
@@ -112,7 +112,7 @@ jobs:
                 - uses: ${OWNER}/${REPO}@${LATEST_SHA} # ${LATEST}
           YAML
 
-            if ./target/release/pinprick --json audit "${TMPDIR}" 2>/dev/null; then
+            if ./target/debug/pinprick --json audit "${TMPDIR}" 2>/dev/null; then
               echo "  Clean — adding ${LATEST}"
               if [[ "${DRY_RUN}" == "false" ]]; then
                 jq -r --arg sha "${LATEST_SHA}" --arg tag "${LATEST}" '
