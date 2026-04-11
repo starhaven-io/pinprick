@@ -1,8 +1,0 @@
-rules:
-  use-trusted-publishing:
-    # Tracked for a follow-up PR. The initial crates.io publish requires a
-    # stored token because trusted publishers must be configured against an
-    # existing crate. After the first release with the stored token, we will
-    # swap in OIDC-based publishing and delete the stored token.
-    ignore:
-      - release.yml
