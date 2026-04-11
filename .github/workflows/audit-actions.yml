@@ -185,6 +185,8 @@ jobs:
           APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
           INPUT_ACTION: ${{ inputs.action }}
           REPOSITORY: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
         run: |
           BOT_USER="${APP_SLUG}[bot]"
           BOT_ID=$(gh api "/users/${BOT_USER}" --jq .id)
@@ -202,6 +204,16 @@ jobs:
           fi
 
           COMMIT_BODY="Signed-off-by: ${BOT_USER} <${BOT_ID}+${BOT_USER}@users.noreply.github.com>"
+
+          # On a manual dispatch, credit the human who clicked Run workflow
+          # as a co-author. Scheduled cron runs have no dispatcher and keep
+          # the sign-off-only body. Trailer lines are contiguous (no blank
+          # line between) so `git interpret-trailers` parses both.
+          if [[ "${EVENT_NAME}" == "workflow_dispatch" && -n "${TRIGGERING_ACTOR}" ]]; then
+            ACTOR_ID=$(gh api "/users/${TRIGGERING_ACTOR}" --jq .id)
+            COAUTHOR="Co-authored-by: ${TRIGGERING_ACTOR} <${ACTOR_ID}+${TRIGGERING_ACTOR}@users.noreply.github.com>"
+            COMMIT_BODY="${COMMIT_BODY}"$'\n'"${COAUTHOR}"
+          fi
 
           ADDITIONS=$(
             git diff --name-only HEAD -- audited-actions/ |
