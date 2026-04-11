@@ -101,6 +101,8 @@ pub struct UpdateResult {
     pub latest_tag: String,
     pub latest_sha: String,
     pub line: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub release_url: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -133,6 +135,9 @@ impl UpdateReport {
                 "->".dimmed(),
                 u.latest_tag.green()
             );
+            if let Some(url) = &u.release_url {
+                println!("    {}", url.dimmed());
+            }
         }
 
         println!();

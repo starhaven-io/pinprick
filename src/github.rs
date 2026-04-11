@@ -41,6 +41,7 @@ pub struct Release {
     pub tag_name: String,
     pub draft: bool,
     pub prerelease: bool,
+    pub html_url: Option<String>,
 }
 
 #[derive(Deserialize)]

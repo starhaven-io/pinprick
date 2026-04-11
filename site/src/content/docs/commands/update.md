@@ -19,6 +19,7 @@ pinprick update /path/to/repo
 - Queries the GitHub Releases API for the latest non-draft, non-prerelease release
 - Compares version numbers numerically — suggests the latest release regardless of major version
 - Dry-run by default — shows what would change without writing files
+- Each update is printed with a link to the release page for easy changelog review
 - Exit code 1 when updates are available (useful in CI)
 
 ## Filtering with `--only`
@@ -38,8 +39,10 @@ Matching is case-sensitive. Matching is against `owner/repo` only — subpaths a
 ```
 $ pinprick update
 .github/workflows/ci.yml
-  actions/checkout  v4.1.0 -> v6.0.2
-  actions/setup-node  v4.0.0 -> v6.3.0
+  actions/checkout v4.1.0 -> v6.0.2
+    https://github.com/actions/checkout/releases/tag/v6.0.2
+  actions/setup-node v4.0.0 -> v6.3.0
+    https://github.com/actions/setup-node/releases/tag/v6.3.0
 
 2 updates available. Run with --apply to apply.
 ```

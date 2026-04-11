@@ -101,6 +101,7 @@ pub async fn run(
                 latest_tag: latest.tag_name.clone(),
                 latest_sha: new_sha.clone(),
                 line: action.line_number,
+                release_url: latest.html_url.clone(),
             });
 
             if apply
