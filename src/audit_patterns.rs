@@ -40,7 +40,10 @@ re!(
     SH_PIP_UNVERSIONED,
     r"pip3?\s+install\s+[a-zA-Z][a-zA-Z0-9_-]*\s*$"
 );
-re!(SH_NPM_UNVERSIONED, r"npm\s+install\s+[a-zA-Z@][^\s]*$");
+re!(
+    SH_NPM_UNVERSIONED,
+    r"npm\s+install\s+(@[a-zA-Z][a-zA-Z0-9_-]*/)?[a-zA-Z][a-zA-Z0-9_-]*\s*$"
+);
 re!(SH_GO_INSTALL_LATEST, r"go\s+install\s+\S+@latest");
 re!(
     SH_IWR_LATEST,
@@ -502,6 +505,44 @@ mod tests {
             !SH_GO_INSTALL_LATEST
                 .is_match("go install github.com/golangci/golangci-lint/cmd/golangci-lint@v1.55.0")
         );
+    }
+
+    #[test]
+    fn npm_install_unversioned_detected() {
+        assert!(SH_NPM_UNVERSIONED.is_match("npm install typescript"));
+        assert!(SH_NPM_UNVERSIONED.is_match("npm install svelte-kit"));
+    }
+
+    #[test]
+    fn npm_install_scoped_unversioned_detected() {
+        assert!(SH_NPM_UNVERSIONED.is_match("npm install @babel/core"));
+    }
+
+    #[test]
+    fn npm_install_version_pinned_not_flagged() {
+        assert!(!SH_NPM_UNVERSIONED.is_match("npm install typescript@5.6.0"));
+        assert!(!SH_NPM_UNVERSIONED.is_match("npm install @babel/core@1.0.0"));
+    }
+
+    #[test]
+    fn npm_install_no_args_not_flagged() {
+        assert!(!SH_NPM_UNVERSIONED.is_match("npm install"));
+    }
+
+    #[test]
+    fn pip_install_unversioned_detected() {
+        assert!(SH_PIP_UNVERSIONED.is_match("pip install requests"));
+        assert!(SH_PIP_UNVERSIONED.is_match("pip3 install flask"));
+    }
+
+    #[test]
+    fn pip_install_version_pinned_not_flagged() {
+        assert!(!SH_PIP_UNVERSIONED.is_match("pip install requests==2.31.0"));
+    }
+
+    #[test]
+    fn pip_install_requirements_not_flagged() {
+        assert!(!SH_PIP_UNVERSIONED.is_match("pip install -r requirements.txt"));
     }
 
     // ── JavaScript patterns ─────────────────────────────────────────────

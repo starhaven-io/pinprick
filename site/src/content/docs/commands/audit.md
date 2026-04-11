@@ -3,69 +3,21 @@ title: audit
 description: Scan actions for runtime fetch patterns that bypass pinning.
 ---
 
-Fetch action source code at the pinned SHA and scan for unversioned runtime fetch patterns.
+Scan workflow `run:` blocks and action source code for runtime fetch patterns that bypass SHA pinning.
 
 ```bash
 pinprick audit
 pinprick audit /path/to/repo
 ```
 
-## What it detects
+## What it scans
 
-### Shell (in `run:` blocks and `action.yml`)
+- Shell commands in workflow `run:` blocks and composite `action.yml` steps
+- JavaScript and TypeScript files (`.js`, `.ts`) inside each action's source tree, including minified bundles
+- Python files (`.py`) inside each action's source tree
+- `Dockerfile` and `*.dockerfile` files inside each action's source tree
 
-| Pattern                                               | Severity |
-| ----------------------------------------------------- | -------- |
-| `curl`/`wget` piped to `sh`/`bash`/`python` (any URL) | High     |
-| `bash <(curl ...)` process substitution               | High     |
-| `bash -c "$(curl ...)"` / `eval "$(curl ...)"`        | High     |
-| `curl`/`wget` to `/latest/` URLs                      | High     |
-| `curl`/`wget` to unversioned URLs                     | Medium   |
-| `gh release download` without a pinned tag            | Medium   |
-| `go install @latest`                                  | Medium   |
-| `pip install` without version pin                     | Low      |
-| `npm install` without version pin                     | Low      |
-
-### PowerShell (in `run:` blocks)
-
-| Pattern                                                                 | Severity |
-| ----------------------------------------------------------------------- | -------- |
-| `iex`/`Invoke-Expression` on fetched content (`iex (iwr ...)`)          | High     |
-| `Invoke-WebRequest`/`iwr`/`Invoke-RestMethod`/`irm` to `/latest/` URLs  | High     |
-| `Invoke-WebRequest`/`iwr`/`Invoke-RestMethod`/`irm` to unversioned URLs | Medium   |
-
-### JavaScript (in `.js`/`.ts` files)
-
-| Pattern                                                | Severity |
-| ------------------------------------------------------ | -------- |
-| `fetch()`/`axios`/`got`/`http.get` to `/latest/` URLs  | High     |
-| `exec()`/`child_process` shelling out to `curl`/`wget` | High     |
-| `fetch()`/`axios` to unversioned URLs                  | Medium   |
-
-Minified bundles (`dist/index.js`) are split on `;` and scanned statement-by-statement.
-
-### Python (in `.py` files)
-
-| Pattern                                                     | Severity |
-| ----------------------------------------------------------- | -------- |
-| `urllib.request.urlopen`/`requests.get` to `/latest/` URLs  | High     |
-| `subprocess` shelling out to `curl`/`wget`                  | High     |
-| `urllib.request.urlopen`/`requests.get` to unversioned URLs | Medium   |
-
-### Docker (in Dockerfiles)
-
-| Pattern                                | Severity                 |
-| -------------------------------------- | ------------------------ |
-| `FROM image:latest` or untagged `FROM` | High                     |
-| `RUN curl`/`wget` piped to a shell     | High                     |
-| `curl`/`wget` in `RUN` instructions    | Medium                   |
-| `FROM image@sha256:...`                | Skipped (already pinned) |
-
-### Checksum verification
-
-Findings followed within 3 lines by a checksum verification command (`sha256sum`, `shasum`, `openssl dgst`, `gpg --verify`, `Get-FileHash`) are downgraded one severity level. The fetch is still flagged, but verified downloads are less risky.
-
-Pipe-to-shell findings are **not** downgraded by a following checksum command — the piped payload is never written to disk, so a checksum line nearby cannot cover it.
+For the full list of every rule, including examples and severity, see the [Detections reference](/reference/detections).
 
 ## Audited actions list
 
@@ -75,7 +27,14 @@ See [Audited Actions](/configuration/audited-actions) for details on how the lis
 
 ## Without a token
 
-When no GitHub token is available, audit scans only local `run:` blocks in workflow files. Action source code is not fetched. This still catches the most common patterns (shell commands fetching unversioned resources) but misses JavaScript, Python, and Docker patterns inside actions.
+When no GitHub token is available, audit scans only workflow `run:` blocks. Action source code is not fetched. This still catches the most common patterns (shell commands fetching unversioned resources) but misses JavaScript, Python, and Docker patterns inside actions.
+
+## Output formats
+
+- Default: colored human-readable output with severity buckets
+- `--json`: machine-readable JSON for CI integration
+- `--sarif`: SARIF 2.1.0 for upload to GitHub code scanning
+- `--verbose`: also report _allowed_ matches (fetches that fired a rule but were dropped because the URL is versioned)
 
 ## Example
 
