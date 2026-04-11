@@ -107,15 +107,16 @@ pub async fn run(
                     continue;
                 }
 
-                if audited
+                if let Some(source) = audited
                     .check(&action.owner, &action.repo, &action.ref_string)
                     .await
                 {
                     if !quiet {
                         eprintln!(
-                            "  {}@{} audited",
+                            "  {}@{} audited ({})",
                             action.full_name(),
-                            short_sha(&action.ref_string)
+                            short_sha(&action.ref_string),
+                            source.label()
                         );
                     }
                     continue;

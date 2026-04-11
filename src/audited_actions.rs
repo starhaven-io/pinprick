@@ -10,6 +10,28 @@ struct AuditedEntry {
     sha: String,
 }
 
+/// Which layer in the lookup satisfied an audited-action check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuditSource {
+    /// Compiled into the pinprick binary from `audited-actions/`.
+    Bundled,
+    /// Read from `~/.cache/pinprick/audited/` (populated by previous scans).
+    LocalCache,
+    /// Fetched from `https://pinprick.rs/audited-actions/`.
+    Remote,
+}
+
+impl AuditSource {
+    /// Short human-readable label for terminal output.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Bundled => "bundled",
+            Self::LocalCache => "local cache",
+            Self::Remote => "pinprick.rs",
+        }
+    }
+}
+
 /// Layered lookup for pre-audited action SHAs.
 ///
 /// Resolution order:
@@ -39,8 +61,9 @@ impl AuditedActions {
         }
     }
 
-    /// Check if an action at a specific SHA has been pre-audited.
-    pub async fn check(&mut self, owner: &str, repo: &str, sha: &str) -> bool {
+    /// Check if an action at a specific SHA has been pre-audited. Returns
+    /// which lookup layer satisfied the check, or `None` if no layer matched.
+    pub async fn check(&mut self, owner: &str, repo: &str, sha: &str) -> Option<AuditSource> {
         let key = format!("{owner}/{repo}");
 
         if self
@@ -48,7 +71,7 @@ impl AuditedActions {
             .get(&key)
             .is_some_and(|shas| shas.contains(sha))
         {
-            return true;
+            return Some(AuditSource::Bundled);
         }
 
         if !self.local.contains_key(&key) {
@@ -56,7 +79,7 @@ impl AuditedActions {
             self.local.insert(key.clone(), shas);
         }
         if self.local.get(&key).is_some_and(|shas| shas.contains(sha)) {
-            return true;
+            return Some(AuditSource::LocalCache);
         }
 
         if self.fetch_remote {
@@ -65,11 +88,11 @@ impl AuditedActions {
                 self.remote.insert(key.clone(), shas);
             }
             if self.remote.get(&key).is_some_and(|shas| shas.contains(sha)) {
-                return true;
+                return Some(AuditSource::Remote);
             }
         }
 
-        false
+        None
     }
 
     /// Record a clean scan result in the local cache.
