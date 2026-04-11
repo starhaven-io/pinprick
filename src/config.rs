@@ -22,6 +22,14 @@ pub struct Config {
     /// leading dots are stripped.
     #[serde(default)]
     pub extra_data_formats: Vec<String>,
+
+    /// Hostnames that are trusted sources for unversioned fetches. A fetch
+    /// whose URL host exactly matches an entry is downgraded from a finding
+    /// to an allowed match. Case-insensitive. Only applies to the
+    /// unversioned-URL rules — `/latest/` URLs and pipe-to-shell still fire
+    /// regardless.
+    #[serde(default)]
+    pub trusted_hosts: Vec<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -102,6 +110,18 @@ impl Config {
         self.extra_data_formats
             .iter()
             .any(|e| e.trim_start_matches('.').eq_ignore_ascii_case(ext))
+    }
+
+    /// Check if a URL's host is in the configured `trusted_hosts` list.
+    /// Case-insensitive exact match. Returns false if the URL cannot be
+    /// parsed or has no host.
+    pub fn is_host_trusted(&self, url: &str) -> bool {
+        let Some(host) = audit_patterns::url_host(url) else {
+            return false;
+        };
+        self.trusted_hosts
+            .iter()
+            .any(|h| h.eq_ignore_ascii_case(host))
     }
 }
 
@@ -193,5 +213,76 @@ extra-data-formats = ["proto", "graphql"]
         let toml_content = "";
         let cfg: Config = toml::from_str(toml_content).unwrap();
         assert!(cfg.extra_data_formats.is_empty());
+    }
+
+    #[test]
+    fn is_host_trusted_exact_match() {
+        let cfg = Config {
+            trusted_hosts: vec!["artifacts.example.com".to_string()],
+            ..Config::default()
+        };
+        assert!(cfg.is_host_trusted("https://artifacts.example.com/foo/bar"));
+    }
+
+    #[test]
+    fn is_host_trusted_case_insensitive() {
+        let cfg = Config {
+            trusted_hosts: vec!["artifacts.example.com".to_string()],
+            ..Config::default()
+        };
+        assert!(cfg.is_host_trusted("https://ARTIFACTS.EXAMPLE.COM/foo"));
+    }
+
+    #[test]
+    fn is_host_trusted_strips_port() {
+        let cfg = Config {
+            trusted_hosts: vec!["artifacts.example.com".to_string()],
+            ..Config::default()
+        };
+        assert!(cfg.is_host_trusted("https://artifacts.example.com:8443/foo"));
+    }
+
+    #[test]
+    fn is_host_trusted_no_subdomain_match() {
+        let cfg = Config {
+            trusted_hosts: vec!["example.com".to_string()],
+            ..Config::default()
+        };
+        // Exact match only — `api.example.com` is not trusted.
+        assert!(!cfg.is_host_trusted("https://api.example.com/foo"));
+    }
+
+    #[test]
+    fn is_host_trusted_empty_list_rejects_all() {
+        let cfg = Config::default();
+        assert!(!cfg.is_host_trusted("https://example.com/foo"));
+    }
+
+    #[test]
+    fn is_host_trusted_non_url_returns_false() {
+        let cfg = Config {
+            trusted_hosts: vec!["example.com".to_string()],
+            ..Config::default()
+        };
+        assert!(!cfg.is_host_trusted("example.com"));
+    }
+
+    #[test]
+    fn deserializes_trusted_hosts_from_toml() {
+        let toml_content = r#"
+trusted-hosts = ["artifacts.example.com", "releases.example.org"]
+"#;
+        let cfg: Config = toml::from_str(toml_content).unwrap();
+        assert_eq!(
+            cfg.trusted_hosts,
+            vec!["artifacts.example.com", "releases.example.org"]
+        );
+    }
+
+    #[test]
+    fn missing_trusted_hosts_defaults_to_empty() {
+        let toml_content = "";
+        let cfg: Config = toml::from_str(toml_content).unwrap();
+        assert!(cfg.trusted_hosts.is_empty());
     }
 }

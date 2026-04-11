@@ -17,6 +17,7 @@ pinprick scans line by line. Each rule is an anchored regex, compiled once at st
 
 - **Pipe-to-shell pre-empts other shell rules.** If a line matches a pipe-to-shell rule, no other shell or Docker rule fires on that line. So `curl ... | sh` produces a single high-severity finding instead of one medium (unversioned URL) plus one high (pipe-to-shell).
 - **Versioned-URL downgrade.** Non-pipe shell, JavaScript, and Python fetch rules only fire if the URL is _unversioned_. A URL is versioned if any path segment matches `v?\d+(\.\d+)+` — e.g. `/v1.2.3/`, `/0.55.8/`. See [Versioned URL heuristic](#versioned-url-heuristic).
+- **Trusted hosts exemption.** Unversioned-URL rules are downgraded to allowed matches when the URL host matches an entry in the user's [`trusted-hosts`](#trusted-hosts-exemption) list.
 - **Data-format exemption.** If a fetch targets a URL whose path ends in a known data-format extension (`.json`, `.yaml`, `.toml`, etc.), it is treated as a data fetch, not a code fetch, and downgraded to an allowed match instead of a finding. See [Data-format exemption](#data-format-exemption).
 - **Checksum downgrade.** A non-pipe finding followed within 3 lines by `sha256sum`, `shasum`, `openssl dgst`, `gpg --verify`, or `Get-FileHash` is downgraded one severity level (high → medium → low). The fetch is still reported.
 - **Pipe-to-shell is never downgraded.** A piped payload is never written to disk, so no checksum command can verify it.
@@ -124,6 +125,7 @@ wget https://example.com/bin/tool
 Not flagged:
 
 - Any URL whose path contains a segment matching `v?\d+(\.\d+)+`, e.g. `https://example.com/releases/download/v1.2.3/tool`.
+- Any URL whose host matches [`trusted-hosts`](#trusted-hosts-exemption) in `.pinprick.toml`.
 - Any URL whose path ends in a data-format extension (`.json`, `.yaml`, `.toml`, `.csv`, etc.). See [Data-format exemption](#data-format-exemption).
 
 ### gh release download without a pinned tag
@@ -262,6 +264,7 @@ const r = await axios.get('https://example.com/api/data');
 Not flagged:
 
 - Versioned URL: `fetch('https://example.com/api/1.2.3/data')`
+- Trusted host via [`trusted-hosts`](#trusted-hosts-exemption)
 - Data-format URL: `fetch('https://example.com/config.json')` — see [Data-format exemption](#data-format-exemption).
 
 ## Python fetches
@@ -298,6 +301,7 @@ urllib.request.urlopen("https://example.com/file")
 Not flagged:
 
 - Versioned URL: `requests.get("https://example.com/releases/download/v1.2.3/tool")`
+- Trusted host via [`trusted-hosts`](#trusted-hosts-exemption)
 - Data-format URL: `requests.get("https://example.com/data.json")` — see [Data-format exemption](#data-format-exemption).
 
 ## Dockerfile patterns
@@ -370,6 +374,7 @@ ADD --chown=user:group https://example.com/tool.tgz /opt/
 Not flagged:
 
 - Versioned URL: `ADD https://example.com/releases/download/v1.2.3/install.tar.gz /tmp/`
+- Trusted host via [`trusted-hosts`](#trusted-hosts-exemption)
 - Data-format URL: `ADD https://example.com/config.json /etc/` — see [Data-format exemption](#data-format-exemption).
 - Local source: `ADD ./local.tar.gz /tmp/`
 
@@ -407,6 +412,23 @@ Matching is case-insensitive. Query strings (`?foo=bar`) and fragments (`#sectio
 The exemption applies only to the _unversioned-URL_ rules. `/latest/` URLs, pipe-to-shell, and `gh release download` without a tag still fire regardless of extension, because the risk there is about the _path_ being mutable, not about what the bytes decode to.
 
 The list can be extended via `extra-data-formats` in [`.pinprick.toml`](/configuration/config-file#extra-data-formats) to add project-specific extensions (e.g., `.proto`, `.graphql`).
+
+## Trusted hosts exemption
+
+Unversioned-URL rules are downgraded to allowed matches when the URL host matches an entry in the user's [`trusted-hosts`](/configuration/config-file#trusted-hosts) list. Configured via `.pinprick.toml`:
+
+```toml
+trusted-hosts = ["artifacts.example.com"]
+```
+
+Matching is exact hostname, case-insensitive. `example.com` does _not_ trust `api.example.com` — each subdomain must be listed separately. Port numbers and paths are stripped before comparison.
+
+The exemption applies only to the _unversioned-URL_ rules — the same scope as the data-format exemption. It does **not** cover:
+
+- `/latest/` URLs — the risk is the path being mutable, regardless of who's serving it.
+- Pipe-to-shell — the piped payload is never written to disk, so host trust doesn't change the safety profile.
+- `gh release download` without a pinned tag.
+- Package manager installs (`pip install foo`, `npm install foo`) — those go through package registries, not the HTTP host.
 
 ## Suppressing findings
 

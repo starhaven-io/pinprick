@@ -24,6 +24,11 @@ severity = "medium"
 # leading dots are optional.
 extra-data-formats = ["proto", "graphql"]
 
+# Hostnames to treat as trusted sources for unversioned fetches. A fetch whose
+# URL host exactly matches an entry is downgraded from a finding to an allowed
+# match. Case-insensitive.
+trusted-hosts = ["artifacts.example.com"]
+
 # Suppress specific findings
 [ignore]
 # Skip audit for these actions entirely
@@ -54,6 +59,28 @@ extra-data-formats = ["proto", "graphql", "tf", "hcl"]
 ```
 
 Matching is case-insensitive. Leading dots are stripped (`".proto"` and `"proto"` behave identically). The configured extensions are _added_ to the built-in set, not replacing it.
+
+### `trusted-hosts`
+
+A list of hostnames that are trusted sources for unversioned fetches. Any fetch whose URL host exactly matches an entry is recorded as an allowed match (visible under `--verbose`) with reason `trusted host` instead of being emitted as a finding.
+
+```toml
+trusted-hosts = [
+  "artifacts.example.com",
+  "releases.internal.example.org",
+]
+```
+
+**Matching is exact and case-insensitive.** `example.com` does _not_ trust `api.example.com` — each subdomain must be listed separately. This is deliberate: suffix-matching `example.com` would implicitly trust any subdomain including ones that don't exist yet, which is an easy way to accidentally widen the trust boundary.
+
+**Scope.** `trusted-hosts` exempts the same rules as the [data-format exemption](/reference/detections#data-format-exemption): unversioned-URL rules only. It does **not** suppress:
+
+- `/latest/` URL findings — the risk is about the path being mutable, regardless of who's serving it
+- Pipe-to-shell findings — the risk is that the payload is never written to disk, regardless of trust
+- `gh release download` without a pinned tag
+- Package manager installs (`pip install foo`, `npm install foo`) — those are package registries, not HTTP hosts
+
+To suppress a specific pattern that `trusted-hosts` doesn't cover, use [`ignore.patterns`](#ignorepatterns) instead.
 
 ### `ignore.actions`
 

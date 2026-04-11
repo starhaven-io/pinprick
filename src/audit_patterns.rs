@@ -391,6 +391,20 @@ pub fn url_extension(url: &str) -> Option<&str> {
     Some(&last[dot + 1..])
 }
 
+/// Extract the hostname from an `http(s)://` URL. Strips the protocol,
+/// optional `user@` prefix, and trailing port/path/query/fragment. Returns
+/// `None` if the URL does not start with `http://` or `https://`.
+pub fn url_host(url: &str) -> Option<&str> {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
+    let after_userinfo = rest.split_once('@').map(|(_, r)| r).unwrap_or(rest);
+    let end = after_userinfo
+        .find(['/', ':', '?', '#'])
+        .unwrap_or(after_userinfo.len());
+    Some(&after_userinfo[..end])
+}
+
 /// Check if a URL's path ends with a known data-format extension.
 pub fn url_is_data_format(url: &str) -> bool {
     let Some(ext) = url_extension(url) else {
@@ -498,6 +512,66 @@ mod tests {
             url_extension("https://example.com/v1.2.3/config/settings"),
             None
         );
+    }
+
+    // ── url_host ────────────────────────────────────────────────────────
+
+    #[test]
+    fn url_host_simple_https() {
+        assert_eq!(
+            url_host("https://example.com/path/to/file"),
+            Some("example.com")
+        );
+    }
+
+    #[test]
+    fn url_host_simple_http() {
+        assert_eq!(url_host("http://example.com/"), Some("example.com"));
+    }
+
+    #[test]
+    fn url_host_with_port_strips_port() {
+        assert_eq!(
+            url_host("https://example.com:8080/api"),
+            Some("example.com")
+        );
+    }
+
+    #[test]
+    fn url_host_with_query() {
+        assert_eq!(url_host("https://example.com?foo=bar"), Some("example.com"));
+    }
+
+    #[test]
+    fn url_host_with_fragment() {
+        assert_eq!(url_host("https://example.com#section"), Some("example.com"));
+    }
+
+    #[test]
+    fn url_host_bare() {
+        assert_eq!(url_host("https://example.com"), Some("example.com"));
+    }
+
+    #[test]
+    fn url_host_strips_userinfo() {
+        assert_eq!(
+            url_host("https://user@example.com/path"),
+            Some("example.com")
+        );
+    }
+
+    #[test]
+    fn url_host_subdomain() {
+        assert_eq!(
+            url_host("https://api.example.com/data"),
+            Some("api.example.com")
+        );
+    }
+
+    #[test]
+    fn url_host_not_a_url() {
+        assert_eq!(url_host("example.com"), None);
+        assert_eq!(url_host("ftp://example.com"), None);
     }
 
     // ── url_is_data_format ──────────────────────────────────────────────

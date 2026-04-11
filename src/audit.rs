@@ -519,6 +519,16 @@ fn check_url_patterns(
                 pattern_matched: line.trim().to_string(),
                 reason: "versioned URL".to_string(),
             });
+        } else if config.is_host_trusted(url) {
+            collector.push_allowed(AuditMatch {
+                severity: output::severity_str(&pattern.severity).to_string(),
+                category: category_str(&pattern.category).to_string(),
+                action: action_name.to_string(),
+                source_file: source_file.to_string(),
+                line: Some(line_num),
+                pattern_matched: line.trim().to_string(),
+                reason: "trusted host".to_string(),
+            });
         } else if config.is_data_format_exempt(url) {
             collector.push_allowed(AuditMatch {
                 severity: output::severity_str(&pattern.severity).to_string(),
@@ -1081,5 +1091,106 @@ mod tests {
             &config,
         );
         assert_eq!(c.findings.len(), 1);
+    }
+
+    #[test]
+    fn shell_scan_trusted_host_is_allowed() {
+        let config = Config {
+            trusted_hosts: vec!["artifacts.example.com".to_string()],
+            ..Config::default()
+        };
+        let mut c = AuditCollector::new(true);
+        scan_shell_content(
+            "curl -L https://artifacts.example.com/install.sh -o install.sh",
+            "test.sh",
+            1,
+            "",
+            &mut c,
+            &config,
+        );
+        assert!(c.findings.is_empty());
+        assert_eq!(c.allowed.len(), 1);
+        assert_eq!(c.allowed[0].reason, "trusted host");
+    }
+
+    #[test]
+    fn shell_scan_untrusted_host_still_flagged() {
+        let config = Config {
+            trusted_hosts: vec!["artifacts.example.com".to_string()],
+            ..Config::default()
+        };
+        let mut c = AuditCollector::new(false);
+        scan_shell_content(
+            "curl -L https://other.example.com/install.sh -o install.sh",
+            "test.sh",
+            1,
+            "",
+            &mut c,
+            &config,
+        );
+        assert_eq!(c.findings.len(), 1);
+    }
+
+    #[test]
+    fn shell_scan_trusted_host_does_not_exempt_latest() {
+        // `/latest/` still fires on a trusted host — the risk is about the
+        // mutable path, not about who's serving it.
+        let config = Config {
+            trusted_hosts: vec!["artifacts.example.com".to_string()],
+            ..Config::default()
+        };
+        let mut c = AuditCollector::new(false);
+        scan_shell_content(
+            "curl -L https://artifacts.example.com/releases/latest/install.sh -o foo",
+            "test.sh",
+            1,
+            "",
+            &mut c,
+            &config,
+        );
+        assert_eq!(c.findings.len(), 1);
+        assert_eq!(c.findings[0].severity, "high");
+        assert!(c.findings[0].description.contains("'latest' URL"));
+    }
+
+    #[test]
+    fn shell_scan_trusted_host_does_not_exempt_pipe_to_shell() {
+        // Pipe-to-shell still fires on a trusted host — payload isn't
+        // written to disk regardless of who's serving it.
+        let config = Config {
+            trusted_hosts: vec!["artifacts.example.com".to_string()],
+            ..Config::default()
+        };
+        let mut c = AuditCollector::new(false);
+        scan_shell_content(
+            "curl -sSL https://artifacts.example.com/install.sh | sh",
+            "test.sh",
+            1,
+            "",
+            &mut c,
+            &config,
+        );
+        assert_eq!(c.findings.len(), 1);
+        assert_eq!(c.findings[0].severity, "high");
+        assert!(c.findings[0].description.contains("piped to shell"));
+    }
+
+    #[test]
+    fn js_scan_trusted_host_is_allowed() {
+        let config = Config {
+            trusted_hosts: vec!["api.example.com".to_string()],
+            ..Config::default()
+        };
+        let mut c = AuditCollector::new(true);
+        scan_js_content(
+            r#"const r = await fetch("https://api.example.com/data");"#,
+            "test.js",
+            "",
+            &mut c,
+            &config,
+        );
+        assert!(c.findings.is_empty());
+        assert_eq!(c.allowed.len(), 1);
+        assert_eq!(c.allowed[0].reason, "trusted host");
     }
 }
