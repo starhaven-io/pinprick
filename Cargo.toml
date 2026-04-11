@@ -2,8 +2,18 @@
 name = "pinprick"
 version = "0.3.0"
 edition = "2024"
+rust-version = "1.88"
 description = "GitHub Actions supply chain security tool"
 license = "AGPL-3.0-only"
+repository = "https://github.com/p-linnane/pinprick"
+homepage = "https://pinprick.rs"
+keywords = ["github-actions", "security", "supply-chain", "sha", "cli"]
+categories = ["command-line-utilities", "development-tools"]
+exclude = [
+    "/.github/",
+    "/site/",
+    "/scripts/",
+]
 
 [dependencies]
 clap = { version = "4", features = ["derive", "color"] }
