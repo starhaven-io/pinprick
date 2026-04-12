@@ -143,7 +143,9 @@ jobs:
     needs: scan
     if: needs.scan.result == 'success' && !inputs.dry-run
     runs-on: ubuntu-slim
-    environment: starhaven
+    environment:
+      name: starhaven
+      deployment: false
     permissions:
       contents: read
       actions: read # required by download-artifact
