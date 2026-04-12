@@ -423,11 +423,12 @@ pub fn extract_url(line: &str) -> Option<&str> {
 }
 
 /// Check if a `gh release download` line has a version tag argument.
-/// `gh release download v1.2.3 --pattern ...` is pinned.
+/// `gh release download v1.2.3 --pattern ...` is pinned (positional).
+/// `gh release download --tag v1.2.3 --pattern ...` is pinned (flag).
 /// `gh release download --pattern ...` grabs latest.
 pub fn gh_release_has_tag(line: &str) -> bool {
     static GH_RELEASE_TAG: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"gh\s+release\s+download\s+v?\d").unwrap());
+        LazyLock::new(|| Regex::new(r"gh\s+release\s+download\s+(v?\d|--tag\s+v?\d)").unwrap());
     GH_RELEASE_TAG.is_match(line)
 }
 
@@ -724,6 +725,16 @@ mod tests {
         assert!(SH_GH_RELEASE_LATEST.is_match("gh release download v1.2.3 --pattern '*.tar.gz'"));
         assert!(gh_release_has_tag(
             "gh release download v1.2.3 --pattern '*.tar.gz'"
+        ));
+    }
+
+    #[test]
+    fn gh_release_download_versioned_tag_flag() {
+        assert!(
+            SH_GH_RELEASE_LATEST.is_match("gh release download --tag v1.2.3 --pattern '*.tar.gz'")
+        );
+        assert!(gh_release_has_tag(
+            "gh release download --tag v1.2.3 --pattern '*.tar.gz'"
         ));
     }
 
