@@ -7,7 +7,7 @@ Check SHA-pinned actions for newer releases and optionally update them.
 
 ```bash
 pinprick update                       # dry-run (show available updates)
-pinprick update --apply               # write updates to files
+pinprick update --write               # write updates to files
 pinprick update --only actions/       # only check actions in the `actions/` org
 pinprick update --only actions/checkout
 pinprick update /path/to/repo
@@ -44,5 +44,5 @@ $ pinprick update
   actions/setup-node v4.0.0 -> v6.3.0
     https://github.com/actions/setup-node/releases/tag/v6.3.0
 
-2 updates available. Run with --apply to apply.
+2 updates available. Run with --write to apply.
 ```

@@ -72,10 +72,9 @@ enum Command {
         #[arg(default_value = ".")]
         path: PathBuf,
 
-        /// Preview changes without writing files. Exits 1 when there are
-        /// unpinned actions — useful for CI gating.
-        #[arg(long)]
-        dry_run: bool,
+        /// Write changes to files (default is dry-run)
+        #[arg(long = "write")]
+        apply: bool,
     },
     /// Check for updates to pinned actions
     Update {
@@ -83,8 +82,8 @@ enum Command {
         #[arg(default_value = ".")]
         path: PathBuf,
 
-        /// Apply updates (default is dry-run)
-        #[arg(long)]
+        /// Write changes to files (default is dry-run)
+        #[arg(long = "write")]
         apply: bool,
 
         /// Only check actions whose owner/repo contains this substring
@@ -138,7 +137,7 @@ async fn main() -> ExitCode {
             );
             return ExitCode::SUCCESS;
         }
-        Command::Pin { path, dry_run } => pin::run(path, cli.json, *dry_run).await,
+        Command::Pin { path, apply } => pin::run(path, cli.json, *apply).await,
         Command::Update { path, apply, only } => {
             update::run(path, *apply, cli.json, only.as_deref()).await
         }

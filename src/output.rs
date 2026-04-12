@@ -86,7 +86,7 @@ impl PinReport {
             }
         );
         if !self.applied && !self.pinned.is_empty() {
-            println!("Run without {} to write changes.", "--dry-run".bold());
+            println!("Run with {} to apply.", "--write".bold());
         }
     }
 
@@ -157,7 +157,7 @@ impl UpdateReport {
                 "{} update{} available. Run with {} to apply.",
                 self.updates.len(),
                 if self.updates.len() == 1 { "" } else { "s" },
-                "--apply".bold()
+                "--write".bold()
             );
         }
     }

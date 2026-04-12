@@ -47,14 +47,14 @@ All commands default to the current directory. Pass a path to target a different
 # Pin action tags to full SHAs
 pinprick pin
 
-# Preview without writing
-pinprick pin --dry-run
+# Write changes to files
+pinprick pin --write
 
 # Check pinned actions for newer releases (dry-run)
 pinprick update
 
-# Apply updates
-pinprick update --apply
+# Write updates to files
+pinprick update --write
 
 # Only check a specific action or org
 pinprick update --only actions/checkout
@@ -74,7 +74,7 @@ pinprick completions zsh
 
 ### Pin
 
-Resolve action tag references to full SHAs:
+Resolve action tag references to full SHAs (dry-run by default):
 
 ```
 $ pinprick pin
@@ -85,21 +85,22 @@ $ pinprick pin
   ! actions/checkout@v4 -- sliding tag, resolved to v6.0.2
   ! Homebrew/actions/setup-homebrew@main -- branch ref — pin to a SHA manually
 
-Pinned 2 actions across 1 file (2 skipped)
+Would pin 2 actions across 1 file (2 skipped)
+Run with --write to apply.
 ```
 
 Sliding tags like `@v4` are resolved to their exact version. Branch refs like `@main` are flagged.
 
 ### Update
 
-Check pinned actions for newer releases:
+Check pinned actions for newer releases (dry-run by default):
 
 ```
 $ pinprick update
 .github/workflows/ci.yml
   actions/checkout  v4.1.0 -> v6.0.2
 
-1 update available. Run with --apply to apply.
+1 update available. Run with --write to apply.
 ```
 
 ### Audit

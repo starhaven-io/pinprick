@@ -44,8 +44,8 @@ pinprick/
 
 ### Commands
 
-- `pinprick pin [PATH] [--dry-run]` — Scan `.github/workflows/*.yml`, resolve action tag refs to full SHAs via GitHub API, rewrite files with `@sha # tag` format. Skips already-pinned (SHA) refs. Warns on branch refs (`@main`) and sliding tags (`@v4`), resolving sliding tags to exact versions. `--dry-run` previews changes without writing and exits 1 when there are unpinned actions.
-- `pinprick update [PATH] [--apply] [--only PATTERN]` — Check SHA-pinned actions for newer releases. Dry-run by default, `--apply` to write changes. `--only` restricts the check to actions whose `owner/repo` contains the given substring.
+- `pinprick pin [PATH] [--write]` — Scan `.github/workflows/*.yml`, resolve action tag refs to full SHAs via GitHub API. Dry-run by default (exits 1 when there are unpinned actions). `--write` rewrites files with `@sha # tag` format. Skips already-pinned (SHA) refs. Warns on branch refs (`@main`) and sliding tags (`@v4`), resolving sliding tags to exact versions.
+- `pinprick update [PATH] [--write] [--only PATTERN]` — Check SHA-pinned actions for newer releases. Dry-run by default, `--write` to apply changes. `--only` restricts the check to actions whose `owner/repo` contains the given substring.
 - `pinprick audit [PATH] [--verbose] [--sarif]` — Scan for runtime fetch patterns that bypass pinning. Without a GitHub token, scans only local `run:` blocks. With a token, also fetches and scans action source code (JS/TS, Python, Dockerfiles, action.yml). `--verbose` shows allowed matches. `--sarif` outputs SARIF 2.1.0 for GitHub code scanning.
 - `pinprick clean` — Remove locally cached audit results (`~/.cache/pinprick/audited/`).
 - `pinprick completions <SHELL>` — Generate shell completions for bash, zsh, fish, etc.
