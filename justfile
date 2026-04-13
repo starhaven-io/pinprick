@@ -146,6 +146,11 @@ check:
     else
         skip typos typos typos-cli
     fi
+    if command -v cargo-deny &>/dev/null; then
+        run cargo deny check
+    else
+        skip cargo-deny cargo-deny cargo-deny
+    fi
     if command -v zizmor &>/dev/null; then
         run zizmor --persona auditor .github/workflows/
     else

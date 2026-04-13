@@ -161,6 +161,10 @@ jobs:
         if: matrix.check == 'lint'
         run: cargo install typos-cli --locked
 
+      - name: Install cargo-deny
+        if: matrix.check == 'lint'
+        run: cargo install cargo-deny --locked
+
       - name: Clippy
         if: matrix.check == 'lint'
         run: cargo clippy -- -D warnings
@@ -172,6 +176,10 @@ jobs:
       - name: Typos
         if: matrix.check == 'lint'
         run: typos
+
+      - name: Cargo deny
+        if: matrix.check == 'lint'
+        run: cargo deny check
 
       # --- Test ---
 

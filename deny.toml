@@ -1,0 +1,29 @@
+[licenses]
+allow = [
+    "AGPL-3.0-only",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+]
+confidence-threshold = 0.95
+
+# r-efi is LGPL-2.1-or-later but only compiled on UEFI targets —
+# never linked into pinprick on macOS/Linux.
+[[licenses.exceptions]]
+allow = ["LGPL-2.1-or-later"]
+name = "r-efi"
+
+[advisories]
+
+[sources]
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
