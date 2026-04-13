@@ -1234,4 +1234,200 @@ mod tests {
         assert_eq!(c.allowed.len(), 1);
         assert_eq!(c.allowed[0].reason, "trusted host");
     }
+
+    #[test]
+    fn gh_release_download_without_tag_is_finding() {
+        let mut c = AuditCollector::new(false);
+        scan_shell_content(
+            "gh release download -R owner/repo -p '*.tar.gz'",
+            "test.sh",
+            1,
+            "",
+            &mut c,
+            &DEFAULT_CONFIG,
+        );
+        assert_eq!(c.findings.len(), 1);
+        assert_eq!(c.findings[0].severity, "medium");
+        assert!(c.findings[0].description.contains("gh release download"));
+    }
+
+    #[test]
+    fn js_minified_line_splitting() {
+        let mut c = AuditCollector::new(false);
+        // Build a line > 500 chars with a fetch call buried in it
+        let padding = "a".repeat(450);
+        let minified = format!(
+            r#"{}; const r = await fetch("https://example.com/api/data"); {}"#,
+            padding, padding
+        );
+        scan_js_content(&minified, "dist/index.js", "", &mut c, &DEFAULT_CONFIG);
+        assert_eq!(c.findings.len(), 1);
+    }
+
+    #[test]
+    fn dockerfile_digest_pinned_skipped() {
+        let mut c = AuditCollector::new(false);
+        scan_dockerfile_content(
+            "FROM ubuntu@sha256:abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890\nRUN echo hello\n",
+            "Dockerfile",
+            "",
+            &mut c,
+            &DEFAULT_CONFIG,
+        );
+        assert!(c.findings.is_empty());
+    }
+
+    #[test]
+    fn dockerfile_from_latest_is_finding() {
+        let mut c = AuditCollector::new(false);
+        scan_dockerfile_content(
+            "FROM ubuntu:latest\nRUN echo hello\n",
+            "Dockerfile",
+            "",
+            &mut c,
+            &DEFAULT_CONFIG,
+        );
+        assert_eq!(c.findings.len(), 1);
+    }
+
+    #[test]
+    fn dockerfile_from_no_tag_is_finding() {
+        let mut c = AuditCollector::new(false);
+        scan_dockerfile_content(
+            "FROM ubuntu\nRUN echo hello\n",
+            "Dockerfile",
+            "",
+            &mut c,
+            &DEFAULT_CONFIG,
+        );
+        assert_eq!(c.findings.len(), 1);
+    }
+
+    #[test]
+    fn scan_action_yml_composite_steps() {
+        let yaml: serde_norway::Value = serde_norway::from_str(
+            r#"
+runs:
+  using: composite
+  steps:
+    - run: curl -L https://example.com/install.sh -o install.sh
+"#,
+        )
+        .unwrap();
+        let mut c = AuditCollector::new(false);
+        scan_action_yml_runs(&yaml, "action.yml", "test-action", &mut c, &DEFAULT_CONFIG);
+        assert_eq!(c.findings.len(), 1);
+    }
+
+    #[test]
+    fn scan_action_yml_args() {
+        let yaml: serde_norway::Value = serde_norway::from_str(
+            r#"
+runs:
+  using: node20
+  args: |
+    curl -L https://example.com/install.sh -o install.sh
+"#,
+        )
+        .unwrap();
+        let mut c = AuditCollector::new(false);
+        scan_action_yml_runs(&yaml, "action.yml", "test-action", &mut c, &DEFAULT_CONFIG);
+        assert_eq!(c.findings.len(), 1);
+    }
+
+    #[test]
+    fn scan_action_yml_no_runs_key() {
+        let yaml: serde_norway::Value = serde_norway::from_str("name: test\n").unwrap();
+        let mut c = AuditCollector::new(false);
+        scan_action_yml_runs(&yaml, "action.yml", "test-action", &mut c, &DEFAULT_CONFIG);
+        assert!(c.findings.is_empty());
+    }
+
+    #[test]
+    fn downgrade_low_stays_low() {
+        assert_eq!(downgrade_severity("low"), "low");
+    }
+
+    #[test]
+    fn downgrade_unknown_unchanged() {
+        assert_eq!(downgrade_severity("info"), "info");
+    }
+
+    #[test]
+    fn short_sha_full() {
+        assert_eq!(
+            short_sha("abc1234567890abcdef1234567890abcdef123456"),
+            "abc1234"
+        );
+    }
+
+    #[test]
+    fn short_sha_short() {
+        assert_eq!(short_sha("abc"), "abc");
+    }
+
+    #[test]
+    fn py_scan_trusted_host_is_allowed() {
+        let config = Config {
+            trusted_hosts: vec!["api.example.com".to_string()],
+            ..Config::default()
+        };
+        let mut c = AuditCollector::new(true);
+        scan_py_content(
+            r#"r = requests.get("https://api.example.com/data")"#,
+            "test.py",
+            "",
+            &mut c,
+            &config,
+        );
+        assert!(c.findings.is_empty());
+        assert_eq!(c.allowed.len(), 1);
+        assert_eq!(c.allowed[0].reason, "trusted host");
+    }
+
+    #[test]
+    fn finding_includes_action_name() {
+        let mut c = AuditCollector::new(false);
+        scan_shell_content(
+            "curl -L https://example.com/install.sh -o foo",
+            "test.sh",
+            1,
+            "actions/checkout@abc1234",
+            &mut c,
+            &DEFAULT_CONFIG,
+        );
+        assert_eq!(c.findings.len(), 1);
+        assert_eq!(c.findings[0].action, "actions/checkout@abc1234");
+    }
+
+    #[test]
+    fn checksum_at_boundary_of_three_lines() {
+        let mut c = AuditCollector::new(false);
+        scan_shell_content(
+            "curl -L https://example.com/releases/latest/download/tool -o tool\necho step1\necho step2\nsha256sum --check tool.sha256",
+            "test.sh",
+            1,
+            "",
+            &mut c,
+            &DEFAULT_CONFIG,
+        );
+        assert_eq!(c.findings.len(), 1);
+        assert_eq!(c.findings[0].severity, "medium");
+        assert!(c.findings[0].description.contains("checksum verified"));
+    }
+
+    #[test]
+    fn checksum_beyond_three_lines_no_downgrade() {
+        let mut c = AuditCollector::new(false);
+        scan_shell_content(
+            "curl -L https://example.com/releases/latest/download/tool -o tool\necho 1\necho 2\necho 3\nsha256sum --check tool.sha256",
+            "test.sh",
+            1,
+            "",
+            &mut c,
+            &DEFAULT_CONFIG,
+        );
+        assert_eq!(c.findings.len(), 1);
+        assert_eq!(c.findings[0].severity, "high");
+    }
 }

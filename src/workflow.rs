@@ -395,6 +395,108 @@ jobs:
         assert_eq!(refs[0].full_name(), "real/a");
         assert_eq!(refs[1].full_name(), "real/b");
     }
+
+    // ── classify_ref edge cases ────────────────────────────────────────
+
+    #[test]
+    fn classify_39_hex_chars_is_branch() {
+        let short = "a".repeat(39);
+        assert!(matches!(classify_ref(&short), RefType::Branch));
+    }
+
+    #[test]
+    fn classify_41_hex_chars_is_branch() {
+        let long = "a".repeat(41);
+        assert!(matches!(classify_ref(&long), RefType::Branch));
+    }
+
+    #[test]
+    fn classify_40_hex_chars_is_sha() {
+        let sha = "a".repeat(40);
+        assert!(matches!(classify_ref(&sha), RefType::Sha));
+    }
+
+    #[test]
+    fn classify_mixed_case_hex_is_sha() {
+        let sha = "aAbBcCdDeEfF0011223344556677889900112233";
+        assert!(matches!(classify_ref(sha), RefType::Sha));
+    }
+
+    #[test]
+    fn classify_prerelease_tag_is_branch() {
+        assert!(matches!(classify_ref("v1.2.3-alpha"), RefType::Branch));
+    }
+
+    #[test]
+    fn classify_main_is_branch() {
+        assert!(matches!(classify_ref("main"), RefType::Branch));
+    }
+
+    // ── build_pinned_line ──────────────────────────────────────────────
+
+    #[test]
+    fn build_pinned_line_non_uses_returns_none() {
+        assert!(build_pinned_line("  - run: echo hello", "abc123", "v1").is_none());
+    }
+
+    // ── display_path ───────────────────────────────────────────────────
+
+    #[test]
+    fn display_path_relative() {
+        let root = Path::new("/repo");
+        let path = Path::new("/repo/.github/workflows/ci.yml");
+        assert_eq!(display_path(path, root), ".github/workflows/ci.yml");
+    }
+
+    #[test]
+    fn display_path_outside_root() {
+        let root = Path::new("/repo");
+        let path = Path::new("/other/ci.yml");
+        assert_eq!(display_path(path, root), "/other/ci.yml");
+    }
+
+    // ── rewrite_actions ────────────────────────────────────────────────
+
+    #[test]
+    fn rewrite_preserves_trailing_newline() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = dir.path().join("test.yml");
+        std::fs::write(&file, "line1\nline2\n").unwrap();
+        let count = rewrite_actions(&file, &[(1, "replaced".to_string())]).unwrap();
+        assert_eq!(count, 1);
+        let result = std::fs::read_to_string(&file).unwrap();
+        assert!(result.ends_with('\n'));
+        assert_eq!(result, "replaced\nline2\n");
+    }
+
+    #[test]
+    fn rewrite_no_trailing_newline() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = dir.path().join("test.yml");
+        std::fs::write(&file, "line1\nline2").unwrap();
+        let count = rewrite_actions(&file, &[(1, "replaced".to_string())]).unwrap();
+        assert_eq!(count, 1);
+        let result = std::fs::read_to_string(&file).unwrap();
+        assert!(!result.ends_with('\n'));
+    }
+
+    #[test]
+    fn rewrite_out_of_bounds_skipped() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = dir.path().join("test.yml");
+        std::fs::write(&file, "line1\n").unwrap();
+        let count = rewrite_actions(&file, &[(99, "nope".to_string())]).unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn rewrite_empty_replacements() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = dir.path().join("test.yml");
+        std::fs::write(&file, "line1\n").unwrap();
+        let count = rewrite_actions(&file, &[]).unwrap();
+        assert_eq!(count, 0);
+    }
 }
 
 /// Format a file path relative to the repo root for display.

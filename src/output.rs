@@ -815,11 +815,28 @@ mod audit_summary_tests {
         }
     }
 
-    fn lines_without_ansi(r: &AuditReport) -> Vec<String> {
-        colored::control::set_override(false);
-        let out = r.audit_summary_lines();
-        colored::control::unset_override();
+    fn strip_ansi(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut in_escape = false;
+        for c in s.chars() {
+            if in_escape {
+                if c.is_ascii_alphabetic() {
+                    in_escape = false;
+                }
+            } else if c == '\x1b' {
+                in_escape = true;
+            } else {
+                out.push(c);
+            }
+        }
         out
+    }
+
+    fn lines_without_ansi(r: &AuditReport) -> Vec<String> {
+        r.audit_summary_lines()
+            .into_iter()
+            .map(|s| strip_ansi(&s))
+            .collect()
     }
 
     #[test]
@@ -998,6 +1015,55 @@ mod audit_summary_tests {
                 "1 branch ref scanned. Pin to a SHA manually.",
                 "1 action ignored per config.",
             ]
+        );
+    }
+
+    #[test]
+    fn local_cache_only() {
+        let r = AuditReport {
+            audited_local_cache: 3,
+            ..empty_report()
+        };
+        assert_eq!(
+            lines_without_ansi(&r),
+            vec!["Audited 3 actions: 3 local cache."]
+        );
+    }
+
+    #[test]
+    fn remote_only() {
+        let r = AuditReport {
+            audited_remote: 1,
+            ..empty_report()
+        };
+        assert_eq!(
+            lines_without_ansi(&r),
+            vec!["Audited 1 action: 1 pinprick.rs."]
+        );
+    }
+
+    #[test]
+    fn unpinned_only_no_audited_line() {
+        let r = AuditReport {
+            scanned_unpinned_sliding: 1,
+            scanned_unpinned_branch: 2,
+            ..empty_report()
+        };
+        let lines = lines_without_ansi(&r);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("1 sliding tag scanned"));
+        assert!(lines[1].contains("2 branch refs scanned"));
+    }
+
+    #[test]
+    fn plural_ignored() {
+        let r = AuditReport {
+            ignored: 5,
+            ..empty_report()
+        };
+        assert_eq!(
+            lines_without_ansi(&r),
+            vec!["5 actions ignored per config."]
         );
     }
 }

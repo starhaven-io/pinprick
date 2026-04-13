@@ -214,4 +214,33 @@ mod tests {
         assert!(is_newer("v3", "v4"));
         assert!(!is_newer("v4", "v3"));
     }
+
+    #[test]
+    fn prerelease_suffix_ignored() {
+        // "rc1" is not numeric, so filter_map drops it: v1.2.3-rc1 → [1,2,3]
+        assert!(!is_newer("v1.2.3", "v1.2.3-rc1"));
+    }
+
+    #[test]
+    fn leading_zeros() {
+        assert!(is_newer("v01.02.03", "v01.02.04"));
+    }
+
+    #[test]
+    fn empty_segments_skipped() {
+        // "v1..3" splits into ["1", "", "3"], empty string fails parse → [1, 3]
+        assert!(is_newer("v1.2", "v1.3"));
+    }
+
+    #[test]
+    fn long_version() {
+        assert!(is_newer("v1.2.3.4.5", "v1.2.3.4.6"));
+        assert!(!is_newer("v1.2.3.4.6", "v1.2.3.4.5"));
+    }
+
+    #[test]
+    fn both_empty_after_parse() {
+        // No numeric components at all
+        assert!(!is_newer("alpha", "beta"));
+    }
 }
