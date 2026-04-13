@@ -99,7 +99,9 @@ jobs:
               LATEST="${TAG}"
               LATEST_SHA="${TAG_SHA}"
             else
-              LATEST=$(gh api "repos/${OWNER}/${REPO}/releases/latest" --jq '.tag_name' 2>/dev/null || echo "")
+              LATEST=$(gh api "repos/${OWNER}/${REPO}/releases?per_page=10" \
+                --jq '[.[] | select(.draft == false and .prerelease == false and (.tag_name | test("^v")))][0].tag_name' \
+                2>/dev/null || echo "")
               if [[ -z "${LATEST}" ]]; then
                 echo "  No releases found, skipping"
                 continue

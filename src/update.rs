@@ -65,7 +65,9 @@ pub async fn run(
                 }
             };
 
-            let latest = releases.iter().find(|r| !r.draft && !r.prerelease);
+            let latest = releases
+                .iter()
+                .find(|r| !r.draft && !r.prerelease && r.tag_name.starts_with('v'));
 
             let latest = match latest {
                 Some(r) => r,
