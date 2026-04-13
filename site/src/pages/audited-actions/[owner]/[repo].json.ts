@@ -1,8 +1,21 @@
-import type { APIRoute } from 'astro';
+import type { APIRoute, GetStaticPaths } from 'astro';
 import fs from 'node:fs';
 import path from 'node:path';
 
-export const prerender = false;
+export const getStaticPaths: GetStaticPaths = () => {
+  const dataDir = path.resolve('..', 'audited-actions');
+  const paths: { params: { owner: string; repo: string } }[] = [];
+
+  for (const owner of fs.readdirSync(dataDir, { withFileTypes: true })) {
+    if (!owner.isDirectory()) continue;
+    for (const file of fs.readdirSync(path.join(dataDir, owner.name))) {
+      if (!file.endsWith('.json')) continue;
+      paths.push({ params: { owner: owner.name, repo: file.replace(/\.json$/, '') } });
+    }
+  }
+
+  return paths;
+};
 
 export const GET: APIRoute = ({ params }) => {
   const { owner, repo } = params;
