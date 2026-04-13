@@ -1,4 +1,5 @@
 [
+  { "sha": "f94817b9f0deeb3871261446912ae8f854d1b675", "tag": "codeql-bundle-v2.25.1" },
   { "sha": "c10b8064de6f491fea524254123dbe5e09572f13", "tag": "v4.35.1" },
   { "sha": "0d579ffd059c29b07949a3cce3983f0780820c98", "tag": "v4.32.6" }
 ]
