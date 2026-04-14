@@ -217,7 +217,7 @@ jobs:
         run: |
           FAILED=0
           for JSON_FILE in audited-actions/*/*.json; do
-            SORTED=$(jq 'sort_by(.tag | ltrimstr("v") | split(".") | map(tonumber? // 0)) | reverse' "${JSON_FILE}")
+            SORTED=$(jq 'sort_by([(.tag | ltrimstr("v") | split(".") | map(tonumber? // 0)), .tag]) | reverse' "${JSON_FILE}")
             ACTUAL=$(jq '.' "${JSON_FILE}")
             if [[ "${SORTED}" != "${ACTUAL}" ]]; then
               echo "::error::${JSON_FILE} is not sorted by version"

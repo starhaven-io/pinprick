@@ -160,7 +160,7 @@ jobs:
                 echo "  Clean — adding ${TAG}"
                 jq -r --arg sha "${TAG_SHA}" --arg tag "${TAG}" '
                   (if any(.[]; .sha == $sha) then . else [{sha: $sha, tag: $tag}] + . end)
-                  | sort_by(.tag | ltrimstr("v") | split(".") | map(tonumber? // 0)) | reverse
+                  | sort_by([(.tag | ltrimstr("v") | split(".") | map(tonumber? // 0)), .tag]) | reverse
                   | "[\n" + ([.[] | "  { \"sha\": \"\(.sha)\", \"tag\": \"\(.tag)\" }"] | join(",\n")) + "\n]"
                 ' "${JSON_FILE}" > "${JSON_FILE}.tmp"
                 mv "${JSON_FILE}.tmp" "${JSON_FILE}"
