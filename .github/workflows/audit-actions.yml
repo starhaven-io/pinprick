@@ -113,12 +113,8 @@ jobs:
               fi
               TAGS=("${TAG}")
               declare -A TAG_SHAS=(["${TAG}"]="${TAG_SHA}")
-            elif [[ -n "${INPUT_ACTION}" ]]; then
-              # Backfill: paginate all releases for this action.
-              readarray -t TAGS < <(gh api --paginate "repos/${OWNER}/${REPO}/releases" \
-                --jq "${VERSION_FILTER}" 2>/dev/null)
             else
-              # Weekly scan: check recent releases only.
+              # Check recent releases for unaudited versions.
               readarray -t TAGS < <(gh api "repos/${OWNER}/${REPO}/releases?per_page=10" \
                 --jq "${VERSION_FILTER}" 2>/dev/null)
             fi
@@ -129,6 +125,12 @@ jobs:
             fi
 
             for TAG in "${TAGS[@]}"; do
+              # Check by tag name first (no API call) to skip already-audited releases.
+              if jq -e ".[] | select(.tag == \"${TAG}\")" "${JSON_FILE}" > /dev/null 2>&1; then
+                echo "  ${TAG} already audited"
+                continue
+              fi
+
               # Resolve tag to SHA (skip if already resolved in the specific-ref path).
               if [[ -z "${TAG_SHAS["${TAG}"]+x}" ]]; then
                 TAG_SHA=$(resolve_tag_sha "${OWNER}" "${REPO}" "${TAG}")
@@ -138,11 +140,6 @@ jobs:
                 fi
               else
                 TAG_SHA="${TAG_SHAS["${TAG}"]}"
-              fi
-
-              if jq -e ".[] | select(.sha == \"${TAG_SHA}\")" "${JSON_FILE}" > /dev/null 2>&1; then
-                echo "  ${TAG} already audited"
-                continue
               fi
 
               echo "  New release: ${TAG} (${TAG_SHA:0:7})"
