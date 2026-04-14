@@ -92,6 +92,7 @@ jobs:
             OWNER=$(basename "$(dirname "${JSON_FILE}")")
             REPO=$(basename "${JSON_FILE}" .json)
             echo "--- ${OWNER}/${REPO} ---"
+            declare -A TAG_SHAS=()
 
             if [[ -n "${INPUT_REF}" && -n "${INPUT_ACTION}" ]]; then
               # Specific ref: resolve and audit exactly this tag/SHA.
