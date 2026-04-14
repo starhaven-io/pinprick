@@ -3,6 +3,9 @@ name: CI
 on:
   pull_request:
     types: [opened, synchronize, reopened, edited]
+  push:
+    branches:
+      - main
 
 defaults:
   run:
@@ -33,7 +36,14 @@ jobs:
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           EVENT_ACTION: ${{ github.event.action }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
+          # Push to main: run lint to warm the cache.
+          if [[ "${EVENT_NAME}" == "push" ]]; then
+            echo 'matrix=[{"name":"Lint","check":"lint","runner":"ubuntu-latest"}]' >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
           MATRIX='[{"name":"Conventional Commits","check":"commits","runner":"ubuntu-slim","fetch_depth":"0"}'
 
           # For title/body edits, only recheck conventional commits
@@ -180,6 +190,18 @@ jobs:
       - name: Cargo deny
         if: matrix.check == 'lint'
         run: cargo deny check
+
+      - name: Save cargo cache
+        if: matrix.check == 'lint' && github.event_name == 'push'
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-debug-${{ hashFiles('**/Cargo.lock') }}
 
       # --- Test ---
 
