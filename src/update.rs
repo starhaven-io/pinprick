@@ -65,9 +65,27 @@ pub async fn run(
                 }
             };
 
+            // Filter to tags that look like version numbers (rejects non-action
+            // releases like codeql-bundle-*) and pick the highest version rather
+            // than the most-recently-created release (handles backport releases
+            // like v3.1.0-node20 published after v8.0.1).
             let latest = releases
                 .iter()
-                .find(|r| !r.draft && !r.prerelease && r.tag_name.starts_with('v'));
+                .filter(|r| {
+                    !r.draft
+                        && !r.prerelease
+                        && r.tag_name
+                            .strip_prefix('v')
+                            .unwrap_or(&r.tag_name)
+                            .starts_with(|c: char| c.is_ascii_digit())
+                })
+                .reduce(|best, r| {
+                    if is_newer(&best.tag_name, &r.tag_name) {
+                        r
+                    } else {
+                        best
+                    }
+                });
 
             let latest = match latest {
                 Some(r) => r,
