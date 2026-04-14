@@ -113,12 +113,8 @@ jobs:
               fi
               TAGS=("${TAG}")
               declare -A TAG_SHAS=(["${TAG}"]="${TAG_SHA}")
-            elif [[ -n "${INPUT_ACTION}" ]]; then
-              # Backfill: paginate all releases for this action.
-              readarray -t TAGS < <(gh api --paginate "repos/${OWNER}/${REPO}/releases" \
-                --jq "${VERSION_FILTER}" 2>/dev/null)
             else
-              # Weekly scan: check recent releases only.
+              # Check recent releases for unaudited versions.
               readarray -t TAGS < <(gh api "repos/${OWNER}/${REPO}/releases?per_page=10" \
                 --jq "${VERSION_FILTER}" 2>/dev/null)
             fi
