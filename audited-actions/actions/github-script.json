@@ -1,3 +1,12 @@
 [
-  { "sha": "ed597411d8f924073f98dfc5c65a23a2325f34cd", "tag": "v8.0.0" }
+  { "sha": "3a2844b7e9c422d3c10d287c895573f7108da1b3", "tag": "v9.0.0" },
+  { "sha": "ed597411d8f924073f98dfc5c65a23a2325f34cd", "tag": "v8.0.0" },
+  { "sha": "f28e40c7f34bde8b3046d885e986cb6290c5673b", "tag": "v7.1.0" },
+  { "sha": "60a0d83039c74a4aee543508d2ffcb1c3799cdea", "tag": "v7.0.1" },
+  { "sha": "e69ef5462fd455e02edcaf4dd7708eda96b9eda0", "tag": "v7.0.0" },
+  { "sha": "d7906e4ad0b1822421a7e6a35d5ca353c962f410", "tag": "v6.4.1" },
+  { "sha": "211cb3fefb35a799baa5156f9321bb774fe56294", "tag": "v5.2.0" },
+  { "sha": "10b53a9ec6c222bb4ce97aa6bd2b5f739696b536", "tag": "v4.2.0" },
+  { "sha": "ffc2c79a5b2490bd33e0a41c1de74b877714d736", "tag": "v3.2.0" },
+  { "sha": "4aed96e0ba636e3df2423e6887c9a83ef8522d6d", "tag": "v2.1.0" }
 ]

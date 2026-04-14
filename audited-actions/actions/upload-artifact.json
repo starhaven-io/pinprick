@@ -1,3 +1,12 @@
 [
-  { "sha": "bbbca2ddaa5d8feaa63e36b76fdaad77386f024f", "tag": "v7.0.0" }
+  { "sha": "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a", "tag": "v7.0.1" },
+  { "sha": "bbbca2ddaa5d8feaa63e36b76fdaad77386f024f", "tag": "v7.0.0" },
+  { "sha": "b7c566a772e6b6bfb58ed0dc250532a479d7789f", "tag": "v6.0.0" },
+  { "sha": "330a01c490aca151604b8cf639adc76d48f6c5d4", "tag": "v5.0.0" },
+  { "sha": "ea165f8d65b6e75b540449e92b4886f43607fa02", "tag": "v4.6.2" },
+  { "sha": "4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1", "tag": "v4.6.1" },
+  { "sha": "65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08", "tag": "v4.6.0" },
+  { "sha": "6f51ac03b9356f520e9adb1b1b7802705f340c2b", "tag": "v4.5.0" },
+  { "sha": "c6a366c94c3e0affe28c06c8df20a878f24da3cf", "tag": "v3.2.2" },
+  { "sha": "c6a3b2bd78b3985e4b2f15397fec357f0fd808de", "tag": "v3.2.2-node20" }
 ]
