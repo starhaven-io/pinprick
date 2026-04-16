@@ -199,17 +199,20 @@ Also flagged in Dockerfile `RUN` instructions under the `pinprick/docker_unpinne
 
 **Severity:** Low
 
-Triggers on `pip install <package>` where `<package>` has no `==`/`>=` specifier and is the last argument.
+Triggers on `pip install <package>` where `<package>` has no `==`/`>=`/`~=` specifier and the line is not a `-r requirements.txt` install.
 
 ```bash
 pip install requests
 pip3 install flask
+pip install requests --quiet
+pip install requests --user
 ```
 
 Not flagged:
 
 ```bash
 pip install requests==2.31.0
+pip install requests>=2.0
 pip install -r requirements.txt
 ```
 
@@ -217,17 +220,19 @@ pip install -r requirements.txt
 
 **Severity:** Low
 
-Triggers on `npm install <package>` where `<package>` has no `@version` specifier.
+Triggers on `npm install <package>` where `<package>` has no `@version` specifier (a digit after `@`). Scoped packages like `@babel/core` are not version-pinned; `@babel/core@1.0.0` is.
 
 ```bash
 npm install typescript
 npm install @babel/core
+npm install typescript --save-dev
 ```
 
 Not flagged:
 
 ```bash
 npm install typescript@5.6.0
+npm install @babel/core@1.0.0
 npm install    # no package argument — uses package-lock.json
 ```
 
@@ -235,10 +240,12 @@ npm install    # no package argument — uses package-lock.json
 
 **Severity:** Low
 
-Triggers on `cargo install <crate>` where `<crate>` has no `@version` specifier and no `--version` flag.
+Triggers on `cargo install <crate>` where the line has neither `@version` on the crate name nor a `--version` flag. Note: `--locked` pins the crate's _dependencies_ via its lockfile, not the crate's own version, so it does not suppress this finding.
 
 ```bash
 cargo install ripgrep
+cargo install typos-cli --locked
+cargo install cargo-deny --locked
 ```
 
 Not flagged:
@@ -253,16 +260,18 @@ cargo install    # no crate argument — uses Cargo.toml
 
 **Severity:** Low
 
-Triggers on `gem install <gem>` where `<gem>` has no `-v` version specifier.
+Triggers on `gem install <gem>` where the line has neither `-v <version>` nor `--version <version>`.
 
 ```bash
 gem install rubocop
+gem install rubocop --no-document
 ```
 
 Not flagged:
 
 ```bash
 gem install rubocop -v 1.0.0
+gem install rubocop --version 1.0.0
 gem install    # no gem argument
 ```
 

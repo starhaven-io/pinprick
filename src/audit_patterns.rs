@@ -38,11 +38,11 @@ re!(SH_CURL_UNVERSIONED, r#"curl\b.*https?://[^\s"']+"#);
 re!(SH_WGET_UNVERSIONED, r#"wget\b.*https?://[^\s"']+"#);
 re!(
     SH_PIP_UNVERSIONED,
-    r"pip3?\s+install\s+[a-zA-Z][a-zA-Z0-9_-]*\s*$"
+    r"pip3?\s+install\s+[a-zA-Z][a-zA-Z0-9_-]*(\s|$)"
 );
 re!(
     SH_NPM_UNVERSIONED,
-    r"npm\s+install\s+(@[a-zA-Z][a-zA-Z0-9_-]*/)?[a-zA-Z][a-zA-Z0-9_-]*\s*$"
+    r"npm\s+install\s+(@[a-zA-Z][a-zA-Z0-9_-]*/)?[a-zA-Z][a-zA-Z0-9_-]*(\s|$)"
 );
 re!(SH_GO_INSTALL_LATEST, r"go\s+install\s+\S+@latest");
 re!(
@@ -75,11 +75,11 @@ re!(SH_GIT_CLONE, r"git\s+clone\s");
 re!(GIT_CHECKOUT_SHA, r"git\s+checkout\s+[0-9a-f]{40}\b");
 re!(
     SH_CARGO_INSTALL_UNVERSIONED,
-    r"cargo\s+install\s+[a-zA-Z][a-zA-Z0-9_-]*\s*$"
+    r"cargo\s+install\s+[a-zA-Z][a-zA-Z0-9_-]*(\s|$)"
 );
 re!(
     SH_GEM_INSTALL_UNVERSIONED,
-    r"gem\s+install\s+[a-zA-Z][a-zA-Z0-9_-]*\s*$"
+    r"gem\s+install\s+[a-zA-Z][a-zA-Z0-9_-]*(\s|$)"
 );
 
 pub static SHELL_PATTERNS: LazyLock<Vec<Pattern>> = LazyLock::new(|| {
@@ -107,30 +107,6 @@ pub static SHELL_PATTERNS: LazyLock<Vec<Pattern>> = LazyLock::new(|| {
             severity: Severity::High,
             category: Category::ShellFetch,
             description: "PowerShell fetching from a 'latest' URL — can change without notice",
-        },
-        Pattern {
-            regex: &SH_PIP_UNVERSIONED,
-            severity: Severity::Low,
-            category: Category::ShellFetch,
-            description: "pip install without version pin",
-        },
-        Pattern {
-            regex: &SH_NPM_UNVERSIONED,
-            severity: Severity::Low,
-            category: Category::ShellFetch,
-            description: "npm install without version pin",
-        },
-        Pattern {
-            regex: &SH_CARGO_INSTALL_UNVERSIONED,
-            severity: Severity::Low,
-            category: Category::ShellFetch,
-            description: "cargo install without --version pin",
-        },
-        Pattern {
-            regex: &SH_GEM_INSTALL_UNVERSIONED,
-            severity: Severity::Low,
-            category: Category::ShellFetch,
-            description: "gem install without version pin",
         },
     ]
 });
@@ -480,6 +456,37 @@ pub fn git_clone_has_pinned_ref(line: &str) -> bool {
 /// Check if a line contains a `git checkout <full-SHA>`.
 pub fn has_git_checkout_sha(line: &str) -> bool {
     GIT_CHECKOUT_SHA.is_match(line)
+}
+
+/// Check if a `pip install` line has a version specifier or uses `-r`.
+pub fn pip_install_has_version(line: &str) -> bool {
+    static PIP_VERSION: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"pip3?\s+install\s+\S*[=>~]=|pip3?\s+install\s+-r\s").unwrap()
+    });
+    PIP_VERSION.is_match(line)
+}
+
+/// Check if an `npm install` line has a version pin (`@version` after the package name).
+/// Scoped packages (`@babel/core`) are not version-pinned; `@babel/core@1.0.0` is.
+pub fn npm_install_has_version(line: &str) -> bool {
+    static NPM_VERSION: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"npm\s+install\s+\S+@\d").unwrap());
+    NPM_VERSION.is_match(line)
+}
+
+/// Check if a `cargo install` line has a version pin (`@version` or `--version`).
+pub fn cargo_install_has_version(line: &str) -> bool {
+    static CARGO_VERSION: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"cargo\s+install\s+\S+@\d|cargo\s+install\s+.*--version\s").unwrap()
+    });
+    CARGO_VERSION.is_match(line)
+}
+
+/// Check if a `gem install` line has a version pin (`-v` or `--version`).
+pub fn gem_install_has_version(line: &str) -> bool {
+    static GEM_VERSION: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"gem\s+install\s+.*(-v\s+\d|--version\s)").unwrap());
+    GEM_VERSION.is_match(line)
 }
 
 pub fn category_str(c: &Category) -> &'static str {
@@ -1211,13 +1218,9 @@ mod tests {
     }
 
     #[test]
-    fn cargo_install_versioned_not_flagged() {
-        assert!(!SH_CARGO_INSTALL_UNVERSIONED.is_match("cargo install ripgrep@14.0.0"));
-    }
-
-    #[test]
-    fn cargo_install_with_version_flag_not_flagged() {
-        assert!(!SH_CARGO_INSTALL_UNVERSIONED.is_match("cargo install ripgrep --version 14.0.0"));
+    fn cargo_install_with_flags_detected() {
+        assert!(SH_CARGO_INSTALL_UNVERSIONED.is_match("cargo install typos-cli --locked"));
+        assert!(SH_CARGO_INSTALL_UNVERSIONED.is_match("cargo install cargo-deny --locked"));
     }
 
     #[test]
@@ -1231,12 +1234,92 @@ mod tests {
     }
 
     #[test]
-    fn gem_install_versioned_not_flagged() {
-        assert!(!SH_GEM_INSTALL_UNVERSIONED.is_match("gem install rubocop -v 1.0.0"));
+    fn gem_install_with_flags_detected() {
+        assert!(SH_GEM_INSTALL_UNVERSIONED.is_match("gem install rubocop --no-document"));
     }
 
     #[test]
     fn gem_install_no_args_not_flagged() {
         assert!(!SH_GEM_INSTALL_UNVERSIONED.is_match("gem install"));
+    }
+
+    // ── pip/npm install with trailing flags ─────────────────────────────
+
+    #[test]
+    fn pip_install_with_flags_detected() {
+        assert!(SH_PIP_UNVERSIONED.is_match("pip install requests --quiet"));
+        assert!(SH_PIP_UNVERSIONED.is_match("pip3 install flask --user"));
+    }
+
+    #[test]
+    fn npm_install_with_flags_detected() {
+        assert!(SH_NPM_UNVERSIONED.is_match("npm install typescript --save-dev"));
+        assert!(SH_NPM_UNVERSIONED.is_match("npm install @babel/core --save-dev"));
+    }
+
+    // ── version-pin check functions ────────────────────────────────────
+
+    #[test]
+    fn pip_version_pinned() {
+        assert!(pip_install_has_version("pip install requests==2.31.0"));
+        assert!(pip_install_has_version("pip install requests>=2.0"));
+        assert!(pip_install_has_version("pip install requests~=2.31"));
+        assert!(pip_install_has_version("pip install -r requirements.txt"));
+    }
+
+    #[test]
+    fn pip_version_not_pinned() {
+        assert!(!pip_install_has_version("pip install requests"));
+        assert!(!pip_install_has_version("pip install requests --quiet"));
+    }
+
+    #[test]
+    fn npm_version_pinned() {
+        assert!(npm_install_has_version("npm install typescript@5.6.0"));
+        assert!(npm_install_has_version("npm install @babel/core@1.0.0"));
+    }
+
+    #[test]
+    fn npm_version_not_pinned() {
+        assert!(!npm_install_has_version("npm install typescript"));
+        assert!(!npm_install_has_version("npm install @babel/core"));
+        assert!(!npm_install_has_version(
+            "npm install typescript --save-dev"
+        ));
+    }
+
+    #[test]
+    fn cargo_version_pinned() {
+        assert!(cargo_install_has_version("cargo install ripgrep@14.0.0"));
+        assert!(cargo_install_has_version(
+            "cargo install ripgrep --version 14.0.0"
+        ));
+    }
+
+    #[test]
+    fn cargo_version_not_pinned() {
+        assert!(!cargo_install_has_version("cargo install ripgrep"));
+        assert!(!cargo_install_has_version(
+            "cargo install typos-cli --locked"
+        ));
+        assert!(!cargo_install_has_version(
+            "cargo install cargo-deny --locked"
+        ));
+    }
+
+    #[test]
+    fn gem_version_pinned() {
+        assert!(gem_install_has_version("gem install rubocop -v 1.0.0"));
+        assert!(gem_install_has_version(
+            "gem install rubocop --version 1.0.0"
+        ));
+    }
+
+    #[test]
+    fn gem_version_not_pinned() {
+        assert!(!gem_install_has_version("gem install rubocop"));
+        assert!(!gem_install_has_version(
+            "gem install rubocop --no-document"
+        ));
     }
 }
