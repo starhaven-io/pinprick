@@ -65,6 +65,12 @@ pinprick audit
 # Target a specific repo
 pinprick audit /path/to/repo
 
+# Show every matched pattern, including ones that passed the version check
+pinprick audit --verbose
+
+# Emit SARIF 2.1.0 for GitHub code scanning
+pinprick audit --sarif > pinprick.sarif
+
 # Clear locally cached audit results
 pinprick clean
 
@@ -119,6 +125,36 @@ HIGH  .github/workflows/ci.yml:42
 
 Without a GitHub token, audit scans local `run:` blocks only. With a token (via `GITHUB_TOKEN` or `gh auth`), it also fetches and scans action source code — JavaScript, Python, Dockerfiles, and composite action steps.
 
+Pass `--sarif` to emit SARIF 2.1.0 for upload to [GitHub code scanning](https://docs.github.com/en/code-security/code-scanning). Pass `--verbose` to see every match, including ones that passed the version check or were downgraded to an allowed match by the trusted-host or data-format rules.
+
+### Configuration
+
+A `.pinprick.toml` at the repo root (or `~/.config/pinprick/config.toml` globally) customizes behavior. All keys are optional:
+
+```toml
+# Minimum severity to report: "low" (default), "medium", or "high"
+severity = "low"
+
+# Fetch the audited-actions catalog from pinprick.rs instead of only using
+# the bundle compiled into the binary. Useful in CI.
+fetch-remote = false
+
+# Hosts whose unversioned URL fetches are downgraded to allowed matches.
+# Case-insensitive exact match. Only applies to the unversioned-URL rules.
+trusted-hosts = ["crates.io"]
+
+# Extra file extensions (beyond .json/.yaml/.toml/.csv/.tsv/.xml/.md/.rst/.txt)
+# to treat as data formats for the unversioned-URL exemption.
+extra-data-formats = ["proto"]
+
+[ignore]
+# Skip these actions entirely (prefix match on owner/repo).
+actions = ["actions/checkout"]
+
+# Suppress findings whose description contains any of these strings.
+patterns = []
+```
+
 ### Clean
 
 Remove locally cached audit results (`~/.cache/pinprick/audited/`):
@@ -137,7 +173,9 @@ Cache cleaned.
 | Pipe-to-shell | PowerShell `iex (iwr ...)` / `Invoke-Expression (... DownloadString ...)` | High |
 | Shell | `curl`/`wget` to `/latest/` URLs | High |
 | Shell | `curl`/`wget` to unversioned URLs | Medium |
-| Shell | `go install @latest`, unpinned `pip`/`npm` | Low–Medium |
+| Shell | `gh release download` without a tag | Medium |
+| Shell | `git clone` without a pinned `--branch` ref (unless a `git checkout <sha>` follows within 3 lines) | Medium |
+| Shell | `go install @latest`, unpinned `pip`/`npm`/`cargo install`/`gem install` | Low |
 | PowerShell | `Invoke-WebRequest`/`iwr`/`irm` to `/latest/` URLs | High |
 | PowerShell | `Invoke-WebRequest`/`iwr`/`irm` to unversioned URLs | Medium |
 | JavaScript | `fetch()`/`axios`/`got` to `/latest/` URLs | High |

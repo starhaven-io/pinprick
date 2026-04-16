@@ -66,6 +66,12 @@ pinprick/
 2. `gh auth token` CLI fallback
 3. Graceful degradation: `pin` and `update` require a token; `audit` works without one (reduced coverage)
 
+Rate-limit handling: `github::get` retries once on network/5xx errors and sleeps through `x-ratelimit-reset` when the reset is within 60 s; longer waits bail with `RateLimit`.
+
+### Configuration
+
+A `.pinprick.toml` at the repo root (or `~/.config/pinprick/config.toml`) customizes behavior. Keys are all optional: `severity`, `fetch-remote`, `trusted-hosts`, `extra-data-formats`, `ignore.actions`, `ignore.patterns`. Per-repo wholly overrides global (no field-level merge).
+
 ### Audit patterns
 
 Six categories of runtime fetch detection:
