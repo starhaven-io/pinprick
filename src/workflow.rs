@@ -497,6 +497,40 @@ jobs:
         let count = rewrite_actions(&file, &[]).unwrap();
         assert_eq!(count, 0);
     }
+
+    #[test]
+    #[cfg(not(debug_assertions))]
+    fn rewrite_duplicate_line_skipped_in_release() {
+        // In release builds a duplicate is dropped rather than clobbering
+        // the earlier entry. In debug builds this case is an assertion.
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = dir.path().join("test.yml");
+        std::fs::write(&file, "line1\nline2\n").unwrap();
+        let count = rewrite_actions(
+            &file,
+            &[
+                (1, "first".to_string()),
+                (1, "second-should-be-ignored".to_string()),
+            ],
+        )
+        .unwrap();
+        assert_eq!(count, 1);
+        let result = std::fs::read_to_string(&file).unwrap();
+        assert_eq!(result, "first\nline2\n");
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "duplicate rewrite target")]
+    fn rewrite_duplicate_line_panics_in_debug() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = dir.path().join("test.yml");
+        std::fs::write(&file, "line1\nline2\n").unwrap();
+        let _ = rewrite_actions(
+            &file,
+            &[(1, "first".to_string()), (1, "second".to_string())],
+        );
+    }
 }
 
 /// Format a file path relative to the repo root for display.
@@ -508,6 +542,11 @@ pub fn display_path(path: &Path, root: &Path) -> String {
 }
 
 /// Rewrite action references in a file. Returns the number of replacements made.
+///
+/// Each entry's line number must be unique — a `uses:` line maps to a single
+/// action. In debug builds a duplicate trips an assertion; in release it is
+/// silently skipped so a caller bug can't corrupt a workflow by letting the
+/// later entry clobber the earlier one.
 pub fn rewrite_actions(
     path: &Path,
     replacements: &[(usize, String)], // (line_number, new_line)
@@ -516,9 +555,19 @@ pub fn rewrite_actions(
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
 
     let mut lines: Vec<String> = content.lines().map(String::from).collect();
+    let mut seen: std::collections::HashSet<usize> =
+        std::collections::HashSet::with_capacity(replacements.len());
     let mut count = 0;
 
     for (line_num, new_line) in replacements {
+        if !seen.insert(*line_num) {
+            debug_assert!(
+                false,
+                "duplicate rewrite target for line {line_num} in {}",
+                path.display()
+            );
+            continue;
+        }
         let idx = line_num - 1; // 1-based to 0-based
         if idx < lines.len() {
             lines[idx] = new_line.clone();
