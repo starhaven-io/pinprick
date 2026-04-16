@@ -6,9 +6,9 @@ use std::process::ExitCode;
 
 use crate::audit_patterns::{
     self, DOCKER_PATTERNS, DOCKER_URL_PATTERNS, JS_PATTERNS, JS_URL_PATTERNS, PY_PATTERNS,
-    PY_URL_PATTERNS, Pattern, SH_GH_RELEASE_LATEST, SHELL_PATTERNS, SHELL_PIPE_PATTERNS,
-    SHELL_URL_PATTERNS, category_str, extract_url, gh_release_has_tag, has_checksum_verify,
-    url_has_version,
+    PY_URL_PATTERNS, Pattern, SH_GH_RELEASE_LATEST, SH_GIT_CLONE, SHELL_PATTERNS,
+    SHELL_PIPE_PATTERNS, SHELL_URL_PATTERNS, category_str, extract_url, gh_release_has_tag,
+    git_clone_has_pinned_ref, has_checksum_verify, has_git_checkout_sha, url_has_version,
 };
 use crate::audited_actions::{AuditSource, AuditedActions};
 use crate::auth;
@@ -361,6 +361,36 @@ fn scan_shell_content(
                 workflow_line: None,
             });
         }
+
+        if SH_GIT_CLONE.is_match(line) && !git_clone_has_pinned_ref(line) {
+            let has_sha_checkout = (1..=3)
+                .any(|offset| i + offset < lines.len() && has_git_checkout_sha(lines[i + offset]));
+
+            if has_sha_checkout {
+                collector.push_allowed(AuditMatch {
+                    severity: output::severity_str(&audit_patterns::Severity::Medium).to_string(),
+                    category: category_str(&audit_patterns::Category::ShellFetch).to_string(),
+                    action: action_name.to_string(),
+                    source_file: source_file.to_string(),
+                    line: Some(line_num),
+                    pattern_matched: line.trim().to_string(),
+                    reason: "followed by SHA checkout".to_string(),
+                });
+            } else {
+                collector.push_finding(AuditFinding {
+                    severity: output::severity_str(&audit_patterns::Severity::Medium).to_string(),
+                    category: category_str(&audit_patterns::Category::ShellFetch).to_string(),
+                    action: action_name.to_string(),
+                    source_file: source_file.to_string(),
+                    line: Some(line_num),
+                    pattern_matched: line.trim().to_string(),
+                    description: "git clone without pinned ref — clones HEAD of default branch"
+                        .to_string(),
+                    workflow_file: None,
+                    workflow_line: None,
+                });
+            }
+        }
     }
 
     // Downgrade severity for findings followed by checksum verification.
@@ -531,6 +561,20 @@ fn scan_dockerfile_content(
             collector,
             config,
         );
+
+        if SH_GIT_CLONE.is_match(line) && !git_clone_has_pinned_ref(line) {
+            collector.push_finding(AuditFinding {
+                severity: output::severity_str(&audit_patterns::Severity::Medium).to_string(),
+                category: category_str(&audit_patterns::Category::DockerUnpinned).to_string(),
+                action: action_name.to_string(),
+                source_file: source_file.to_string(),
+                line: Some(line_num),
+                pattern_matched: line.trim().to_string(),
+                description: "git clone in Dockerfile without pinned ref".to_string(),
+                workflow_file: None,
+                workflow_line: None,
+            });
+        }
     }
 }
 
@@ -1356,8 +1400,8 @@ runs:
     #[test]
     fn short_sha_full() {
         assert_eq!(
-            short_sha("abc1234567890abcdef1234567890abcdef123456"),
-            "abc1234"
+            short_sha("abcdef1234567890abcdef1234567890abcdef12"),
+            "abcdef1"
         );
     }
 
@@ -1429,5 +1473,95 @@ runs:
         );
         assert_eq!(c.findings.len(), 1);
         assert_eq!(c.findings[0].severity, "high");
+    }
+
+    // ── git clone ─────────────────────────────────────────────────────
+
+    #[test]
+    fn git_clone_unpinned_is_finding() {
+        let mut c = AuditCollector::new(false);
+        scan_shell_content(
+            "git clone https://github.com/org/repo",
+            "test.sh",
+            1,
+            "",
+            &mut c,
+            &DEFAULT_CONFIG,
+        );
+        assert_eq!(c.findings.len(), 1);
+        assert_eq!(c.findings[0].severity, "medium");
+        assert!(c.findings[0].description.contains("git clone"));
+    }
+
+    #[test]
+    fn git_clone_versioned_branch_clean() {
+        let mut c = AuditCollector::new(false);
+        scan_shell_content(
+            "git clone --branch v1.2.3 https://github.com/org/repo",
+            "test.sh",
+            1,
+            "",
+            &mut c,
+            &DEFAULT_CONFIG,
+        );
+        assert!(c.findings.is_empty());
+    }
+
+    #[test]
+    fn git_clone_main_branch_is_finding() {
+        let mut c = AuditCollector::new(false);
+        scan_shell_content(
+            "git clone --branch main https://github.com/org/repo",
+            "test.sh",
+            1,
+            "",
+            &mut c,
+            &DEFAULT_CONFIG,
+        );
+        assert_eq!(c.findings.len(), 1);
+    }
+
+    #[test]
+    fn git_clone_depth_one_versioned_clean() {
+        let mut c = AuditCollector::new(false);
+        scan_shell_content(
+            "git clone --depth 1 --branch v1.2.3 https://github.com/org/repo",
+            "test.sh",
+            1,
+            "",
+            &mut c,
+            &DEFAULT_CONFIG,
+        );
+        assert!(c.findings.is_empty());
+    }
+
+    #[test]
+    fn git_clone_followed_by_sha_checkout_is_allowed() {
+        let mut c = AuditCollector::new(true);
+        scan_shell_content(
+            "git clone https://github.com/org/repo\ncd repo\ngit checkout abcdef1234567890abcdef1234567890abcdef12",
+            "test.sh",
+            1,
+            "",
+            &mut c,
+            &DEFAULT_CONFIG,
+        );
+        assert!(c.findings.is_empty());
+        assert_eq!(c.allowed.len(), 1);
+        assert_eq!(c.allowed[0].reason, "followed by SHA checkout");
+    }
+
+    #[test]
+    fn git_clone_sha_checkout_beyond_three_lines_still_finding() {
+        let mut c = AuditCollector::new(false);
+        scan_shell_content(
+            "git clone https://github.com/org/repo\necho 1\necho 2\necho 3\ngit checkout abcdef1234567890abcdef1234567890abcdef12",
+            "test.sh",
+            1,
+            "",
+            &mut c,
+            &DEFAULT_CONFIG,
+        );
+        assert_eq!(c.findings.len(), 1);
     }
 }

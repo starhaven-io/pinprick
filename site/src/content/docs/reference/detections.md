@@ -162,6 +162,39 @@ Not flagged:
 go install github.com/golangci/golangci-lint/cmd/golangci-lint@v1.55.0
 ```
 
+### git clone without a pinned ref
+
+**Severity:** Medium
+
+Triggers on `git clone` without `--branch`/`-b` or with a branch name that doesn't look like a version tag.
+
+```bash
+git clone https://github.com/org/repo
+git clone --branch main https://github.com/org/repo
+git clone -b develop https://github.com/org/repo
+```
+
+Not flagged:
+
+```bash
+git clone --branch v1.2.3 https://github.com/org/repo
+git clone -b 2.0.1 https://github.com/org/repo
+git clone --depth 1 --branch v1.2.3 https://github.com/org/repo
+```
+
+A bare `git clone` defaults to HEAD of the default branch, which is mutable. Pinning to a version tag via `--branch` makes the clone deterministic (at least to the tag level).
+
+**SHA checkout suppression:** if `git checkout <40-character-SHA>` appears within 3 lines after an unpinned `git clone`, the finding is fully suppressed (recorded as an allowed match visible under `--verbose`). The SHA checkout deterministically pins the repository content.
+
+```bash
+# This produces zero findings:
+git clone https://github.com/org/repo
+cd repo
+git checkout abcdef1234567890abcdef1234567890abcdef12
+```
+
+Also flagged in Dockerfile `RUN` instructions under the `pinprick/docker_unpinned` rule.
+
 ### pip install without a version pin
 
 **Severity:** Low
@@ -196,6 +229,41 @@ Not flagged:
 ```bash
 npm install typescript@5.6.0
 npm install    # no package argument — uses package-lock.json
+```
+
+### cargo install without a version pin
+
+**Severity:** Low
+
+Triggers on `cargo install <crate>` where `<crate>` has no `@version` specifier and no `--version` flag.
+
+```bash
+cargo install ripgrep
+```
+
+Not flagged:
+
+```bash
+cargo install ripgrep@14.0.0
+cargo install ripgrep --version 14.0.0
+cargo install    # no crate argument — uses Cargo.toml
+```
+
+### gem install without a version pin
+
+**Severity:** Low
+
+Triggers on `gem install <gem>` where `<gem>` has no `-v` version specifier.
+
+```bash
+gem install rubocop
+```
+
+Not flagged:
+
+```bash
+gem install rubocop -v 1.0.0
+gem install    # no gem argument
 ```
 
 ## PowerShell fetches

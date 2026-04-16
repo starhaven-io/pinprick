@@ -70,7 +70,7 @@ pinprick/
 
 Six categories of runtime fetch detection:
 - **Pipe-to-shell:** `curl`/`wget` piped into `sh`/`bash`/`python`, `bash <(curl …)` process substitution, `bash -c "$(curl …)"` / `eval "$(…)"` command substitution, PowerShell `iex (iwr …)` / `Invoke-Expression (… DownloadString …)`. Flagged high severity regardless of URL versioning.
-- **Shell:** `curl`/`wget`/`gh release download` with unversioned URLs, `go install @latest`, unpinned `pip`/`npm` installs
+- **Shell:** `curl`/`wget`/`gh release download` with unversioned URLs, `git clone` without a pinned ref, `go install @latest`, unpinned `pip`/`npm`/`cargo install`/`gem install` installs
 - **PowerShell:** `Invoke-WebRequest`/`iwr`/`Invoke-RestMethod`/`irm` with unversioned URLs
 - **JavaScript:** `fetch()`/`axios`/`got`/`http.get` with unversioned URLs, `exec()`/`child_process` shelling out to curl
 - **Python:** `urllib.request.urlopen`/`requests.get` with unversioned URLs, `subprocess` shelling out to curl/wget
@@ -83,6 +83,8 @@ URL "versioned" heuristic: a URL is considered versioned if any path segment mat
 Data-format exemption: unversioned-URL rules (shell, JS, Python) do **not** fire when the URL's path ends in a data-format extension (`.json`/`.jsonl`/`.ndjson`, `.yaml`/`.yml`/`.toml`, `.csv`/`.tsv`/`.xml`, `.txt`/`.md`/`.rst`). Matches are recorded as allowed (visible under `--verbose`) with reason `data format URL`. Applies only to the unversioned-URL rules — `/latest/` URLs, pipe-to-shell, and `gh release download` without a tag still fire regardless of extension. `.html` and `.svg` are intentionally excluded because both can carry embedded scripts.
 
 Checksum verification: findings followed within 3 lines by `sha256sum`, `shasum`, `openssl dgst`, `gpg --verify`, or `Get-FileHash` are downgraded one severity level. Pipe-to-shell findings are exempt — the piped payload is never written to disk, so a nearby checksum command cannot verify it.
+
+Git clone ref pinning: `git clone` without `--branch`/`-b` or with a branch name (main, develop, feature/foo) is flagged medium severity. `--branch v1.2.3` (version-like ref) suppresses the finding. A `git checkout <40-char-SHA>` within 3 lines fully suppresses the finding (recorded as allowed, visible under `--verbose`), since the SHA checkout deterministically pins the repo content.
 
 ### Exit codes
 

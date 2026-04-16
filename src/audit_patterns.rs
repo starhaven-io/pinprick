@@ -71,6 +71,17 @@ re!(
     r"(?i)\b(iex|Invoke-Expression)\b.*\b(iwr|Invoke-WebRequest|Invoke-RestMethod|irm|DownloadString)\b"
 );
 
+re!(SH_GIT_CLONE, r"git\s+clone\s");
+re!(GIT_CHECKOUT_SHA, r"git\s+checkout\s+[0-9a-f]{40}\b");
+re!(
+    SH_CARGO_INSTALL_UNVERSIONED,
+    r"cargo\s+install\s+[a-zA-Z][a-zA-Z0-9_-]*\s*$"
+);
+re!(
+    SH_GEM_INSTALL_UNVERSIONED,
+    r"gem\s+install\s+[a-zA-Z][a-zA-Z0-9_-]*\s*$"
+);
+
 pub static SHELL_PATTERNS: LazyLock<Vec<Pattern>> = LazyLock::new(|| {
     vec![
         Pattern {
@@ -108,6 +119,18 @@ pub static SHELL_PATTERNS: LazyLock<Vec<Pattern>> = LazyLock::new(|| {
             severity: Severity::Low,
             category: Category::ShellFetch,
             description: "npm install without version pin",
+        },
+        Pattern {
+            regex: &SH_CARGO_INSTALL_UNVERSIONED,
+            severity: Severity::Low,
+            category: Category::ShellFetch,
+            description: "cargo install without --version pin",
+        },
+        Pattern {
+            regex: &SH_GEM_INSTALL_UNVERSIONED,
+            severity: Severity::Low,
+            category: Category::ShellFetch,
+            description: "gem install without version pin",
         },
     ]
 });
@@ -430,6 +453,33 @@ pub fn gh_release_has_tag(line: &str) -> bool {
     static GH_RELEASE_TAG: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"gh\s+release\s+download\s+(v?\d|--tag\s+v?\d)").unwrap());
     GH_RELEASE_TAG.is_match(line)
+}
+
+/// Check if a ref argument looks like a version tag rather than a branch name.
+/// Returns true for: v1.2.3, 1.2.3, release/1.0.0 (contains version segment).
+/// Returns false for: main, master, develop, feature/foo.
+fn ref_looks_versioned(ref_name: &str) -> bool {
+    static VERSION_REF: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"v?\d+(\.\d+)+").unwrap());
+    VERSION_REF.is_match(ref_name)
+}
+
+/// Check if a `git clone` line has a pinned ref via `--branch`/`-b`.
+///
+/// `git clone --branch v1.2.3 ...` is pinned.
+/// `git clone -b main ...` is not.
+/// `git clone ...` (no branch flag) is not.
+pub fn git_clone_has_pinned_ref(line: &str) -> bool {
+    static GIT_CLONE_BRANCH: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"git\s+clone\s+.*(?:--branch|-b)\s+(\S+)").unwrap());
+    let Some(caps) = GIT_CLONE_BRANCH.captures(line) else {
+        return false;
+    };
+    ref_looks_versioned(&caps[1])
+}
+
+/// Check if a line contains a `git checkout <full-SHA>`.
+pub fn has_git_checkout_sha(line: &str) -> bool {
+    GIT_CHECKOUT_SHA.is_match(line)
 }
 
 pub fn category_str(c: &Category) -> &'static str {
@@ -1047,5 +1097,146 @@ mod tests {
     #[test]
     fn no_checksum() {
         assert!(!has_checksum_verify("echo done"));
+    }
+
+    // ── git clone patterns ─────────────────────────────────────────────
+
+    #[test]
+    fn git_clone_basic_detected() {
+        assert!(SH_GIT_CLONE.is_match("git clone https://github.com/org/repo"));
+    }
+
+    #[test]
+    fn git_clone_with_depth_detected() {
+        assert!(SH_GIT_CLONE.is_match("git clone --depth 1 https://github.com/org/repo"));
+    }
+
+    #[test]
+    fn git_clone_with_branch_detected() {
+        assert!(SH_GIT_CLONE.is_match("git clone --branch main https://github.com/org/repo"));
+    }
+
+    #[test]
+    fn git_clone_pinned_versioned_branch() {
+        assert!(git_clone_has_pinned_ref(
+            "git clone --branch v1.2.3 https://github.com/org/repo"
+        ));
+    }
+
+    #[test]
+    fn git_clone_pinned_short_flag() {
+        assert!(git_clone_has_pinned_ref(
+            "git clone -b v1.2.3 https://github.com/org/repo"
+        ));
+    }
+
+    #[test]
+    fn git_clone_pinned_no_v_prefix() {
+        assert!(git_clone_has_pinned_ref(
+            "git clone --branch 2.0.1 https://github.com/org/repo"
+        ));
+    }
+
+    #[test]
+    fn git_clone_pinned_release_branch_with_version() {
+        assert!(git_clone_has_pinned_ref(
+            "git clone --branch release/1.0.0 https://github.com/org/repo"
+        ));
+    }
+
+    #[test]
+    fn git_clone_pinned_depth_one_versioned() {
+        assert!(git_clone_has_pinned_ref(
+            "git clone --depth 1 --branch v1.2.3 https://github.com/org/repo"
+        ));
+    }
+
+    #[test]
+    fn git_clone_unpinned_main() {
+        assert!(!git_clone_has_pinned_ref(
+            "git clone --branch main https://github.com/org/repo"
+        ));
+    }
+
+    #[test]
+    fn git_clone_unpinned_master() {
+        assert!(!git_clone_has_pinned_ref(
+            "git clone -b master https://github.com/org/repo"
+        ));
+    }
+
+    #[test]
+    fn git_clone_unpinned_develop() {
+        assert!(!git_clone_has_pinned_ref(
+            "git clone -b develop https://github.com/org/repo"
+        ));
+    }
+
+    #[test]
+    fn git_clone_unpinned_feature_branch() {
+        assert!(!git_clone_has_pinned_ref(
+            "git clone --branch feature/my-feature https://github.com/org/repo"
+        ));
+    }
+
+    #[test]
+    fn git_clone_no_branch_flag() {
+        assert!(!git_clone_has_pinned_ref(
+            "git clone https://github.com/org/repo"
+        ));
+    }
+
+    #[test]
+    fn git_checkout_sha_detected() {
+        assert!(has_git_checkout_sha(
+            "git checkout abcdef1234567890abcdef1234567890abcdef12"
+        ));
+    }
+
+    #[test]
+    fn git_checkout_branch_not_sha() {
+        assert!(!has_git_checkout_sha("git checkout main"));
+    }
+
+    #[test]
+    fn git_checkout_short_sha_not_matched() {
+        assert!(!has_git_checkout_sha("git checkout abc1234"));
+    }
+
+    // ── cargo/gem install patterns ─────────────────────────────────────
+
+    #[test]
+    fn cargo_install_unversioned_detected() {
+        assert!(SH_CARGO_INSTALL_UNVERSIONED.is_match("cargo install ripgrep"));
+    }
+
+    #[test]
+    fn cargo_install_versioned_not_flagged() {
+        assert!(!SH_CARGO_INSTALL_UNVERSIONED.is_match("cargo install ripgrep@14.0.0"));
+    }
+
+    #[test]
+    fn cargo_install_with_version_flag_not_flagged() {
+        assert!(!SH_CARGO_INSTALL_UNVERSIONED.is_match("cargo install ripgrep --version 14.0.0"));
+    }
+
+    #[test]
+    fn cargo_install_no_args_not_flagged() {
+        assert!(!SH_CARGO_INSTALL_UNVERSIONED.is_match("cargo install"));
+    }
+
+    #[test]
+    fn gem_install_unversioned_detected() {
+        assert!(SH_GEM_INSTALL_UNVERSIONED.is_match("gem install rubocop"));
+    }
+
+    #[test]
+    fn gem_install_versioned_not_flagged() {
+        assert!(!SH_GEM_INSTALL_UNVERSIONED.is_match("gem install rubocop -v 1.0.0"));
+    }
+
+    #[test]
+    fn gem_install_no_args_not_flagged() {
+        assert!(!SH_GEM_INSTALL_UNVERSIONED.is_match("gem install"));
     }
 }

@@ -527,7 +527,7 @@ const SARIF_RULES: &[RuleDef] = &[
         id: "pinprick/shell_fetch",
         name: "ShellFetch",
         short: "Shell runtime fetch without pinning",
-        full: "Shell commands (curl, wget, gh release download, go install, pip, npm, PowerShell Invoke-WebRequest) that download content at runtime without pinning to a specific version. These bypass action SHA pinning.",
+        full: "Shell commands (curl, wget, gh release download, git clone, go install, pip, npm, cargo install, gem install, PowerShell Invoke-WebRequest) that download content at runtime without pinning to a specific version. These bypass action SHA pinning.",
     },
     RuleDef {
         id: "pinprick/javascript_fetch",

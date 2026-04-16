@@ -476,3 +476,46 @@ jobs:
         "expected .proto to be exempt via extra-data-formats"
     );
 }
+
+// ── git clone ─────────────────────────────────────────────────────────────
+
+#[test]
+fn git_clone_unpinned_finding() {
+    let dir = common::repo_with_workflow("ci.yml", common::WORKFLOW_GIT_CLONE);
+
+    let output = common::pinprick_cmd()
+        .arg("--json")
+        .arg("audit")
+        .arg(dir.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let findings = json["findings"].as_array().unwrap();
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0]["severity"], "medium");
+    assert!(
+        findings[0]["description"]
+            .as_str()
+            .unwrap()
+            .contains("git clone")
+    );
+}
+
+#[test]
+fn git_clone_versioned_branch_clean() {
+    let dir = common::repo_with_workflow("ci.yml", common::WORKFLOW_GIT_CLONE_VERSIONED);
+
+    let output = common::pinprick_cmd()
+        .arg("--json")
+        .arg("audit")
+        .arg(dir.path())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let findings = json["findings"].as_array().unwrap();
+    assert!(findings.is_empty());
+}

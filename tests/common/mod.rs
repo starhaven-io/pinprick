@@ -154,3 +154,29 @@ jobs:
     runs-on: ubuntu-latest
     steps: []
 ";
+
+/// git clone without pinned ref. Expect one medium-severity finding.
+pub const WORKFLOW_GIT_CLONE: &str = "\
+name: git-clone
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - run: |
+          git clone https://github.com/org/repo
+          cd repo && make install
+";
+
+/// git clone with versioned --branch. Expect zero findings.
+pub const WORKFLOW_GIT_CLONE_VERSIONED: &str = "\
+name: git-clone-versioned
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - run: git clone --depth 1 --branch v1.2.3 https://github.com/org/repo
+";
