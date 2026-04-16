@@ -82,10 +82,13 @@ pub async fn run(
             eprintln!("Scanning {display_name}");
         }
 
-        let run_blocks = extract_run_blocks(file)?;
-        for (line_offset, content) in &run_blocks {
+        let content =
+            std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
+
+        let run_blocks = extract_run_blocks(file, &content)?;
+        for (line_offset, run_content) in &run_blocks {
             scan_shell_content(
-                content,
+                run_content,
                 &display_name,
                 *line_offset,
                 "",
@@ -95,7 +98,7 @@ pub async fn run(
         }
 
         if let Some(client) = &client {
-            let actions = workflow::scan_workflow(file)?;
+            let actions = workflow::scan_content(&content);
             for action in &actions {
                 let key = format!("{}@{}", action.owner_repo(), action.ref_string);
                 if !scanned_actions.insert(key) {
@@ -248,11 +251,9 @@ pub async fn run(
     }
 }
 
-fn extract_run_blocks(path: &Path) -> Result<Vec<(usize, String)>> {
-    let content =
-        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+fn extract_run_blocks(path: &Path, content: &str) -> Result<Vec<(usize, String)>> {
     let yaml: Value =
-        serde_norway::from_str(&content).with_context(|| format!("parsing {}", path.display()))?;
+        serde_norway::from_str(content).with_context(|| format!("parsing {}", path.display()))?;
 
     let mut blocks = Vec::new();
     let mut cursor: usize = 0; // 0-based line index, monotonically advancing
@@ -265,7 +266,7 @@ fn extract_run_blocks(path: &Path) -> Result<Vec<(usize, String)>> {
             if let Some(steps) = job.get("steps").and_then(|s| s.as_sequence()) {
                 for step in steps {
                     if let Some(run) = step.get("run").and_then(|r| r.as_str()) {
-                        let (line, next_cursor) = find_run_line(&content, run, cursor);
+                        let (line, next_cursor) = find_run_line(content, run, cursor);
                         cursor = next_cursor;
                         blocks.push((line, run.to_string()));
                     }
