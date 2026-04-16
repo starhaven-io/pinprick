@@ -317,6 +317,38 @@ fn is_shell_comment_line(line: &str) -> bool {
     line.trim_start().starts_with('#')
 }
 
+/// Join shell lines ending in `\` into a single logical line, anchored at the
+/// 0-based index of the first physical line.
+fn join_continuations(content: &str) -> Vec<(usize, String)> {
+    let mut out: Vec<(usize, String)> = Vec::new();
+    let mut pending: Option<(usize, String)> = None;
+    for (i, raw) in content.lines().enumerate() {
+        let trimmed_end = raw.trim_end();
+        let is_continuation = trimmed_end.ends_with('\\');
+        let body = if is_continuation {
+            &trimmed_end[..trimmed_end.len() - 1]
+        } else {
+            raw
+        };
+        match pending.as_mut() {
+            Some((_, buf)) => {
+                buf.push(' ');
+                buf.push_str(body.trim());
+            }
+            None => {
+                pending = Some((i, body.to_string()));
+            }
+        }
+        if !is_continuation && let Some((start, buf)) = pending.take() {
+            out.push((start, buf));
+        }
+    }
+    if let Some(p) = pending {
+        out.push(p);
+    }
+    out
+}
+
 fn scan_shell_content(
     content: &str,
     source_file: &str,
@@ -328,17 +360,18 @@ fn scan_shell_content(
     let lines: Vec<&str> = content.lines().collect();
 
     // Pipe-to-shell pass runs first so its findings land before `findings_before`
-    // and escape the checksum downgrade loop below.
+    // and escape the checksum downgrade loop below. Continuations are joined so
+    // the pipe can sit on a later physical line than the curl.
     let mut pipe_shell_lines: HashSet<usize> = HashSet::new();
-    for (i, line) in lines.iter().enumerate() {
-        if is_shell_comment_line(line) {
+    for (start, joined) in join_continuations(content) {
+        if is_shell_comment_line(&joined) {
             continue;
         }
-        let line_num = base_line + i;
+        let line_num = base_line + start;
         let before = collector.findings.len();
         check_patterns(
             &SHELL_PIPE_PATTERNS,
-            line,
+            &joined,
             source_file,
             line_num,
             action_name,
@@ -974,6 +1007,44 @@ more stuff
         // distinguished from one inside a string without real shell parsing.
         assert!(!is_shell_comment_line("echo hello  # note"));
         assert!(!is_shell_comment_line("foo=\"# not a comment\""));
+    }
+
+    #[test]
+    fn join_continuations_merges_trailing_backslash() {
+        let joined = join_continuations("curl https://x.example/s.sh \\\n  | sh\n");
+        assert_eq!(joined.len(), 1);
+        assert_eq!(joined[0].0, 0);
+        assert_eq!(joined[0].1, "curl https://x.example/s.sh  | sh");
+    }
+
+    #[test]
+    fn join_continuations_leaves_unbroken_lines_alone() {
+        let joined = join_continuations("echo one\necho two\n");
+        assert_eq!(joined, vec![(0, "echo one".into()), (1, "echo two".into())]);
+    }
+
+    #[test]
+    fn join_continuations_handles_multiple_breaks() {
+        let joined = join_continuations("curl \\\n  -L \\\n  https://x.example/s.sh | sh\n");
+        assert_eq!(joined.len(), 1);
+        assert!(joined[0].1.contains("curl"));
+        assert!(joined[0].1.contains("| sh"));
+    }
+
+    #[test]
+    fn shell_scan_catches_pipe_to_shell_across_continuation() {
+        let mut c = AuditCollector::new(false);
+        scan_shell_content(
+            "curl -fsSL https://example.com/install.sh \\\n  | sh\n",
+            "test.sh",
+            1,
+            "",
+            &mut c,
+            &DEFAULT_CONFIG,
+        );
+        assert_eq!(c.findings.len(), 1);
+        assert_eq!(c.findings[0].severity, "high");
+        assert_eq!(c.findings[0].line, Some(1));
     }
 
     #[test]
