@@ -1,11 +1,19 @@
 use anyhow::{Context, Result, bail};
 use reqwest::header::{ACCEPT, AUTHORIZATION, USER_AGENT};
 use serde::Deserialize;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub struct GitHubClient {
     client: reqwest::Client,
     token: String,
 }
+
+/// Cap on how long we'll sleep waiting for a rate-limit reset. Longer waits
+/// would make `pin` / `update` appear hung from the user's perspective.
+const MAX_RATE_LIMIT_WAIT: Duration = Duration::from_secs(60);
+
+/// Delay before retrying a transient 5xx or network error.
+const TRANSIENT_RETRY_DELAY: Duration = Duration::from_millis(500);
 
 #[derive(Deserialize)]
 struct GitRef {
@@ -80,9 +88,8 @@ impl GitHubClient {
         }
     }
 
-    async fn get(&self, url: &str) -> Result<reqwest::Response> {
-        let resp = self
-            .client
+    async fn send_once(&self, url: &str) -> reqwest::Result<reqwest::Response> {
+        self.client
             .get(url)
             .header(USER_AGENT, "pinprick")
             .header(AUTHORIZATION, format!("Bearer {}", self.token))
@@ -90,20 +97,46 @@ impl GitHubClient {
             .header("X-GitHub-Api-Version", "2022-11-28")
             .send()
             .await
-            .context("GitHub API request failed")?;
+    }
 
-        match resp.status().as_u16() {
-            401 => bail!(GitHubError::AuthRequired),
-            403 => {
-                if let Some(remaining) = resp.headers().get("x-ratelimit-remaining")
-                    && remaining.to_str().unwrap_or("1") == "0"
-                {
+    async fn get(&self, url: &str) -> Result<reqwest::Response> {
+        // Up to two attempts: the first may hit a transient error or a
+        // rate-limit reset that's imminent; the second is the real answer.
+        for attempt in 0..2u8 {
+            let last_attempt = attempt == 1;
+
+            let resp = match self.send_once(url).await {
+                Ok(r) => r,
+                Err(e) if last_attempt => {
+                    return Err(e).context("GitHub API request failed");
+                }
+                Err(_) => {
+                    tokio::time::sleep(TRANSIENT_RETRY_DELAY).await;
+                    continue;
+                }
+            };
+
+            match resp.status().as_u16() {
+                401 => bail!(GitHubError::AuthRequired),
+                403 if is_rate_limited(&resp) => {
+                    if let Some(wait) = rate_limit_wait(&resp)
+                        && wait <= MAX_RATE_LIMIT_WAIT
+                        && !last_attempt
+                    {
+                        // +1s so we don't wake exactly at reset and race the clock.
+                        tokio::time::sleep(wait + Duration::from_secs(1)).await;
+                        continue;
+                    }
                     bail!(GitHubError::RateLimit);
                 }
-                Ok(resp)
+                500..=599 if !last_attempt => {
+                    tokio::time::sleep(TRANSIENT_RETRY_DELAY).await;
+                    continue;
+                }
+                _ => return Ok(resp),
             }
-            _ => Ok(resp),
         }
+        unreachable!("loop always returns or continues until last_attempt")
     }
 
     /// Resolve a tag to its commit SHA, following annotated tag objects.
@@ -234,4 +267,28 @@ impl GitHubClient {
 
         resp.text().await.context("reading file content")
     }
+}
+
+/// True if the response's `x-ratelimit-remaining` is exactly zero — GitHub's
+/// signal that further requests will be rejected until `x-ratelimit-reset`.
+fn is_rate_limited(resp: &reqwest::Response) -> bool {
+    resp.headers()
+        .get("x-ratelimit-remaining")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v == "0")
+}
+
+/// Seconds from now until the rate-limit window resets, per the response's
+/// `x-ratelimit-reset` epoch-seconds header. Returns `None` if the header is
+/// missing or unparsable.
+fn rate_limit_wait(resp: &reqwest::Response) -> Option<Duration> {
+    let reset_at: u64 = resp
+        .headers()
+        .get("x-ratelimit-reset")?
+        .to_str()
+        .ok()?
+        .parse()
+        .ok()?;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
+    Some(Duration::from_secs(reset_at.saturating_sub(now)))
 }
