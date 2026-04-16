@@ -367,6 +367,11 @@ pub fn has_checksum_verify(line: &str) -> bool {
 
 // ── URL version detection ───────────────────────────────────────────────────
 
+// Requires at least one dotted component (e.g. `v1.2`, `1.2.3`) so that a
+// bare `/v1/` or `/v2/` in a REST URL does not register as a pinned version.
+// That is intentional — a single-digit major is a sliding namespace, not a
+// release. Callers who want to exempt such hosts should use the
+// `trusted-hosts` config instead of relaxing this regex.
 static VERSION_SEGMENT: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"[/=]v?\d+(\.\d+)+[/\s"]"#).unwrap());
 
