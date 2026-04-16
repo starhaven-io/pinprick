@@ -255,14 +255,18 @@ fn extract_run_blocks(path: &Path) -> Result<Vec<(usize, String)>> {
         serde_norway::from_str(&content).with_context(|| format!("parsing {}", path.display()))?;
 
     let mut blocks = Vec::new();
+    let mut cursor: usize = 0; // 0-based line index, monotonically advancing
 
-    // Walk jobs.*.steps[].run
+    // Walk jobs.*.steps[].run. serde_norway's Mapping preserves insertion
+    // order, so iterating here visits `run:` blocks in document order and we
+    // can anchor each one at the next matching line, never earlier ones.
     if let Some(jobs) = yaml.get("jobs").and_then(|j| j.as_mapping()) {
         for (_job_name, job) in jobs {
             if let Some(steps) = job.get("steps").and_then(|s| s.as_sequence()) {
                 for step in steps {
                     if let Some(run) = step.get("run").and_then(|r| r.as_str()) {
-                        let line = find_run_line(&content, run).unwrap_or(0);
+                        let (line, next_cursor) = find_run_line(&content, run, cursor);
+                        cursor = next_cursor;
                         blocks.push((line, run.to_string()));
                     }
                 }
@@ -273,18 +277,27 @@ fn extract_run_blocks(path: &Path) -> Result<Vec<(usize, String)>> {
     Ok(blocks)
 }
 
-fn find_run_line(file_content: &str, run_content: &str) -> Option<usize> {
-    let first_line = run_content.lines().next()?;
+/// Locate the 1-based line of `run_content` in the raw file, starting the
+/// search at `start` (0-based). Returns the line and the cursor to start the
+/// next search at. A zero line means "not found"; the cursor is preserved.
+///
+/// Anchoring at `start` prevents matches on earlier lines (e.g. a preceding
+/// comment or an echoed duplicate) from stealing the position of a later
+/// `run:` block.
+fn find_run_line(file_content: &str, run_content: &str, start: usize) -> (usize, usize) {
+    let Some(first_line) = run_content.lines().next() else {
+        return (0, start);
+    };
     let trimmed = first_line.trim();
     if trimmed.is_empty() {
-        return None;
+        return (0, start);
     }
-    for (i, line) in file_content.lines().enumerate() {
+    for (i, line) in file_content.lines().enumerate().skip(start) {
         if line.contains(trimmed) {
-            return Some(i + 1);
+            return (i + 1, i + 1);
         }
     }
-    None
+    (0, start)
 }
 
 fn scan_shell_content(
@@ -865,6 +878,43 @@ mod tests {
             reason: "versioned URL".into(),
         });
         assert_eq!(c.allowed.len(), 1);
+    }
+
+    #[test]
+    fn find_run_line_advances_past_earlier_match() {
+        // Two `run:` blocks both start with `echo hello`. The second one must
+        // map to its own line, not the first occurrence, so severity-downgrade
+        // windows and SARIF locations stay anchored correctly.
+        let yaml = "\
+jobs:
+  a:
+    steps:
+      - run: |
+          echo hello
+          curl https://example.com/install.sh | sh
+      - run: |
+          echo hello
+          curl https://example.com/install.sh | sh
+";
+        let (first, cursor) = find_run_line(yaml, "echo hello\n          curl ...", 0);
+        assert_eq!(first, 5, "first block should anchor at line 5");
+        let (second, _) = find_run_line(yaml, "echo hello\n          curl ...", cursor);
+        assert_eq!(
+            second, 8,
+            "second block must skip the first block's first-line match"
+        );
+    }
+
+    #[test]
+    fn find_run_line_empty_run_content() {
+        let (line, cursor) = find_run_line("foo\nbar\n", "", 0);
+        assert_eq!((line, cursor), (0, 0));
+    }
+
+    #[test]
+    fn find_run_line_no_match_preserves_cursor() {
+        let (line, cursor) = find_run_line("foo\nbar\n", "baz", 1);
+        assert_eq!((line, cursor), (0, 1));
     }
 
     #[test]
