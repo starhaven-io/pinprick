@@ -282,9 +282,10 @@ fn extract_run_blocks(path: &Path, content: &str) -> Result<Vec<(usize, String)>
 /// search at `start` (0-based). Returns the line and the cursor to start the
 /// next search at. A zero line means "not found"; the cursor is preserved.
 ///
-/// Anchoring at `start` prevents matches on earlier lines (e.g. a preceding
-/// comment or an echoed duplicate) from stealing the position of a later
-/// `run:` block.
+/// Prefers an exact trimmed-line match so `echo hello` does not steal the
+/// position of a longer line like `    echo hello world` that appears first.
+/// Falls back to `contains` if no exact match is found past the cursor, which
+/// preserves the prior behavior for run blocks that serde_norway normalized.
 fn find_run_line(file_content: &str, run_content: &str, start: usize) -> (usize, usize) {
     let Some(first_line) = run_content.lines().next() else {
         return (0, start);
@@ -293,12 +294,19 @@ fn find_run_line(file_content: &str, run_content: &str, start: usize) -> (usize,
     if trimmed.is_empty() {
         return (0, start);
     }
+    let mut contains_hit: Option<usize> = None;
     for (i, line) in file_content.lines().enumerate().skip(start) {
-        if line.contains(trimmed) {
+        if line.trim() == trimmed {
             return (i + 1, i + 1);
         }
+        if contains_hit.is_none() && line.contains(trimmed) {
+            contains_hit = Some(i);
+        }
     }
-    (0, start)
+    match contains_hit {
+        Some(i) => (i + 1, i + 1),
+        None => (0, start),
+    }
 }
 
 /// Whether a shell source line is a pure comment and thus never executed.
@@ -930,6 +938,27 @@ jobs:
     fn find_run_line_no_match_preserves_cursor() {
         let (line, cursor) = find_run_line("foo\nbar\n", "baz", 1);
         assert_eq!((line, cursor), (0, 1));
+    }
+
+    #[test]
+    fn find_run_line_prefers_exact_trimmed_match() {
+        // A longer line that `contains` the target shouldn't steal the
+        // anchor from the actual run block's first line further down.
+        let file = "\
+prefix echo hello world
+    echo hello
+more stuff
+";
+        let (line, cursor) = find_run_line(file, "echo hello", 0);
+        assert_eq!((line, cursor), (2, 2));
+    }
+
+    #[test]
+    fn find_run_line_falls_back_to_contains() {
+        // No exact trimmed match exists, so `contains` still anchors.
+        let file = "echo hello world\nother\n";
+        let (line, cursor) = find_run_line(file, "echo hello", 0);
+        assert_eq!((line, cursor), (1, 1));
     }
 
     #[test]
