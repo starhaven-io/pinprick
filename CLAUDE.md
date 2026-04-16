@@ -118,7 +118,7 @@ Common types: `feat`, `fix`, `refactor`, `docs`, `ci`, `chore`
 
 All commits must:
 - Use `git commit -s` for DCO sign-off
-- Include a `Co-authored-by: Claude Opus 4.6 (1M context) <noreply@anthropic.com>` trailer when authored with Claude
+- Include a `Co-authored-by: Claude Opus 4.7 <noreply@anthropic.com>` trailer when authored with Claude
 
 ## Git workflow
 
