@@ -175,6 +175,58 @@ pub fn find_workflows(repo_root: &Path) -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
+/// Format a file path relative to the repo root for display.
+pub fn display_path(path: &Path, root: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .display()
+        .to_string()
+}
+
+/// Rewrite action references in a file. Returns the number of replacements made.
+///
+/// Each entry's line number must be unique — a `uses:` line maps to a single
+/// action. In debug builds a duplicate trips an assertion; in release it is
+/// silently skipped so a caller bug can't corrupt a workflow by letting the
+/// later entry clobber the earlier one.
+pub fn rewrite_actions(
+    path: &Path,
+    replacements: &[(usize, String)], // (line_number, new_line)
+) -> Result<usize> {
+    let content =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+
+    let mut lines: Vec<String> = content.lines().map(String::from).collect();
+    let mut seen: std::collections::HashSet<usize> =
+        std::collections::HashSet::with_capacity(replacements.len());
+    let mut count = 0;
+
+    for (line_num, new_line) in replacements {
+        if !seen.insert(*line_num) {
+            debug_assert!(
+                false,
+                "duplicate rewrite target for line {line_num} in {}",
+                path.display()
+            );
+            continue;
+        }
+        let idx = line_num - 1; // 1-based to 0-based
+        if idx < lines.len() {
+            lines[idx] = new_line.clone();
+            count += 1;
+        }
+    }
+
+    // Preserve trailing newline if original had one
+    let mut output = lines.join("\n");
+    if content.ends_with('\n') {
+        output.push('\n');
+    }
+
+    std::fs::write(path, &output).with_context(|| format!("writing {}", path.display()))?;
+    Ok(count)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -531,56 +583,4 @@ jobs:
             &[(1, "first".to_string()), (1, "second".to_string())],
         );
     }
-}
-
-/// Format a file path relative to the repo root for display.
-pub fn display_path(path: &Path, root: &Path) -> String {
-    path.strip_prefix(root)
-        .unwrap_or(path)
-        .display()
-        .to_string()
-}
-
-/// Rewrite action references in a file. Returns the number of replacements made.
-///
-/// Each entry's line number must be unique — a `uses:` line maps to a single
-/// action. In debug builds a duplicate trips an assertion; in release it is
-/// silently skipped so a caller bug can't corrupt a workflow by letting the
-/// later entry clobber the earlier one.
-pub fn rewrite_actions(
-    path: &Path,
-    replacements: &[(usize, String)], // (line_number, new_line)
-) -> Result<usize> {
-    let content =
-        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-
-    let mut lines: Vec<String> = content.lines().map(String::from).collect();
-    let mut seen: std::collections::HashSet<usize> =
-        std::collections::HashSet::with_capacity(replacements.len());
-    let mut count = 0;
-
-    for (line_num, new_line) in replacements {
-        if !seen.insert(*line_num) {
-            debug_assert!(
-                false,
-                "duplicate rewrite target for line {line_num} in {}",
-                path.display()
-            );
-            continue;
-        }
-        let idx = line_num - 1; // 1-based to 0-based
-        if idx < lines.len() {
-            lines[idx] = new_line.clone();
-            count += 1;
-        }
-    }
-
-    // Preserve trailing newline if original had one
-    let mut output = lines.join("\n");
-    if content.ends_with('\n') {
-        output.push('\n');
-    }
-
-    std::fs::write(path, &output).with_context(|| format!("writing {}", path.display()))?;
-    Ok(count)
 }
