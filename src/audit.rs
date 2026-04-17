@@ -5,12 +5,15 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use crate::audit_patterns::{
-    self, DOCKER_PATTERNS, DOCKER_URL_PATTERNS, JS_PATTERNS, JS_URL_PATTERNS, PY_PATTERNS,
-    PY_URL_PATTERNS, Pattern, SH_CARGO_INSTALL_UNVERSIONED, SH_GEM_INSTALL_UNVERSIONED,
-    SH_GH_RELEASE_LATEST, SH_GIT_CLONE, SH_NPM_UNVERSIONED, SH_PIP_UNVERSIONED, SHELL_PATTERNS,
-    SHELL_PIPE_PATTERNS, SHELL_URL_PATTERNS, cargo_install_has_version, category_str, extract_url,
-    gem_install_has_version, gh_release_has_tag, git_clone_has_pinned_ref, has_checksum_verify,
-    has_git_checkout_sha, npm_install_has_version, pip_install_has_version, url_has_version,
+    self, DOCKER_PATTERNS, DOCKER_URL_PATTERNS, JS_PATTERNS, JS_URL_PATTERNS,
+    PS_INSTALL_MODULE_UNVERSIONED, PY_PATTERNS, PY_URL_PATTERNS, Pattern,
+    SH_CARGO_INSTALL_UNVERSIONED, SH_GEM_INSTALL_UNVERSIONED, SH_GH_RELEASE_LATEST, SH_GIT_CLONE,
+    SH_NPM_UNVERSIONED, SH_NPX_UNVERSIONED, SH_PIP_GIT_URL_UNVERSIONED, SH_PIP_UNVERSIONED,
+    SHELL_PATTERNS, SHELL_PIPE_PATTERNS, SHELL_URL_PATTERNS, cargo_install_has_version,
+    category_str, extract_url, gem_install_has_version, gh_release_has_tag,
+    git_clone_has_pinned_ref, has_checksum_verify, has_git_checkout_sha, npm_install_has_version,
+    npx_has_version, pip_git_url_has_ref, pip_install_has_version, ps_install_has_required_version,
+    url_has_version,
 };
 use crate::audited_actions::{AuditSource, AuditedActions};
 use crate::auth;
@@ -466,6 +469,7 @@ fn scan_shell_content(
         if SH_PIP_UNVERSIONED.is_match(line) && !pip_install_has_version(line) {
             push_pkg_finding(
                 "pip install without version pin",
+                audit_patterns::Severity::Low,
                 line,
                 source_file,
                 line_num,
@@ -476,6 +480,7 @@ fn scan_shell_content(
         if SH_NPM_UNVERSIONED.is_match(line) && !npm_install_has_version(line) {
             push_pkg_finding(
                 "npm install without version pin",
+                audit_patterns::Severity::Low,
                 line,
                 source_file,
                 line_num,
@@ -486,6 +491,7 @@ fn scan_shell_content(
         if SH_CARGO_INSTALL_UNVERSIONED.is_match(line) && !cargo_install_has_version(line) {
             push_pkg_finding(
                 "cargo install without --version pin",
+                audit_patterns::Severity::Low,
                 line,
                 source_file,
                 line_num,
@@ -496,6 +502,40 @@ fn scan_shell_content(
         if SH_GEM_INSTALL_UNVERSIONED.is_match(line) && !gem_install_has_version(line) {
             push_pkg_finding(
                 "gem install without version pin",
+                audit_patterns::Severity::Low,
+                line,
+                source_file,
+                line_num,
+                action_name,
+                collector,
+            );
+        }
+        if SH_NPX_UNVERSIONED.is_match(line) && !npx_has_version(line) {
+            push_pkg_finding(
+                "npx without version pin — fetches and executes latest on every run",
+                audit_patterns::Severity::Medium,
+                line,
+                source_file,
+                line_num,
+                action_name,
+                collector,
+            );
+        }
+        if PS_INSTALL_MODULE_UNVERSIONED.is_match(line) && !ps_install_has_required_version(line) {
+            push_pkg_finding(
+                "PowerShell Install-Module/Install-Script without -RequiredVersion",
+                audit_patterns::Severity::Medium,
+                line,
+                source_file,
+                line_num,
+                action_name,
+                collector,
+            );
+        }
+        if SH_PIP_GIT_URL_UNVERSIONED.is_match(line) && !pip_git_url_has_ref(line) {
+            push_pkg_finding(
+                "pip install git+URL without @<ref> — tracks default branch HEAD",
+                audit_patterns::Severity::Medium,
                 line,
                 source_file,
                 line_num,
@@ -692,6 +732,7 @@ fn scan_dockerfile_content(
 
 fn push_pkg_finding(
     description: &str,
+    severity: audit_patterns::Severity,
     line: &str,
     source_file: &str,
     line_num: usize,
@@ -699,7 +740,7 @@ fn push_pkg_finding(
     collector: &mut AuditCollector,
 ) {
     collector.push_finding(AuditFinding {
-        severity: output::severity_str(&audit_patterns::Severity::Low).to_string(),
+        severity: output::severity_str(&severity).to_string(),
         category: category_str(&audit_patterns::Category::ShellFetch).to_string(),
         action: action_name.to_string(),
         source_file: source_file.to_string(),
@@ -1839,5 +1880,124 @@ runs:
             &DEFAULT_CONFIG,
         );
         assert_eq!(c.findings.len(), 1);
+    }
+
+    #[test]
+    fn shell_scan_npx_unversioned_is_finding() {
+        let mut c = AuditCollector::new(false);
+        scan_shell_content(
+            "npx create-react-app my-app",
+            "test.sh",
+            1,
+            "",
+            &mut c,
+            &DEFAULT_CONFIG,
+        );
+        assert_eq!(c.findings.len(), 1);
+        assert_eq!(c.findings[0].severity, "medium");
+        assert!(c.findings[0].description.contains("npx"));
+    }
+
+    #[test]
+    fn shell_scan_npx_version_pinned_clean() {
+        let mut c = AuditCollector::new(false);
+        scan_shell_content(
+            "npx typescript@5.6.0",
+            "test.sh",
+            1,
+            "",
+            &mut c,
+            &DEFAULT_CONFIG,
+        );
+        assert!(c.findings.is_empty());
+    }
+
+    #[test]
+    fn shell_scan_brew_head_is_finding() {
+        let mut c = AuditCollector::new(false);
+        scan_shell_content(
+            "brew install ffmpeg --HEAD",
+            "test.sh",
+            1,
+            "",
+            &mut c,
+            &DEFAULT_CONFIG,
+        );
+        assert_eq!(c.findings.len(), 1);
+        assert_eq!(c.findings[0].severity, "medium");
+        assert!(c.findings[0].description.contains("--HEAD"));
+    }
+
+    #[test]
+    fn shell_scan_brew_install_without_head_clean() {
+        let mut c = AuditCollector::new(false);
+        scan_shell_content(
+            "brew install ffmpeg",
+            "test.sh",
+            1,
+            "",
+            &mut c,
+            &DEFAULT_CONFIG,
+        );
+        assert!(c.findings.is_empty());
+    }
+
+    #[test]
+    fn shell_scan_ps_install_module_is_finding() {
+        let mut c = AuditCollector::new(false);
+        scan_shell_content(
+            "Install-Module -Name Pester -Force",
+            "test.ps1",
+            1,
+            "",
+            &mut c,
+            &DEFAULT_CONFIG,
+        );
+        assert_eq!(c.findings.len(), 1);
+        assert_eq!(c.findings[0].severity, "medium");
+    }
+
+    #[test]
+    fn shell_scan_ps_install_module_required_version_clean() {
+        let mut c = AuditCollector::new(false);
+        scan_shell_content(
+            "Install-Module -Name Pester -RequiredVersion 5.3.1 -Force",
+            "test.ps1",
+            1,
+            "",
+            &mut c,
+            &DEFAULT_CONFIG,
+        );
+        assert!(c.findings.is_empty());
+    }
+
+    #[test]
+    fn shell_scan_pip_git_url_unversioned_is_finding() {
+        let mut c = AuditCollector::new(false);
+        scan_shell_content(
+            "pip install git+https://github.com/owner/repo.git",
+            "test.sh",
+            1,
+            "",
+            &mut c,
+            &DEFAULT_CONFIG,
+        );
+        assert_eq!(c.findings.len(), 1);
+        assert_eq!(c.findings[0].severity, "medium");
+        assert!(c.findings[0].description.contains("git+URL"));
+    }
+
+    #[test]
+    fn shell_scan_pip_git_url_with_ref_clean() {
+        let mut c = AuditCollector::new(false);
+        scan_shell_content(
+            "pip install git+https://github.com/owner/repo.git@v1.2.3",
+            "test.sh",
+            1,
+            "",
+            &mut c,
+            &DEFAULT_CONFIG,
+        );
+        assert!(c.findings.is_empty());
     }
 }

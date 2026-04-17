@@ -236,6 +236,48 @@ npm install @babel/core@1.0.0
 npm install    # no package argument — uses package-lock.json
 ```
 
+### npx without a version pin
+
+**Severity:** Medium
+
+Triggers on `npx <package>` (or `npx -p <package>`, `npx --package=<package>`) where no token on the line has an `@<digit>` version specifier. Rated higher than `npm install` because `npx` is fetch-and-execute with no lockfile: every CI run pulls whatever the registry currently resolves, and the resolved code runs immediately.
+
+```bash
+npx create-react-app my-app
+npx typescript
+npx -y @angular/cli new my-app
+npx --yes typescript
+```
+
+Not flagged:
+
+```bash
+npx typescript@5.6.0
+npx @angular/cli@17.0.0 new my-app
+npx -p typescript@5.6.0 tsc
+npx --package=typescript@5.6.0 tsc
+```
+
+### pip install git+URL without a ref
+
+**Severity:** Medium
+
+Triggers on `pip install git+https://…` (or `git+http://…`) where the VCS URL has no `@<ref>` suffix. Without a ref, pip installs from the repo's default branch at HEAD, which silently changes over time. Any ref — tag, branch name, or full SHA — suppresses the finding (mirrors `git clone --branch` handling: branch refs are accepted here rather than requiring a SHA).
+
+```bash
+pip install git+https://github.com/owner/repo.git
+pip install --user git+https://github.com/owner/repo.git
+pip3 install git+https://gitlab.example.com/team/tool.git
+```
+
+Not flagged:
+
+```bash
+pip install git+https://github.com/owner/repo.git@v1.2.3
+pip install git+https://github.com/owner/repo.git@main
+pip install git+https://github.com/owner/repo.git@abc1234567890abcdef1234567890abcdef123456
+```
+
 ### cargo install without a version pin
 
 **Severity:** Low
@@ -275,6 +317,24 @@ gem install rubocop --version 1.0.0
 gem install    # no gem argument
 ```
 
+### brew install --HEAD
+
+**Severity:** Medium
+
+Triggers on `brew install <pkg> --HEAD` (or `--head`). `--HEAD` ignores the formula's bottle/version and builds from the upstream repository's main branch, so the installed code silently changes between runs.
+
+```bash
+brew install ffmpeg --HEAD
+brew install imagemagick --head
+```
+
+Not flagged:
+
+```bash
+brew install ffmpeg
+brew install ffmpeg --with-chromaprint
+```
+
 ## PowerShell fetches
 
 Flagged in shell `run:` blocks that happen to be PowerShell.
@@ -301,6 +361,24 @@ Not flagged:
 
 ```powershell
 Invoke-WebRequest "https://example.com/releases/download/v1.2.3/tool"
+```
+
+### Install-Module / Install-Script without -RequiredVersion
+
+**Severity:** Medium
+
+Triggers on `Install-Module` or `Install-Script` without `-RequiredVersion <version>`. Only `-RequiredVersion` pins to a single release; `-MinimumVersion` and `-MaximumVersion` (alone or together) leave at least one end of the range unbounded and are not accepted as a pin.
+
+```powershell
+Install-Module -Name Pester -Force
+Install-Script -Name Get-WindowsAutoPilotInfo
+Install-Module -Name Pester -MinimumVersion 5.0.0
+```
+
+Not flagged:
+
+```powershell
+Install-Module -Name Pester -RequiredVersion 5.3.1 -Force
 ```
 
 ## JavaScript / TypeScript fetches

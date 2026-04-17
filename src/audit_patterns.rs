@@ -81,6 +81,19 @@ re!(
     SH_GEM_INSTALL_UNVERSIONED,
     r"gem\s+install\s+[a-zA-Z][a-zA-Z0-9_-]*(\s|$)"
 );
+re!(
+    SH_NPX_UNVERSIONED,
+    r"\bnpx\s+(-\S+\s+)*(@[a-zA-Z][a-zA-Z0-9_-]*/)?[a-zA-Z][a-zA-Z0-9_-]*"
+);
+re!(SH_BREW_HEAD, r"(?i)\bbrew\s+install\b[^\n]*--head\b");
+re!(
+    PS_INSTALL_MODULE_UNVERSIONED,
+    r"(?i)\bInstall-(Module|Script)\b"
+);
+re!(
+    SH_PIP_GIT_URL_UNVERSIONED,
+    r"pip3?\s+install\b[^#\n]*\bgit\+https?://\S+"
+);
 
 pub static SHELL_PATTERNS: LazyLock<Vec<Pattern>> = LazyLock::new(|| {
     vec![
@@ -107,6 +120,12 @@ pub static SHELL_PATTERNS: LazyLock<Vec<Pattern>> = LazyLock::new(|| {
             severity: Severity::High,
             category: Category::ShellFetch,
             description: "PowerShell fetching from a 'latest' URL — can change without notice",
+        },
+        Pattern {
+            regex: &SH_BREW_HEAD,
+            severity: Severity::Medium,
+            category: Category::ShellFetch,
+            description: "brew install --HEAD — builds from upstream main, bypasses pinning",
         },
     ]
 });
@@ -492,6 +511,27 @@ pub fn gem_install_has_version(line: &str) -> bool {
     static GEM_VERSION: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"gem\s+install\s+.*(-v\s+\d|--version\s)").unwrap());
     GEM_VERSION.is_match(line)
+}
+
+/// Check if an `npx` line has a version pin on any token (`@<version>`).
+pub fn npx_has_version(line: &str) -> bool {
+    static NPX_VERSION: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"\bnpx\s+.*\S+@\d").unwrap());
+    NPX_VERSION.is_match(line)
+}
+
+/// Check if a PowerShell `Install-Module`/`Install-Script` line has `-RequiredVersion`.
+pub fn ps_install_has_required_version(line: &str) -> bool {
+    static PS_VERSION: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?i)-RequiredVersion\s+\S+").unwrap());
+    PS_VERSION.is_match(line)
+}
+
+/// Check if a `pip install git+https://...` line has a ref (`@<ref>`) on the git URL.
+pub fn pip_git_url_has_ref(line: &str) -> bool {
+    static GIT_URL_REF: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"\bgit\+https?://\S+@\S+").unwrap());
+    GIT_URL_REF.is_match(line)
 }
 
 pub fn category_str(c: &Category) -> &'static str {
@@ -1326,5 +1366,149 @@ mod tests {
         assert!(!gem_install_has_version(
             "gem install rubocop --no-document"
         ));
+    }
+
+    // ── npx patterns ───────────────────────────────────────────────────
+
+    #[test]
+    fn npx_unversioned_detected() {
+        assert!(SH_NPX_UNVERSIONED.is_match("npx typescript"));
+        assert!(SH_NPX_UNVERSIONED.is_match("npx create-react-app my-app"));
+    }
+
+    #[test]
+    fn npx_scoped_unversioned_detected() {
+        assert!(SH_NPX_UNVERSIONED.is_match("npx @angular/cli new my-app"));
+    }
+
+    #[test]
+    fn npx_with_flags_detected() {
+        assert!(SH_NPX_UNVERSIONED.is_match("npx -y create-react-app my-app"));
+        assert!(SH_NPX_UNVERSIONED.is_match("npx --yes typescript"));
+    }
+
+    #[test]
+    fn npx_version_pinned_helper_suppresses() {
+        assert!(npx_has_version("npx typescript@5.6.0"));
+        assert!(npx_has_version("npx @angular/cli@17.0.0 new my-app"));
+        assert!(npx_has_version("npx -p typescript@5.6.0 tsc"));
+        assert!(npx_has_version("npx --package=typescript@5.6.0 tsc"));
+    }
+
+    #[test]
+    fn npx_version_not_pinned_helper() {
+        assert!(!npx_has_version("npx typescript"));
+        assert!(!npx_has_version("npx -y create-react-app"));
+        assert!(!npx_has_version("npx @angular/cli"));
+    }
+
+    // ── brew install --HEAD ────────────────────────────────────────────
+
+    #[test]
+    fn brew_install_head_detected() {
+        assert!(SH_BREW_HEAD.is_match("brew install ffmpeg --HEAD"));
+        assert!(SH_BREW_HEAD.is_match("brew install ffmpeg --head"));
+    }
+
+    #[test]
+    fn brew_install_head_with_other_flags_detected() {
+        assert!(SH_BREW_HEAD.is_match("brew install --with-flags ffmpeg --HEAD"));
+    }
+
+    #[test]
+    fn brew_install_without_head_not_flagged() {
+        assert!(!SH_BREW_HEAD.is_match("brew install ffmpeg"));
+        assert!(!SH_BREW_HEAD.is_match("brew install ffmpeg --with-chromaprint"));
+    }
+
+    // ── PowerShell Install-Module ──────────────────────────────────────
+
+    #[test]
+    fn ps_install_module_detected() {
+        assert!(PS_INSTALL_MODULE_UNVERSIONED.is_match("Install-Module -Name Pester -Force"));
+        assert!(PS_INSTALL_MODULE_UNVERSIONED.is_match("install-module PSReadLine"));
+    }
+
+    #[test]
+    fn ps_install_script_detected() {
+        assert!(
+            PS_INSTALL_MODULE_UNVERSIONED.is_match("Install-Script -Name Get-WindowsAutoPilotInfo")
+        );
+    }
+
+    #[test]
+    fn ps_install_required_version_helper() {
+        assert!(ps_install_has_required_version(
+            "Install-Module -Name Pester -RequiredVersion 5.3.1"
+        ));
+        assert!(ps_install_has_required_version(
+            "Install-Module Pester -requiredversion 5.3.1"
+        ));
+    }
+
+    #[test]
+    fn ps_install_minimum_version_not_accepted() {
+        // -MinimumVersion alone is unbounded above — not a real pin.
+        assert!(!ps_install_has_required_version(
+            "Install-Module -Name Pester -MinimumVersion 5.0.0"
+        ));
+    }
+
+    #[test]
+    fn ps_install_no_version_flag() {
+        assert!(!ps_install_has_required_version(
+            "Install-Module -Name Pester -Force"
+        ));
+    }
+
+    // ── pip install git+URL ────────────────────────────────────────────
+
+    #[test]
+    fn pip_install_git_url_detected() {
+        assert!(
+            SH_PIP_GIT_URL_UNVERSIONED
+                .is_match("pip install git+https://github.com/owner/repo.git")
+        );
+        assert!(
+            SH_PIP_GIT_URL_UNVERSIONED
+                .is_match("pip3 install git+https://github.com/owner/repo.git")
+        );
+    }
+
+    #[test]
+    fn pip_install_git_url_with_flags_detected() {
+        assert!(
+            SH_PIP_GIT_URL_UNVERSIONED
+                .is_match("pip install --user git+https://github.com/owner/repo.git")
+        );
+    }
+
+    #[test]
+    fn pip_install_git_url_with_ref_helper() {
+        assert!(pip_git_url_has_ref(
+            "pip install git+https://github.com/owner/repo.git@v1.2.3"
+        ));
+        assert!(pip_git_url_has_ref(
+            "pip install git+https://github.com/owner/repo.git@main"
+        ));
+        assert!(pip_git_url_has_ref(
+            "pip install git+https://github.com/owner/repo.git@abc1234567890abcdef1234567890abcdef123456"
+        ));
+    }
+
+    #[test]
+    fn pip_install_git_url_without_ref() {
+        assert!(!pip_git_url_has_ref(
+            "pip install git+https://github.com/owner/repo.git"
+        ));
+        assert!(!pip_git_url_has_ref(
+            "pip install --user git+https://github.com/owner/repo.git"
+        ));
+    }
+
+    #[test]
+    fn pip_install_plain_package_not_git_url() {
+        assert!(!SH_PIP_GIT_URL_UNVERSIONED.is_match("pip install requests"));
+        assert!(!SH_PIP_GIT_URL_UNVERSIONED.is_match("pip install requests==2.31.0"));
     }
 }
