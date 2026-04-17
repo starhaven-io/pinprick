@@ -6,7 +6,7 @@ const getSecurityTxt = (canonicalURL: URL) => {
   expires.setUTCFullYear(expires.getUTCFullYear() + 1);
   expires.setUTCHours(0, 0, 0, 0);
 
-  return `Contact: https://github.com/p-linnane/pinprick/security/advisories/new
+  return `Contact: https://github.com/starhaven-io/pinprick/security/advisories/new
 Expires: ${expires.toISOString()}
 Preferred-Languages: en
 Canonical: ${canonicalURL.href}

@@ -6,7 +6,7 @@ description: How to install pinprick.
 ## Homebrew
 
 ```bash
-brew install p-linnane/tap/pinprick
+brew install starhaven-io/tap/pinprick
 ```
 
 ## crates.io
@@ -18,12 +18,12 @@ cargo install pinprick
 ## From source (unreleased HEAD)
 
 ```bash
-cargo install --git https://github.com/p-linnane/pinprick
+cargo install --git https://github.com/starhaven-io/pinprick
 ```
 
 ## From releases
 
-Download a prebuilt binary from [GitHub Releases](https://github.com/p-linnane/pinprick/releases). Binaries are available for:
+Download a prebuilt binary from [GitHub Releases](https://github.com/starhaven-io/pinprick/releases). Binaries are available for:
 
 - Linux (amd64)
 - Linux (arm64)

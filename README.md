@@ -1,6 +1,6 @@
 # pinprick
 
-[![CI](https://github.com/p-linnane/pinprick/actions/workflows/ci.yml/badge.svg)](https://github.com/p-linnane/pinprick/actions/workflows/ci.yml)
+[![CI](https://github.com/starhaven-io/pinprick/actions/workflows/ci.yml/badge.svg)](https://github.com/starhaven-io/pinprick/actions/workflows/ci.yml)
 [![License: AGPL-3.0-only](https://img.shields.io/badge/License-AGPL--3.0--only-blue.svg)](LICENSE)
 
 A CLI tool for GitHub Actions supply chain security. Pins action references to full SHAs, checks for updates, and audits pinned actions for runtime fetch patterns that bypass pinning.
@@ -18,7 +18,7 @@ pinprick picks up where static analysis leaves off. SHA-pinning actions is table
 ### Homebrew
 
 ```bash
-brew install p-linnane/tap/pinprick
+brew install starhaven-io/tap/pinprick
 ```
 
 ### crates.io
@@ -29,14 +29,14 @@ cargo install pinprick
 
 ### From releases
 
-Download a prebuilt binary from [GitHub Releases](https://github.com/p-linnane/pinprick/releases).
+Download a prebuilt binary from [GitHub Releases](https://github.com/starhaven-io/pinprick/releases).
 
 ### From git (unreleased HEAD)
 
 To try unreleased changes from `main`:
 
 ```bash
-cargo install --git https://github.com/p-linnane/pinprick
+cargo install --git https://github.com/starhaven-io/pinprick
 ```
 
 ## Usage
