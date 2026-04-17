@@ -35,13 +35,13 @@ export default defineConfig({
         SocialIcons: './src/components/SocialIcons.astro',
       },
       editLink: {
-        baseUrl: 'https://github.com/p-linnane/pinprick/edit/main/site/',
+        baseUrl: 'https://github.com/starhaven-io/pinprick/edit/main/site/',
       },
       social: [
         {
           icon: 'github',
           label: 'GitHub',
-          href: 'https://github.com/p-linnane/pinprick',
+          href: 'https://github.com/starhaven-io/pinprick',
         },
       ],
       sidebar: [
