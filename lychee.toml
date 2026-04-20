@@ -1,0 +1,8 @@
+# Configuration for https://github.com/lycheeverse/lychee
+# Checks links in the built Starlight docs site under `site/dist/client/`
+# and the repo root README.md.
+# Run: `just lychee` (requires `just site-build` first).
+
+max_concurrency = 20
+timeout = 20
+max_retries = 3
