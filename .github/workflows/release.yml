@@ -80,7 +80,7 @@ jobs:
         if: matrix.sign
         env:
           TARGET: ${{ matrix.target }}
-          DEVELOPMENT_TEAM: ${{ secrets.DEVELOPMENT_TEAM }}
+          DEVELOPMENT_TEAM: ${{ vars.DEVELOPMENT_TEAM }}
         run: |
           codesign --sign "Developer ID Application: Patrick Linnane (${DEVELOPMENT_TEAM})" \
             --options runtime \
@@ -92,7 +92,7 @@ jobs:
           TARGET: ${{ matrix.target }}
           APPLE_ID: ${{ secrets.NOTARIZATION_APPLE_ID }}
           NOTARIZATION_PASSWORD: ${{ secrets.NOTARIZATION_PASSWORD }}
-          DEVELOPMENT_TEAM: ${{ secrets.DEVELOPMENT_TEAM }}
+          DEVELOPMENT_TEAM: ${{ vars.DEVELOPMENT_TEAM }}
         run: |
           mkdir -p "${RUNNER_TEMP}/notarize-staging"
           cp "target/${TARGET}/release/pinprick" "${RUNNER_TEMP}/notarize-staging/"
