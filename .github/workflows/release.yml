@@ -139,6 +139,9 @@ jobs:
     runs-on: ubuntu-slim
     permissions:
       contents: write # required to create tags and GitHub releases
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -152,6 +155,7 @@ jobs:
             echo "::error::Could not extract version from Cargo.toml"
             exit 1
           fi
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
           echo "tag=v${VERSION}" >> "${GITHUB_OUTPUT}"
 
       - name: Create tag
@@ -225,3 +229,39 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
         run: cargo publish
+
+  bump-cask:
+    name: Bump Homebrew cask
+    needs: release
+    runs-on: macos-26
+    environment:
+      name: release
+      deployment: false
+    permissions: {}
+    env:
+      VERSION: ${{ needs.release.outputs.version }}
+    steps:
+      - name: Mint bot token for tap
+        id: tap-token
+        uses: actions/create-github-app-token@1b10c78c7865c340bc4f6099eb2f838309f1e8c3 # v3.1.1
+        with:
+          client-id: ${{ vars.APP_CLIENT_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: homebrew-tap
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Bump Homebrew cask
+        env:
+          HOMEBREW_GITHUB_API_TOKEN: ${{ steps.tap-token.outputs.token }}
+          HOMEBREW_NO_AUTO_UPDATE: 1
+          HOMEBREW_NO_ENV_HINTS: 1
+          APP_SLUG: ${{ steps.tap-token.outputs.app-slug }}
+        run: |
+          BOT_USER="${APP_SLUG}[bot]"
+          BOT_ID=$(GH_TOKEN="${HOMEBREW_GITHUB_API_TOKEN}" gh api "/users/${BOT_USER}" --jq .id)
+          export HOMEBREW_GIT_NAME="${BOT_USER}"
+          export HOMEBREW_GIT_EMAIL="${BOT_ID}+${BOT_USER}@users.noreply.github.com"
+          brew tap starhaven-io/homebrew-tap
+          brew bump-cask-pr --no-fork --version "${VERSION}" starhaven-io/tap/pinprick
