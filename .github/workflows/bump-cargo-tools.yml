@@ -33,9 +33,11 @@ jobs:
         run: |
           # Tools tracked in ci.yml. Each entry: crate name on crates.io.
           TOOLS=("typos-cli" "cargo-deny")
+          # crates.io rejects API requests without a descriptive User-Agent (403).
+          UA="pinprick-ci (https://github.com/${GITHUB_REPOSITORY})"
           CHANGED=0
           for TOOL in "${TOOLS[@]}"; do
-            LATEST=$(curl -fsSL "https://crates.io/api/v1/crates/${TOOL}" | jq -r '.crate.max_stable_version')
+            LATEST=$(curl -fsSL -H "User-Agent: ${UA}" "https://crates.io/api/v1/crates/${TOOL}" | jq -r '.crate.max_stable_version')
             if [[ -z "${LATEST}" || "${LATEST}" == "null" ]]; then
               echo "::warning::Could not resolve latest version for ${TOOL}, skipping"
               continue
