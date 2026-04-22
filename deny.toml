@@ -1,3 +1,13 @@
+[graph]
+# Matches the platforms built in .github/workflows/release.yml.
+# Restricts all cargo-deny checks to deps reachable on these targets,
+# silencing noise from Windows-only and Android-only transitive chains.
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+]
+
 [licenses]
 allow = [
     "AGPL-3.0-only",
@@ -15,12 +25,7 @@ allow = [
     "Unlicense",
 ]
 confidence-threshold = 0.95
-
-# r-efi is LGPL-2.1-or-later but only compiled on UEFI targets —
-# never linked into pinprick on macOS/Linux.
-[[licenses.exceptions]]
-allow = ["LGPL-2.1-or-later"]
-name = "r-efi"
+unused-allowed-license = "allow"
 
 [advisories]
 
