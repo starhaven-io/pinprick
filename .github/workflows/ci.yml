@@ -38,10 +38,11 @@ jobs:
           EVENT_ACTION: ${{ github.event.action }}
           EVENT_NAME: ${{ github.event_name }}
         run: |
-          # Push to main: run lint to warm the cache, and Coverage so
-          # Codecov has a baseline for PR comparisons.
+          # Push to main: run lint to warm the cache, Coverage so Codecov
+          # has a coverage baseline for PR comparisons, and Site so Codecov
+          # has a bundle-analysis baseline.
           if [[ "${EVENT_NAME}" == "push" ]]; then
-            echo 'matrix=[{"name":"Lint","check":"lint","runner":"ubuntu-latest"},{"name":"Coverage","check":"coverage","runner":"ubuntu-latest","environment":"codecov"}]' >> "${GITHUB_OUTPUT}"
+            echo 'matrix=[{"name":"Lint","check":"lint","runner":"ubuntu-latest"},{"name":"Coverage","check":"coverage","runner":"ubuntu-latest","environment":"codecov"},{"name":"Site","check":"site","runner":"ubuntu-slim","environment":"codecov"}]' >> "${GITHUB_OUTPUT}"
             exit 0
           fi
 
