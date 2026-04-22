@@ -28,6 +28,7 @@ export default defineConfig({
         bundleName: 'pinprick-site',
         uploadToken: process.env.CODECOV_TOKEN,
         gitService: 'github',
+        telemetry: false,
       }),
     ],
   },
