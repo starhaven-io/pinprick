@@ -1,6 +1,6 @@
 # pinprick scoring rubric
 
-**Status:** draft (rubric version `0.2.0`)
+**Status:** draft (rubric version `0.3.0`)
 
 This document defines how pinprick computes a single score for a GitHub repository's Actions supply chain posture. It is the public specification that the `pinprick score` CLI subcommand implements against, and that any downstream tool wrapping the engine (dashboards, CI plugins, reporting pipelines) should implement against so scores stay portable and comparable.
 
@@ -65,18 +65,22 @@ These rules fire against properties of the referenced action itself. Most requir
 
 `source.unverified` is configurable. The built-in baseline of trusted publishers is `actions` and `github`. Extend with `trusted-owners = ["my-org", "vendor"]` in `.pinprick.toml`. Case-insensitive, exact owner match.
 
-### Runtime-fetch rules (category: `runtime`) — **planned for v0.2.0**
+### Runtime-fetch rules (category: `runtime`)
 
-These reuse findings from the existing `pinprick audit` pipeline. Severity comes straight from the audit finding. Not emitted in v0.1.0; the integration with the audit pipeline lands alongside these rules.
+These reuse findings from the existing `pinprick audit` pipeline applied to each workflow's `run:` blocks. Severity comes straight from the audit finding.
 
-| ID                      | Condition                                          | Severity | Points | Remediation                                        |
-|-------------------------|----------------------------------------------------|----------|--------|----------------------------------------------------|
-| `runtime.pipe_to_shell` | `curl \| sh`, `bash <(curl …)`, `iex (iwr …)`, etc. | high     |   20   | Download, verify, then execute; never pipe         |
-| `runtime.fetch.high`    | Audit finding, severity high                       | high     |   15   | Pin the fetched artifact; add checksum verification|
-| `runtime.fetch.medium`  | Audit finding, severity medium                     | medium   |    8   | Pin or version-lock the fetched resource           |
-| `runtime.fetch.low`     | Audit finding, severity low                        | low      |    3   | Review; often acceptable if the URL is versioned   |
+| ID                      | Condition                                          | Severity | Points | Status | Remediation                                        |
+|-------------------------|----------------------------------------------------|----------|--------|--------|----------------------------------------------------|
+| `runtime.pipe_to_shell` | `curl \| sh`, `bash <(curl …)`, `iex (iwr …)`, etc. | high     |   20   | live   | Download, verify, then execute; never pipe         |
+| `runtime.fetch.high`    | Audit finding, severity high                       | high     |   15   | live   | Pin the fetched artifact; add checksum verification|
+| `runtime.fetch.medium`  | Audit finding, severity medium                     | medium   |    8   | live   | Pin or version-lock the fetched resource           |
+| `runtime.fetch.low`     | Audit finding, severity low                        | low      |    3   | live   | Review; often acceptable if the URL is versioned   |
 
-Note: the audit pipeline already applies the `data format URL` and nearby-checksum adjustments. `runtime.*` scoring uses the post-adjustment severity, so double-counting doesn't happen.
+Notes:
+
+- The audit pipeline already applies the `data format URL` and nearby-checksum adjustments. `runtime.*` scoring uses the post-adjustment severity, so double-counting doesn't happen.
+- v0.3.0 scans `run:` blocks in local workflow files (no GitHub token required). Runtime findings in the source of fetched actions themselves — where `pinprick audit` looks when a token is present — are not yet scored; that integration lands in a later rubric version.
+- Runtime findings are not deduplicated. Each pattern match emits one finding keyed to its `(workflow, line)` — each is a distinct fix in a distinct place.
 
 ### Workflow-level rules (category: `workflow`)
 
@@ -209,13 +213,13 @@ Findings:
 | `pin.full_tag`                     |    2   |
 | `pin.branch`                       |   15   |
 | `source.unverified` (some-org)     |    1   |
-| `runtime.pipe_to_shell` (planned)  |   20   |
+| `runtime.pipe_to_shell`            |   20   |
 | `workflow.permissions_write_all`   |   10   |
 
-Total deducted in v0.2.0: **53**. Score: **47**. Grade: **F**.
+Total deducted: **53**. Score: **47**. Grade: **F**.
 
 Remediation priority (biggest point recovery first):
-1. Remove the `curl | sh` (+20 — lands with the `runtime.*` rules in a later version)
+1. Remove the `curl | sh` (+20)
 2. Pin `some-org/custom-action` to a SHA (+15); if `some-org` is a trusted vendor, add to `trusted-owners` (+1 more)
 3. Scope `permissions:` per-job (+10)
 4. Pin `actions/checkout` to a SHA (+5)

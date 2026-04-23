@@ -12,10 +12,12 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::ExitCode;
 
+use crate::audit::{self, AuditCollector};
 use crate::config::Config;
+use crate::output::AuditFinding;
 use crate::workflow::{self, ActionRef, RefType};
 
-pub const RUBRIC_VERSION: &str = "0.2.0";
+pub const RUBRIC_VERSION: &str = "0.3.0";
 
 // ── Rule catalog ────────────────────────────────────────────────────────────
 
@@ -32,9 +34,8 @@ pub enum Severity {
 pub enum Category {
     Pin,
     Source,
+    Runtime,
     Workflow,
-    // Runtime category is in the rubric spec but has no rules implemented yet;
-    // added alongside its rules.
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -43,6 +44,10 @@ pub enum RuleId {
     PinSliding,
     PinFullTag,
     SourceUnverified,
+    RuntimePipeToShell,
+    RuntimeFetchHigh,
+    RuntimeFetchMedium,
+    RuntimeFetchLow,
     WorkflowPermissionsWriteAll,
     WorkflowPullRequestTarget,
     WorkflowWorkflowRun,
@@ -55,6 +60,10 @@ impl RuleId {
             Self::PinSliding => "pin.sliding",
             Self::PinFullTag => "pin.full_tag",
             Self::SourceUnverified => "source.unverified",
+            Self::RuntimePipeToShell => "runtime.pipe_to_shell",
+            Self::RuntimeFetchHigh => "runtime.fetch.high",
+            Self::RuntimeFetchMedium => "runtime.fetch.medium",
+            Self::RuntimeFetchLow => "runtime.fetch.low",
             Self::WorkflowPermissionsWriteAll => "workflow.permissions_write_all",
             Self::WorkflowPullRequestTarget => "workflow.pull_request_target",
             Self::WorkflowWorkflowRun => "workflow.workflow_run",
@@ -65,6 +74,10 @@ impl RuleId {
         match self {
             Self::PinBranch | Self::PinSliding | Self::PinFullTag => Category::Pin,
             Self::SourceUnverified => Category::Source,
+            Self::RuntimePipeToShell
+            | Self::RuntimeFetchHigh
+            | Self::RuntimeFetchMedium
+            | Self::RuntimeFetchLow => Category::Runtime,
             Self::WorkflowPermissionsWriteAll
             | Self::WorkflowPullRequestTarget
             | Self::WorkflowWorkflowRun => Category::Workflow,
@@ -74,20 +87,25 @@ impl RuleId {
     pub fn severity(self) -> Severity {
         match self {
             Self::PinBranch
+            | Self::RuntimePipeToShell
+            | Self::RuntimeFetchHigh
             | Self::WorkflowPermissionsWriteAll
             | Self::WorkflowPullRequestTarget => Severity::High,
-            Self::PinSliding | Self::WorkflowWorkflowRun => Severity::Medium,
-            Self::PinFullTag | Self::SourceUnverified => Severity::Low,
+            Self::PinSliding | Self::RuntimeFetchMedium | Self::WorkflowWorkflowRun => {
+                Severity::Medium
+            }
+            Self::PinFullTag | Self::SourceUnverified | Self::RuntimeFetchLow => Severity::Low,
         }
     }
 
     pub fn points(self) -> u32 {
         match self {
-            Self::PinBranch => 15,
+            Self::RuntimePipeToShell => 20,
+            Self::PinBranch | Self::RuntimeFetchHigh => 15,
             Self::WorkflowPermissionsWriteAll => 10,
-            Self::PinSliding => 5,
-            Self::WorkflowPullRequestTarget => 5,
-            Self::WorkflowWorkflowRun => 3,
+            Self::RuntimeFetchMedium => 8,
+            Self::PinSliding | Self::WorkflowPullRequestTarget => 5,
+            Self::RuntimeFetchLow | Self::WorkflowWorkflowRun => 3,
             Self::PinFullTag => 2,
             Self::SourceUnverified => 1,
         }
@@ -100,6 +118,16 @@ impl RuleId {
             }
             Self::SourceUnverified => {
                 "Confirm this publisher is trustworthy. Add them to `trusted-owners` in .pinprick.toml, or fork the action into your own org and pin to that."
+            }
+            Self::RuntimePipeToShell => {
+                "Download the payload to disk, verify it (checksum or signature), then execute. Never pipe directly to a shell."
+            }
+            Self::RuntimeFetchHigh => {
+                "Pin the fetched artifact to a specific version; add checksum or signature verification"
+            }
+            Self::RuntimeFetchMedium => "Pin or version-lock the fetched resource",
+            Self::RuntimeFetchLow => {
+                "Review the fetch; often acceptable when the URL is explicitly versioned"
             }
             Self::WorkflowPermissionsWriteAll => {
                 "Declare minimal per-job `permissions:` blocks instead of `write-all`"
@@ -176,8 +204,11 @@ pub fn score_repo(repo_root: &Path, config: &Config) -> Result<ScoreReport> {
 
     // Accumulate action-level findings keyed by (rule, action_ref).
     // Accumulate workflow-level findings keyed by (rule, workflow_path).
+    // Runtime findings are per-line and not deduped — each emitted finding is
+    // a distinct fix in a distinct place.
     let mut action_findings: BTreeMap<(RuleId, String), Vec<Occurrence>> = BTreeMap::new();
     let mut workflow_findings: BTreeMap<(RuleId, String), Vec<Occurrence>> = BTreeMap::new();
+    let mut runtime_findings: Vec<Finding> = Vec::new();
     let mut unique_actions: std::collections::BTreeSet<String> = Default::default();
 
     for file in &files {
@@ -220,6 +251,37 @@ pub fn score_repo(repo_root: &Path, config: &Config) -> Result<ScoreReport> {
                     });
             }
         }
+
+        // Runtime findings (runtime.*) — reuse the audit pipeline's shell
+        // scanner on each `run:` block.
+        if let Ok(run_blocks) = audit::extract_run_blocks(file, &content) {
+            let mut collector = AuditCollector::new(false);
+            for (line_offset, run_content) in &run_blocks {
+                audit::scan_shell_content(
+                    run_content,
+                    &display,
+                    *line_offset,
+                    "",
+                    &mut collector,
+                    config,
+                );
+            }
+            for finding in &collector.findings {
+                let rule = runtime_rule_for(finding);
+                runtime_findings.push(Finding {
+                    id: rule.id(),
+                    category: rule.category(),
+                    severity: rule.severity(),
+                    points: rule.points(),
+                    action_ref: None,
+                    occurrences: vec![Occurrence {
+                        workflow: display.clone(),
+                        line: finding.line.unwrap_or(0),
+                    }],
+                    remediation: rule.remediation(),
+                });
+            }
+        }
     }
 
     let mut findings: Vec<Finding> = Vec::new();
@@ -248,6 +310,8 @@ pub fn score_repo(repo_root: &Path, config: &Config) -> Result<ScoreReport> {
             remediation: rule.remediation(),
         });
     }
+
+    findings.extend(runtime_findings);
 
     // Stable ordering: highest severity + highest points first, then rule id.
     findings.sort_by(|a, b| {
@@ -282,6 +346,36 @@ pub fn score_repo(repo_root: &Path, config: &Config) -> Result<ScoreReport> {
         },
         findings,
     })
+}
+
+/// Map an audit finding to the runtime.* rule it corresponds to. Pipe-to-shell
+/// patterns get their own rule (higher weight) because the payload is never
+/// written to disk and cannot be checksum-verified even after the fact; every
+/// other runtime fetch is scored by severity.
+fn runtime_rule_for(finding: &AuditFinding) -> RuleId {
+    if is_pipe_to_shell_finding(finding) {
+        return RuleId::RuntimePipeToShell;
+    }
+    match finding.severity.as_str() {
+        "high" => RuleId::RuntimeFetchHigh,
+        "medium" => RuleId::RuntimeFetchMedium,
+        _ => RuleId::RuntimeFetchLow,
+    }
+}
+
+/// Pipe-to-shell findings are identified by phrases unique to the four
+/// patterns in `SHELL_PIPE_PATTERNS` (piped to shell, process substitution,
+/// command substitution, Invoke-Expression). If those descriptions are ever
+/// changed, this mapping breaks — the `runtime_pipe_to_shell_descriptions_are_stable`
+/// test exists to catch that.
+fn is_pipe_to_shell_finding(finding: &AuditFinding) -> bool {
+    const MARKERS: &[&str] = &[
+        "piped to shell",
+        "process substitution",
+        "command substitution",
+        "Invoke-Expression on fetched content",
+    ];
+    MARKERS.iter().any(|m| finding.description.contains(m))
 }
 
 fn pin_rule_for(a: &ActionRef) -> Option<RuleId> {
@@ -771,6 +865,66 @@ jobs:
         assert_eq!(report.totals.points_deducted, 8);
         assert_eq!(report.score, 92);
         assert_eq!(report.grade, "A");
+    }
+
+    #[test]
+    fn runtime_rules_fire_end_to_end() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let wfdir = dir.path().join(".github").join("workflows");
+        std::fs::create_dir_all(&wfdir).unwrap();
+        let yaml = r#"
+name: risky
+on: push
+jobs:
+  install:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - run: |
+          curl -fsSL https://example.com/install.sh | bash
+          wget https://github.com/owner/repo/releases/latest/download/tool
+          git clone https://github.com/other/thing
+          pip install requests
+"#;
+        std::fs::write(wfdir.join("risky.yml"), yaml).unwrap();
+
+        let report = score_repo(dir.path(), &Config::default()).unwrap();
+        let ids: Vec<_> = report.findings.iter().map(|f| f.id).collect();
+        assert!(ids.contains(&"runtime.pipe_to_shell"), "ids: {ids:?}");
+        assert!(ids.contains(&"runtime.fetch.high"), "ids: {ids:?}");
+        assert!(ids.contains(&"runtime.fetch.medium"), "ids: {ids:?}");
+        assert!(ids.contains(&"runtime.fetch.low"), "ids: {ids:?}");
+        // 20 (pipe-to-shell) + 15 (wget latest) + 8 (git clone) + 3 (pip install) = 46
+        assert_eq!(report.totals.points_deducted, 46);
+        assert_eq!(report.score, 54);
+        assert_eq!(report.grade, "F");
+    }
+
+    #[test]
+    fn runtime_pipe_to_shell_descriptions_are_stable() {
+        // If any of these descriptions change in audit_patterns.rs, the
+        // `is_pipe_to_shell_finding` mapping silently degrades — pipe-to-shell
+        // findings would get mapped to runtime.fetch.high (-15) instead of
+        // runtime.pipe_to_shell (-20). This test catches that.
+        use crate::audit_patterns::SHELL_PIPE_PATTERNS;
+        for pattern in SHELL_PIPE_PATTERNS.iter() {
+            let fake = AuditFinding {
+                severity: "high".to_string(),
+                category: "ShellFetch".to_string(),
+                action: String::new(),
+                source_file: String::new(),
+                line: Some(1),
+                pattern_matched: String::new(),
+                description: pattern.description.to_string(),
+                workflow_file: None,
+                workflow_line: None,
+            };
+            assert!(
+                is_pipe_to_shell_finding(&fake),
+                "pipe-to-shell description no longer matched by is_pipe_to_shell_finding: {:?}",
+                pattern.description
+            );
+        }
     }
 
     #[test]

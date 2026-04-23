@@ -254,7 +254,7 @@ pub async fn run(
     }
 }
 
-fn extract_run_blocks(path: &Path, content: &str) -> Result<Vec<(usize, String)>> {
+pub fn extract_run_blocks(path: &Path, content: &str) -> Result<Vec<(usize, String)>> {
     let yaml: Value =
         serde_norway::from_str(content).with_context(|| format!("parsing {}", path.display()))?;
 
@@ -352,7 +352,7 @@ fn join_continuations(content: &str) -> Vec<(usize, String)> {
     out
 }
 
-fn scan_shell_content(
+pub fn scan_shell_content(
     content: &str,
     source_file: &str,
     base_line: usize,

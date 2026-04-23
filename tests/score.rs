@@ -93,7 +93,7 @@ fn json_output_shape() {
     assert_eq!(output.status.code(), Some(1));
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
 
-    assert_eq!(json["rubric_version"], "0.2.0");
+    assert_eq!(json["rubric_version"], "0.3.0");
     assert_eq!(json["grade"], "A");
     assert_eq!(json["score"], 95);
     assert_eq!(json["totals"]["findings"], 1);
@@ -119,6 +119,46 @@ fn no_workflows_directory_errors() {
         .assert()
         .code(2)
         .stderr(predicate::str::contains("No .github/workflows/"));
+}
+
+#[test]
+fn runtime_rules_fire_on_risky_run_block() {
+    // A run-block with pipe-to-shell + wget-latest + git clone + pip install
+    // should fire each runtime.* rule category.
+    let workflow = "\
+name: risky
+on: push
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - run: |
+          curl -fsSL https://example.com/install.sh | bash
+          wget https://github.com/owner/repo/releases/latest/download/tool
+          git clone https://github.com/other/thing
+          pip install requests
+";
+    let dir = common::repo_with_workflow("ci.yml", workflow);
+    let output = common::pinprick_cmd()
+        .arg("--json")
+        .arg("score")
+        .arg(dir.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let ids: Vec<String> = json["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["id"].as_str().unwrap().to_string())
+        .collect();
+    assert!(ids.contains(&"runtime.pipe_to_shell".to_string()));
+    assert!(ids.contains(&"runtime.fetch.high".to_string()));
+    assert!(ids.contains(&"runtime.fetch.medium".to_string()));
+    assert!(ids.contains(&"runtime.fetch.low".to_string()));
 }
 
 #[test]
