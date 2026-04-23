@@ -12,9 +12,10 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::ExitCode;
 
+use crate::config::Config;
 use crate::workflow::{self, ActionRef, RefType};
 
-pub const RUBRIC_VERSION: &str = "0.1.0";
+pub const RUBRIC_VERSION: &str = "0.2.0";
 
 // ── Rule catalog ────────────────────────────────────────────────────────────
 
@@ -30,9 +31,10 @@ pub enum Severity {
 #[serde(rename_all = "lowercase")]
 pub enum Category {
     Pin,
+    Source,
     Workflow,
-    // Source and Runtime categories are defined in the rubric spec but have
-    // no rules implemented in v0.1.0. They will be added alongside their rules.
+    // Runtime category is in the rubric spec but has no rules implemented yet;
+    // added alongside its rules.
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -40,6 +42,7 @@ pub enum RuleId {
     PinBranch,
     PinSliding,
     PinFullTag,
+    SourceUnverified,
     WorkflowPermissionsWriteAll,
     WorkflowPullRequestTarget,
     WorkflowWorkflowRun,
@@ -51,6 +54,7 @@ impl RuleId {
             Self::PinBranch => "pin.branch",
             Self::PinSliding => "pin.sliding",
             Self::PinFullTag => "pin.full_tag",
+            Self::SourceUnverified => "source.unverified",
             Self::WorkflowPermissionsWriteAll => "workflow.permissions_write_all",
             Self::WorkflowPullRequestTarget => "workflow.pull_request_target",
             Self::WorkflowWorkflowRun => "workflow.workflow_run",
@@ -60,6 +64,7 @@ impl RuleId {
     pub fn category(self) -> Category {
         match self {
             Self::PinBranch | Self::PinSliding | Self::PinFullTag => Category::Pin,
+            Self::SourceUnverified => Category::Source,
             Self::WorkflowPermissionsWriteAll
             | Self::WorkflowPullRequestTarget
             | Self::WorkflowWorkflowRun => Category::Workflow,
@@ -72,7 +77,7 @@ impl RuleId {
             | Self::WorkflowPermissionsWriteAll
             | Self::WorkflowPullRequestTarget => Severity::High,
             Self::PinSliding | Self::WorkflowWorkflowRun => Severity::Medium,
-            Self::PinFullTag => Severity::Low,
+            Self::PinFullTag | Self::SourceUnverified => Severity::Low,
         }
     }
 
@@ -84,6 +89,7 @@ impl RuleId {
             Self::WorkflowPullRequestTarget => 5,
             Self::WorkflowWorkflowRun => 3,
             Self::PinFullTag => 2,
+            Self::SourceUnverified => 1,
         }
     }
 
@@ -91,6 +97,9 @@ impl RuleId {
         match self {
             Self::PinBranch | Self::PinSliding | Self::PinFullTag => {
                 "Pin to a full 40-char SHA; keep the tag as a comment"
+            }
+            Self::SourceUnverified => {
+                "Confirm publisher trust; add to `trusted-owners` in .pinprick.toml or consider vendoring"
             }
             Self::WorkflowPermissionsWriteAll => {
                 "Declare minimal per-job `permissions:` blocks instead of `write-all`"
@@ -162,7 +171,7 @@ pub fn grade_for(score: u32) -> &'static str {
 
 /// Collect findings across all workflows, dedupe by rule + target, and roll
 /// up into a single report.
-pub fn score_repo(repo_root: &Path) -> Result<ScoreReport> {
+pub fn score_repo(repo_root: &Path, config: &Config) -> Result<ScoreReport> {
     let files = workflow::find_workflows(repo_root)?;
 
     // Accumulate action-level findings keyed by (rule, action_ref).
@@ -176,11 +185,21 @@ pub fn score_repo(repo_root: &Path) -> Result<ScoreReport> {
         let content = std::fs::read_to_string(file)
             .map_err(|e| anyhow::anyhow!("reading {}: {e}", file.display()))?;
 
-        // Action-level findings (pin.*)
+        // Action-level findings (pin.*, source.*)
         for a in workflow::scan_content(&content) {
-            unique_actions.insert(format!("{}@{}", a.full_name(), a.ref_string));
+            let action_ref = format!("{}@{}", a.full_name(), a.ref_string);
+            unique_actions.insert(action_ref.clone());
+
             if let Some(rule) = pin_rule_for(&a) {
-                let key = (rule, format!("{}@{}", a.full_name(), a.ref_string));
+                let key = (rule, action_ref.clone());
+                action_findings.entry(key).or_default().push(Occurrence {
+                    workflow: display.clone(),
+                    line: a.line_number,
+                });
+            }
+
+            if !config.is_owner_trusted(&a.owner) {
+                let key = (RuleId::SourceUnverified, action_ref.clone());
                 action_findings.entry(key).or_default().push(Occurrence {
                     workflow: display.clone(),
                     line: a.line_number,
@@ -319,7 +338,8 @@ fn trigger_present(on: &Value, name: &str) -> bool {
 // ── CLI entry point ─────────────────────────────────────────────────────────
 
 pub async fn run(repo_root: &Path, json: bool) -> Result<ExitCode> {
-    let report = score_repo(repo_root)?;
+    let config = Config::load(repo_root);
+    let report = score_repo(repo_root, &config)?;
 
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -526,10 +546,13 @@ jobs:
 "#;
         std::fs::write(wfdir.join("ci.yml"), yaml).unwrap();
 
-        let report = score_repo(dir.path()).unwrap();
-        // 5 + 2 + 15 + 10 = 32; score = 68; grade = D
-        assert_eq!(report.totals.points_deducted, 32);
-        assert_eq!(report.score, 68);
+        let report = score_repo(dir.path(), &Config::default()).unwrap();
+        // pin.sliding (5) + pin.full_tag (2) + pin.branch (15)
+        //   + workflow.permissions_write_all (10)
+        //   + source.unverified for some-org/custom-action (1)
+        //   = 33; score = 67; grade = D
+        assert_eq!(report.totals.points_deducted, 33);
+        assert_eq!(report.score, 67);
         assert_eq!(report.grade, "D");
     }
 
@@ -551,7 +574,7 @@ jobs:
 "#;
         std::fs::write(wfdir.join("ci.yml"), yaml).unwrap();
 
-        let report = score_repo(dir.path()).unwrap();
+        let report = score_repo(dir.path(), &Config::default()).unwrap();
         assert_eq!(report.score, 100);
         assert_eq!(report.grade, "A");
         assert!(report.findings.is_empty());
@@ -566,7 +589,7 @@ jobs:
         std::fs::write(wfdir.join("a.yml"), yaml).unwrap();
         std::fs::write(wfdir.join("b.yml"), yaml).unwrap();
 
-        let report = score_repo(dir.path()).unwrap();
+        let report = score_repo(dir.path(), &Config::default()).unwrap();
         // Two workflows, same sliding-tag action -> ONE finding with 2 occurrences.
         let pin_findings: Vec<_> = report
             .findings
@@ -626,7 +649,7 @@ jobs:
 "#;
         std::fs::write(wfdir.join("ci.yml"), yaml).unwrap();
 
-        let report = score_repo(dir.path()).unwrap();
+        let report = score_repo(dir.path(), &Config::default()).unwrap();
         let ids: Vec<_> = report.findings.iter().map(|f| f.id).collect();
         assert!(ids.contains(&"workflow.pull_request_target"));
         assert!(ids.contains(&"workflow.workflow_run"));
@@ -634,6 +657,50 @@ jobs:
         assert_eq!(report.totals.points_deducted, 8);
         assert_eq!(report.score, 92);
         assert_eq!(report.grade, "A");
+    }
+
+    #[test]
+    fn source_unverified_fires_for_untrusted_owner() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let wfdir = dir.path().join(".github").join("workflows");
+        std::fs::create_dir_all(&wfdir).unwrap();
+        let yaml = "name: x\non: push\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: random-vendor/tool@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v1\n";
+        std::fs::write(wfdir.join("ci.yml"), yaml).unwrap();
+
+        let report = score_repo(dir.path(), &Config::default()).unwrap();
+        let ids: Vec<_> = report.findings.iter().map(|f| f.id).collect();
+        assert_eq!(ids, vec!["source.unverified"]);
+        assert_eq!(report.score, 99);
+    }
+
+    #[test]
+    fn source_unverified_skipped_for_trusted_baseline() {
+        // `actions` and `github` are in the built-in baseline.
+        let dir = tempfile::TempDir::new().unwrap();
+        let wfdir = dir.path().join(".github").join("workflows");
+        std::fs::create_dir_all(&wfdir).unwrap();
+        let yaml = "name: x\non: push\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6\n      - uses: github/codeql-action/init@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v3\n";
+        std::fs::write(wfdir.join("ci.yml"), yaml).unwrap();
+
+        let report = score_repo(dir.path(), &Config::default()).unwrap();
+        assert!(report.findings.is_empty());
+        assert_eq!(report.score, 100);
+    }
+
+    #[test]
+    fn source_unverified_respects_config_trusted_owners() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let wfdir = dir.path().join(".github").join("workflows");
+        std::fs::create_dir_all(&wfdir).unwrap();
+        let yaml = "name: x\non: push\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: my-vendor/tool@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v1\n";
+        std::fs::write(wfdir.join("ci.yml"), yaml).unwrap();
+
+        let cfg = Config {
+            trusted_owners: vec!["my-vendor".to_string()],
+            ..Config::default()
+        };
+        let report = score_repo(dir.path(), &cfg).unwrap();
+        assert!(report.findings.is_empty());
     }
 
     #[test]

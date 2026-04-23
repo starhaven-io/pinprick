@@ -1,6 +1,6 @@
 # pinprick scoring rubric
 
-**Status:** draft (rubric version `0.1.0`)
+**Status:** draft (rubric version `0.2.0`)
 
 This document defines how pinprick computes a single score for a GitHub repository's Actions supply chain posture. It is the public specification that the `pinprick score` CLI subcommand and the MintMarq dashboard both implement against.
 
@@ -52,16 +52,18 @@ A SHA-pinned reference incurs no pinning deduction.
 
 `pin.none` is catalogued for completeness but currently unreachable: pinprick's `uses:` parser rejects lines without an `@ref`, so no-ref references never reach the scorer. The rule id is reserved so future parser changes (or other tooling that implements this rubric) can emit it without colliding.
 
-### Action-source rules (category: `source`) — **planned for v0.2.0**
+### Action-source rules (category: `source`)
 
-These rules fire against properties of the referenced action itself and require a GitHub token to resolve. They are specified here so the rubric is stable across implementations, but the v0.1.0 scorer does not emit them.
+These rules fire against properties of the referenced action itself. Most require a GitHub token; `source.unverified` is offline (allowlist-based).
 
-| ID                    | Condition                                                    | Severity | Points | Remediation                                      |
-|-----------------------|--------------------------------------------------------------|----------|--------|--------------------------------------------------|
-| `source.archived`     | Referenced repo is archived                                  | high     |   10   | Migrate to an actively maintained replacement    |
-| `source.stale`        | Referenced SHA was committed >365 days ago and no newer tag  | medium   |    5   | Update to a newer maintained version             |
-| `source.advisory`     | Referenced version has a published GHSA advisory             | high     |   15   | Update to a patched version                      |
-| `source.unverified`   | Publisher is not GitHub-verified and not in a trusted-owners allowlist | low |  1   | Confirm publisher trust; consider vendoring      |
+| ID                    | Condition                                                    | Severity | Points | Status   | Remediation                                      |
+|-----------------------|--------------------------------------------------------------|----------|--------|----------|--------------------------------------------------|
+| `source.archived`     | Referenced repo is archived                                  | high     |   10   | planned  | Migrate to an actively maintained replacement    |
+| `source.stale`        | Referenced SHA was committed >365 days ago and no newer tag  | medium   |    5   | planned  | Update to a newer maintained version             |
+| `source.advisory`     | Referenced version has a published GHSA advisory             | high     |   15   | planned  | Update to a patched version                      |
+| `source.unverified`   | Publisher is not in the baseline (`actions`, `github`) or the configured `trusted-owners` list | low | 1 | live | Confirm publisher trust; add to `trusted-owners` in `.pinprick.toml` or consider vendoring |
+
+`source.unverified` is configurable. The built-in baseline of trusted publishers is `actions` and `github`. Extend with `trusted-owners = ["my-org", "vendor"]` in `.pinprick.toml`. Case-insensitive, exact owner match.
 
 ### Runtime-fetch rules (category: `runtime`) — **planned for v0.2.0**
 
@@ -201,19 +203,20 @@ A hypothetical small repo:
 
 Findings:
 
-| Rule              | Points |
-|-------------------|--------|
-| `pin.sliding`     |    5   |
-| `pin.full_tag`    |    2   |
-| `pin.branch`      |   15   |
-| `runtime.pipe_to_shell` | 20 |
-| `workflow.permissions_write_all` | 10 |
+| Rule                               | Points |
+|------------------------------------|--------|
+| `pin.sliding`                      |    5   |
+| `pin.full_tag`                     |    2   |
+| `pin.branch`                       |   15   |
+| `source.unverified` (some-org)     |    1   |
+| `runtime.pipe_to_shell` (planned)  |   20   |
+| `workflow.permissions_write_all`   |   10   |
 
-Total deducted: **52**. Score: **48**. Grade: **F**.
+Total deducted in v0.2.0: **53**. Score: **47**. Grade: **F**.
 
 Remediation priority (biggest point recovery first):
-1. Remove the `curl | sh` (+20)
-2. Pin `some-org/custom-action` to a SHA (+15)
+1. Remove the `curl | sh` (+20 — lands with the `runtime.*` rules in a later version)
+2. Pin `some-org/custom-action` to a SHA (+15); if `some-org` is a trusted vendor, add to `trusted-owners` (+1 more)
 3. Scope `permissions:` per-job (+10)
 4. Pin `actions/checkout` to a SHA (+5)
 5. Pin `actions/setup-node` to a SHA (+2)

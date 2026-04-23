@@ -30,7 +30,18 @@ pub struct Config {
     /// regardless.
     #[serde(default)]
     pub trusted_hosts: Vec<String>,
+
+    /// Additional GitHub owners (users or orgs) whose actions are considered
+    /// trusted publishers for the `source.unverified` scoring rule. Appended
+    /// to the built-in baseline (`actions`, `github`). Case-insensitive.
+    #[serde(default)]
+    pub trusted_owners: Vec<String>,
 }
+
+/// Baseline list of trusted action publishers. GitHub's own orgs are
+/// always considered trusted; users extend this list via `trusted-owners`
+/// in `.pinprick.toml`.
+const BASELINE_TRUSTED_OWNERS: &[&str] = &["actions", "github"];
 
 #[derive(Debug, Default, Deserialize)]
 pub struct IgnoreConfig {
@@ -122,6 +133,19 @@ impl Config {
         self.trusted_hosts
             .iter()
             .any(|h| h.eq_ignore_ascii_case(host))
+    }
+
+    /// Check if an action publisher (owner) is trusted. Combines the
+    /// built-in baseline (`actions`, `github`) with the user-configured
+    /// `trusted_owners` list. Case-insensitive.
+    pub fn is_owner_trusted(&self, owner: &str) -> bool {
+        BASELINE_TRUSTED_OWNERS
+            .iter()
+            .any(|b| b.eq_ignore_ascii_case(owner))
+            || self
+                .trusted_owners
+                .iter()
+                .any(|o| o.eq_ignore_ascii_case(owner))
     }
 }
 

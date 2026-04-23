@@ -93,7 +93,7 @@ fn json_output_shape() {
     assert_eq!(output.status.code(), Some(1));
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
 
-    assert_eq!(json["rubric_version"], "0.1.0");
+    assert_eq!(json["rubric_version"], "0.2.0");
     assert_eq!(json["grade"], "A");
     assert_eq!(json["score"], 95);
     assert_eq!(json["totals"]["findings"], 1);
