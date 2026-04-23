@@ -82,6 +82,12 @@ enum Command {
         /// Repository root
         #[arg(default_value = ".")]
         path: PathBuf,
+
+        /// Emit a self-contained HTML report to stdout
+        ///
+        /// If `--json` is also set, JSON wins (global flags take precedence).
+        #[arg(long)]
+        html: bool,
     },
     /// Check for updates to pinned actions
     Update {
@@ -145,7 +151,7 @@ async fn main() -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Command::Pin { path, apply } => pin::run(path, cli.json, *apply).await,
-        Command::Score { path } => score::run(path, cli.json).await,
+        Command::Score { path, html } => score::run(path, cli.json, *html).await,
         Command::Update { path, apply, only } => {
             update::run(path, *apply, cli.json, only.as_deref()).await
         }

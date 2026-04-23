@@ -120,3 +120,25 @@ fn no_workflows_directory_errors() {
         .code(2)
         .stderr(predicate::str::contains("No .github/workflows/"));
 }
+
+#[test]
+fn html_output_contains_expected_markers() {
+    let dir = common::repo_with_workflow("ci.yml", WORKFLOW_UNPINNED_SLIDING);
+    let output = common::pinprick_cmd()
+        .arg("score")
+        .arg(dir.path())
+        .arg("--html")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let html = String::from_utf8(output.stdout).unwrap();
+    assert!(html.starts_with("<!DOCTYPE html>"));
+    assert!(html.contains("<title>pinprick score report</title>"));
+    assert!(html.contains("grade-A"));
+    assert!(html.contains("95 / 100"));
+    assert!(html.contains("pin.sliding"));
+    assert!(html.contains("actions/checkout@v4"));
+    assert!(html.contains("pinprick.rs"));
+    assert!(html.ends_with("</html>\n"));
+}

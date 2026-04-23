@@ -99,7 +99,7 @@ impl RuleId {
                 "Pin to a full 40-char SHA; keep the tag as a comment"
             }
             Self::SourceUnverified => {
-                "Confirm publisher trust; add to `trusted-owners` in .pinprick.toml or consider vendoring"
+                "Confirm this publisher is trustworthy. Add them to `trusted-owners` in .pinprick.toml, or fork the action into your own org and pin to that."
             }
             Self::WorkflowPermissionsWriteAll => {
                 "Declare minimal per-job `permissions:` blocks instead of `write-all`"
@@ -337,12 +337,16 @@ fn trigger_present(on: &Value, name: &str) -> bool {
 
 // ── CLI entry point ─────────────────────────────────────────────────────────
 
-pub async fn run(repo_root: &Path, json: bool) -> Result<ExitCode> {
+pub async fn run(repo_root: &Path, json: bool, html: bool) -> Result<ExitCode> {
     let config = Config::load(repo_root);
     let report = score_repo(repo_root, &config)?;
 
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
+    } else if html {
+        // render_html terminates its output with a newline already;
+        // `print!` avoids a spurious trailing blank line.
+        print!("{}", render_html(&report));
     } else {
         print_human(&report);
     }
@@ -423,6 +427,116 @@ fn severity_label(s: Severity) -> colored::ColoredString {
         Severity::Medium => "medium".yellow(),
         Severity::Low => "low   ".dimmed(),
     }
+}
+
+// ── HTML rendering ──────────────────────────────────────────────────────────
+
+const HTML_CSS: &str = r#":root{--bg:#0f1419;--fg:#e6edf3;--muted:#7d8590;--accent:#58a6ff;--border:#30363d;--a:#2da44e;--b:#7eb36a;--c:#d29922;--d:#f0883e;--f:#da3633}*{box-sizing:border-box}body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;background:var(--bg);color:var(--fg);line-height:1.5}.container{max-width:960px;margin:0 auto;padding:2rem 1.5rem}.header{display:flex;align-items:baseline;gap:1rem;margin-bottom:1.5rem;flex-wrap:wrap}.title{font-size:1.5rem;font-weight:600}.version{color:var(--muted);font-size:.875rem;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}.grade-banner{display:flex;align-items:center;gap:2rem;padding:2rem;border-radius:12px;border:1px solid var(--border);background:rgba(255,255,255,.02);margin-bottom:2rem;flex-wrap:wrap}.grade{font-size:5rem;font-weight:700;line-height:1}.grade-A{color:var(--a)}.grade-B{color:var(--b)}.grade-C{color:var(--c)}.grade-D{color:var(--d)}.grade-F{color:var(--f)}.score-number{font-size:2.25rem;font-weight:500}.totals{color:var(--muted);font-size:.875rem;margin-top:.25rem}.no-findings{text-align:center;padding:3rem 1rem;color:var(--muted);font-size:1rem}h2{font-size:1.125rem;margin:2rem 0 .5rem;border-bottom:1px solid var(--border);padding-bottom:.5rem}.finding{padding:1rem 0;border-bottom:1px solid var(--border)}.finding:last-child{border-bottom:none}.finding-header{display:flex;align-items:baseline;gap:.75rem;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.875rem;flex-wrap:wrap}.severity{font-size:.6875rem;text-transform:uppercase;padding:.15rem .5rem;border-radius:4px;letter-spacing:.03em;font-family:-apple-system,system-ui,sans-serif;font-weight:600}.severity-high{background:rgba(218,54,51,.15);color:var(--f)}.severity-medium{background:rgba(210,153,34,.15);color:var(--c)}.severity-low{background:rgba(125,133,144,.15);color:var(--muted)}.points{color:var(--muted);min-width:2.5rem}.rule-id{color:var(--accent)}.target{color:var(--muted);word-break:break-all}.remediation{margin-top:.5rem;font-size:.9375rem}.occurrences{margin:.5rem 0 0;padding:0 0 0 1.25rem;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.8125rem;color:var(--muted)}.occurrences li{margin:.125rem 0}.footer{margin-top:3rem;padding-top:1rem;border-top:1px solid var(--border);color:var(--muted);font-size:.8125rem}a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}"#;
+
+fn escape_html(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+fn severity_class(s: Severity) -> &'static str {
+    match s {
+        Severity::High => "high",
+        Severity::Medium => "medium",
+        Severity::Low => "low",
+    }
+}
+
+pub fn render_html(report: &ScoreReport) -> String {
+    let mut out = String::with_capacity(4096);
+    out.push_str("<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n");
+    out.push_str(
+        "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>",
+    );
+    out.push_str("pinprick score report");
+    out.push_str("</title>\n<style>");
+    out.push_str(HTML_CSS);
+    out.push_str("</style>\n</head>\n<body>\n<div class=\"container\">\n");
+
+    // Header
+    out.push_str("<div class=\"header\">\n  <div class=\"title\">pinprick score</div>\n");
+    out.push_str(&format!(
+        "  <div class=\"version\">rubric v{} · pinprick {}</div>\n</div>\n",
+        escape_html(report.rubric_version),
+        escape_html(report.pinprick_version)
+    ));
+
+    // Grade banner
+    out.push_str(&format!(
+        "<div class=\"grade-banner\">\n  <div class=\"grade grade-{0}\">{0}</div>\n  <div>\n    <div class=\"score-number\">{1} / 100</div>\n    <div class=\"totals\">{2} workflows scanned · {3} unique actions · {4} findings</div>\n  </div>\n</div>\n",
+        escape_html(report.grade),
+        report.score,
+        report.totals.workflows_scanned,
+        report.totals.unique_actions,
+        report.totals.findings
+    ));
+
+    // Findings
+    if report.findings.is_empty() {
+        out.push_str("<div class=\"no-findings\">No findings. ");
+        out.push_str(&escape_html(&format!(
+            "{} workflows scanned.",
+            report.totals.workflows_scanned
+        )));
+        out.push_str("</div>\n");
+    } else {
+        out.push_str("<h2>Prioritized fix list</h2>\n");
+        for f in &report.findings {
+            let target = f
+                .action_ref
+                .as_deref()
+                .or_else(|| f.occurrences.first().map(|o| o.workflow.as_str()))
+                .unwrap_or("");
+            out.push_str("<div class=\"finding\">\n");
+            out.push_str(&format!(
+                "  <div class=\"finding-header\">\n    <span class=\"severity severity-{0}\">{0}</span>\n    <span class=\"points\">-{1}</span>\n    <span class=\"rule-id\">{2}</span>\n    <span class=\"target\">{3}</span>\n  </div>\n",
+                severity_class(f.severity),
+                f.points,
+                escape_html(f.id),
+                escape_html(target)
+            ));
+            out.push_str(&format!(
+                "  <div class=\"remediation\">{}</div>\n",
+                escape_html(f.remediation)
+            ));
+            if !f.occurrences.is_empty() {
+                out.push_str("  <ul class=\"occurrences\">\n");
+                for occ in &f.occurrences {
+                    if occ.line > 0 {
+                        out.push_str(&format!(
+                            "    <li>{}:{}</li>\n",
+                            escape_html(&occ.workflow),
+                            occ.line
+                        ));
+                    } else {
+                        out.push_str(&format!("    <li>{}</li>\n", escape_html(&occ.workflow)));
+                    }
+                }
+                out.push_str("  </ul>\n");
+            }
+            out.push_str("</div>\n");
+        }
+    }
+
+    // Footer
+    out.push_str("<div class=\"footer\">\n  Generated by <a href=\"https://pinprick.rs\">pinprick</a>. Scoring rubric: <a href=\"https://github.com/starhaven-io/pinprick/blob/main/docs/scoring.md\">docs/scoring.md</a>.\n</div>\n");
+
+    out.push_str("</div>\n</body>\n</html>\n");
+    out
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
@@ -701,6 +815,129 @@ jobs:
         };
         let report = score_repo(dir.path(), &cfg).unwrap();
         assert!(report.findings.is_empty());
+    }
+
+    #[test]
+    fn escape_html_handles_all_entities() {
+        assert_eq!(escape_html("a & b"), "a &amp; b");
+        assert_eq!(escape_html("<script>"), "&lt;script&gt;");
+        assert_eq!(escape_html("\"quoted\""), "&quot;quoted&quot;");
+        assert_eq!(escape_html("'apos'"), "&#39;apos&#39;");
+        assert_eq!(escape_html("plain text"), "plain text");
+    }
+
+    #[test]
+    fn render_html_clean_report() {
+        let report = ScoreReport {
+            rubric_version: RUBRIC_VERSION,
+            pinprick_version: env!("CARGO_PKG_VERSION"),
+            target: Target {
+                kind: "repo",
+                path: ".".to_string(),
+            },
+            score: 100,
+            grade: "A",
+            totals: Totals {
+                points_deducted: 0,
+                findings: 0,
+                workflows_scanned: 3,
+                unique_actions: 7,
+            },
+            findings: vec![],
+        };
+        let html = render_html(&report);
+        assert!(html.starts_with("<!DOCTYPE html>"));
+        assert!(html.contains("grade-A"));
+        assert!(html.contains("100 / 100"));
+        assert!(html.contains("No findings"));
+        assert!(html.contains("3 workflows scanned"));
+        assert!(html.ends_with("</html>\n"));
+    }
+
+    #[test]
+    fn render_html_with_findings_includes_remediations_and_occurrences() {
+        let report = ScoreReport {
+            rubric_version: RUBRIC_VERSION,
+            pinprick_version: env!("CARGO_PKG_VERSION"),
+            target: Target {
+                kind: "repo",
+                path: ".".to_string(),
+            },
+            score: 80,
+            grade: "B",
+            totals: Totals {
+                points_deducted: 20,
+                findings: 1,
+                workflows_scanned: 2,
+                unique_actions: 4,
+            },
+            findings: vec![Finding {
+                id: "pin.branch",
+                category: Category::Pin,
+                severity: Severity::High,
+                points: 15,
+                action_ref: Some("foo/bar@main".to_string()),
+                occurrences: vec![
+                    Occurrence {
+                        workflow: ".github/workflows/ci.yml".to_string(),
+                        line: 22,
+                    },
+                    Occurrence {
+                        workflow: ".github/workflows/release.yml".to_string(),
+                        line: 15,
+                    },
+                ],
+                remediation: "Pin to a full 40-char SHA; keep the tag as a comment",
+            }],
+        };
+        let html = render_html(&report);
+        assert!(html.contains("grade-B"));
+        assert!(html.contains("80 / 100"));
+        assert!(html.contains("severity-high"));
+        assert!(html.contains("pin.branch"));
+        assert!(html.contains("foo/bar@main"));
+        assert!(html.contains("ci.yml:22"));
+        assert!(html.contains("release.yml:15"));
+        assert!(html.contains("Pin to a full 40-char SHA"));
+        assert!(html.contains("Prioritized fix list"));
+    }
+
+    #[test]
+    fn render_html_escapes_user_content() {
+        // Exercise the escaping path for action refs / workflow paths that
+        // could (in theory) contain HTML metacharacters.
+        let report = ScoreReport {
+            rubric_version: RUBRIC_VERSION,
+            pinprick_version: env!("CARGO_PKG_VERSION"),
+            target: Target {
+                kind: "repo",
+                path: ".".to_string(),
+            },
+            score: 99,
+            grade: "A",
+            totals: Totals {
+                points_deducted: 1,
+                findings: 1,
+                workflows_scanned: 1,
+                unique_actions: 1,
+            },
+            findings: vec![Finding {
+                id: "source.unverified",
+                category: Category::Source,
+                severity: Severity::Low,
+                points: 1,
+                action_ref: Some("<evil>/bar@v1".to_string()),
+                occurrences: vec![Occurrence {
+                    workflow: "a&b.yml".to_string(),
+                    line: 1,
+                }],
+                remediation: "fix it",
+            }],
+        };
+        let html = render_html(&report);
+        assert!(!html.contains("<evil>"));
+        assert!(html.contains("&lt;evil&gt;"));
+        assert!(html.contains("a&amp;b.yml"));
     }
 
     #[test]

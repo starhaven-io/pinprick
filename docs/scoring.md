@@ -2,7 +2,7 @@
 
 **Status:** draft (rubric version `0.2.0`)
 
-This document defines how pinprick computes a single score for a GitHub repository's Actions supply chain posture. It is the public specification that the `pinprick score` CLI subcommand and the MintMarq dashboard both implement against.
+This document defines how pinprick computes a single score for a GitHub repository's Actions supply chain posture. It is the public specification that the `pinprick score` CLI subcommand implements against, and that any downstream tool wrapping the engine (dashboards, CI plugins, reporting pipelines) should implement against so scores stay portable and comparable.
 
 Keeping this document public and versioned is deliberate: security scoring is only trustworthy if anyone can re-derive the score from the raw findings. Vendors that hide the rubric behind "proprietary algorithms" end up being distrusted by the security teams they want as customers.
 
@@ -61,7 +61,7 @@ These rules fire against properties of the referenced action itself. Most requir
 | `source.archived`     | Referenced repo is archived                                  | high     |   10   | planned  | Migrate to an actively maintained replacement    |
 | `source.stale`        | Referenced SHA was committed >365 days ago and no newer tag  | medium   |    5   | planned  | Update to a newer maintained version             |
 | `source.advisory`     | Referenced version has a published GHSA advisory             | high     |   15   | planned  | Update to a patched version                      |
-| `source.unverified`   | Publisher is not in the baseline (`actions`, `github`) or the configured `trusted-owners` list | low | 1 | live | Confirm publisher trust; add to `trusted-owners` in `.pinprick.toml` or consider vendoring |
+| `source.unverified`   | Publisher is not in the baseline (`actions`, `github`) or the configured `trusted-owners` list | low | 1 | live | Confirm this publisher is trustworthy; add them to `trusted-owners` in `.pinprick.toml`, or fork the action into your own org and pin to that |
 
 `source.unverified` is configurable. The built-in baseline of trusted publishers is `actions` and `github`. Extend with `trusted-owners = ["my-org", "vendor"]` in `.pinprick.toml`. Case-insensitive, exact owner match.
 
@@ -168,17 +168,17 @@ A single self-contained HTML file with:
 - Per-workflow drill-down
 - Prioritized remediation list (sorted by points recovered)
 
-No JavaScript frameworks; plain HTML + a little CSS. The HTML report is shareable as a static artifact and works as a customer-discovery demo.
+No JavaScript frameworks; plain HTML + a little CSS. The HTML report is shareable as a static artifact.
 
 ## Roll-ups
 
-The CLI's natural scope is a single repo. The MintMarq app rolls findings up further:
+The CLI's natural scope is a single repo. Wrappers that scan across many repos (dashboards, org-wide scanners) roll findings up further; the roll-up semantics below are specified here so those implementations produce consistent numbers:
 
 - **Workflow score**: `max(0, 100 - sum(points for findings in that workflow))`. Used for within-repo drill-down.
 - **Org score**: weighted mean of repo scores, weighted by action-use count (so a single tiny repo with a bad score doesn't tank the whole org).
-- **Time series**: every scan persists its full finding list plus rubric version; the dashboard shows trend lines and diffs between scans.
+- **Time series**: every scan persists its full finding list plus rubric version; trend lines and scan-over-scan diffs are derived downstream.
 
-Org-level scoring is defined here for reference but is implemented in the MintMarq app, not the pinprick CLI.
+The pinprick CLI does not implement the roll-ups; it scans a single repo and emits findings. Anything cross-repo belongs to a wrapper.
 
 ## Versioning
 
