@@ -1,0 +1,17 @@
+coverage:
+  status:
+    project:
+      default:
+        target: auto
+        threshold: 1%   # tolerate 1% drop on overall project coverage
+    patch:
+      default:
+        target: auto
+        threshold: 0%   # new/changed code should be covered
+  precision: 2
+  round: down
+
+comment: false
+
+github_checks:
+  annotations: true       # inline coverage gutter on PRs
