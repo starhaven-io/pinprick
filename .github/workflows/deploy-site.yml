@@ -46,6 +46,7 @@ jobs:
         run: npm run build
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+          GH_COMPARE_SHA: ${{ github.event.before }}
 
       - name: Deploy to Cloudflare Workers
         working-directory: site

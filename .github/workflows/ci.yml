@@ -321,6 +321,7 @@ jobs:
         run: npm run build
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+          GH_COMPARE_SHA: ${{ github.event.before || github.event.pull_request.base.sha }}
 
       # --- Verify Audited Actions ---
 

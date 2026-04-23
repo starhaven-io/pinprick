@@ -29,7 +29,9 @@ export default defineConfig({
         uploadToken: process.env.CODECOV_TOKEN,
         gitService: 'github',
         telemetry: false,
-        debug: true,
+        uploadOverrides: {
+          compareSha: process.env.GH_COMPARE_SHA,
+        },
       }),
     ],
   },
