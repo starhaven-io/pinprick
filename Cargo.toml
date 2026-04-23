@@ -1,6 +1,6 @@
 [package]
 name = "pinprick"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 rust-version = "1.87.0"
 description = "GitHub Actions supply chain security tool"
