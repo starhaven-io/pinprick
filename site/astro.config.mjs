@@ -33,6 +33,7 @@ export default defineConfig({
       customCss: ['./src/styles/custom.css'],
       components: {
         SocialIcons: './src/components/SocialIcons.astro',
+        ThemeSelect: './src/components/ThemeSelect.astro',
       },
       editLink: {
         baseUrl: 'https://github.com/starhaven-io/pinprick/edit/main/site/',

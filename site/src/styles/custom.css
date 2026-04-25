@@ -1,22 +1,48 @@
-:root {
-  --sl-color-accent-low: #1a1a2e;
-  --sl-color-accent: #e94560;
-  --sl-color-accent-high: #fcd2db;
+/* ==========================================================
+   pinprick — Starlight theme overrides
+   ----------------------------------------------------------
+   Dark-first. Light works as an alternate via prefers-color-scheme
+   (Starlight's ThemeProvider reads the OS preference and sets
+   data-theme on <html> before paint). No toggle UI — ThemeSelect
+   is overridden to an empty component.
 
+   Based on the starhaven-io design system, pinprick brand,
+   "amped" direction: deeper red accent, 2px header rule, accented
+   sidebar current item, filled HIGH severity badges, monospace
+   red wordmark.
+   ========================================================== */
+
+/* ----- Tokens — dark (default) ----------------------------- */
+:root,
+:root[data-theme='dark'] {
+  /* Accent — deeper crimson red */
+  --sl-color-accent-low: #2a0a0e;
+  --sl-color-accent: #dc2626;
+  --sl-color-accent-high: #fecaca;
+  /* Pull the wordmark and other "text-accent" chrome onto the pure
+     accent red rather than the default washed-out accent-high. */
+  --sl-color-text-accent: var(--sl-color-accent);
+
+  /* Neutrals — near-black, true neutral (chroma 0) */
   --sl-color-white: #ffffff;
   --sl-color-gray-1: #eeeeee;
   --sl-color-gray-2: #c2c2c2;
   --sl-color-gray-3: #8b8b8b;
   --sl-color-gray-4: #585858;
-  --sl-color-gray-5: #383838;
-  --sl-color-gray-6: #1e1e1e;
-  --sl-color-black: #121212;
+  --sl-color-gray-5: #2e2e2e;
+  --sl-color-gray-6: #1a1a1a;
+  --sl-color-black: #0e0e0e;
+
+  /* Semantic aliases */
+  --pp-sev-medium: #f5a623;
 }
 
+/* ----- Tokens — light (alternate) -------------------------- */
 :root[data-theme='light'] {
-  --sl-color-accent-low: #fce4ec;
-  --sl-color-accent: #c62828;
-  --sl-color-accent-high: #3c0a0a;
+  --sl-color-accent-low: #fee2e2;
+  --sl-color-accent: #b91c1c;
+  --sl-color-accent-high: #450a0a;
+  --sl-color-text-accent: var(--sl-color-accent);
 
   --sl-color-white: #121212;
   --sl-color-gray-1: #383838;
@@ -26,12 +52,42 @@
   --sl-color-gray-5: #eeeeee;
   --sl-color-gray-6: #f8f8f8;
   --sl-color-black: #ffffff;
+
+  --pp-sev-medium: #bf5700;
 }
 
-/* Version badge in the header, rendered by src/components/SocialIcons.astro */
+/* ----- Header: 2px accent rule ----------------------------- */
+.header {
+  border-bottom: 2px solid var(--sl-color-accent) !important;
+}
+
+/* ----- Wordmark: red, monospace, tight --------------------- */
+.site-title {
+  font-family: var(--sl-font-mono);
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+.site-title:hover {
+  opacity: 0.85;
+}
+
+/* ----- Sidebar current item: accent-soft + 2px left rule --- */
+/* Replace Starlight's default "inverted block" current-page treatment
+   (accent bg + invert text) with the amped treatment: accent-low bg,
+   accent text, 2px left accent border. */
+.sidebar-pane a[aria-current='page'],
+.sidebar-pane a[aria-current='page']:hover,
+.sidebar-pane a[aria-current='page']:focus {
+  color: var(--sl-color-accent);
+  background-color: var(--sl-color-accent-low);
+  border-inline-start: 2px solid var(--sl-color-accent);
+  border-radius: 0;
+}
+
+/* ----- Version badge (rendered in SocialIcons.astro) ------- */
 .version-badge {
   font-size: 0.75rem;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-family: var(--sl-font-mono);
   color: var(--sl-color-gray-3);
   text-decoration: none;
   padding: 0.2rem 0.5rem;
@@ -45,4 +101,27 @@
 .version-badge:hover {
   color: var(--sl-color-white);
   border-color: var(--sl-color-gray-3);
+}
+
+/* ----- Severity pills (e.g. in Markdown tables via HTML) --- */
+.sev {
+  display: inline-block;
+  padding: 0.15em 0.55em;
+  border-radius: 999px;
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+}
+.sev-high {
+  background: var(--sl-color-accent);
+  color: #fff;
+}
+.sev-medium {
+  background: color-mix(in srgb, var(--pp-sev-medium) 25%, transparent);
+  color: var(--pp-sev-medium);
+}
+.sev-low {
+  background: color-mix(in srgb, var(--sl-color-gray-3) 20%, transparent);
+  color: var(--sl-color-gray-2);
 }
