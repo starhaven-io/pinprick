@@ -57,7 +57,10 @@
 }
 
 /* ----- Header: 2px accent rule ----------------------------- */
-.header {
+/* Scoped to the outer <header> element. Starlight nests a second
+   <div class="header"> inside it for layout; an unscoped .header
+   selector would draw a second rule under the wordmark. */
+header.header {
   border-bottom: 2px solid var(--sl-color-accent) !important;
 }
 
