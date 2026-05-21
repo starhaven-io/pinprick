@@ -69,6 +69,33 @@ pub struct TreeEntry {
     pub entry_type: String,
 }
 
+#[derive(Deserialize)]
+struct TagListEntry {
+    name: String,
+    commit: TagListCommit,
+}
+
+#[derive(Deserialize)]
+struct TagListCommit {
+    sha: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SecurityAdvisory {
+    pub ghsa_id: String,
+    pub html_url: String,
+    pub severity: String,
+    #[serde(default)]
+    pub summary: String,
+    pub vulnerabilities: Vec<AdvisoryVulnerability>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AdvisoryVulnerability {
+    pub vulnerable_version_range: Option<String>,
+    pub patched_versions: Option<String>,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum GitHubError {
     #[error("Authentication required")]
@@ -234,6 +261,45 @@ impl GitHubClient {
 
         let releases: Vec<Release> = resp.json().await.context("parsing releases")?;
         Ok(releases)
+    }
+
+    /// Find a tag name pointing at the given commit SHA, if any. Queries
+    /// the first 100 tags only — pinned actions are virtually always on a
+    /// recent release tag, and paginating further isn't worth the latency.
+    pub async fn sha_to_tag(&self, owner: &str, repo: &str, sha: &str) -> Result<Option<String>> {
+        let url = format!("https://api.github.com/repos/{owner}/{repo}/tags?per_page=100");
+        let resp = self.get(&url).await?;
+        if resp.status().as_u16() == 404 {
+            bail!(GitHubError::RepoNotFound {
+                owner: owner.into(),
+                repo: repo.into(),
+            });
+        }
+        let tags: Vec<TagListEntry> = resp.json().await.context("parsing tags")?;
+        Ok(tags
+            .into_iter()
+            .find(|t| t.commit.sha == sha)
+            .map(|t| t.name))
+    }
+
+    /// List published security advisories for the repo. Draft and withdrawn
+    /// advisories are excluded server-side via the `state` filter.
+    pub async fn list_security_advisories(
+        &self,
+        owner: &str,
+        repo: &str,
+    ) -> Result<Vec<SecurityAdvisory>> {
+        let url = format!(
+            "https://api.github.com/repos/{owner}/{repo}/security-advisories?state=published&per_page=100"
+        );
+        let resp = self.get(&url).await?;
+        if resp.status().as_u16() == 404 {
+            // Some repos disable advisories or don't have any — treat as empty.
+            return Ok(Vec::new());
+        }
+        let advisories: Vec<SecurityAdvisory> =
+            resp.json().await.context("parsing security advisories")?;
+        Ok(advisories)
     }
 
     /// Return `true` if the repo is archived on GitHub.
