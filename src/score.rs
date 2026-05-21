@@ -13,11 +13,13 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use crate::audit::{self, AuditCollector};
+use crate::auth;
 use crate::config::Config;
+use crate::github::GitHubClient;
 use crate::output::AuditFinding;
 use crate::workflow::{self, ActionRef, RefType};
 
-pub const RUBRIC_VERSION: &str = "0.3.0";
+pub const RUBRIC_VERSION: &str = "0.4.0";
 
 // ── Rule catalog ────────────────────────────────────────────────────────────
 
@@ -43,6 +45,7 @@ pub enum RuleId {
     PinBranch,
     PinSliding,
     PinFullTag,
+    SourceArchived,
     SourceUnverified,
     RuntimePipeToShell,
     RuntimeFetchHigh,
@@ -59,6 +62,7 @@ impl RuleId {
             Self::PinBranch => "pin.branch",
             Self::PinSliding => "pin.sliding",
             Self::PinFullTag => "pin.full_tag",
+            Self::SourceArchived => "source.archived",
             Self::SourceUnverified => "source.unverified",
             Self::RuntimePipeToShell => "runtime.pipe_to_shell",
             Self::RuntimeFetchHigh => "runtime.fetch.high",
@@ -73,7 +77,7 @@ impl RuleId {
     pub fn category(self) -> Category {
         match self {
             Self::PinBranch | Self::PinSliding | Self::PinFullTag => Category::Pin,
-            Self::SourceUnverified => Category::Source,
+            Self::SourceArchived | Self::SourceUnverified => Category::Source,
             Self::RuntimePipeToShell
             | Self::RuntimeFetchHigh
             | Self::RuntimeFetchMedium
@@ -87,6 +91,7 @@ impl RuleId {
     pub fn severity(self) -> Severity {
         match self {
             Self::PinBranch
+            | Self::SourceArchived
             | Self::RuntimePipeToShell
             | Self::RuntimeFetchHigh
             | Self::WorkflowPermissionsWriteAll
@@ -102,7 +107,7 @@ impl RuleId {
         match self {
             Self::RuntimePipeToShell => 20,
             Self::PinBranch | Self::RuntimeFetchHigh => 15,
-            Self::WorkflowPermissionsWriteAll => 10,
+            Self::SourceArchived | Self::WorkflowPermissionsWriteAll => 10,
             Self::RuntimeFetchMedium => 8,
             Self::PinSliding | Self::WorkflowPullRequestTarget => 5,
             Self::RuntimeFetchLow | Self::WorkflowWorkflowRun => 3,
@@ -116,6 +121,7 @@ impl RuleId {
             Self::PinBranch | Self::PinSliding | Self::PinFullTag => {
                 "Pin to a full 40-char SHA; keep the tag as a comment"
             }
+            Self::SourceArchived => "Migrate to an actively maintained replacement",
             Self::SourceUnverified => {
                 "Confirm this publisher is trustworthy. Add them to `trusted-owners` in .pinprick.toml, or fork the action into your own org and pin to that."
             }
@@ -313,8 +319,32 @@ pub fn score_repo(repo_root: &Path, config: &Config) -> Result<ScoreReport> {
 
     findings.extend(runtime_findings);
 
-    // Stable ordering: highest severity + highest points first, then rule id.
-    findings.sort_by(|a, b| {
+    let mut report = ScoreReport {
+        rubric_version: RUBRIC_VERSION,
+        pinprick_version: env!("CARGO_PKG_VERSION"),
+        target: Target {
+            kind: "repo",
+            path: repo_root.display().to_string(),
+        },
+        score: 100,
+        grade: "A",
+        totals: Totals {
+            points_deducted: 0,
+            findings: 0,
+            workflows_scanned: files.len(),
+            unique_actions: unique_actions.len(),
+        },
+        findings,
+    };
+    recompute_score(&mut report);
+    Ok(report)
+}
+
+/// Sort findings (highest deduction first, then by rule id, then by action ref)
+/// and recompute the report's totals, score, and grade. `workflows_scanned` and
+/// `unique_actions` are set once by `score_repo` and are not touched here.
+fn recompute_score(report: &mut ScoreReport) {
+    report.findings.sort_by(|a, b| {
         b.points
             .cmp(&a.points)
             .then_with(|| a.id.cmp(b.id))
@@ -325,27 +355,83 @@ pub fn score_repo(repo_root: &Path, config: &Config) -> Result<ScoreReport> {
                     .cmp(b.action_ref.as_deref().unwrap_or(""))
             })
     });
-
-    let points_deducted: u32 = findings.iter().map(|f| f.points).sum();
+    let points_deducted: u32 = report.findings.iter().map(|f| f.points).sum();
     let score = 100u32.saturating_sub(points_deducted);
+    report.totals.points_deducted = points_deducted;
+    report.totals.findings = report.findings.len();
+    report.score = score;
+    report.grade = grade_for(score);
+}
 
-    Ok(ScoreReport {
-        rubric_version: RUBRIC_VERSION,
-        pinprick_version: env!("CARGO_PKG_VERSION"),
-        target: Target {
-            kind: "repo",
-            path: repo_root.display().to_string(),
-        },
-        score,
-        grade: grade_for(score),
-        totals: Totals {
-            points_deducted,
-            findings: findings.len(),
-            workflows_scanned: files.len(),
-            unique_actions: unique_actions.len(),
-        },
-        findings,
-    })
+/// Fire `source.archived` findings for any pinned action whose repo is
+/// archived on GitHub. Requires a token; the caller has already resolved one.
+///
+/// API calls are cached per `(owner, repo)` since archived status is a
+/// repo-level property. A failed lookup (404, network) is silently treated
+/// as "not archived" — same degradation pattern as `audit` when remote
+/// fetches fail. We don't want one bad repo to nuke the whole scan.
+async fn enrich_with_source_archived(
+    report: &mut ScoreReport,
+    repo_root: &Path,
+    client: &GitHubClient,
+) -> Result<()> {
+    let files = workflow::find_workflows(repo_root)?;
+
+    // action_ref -> occurrences
+    let mut occurrences: BTreeMap<String, Vec<Occurrence>> = BTreeMap::new();
+    // action_ref -> (owner, repo)
+    let mut action_repo: BTreeMap<String, (String, String)> = BTreeMap::new();
+
+    for file in &files {
+        let display = workflow::display_path(file, repo_root);
+        let content = std::fs::read_to_string(file)
+            .map_err(|e| anyhow::anyhow!("reading {}: {e}", file.display()))?;
+        for a in workflow::scan_content(&content) {
+            let action_ref = format!("{}@{}", a.full_name(), a.ref_string);
+            action_repo
+                .entry(action_ref.clone())
+                .or_insert((a.owner.clone(), a.repo.clone()));
+            occurrences.entry(action_ref).or_default().push(Occurrence {
+                workflow: display.clone(),
+                line: a.line_number,
+            });
+        }
+    }
+
+    let mut archived_cache: BTreeMap<(String, String), bool> = BTreeMap::new();
+    for (owner, repo) in action_repo.values() {
+        let key = (owner.clone(), repo.clone());
+        if archived_cache.contains_key(&key) {
+            continue;
+        }
+        let archived = client.is_archived(owner, repo).await.unwrap_or(false);
+        archived_cache.insert(key, archived);
+    }
+
+    let rule = RuleId::SourceArchived;
+    let mut added = false;
+    for (action_ref, owner_repo) in &action_repo {
+        if archived_cache.get(owner_repo) != Some(&true) {
+            continue;
+        }
+        let mut occs = occurrences.remove(action_ref).unwrap_or_default();
+        occs.sort_by(|a, b| a.workflow.cmp(&b.workflow).then(a.line.cmp(&b.line)));
+        report.findings.push(Finding {
+            id: rule.id(),
+            category: rule.category(),
+            severity: rule.severity(),
+            points: rule.points(),
+            action_ref: Some(action_ref.clone()),
+            occurrences: occs,
+            remediation: rule.remediation(),
+        });
+        added = true;
+    }
+
+    if added {
+        recompute_score(report);
+    }
+    Ok(())
 }
 
 /// Map an audit finding to the runtime.* rule it corresponds to. Pipe-to-shell
@@ -433,7 +519,14 @@ fn trigger_present(on: &Value, name: &str) -> bool {
 
 pub async fn run(repo_root: &Path, json: bool, html: bool) -> Result<ExitCode> {
     let config = Config::load(repo_root);
-    let report = score_repo(repo_root, &config)?;
+    let mut report = score_repo(repo_root, &config)?;
+
+    // Rules that need the GitHub API run after the offline scan. Without a
+    // token we silently skip them — same behavior as `audit`.
+    if let Some(token) = auth::resolve_token().await {
+        let client = GitHubClient::new(token);
+        enrich_with_source_archived(&mut report, repo_root, &client).await?;
+    }
 
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -819,6 +912,12 @@ jobs:
             RuleId::PinBranch,
             RuleId::PinSliding,
             RuleId::PinFullTag,
+            RuleId::SourceArchived,
+            RuleId::SourceUnverified,
+            RuleId::RuntimePipeToShell,
+            RuleId::RuntimeFetchHigh,
+            RuleId::RuntimeFetchMedium,
+            RuleId::RuntimeFetchLow,
             RuleId::WorkflowPermissionsWriteAll,
             RuleId::WorkflowPullRequestTarget,
             RuleId::WorkflowWorkflowRun,
@@ -969,6 +1068,68 @@ jobs:
         };
         let report = score_repo(dir.path(), &cfg).unwrap();
         assert!(report.findings.is_empty());
+    }
+
+    #[test]
+    fn source_archived_rule_metadata() {
+        // The rubric in docs/scoring.md is the contract: high, 10 points,
+        // category Source, id "source.archived". If any of these drift,
+        // re-derivability of scores from the public rubric breaks.
+        let rule = RuleId::SourceArchived;
+        assert_eq!(rule.id(), "source.archived");
+        assert_eq!(rule.category(), Category::Source);
+        assert_eq!(rule.severity(), Severity::High);
+        assert_eq!(rule.points(), 10);
+        assert!(rule.remediation().contains("maintained"));
+    }
+
+    #[test]
+    fn recompute_score_sorts_and_updates_totals() {
+        let mut report = ScoreReport {
+            rubric_version: RUBRIC_VERSION,
+            pinprick_version: env!("CARGO_PKG_VERSION"),
+            target: Target {
+                kind: "repo",
+                path: ".".to_string(),
+            },
+            score: 100,
+            grade: "A",
+            totals: Totals {
+                points_deducted: 0,
+                findings: 0,
+                workflows_scanned: 1,
+                unique_actions: 2,
+            },
+            findings: vec![
+                // Intentionally inserted out of order to verify the sort.
+                Finding {
+                    id: "pin.sliding",
+                    category: Category::Pin,
+                    severity: Severity::Medium,
+                    points: 5,
+                    action_ref: Some("actions/checkout@v4".to_string()),
+                    occurrences: vec![],
+                    remediation: "",
+                },
+                Finding {
+                    id: "source.archived",
+                    category: Category::Source,
+                    severity: Severity::High,
+                    points: 10,
+                    action_ref: Some("dead/action@v1".to_string()),
+                    occurrences: vec![],
+                    remediation: "",
+                },
+            ],
+        };
+        recompute_score(&mut report);
+        // 10 deducted before 5; total = 15; score = 85; grade = B.
+        assert_eq!(report.findings[0].id, "source.archived");
+        assert_eq!(report.findings[1].id, "pin.sliding");
+        assert_eq!(report.totals.points_deducted, 15);
+        assert_eq!(report.totals.findings, 2);
+        assert_eq!(report.score, 85);
+        assert_eq!(report.grade, "B");
     }
 
     #[test]

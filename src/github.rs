@@ -58,6 +58,11 @@ struct Tree {
 }
 
 #[derive(Deserialize)]
+struct Repository {
+    archived: bool,
+}
+
+#[derive(Deserialize)]
 pub struct TreeEntry {
     pub path: String,
     #[serde(rename = "type")]
@@ -229,6 +234,22 @@ impl GitHubClient {
 
         let releases: Vec<Release> = resp.json().await.context("parsing releases")?;
         Ok(releases)
+    }
+
+    /// Return `true` if the repo is archived on GitHub.
+    pub async fn is_archived(&self, owner: &str, repo: &str) -> Result<bool> {
+        let url = format!("https://api.github.com/repos/{owner}/{repo}");
+        let resp = self.get(&url).await?;
+
+        if resp.status().as_u16() == 404 {
+            bail!(GitHubError::RepoNotFound {
+                owner: owner.into(),
+                repo: repo.into(),
+            });
+        }
+
+        let repo: Repository = resp.json().await.context("parsing repository metadata")?;
+        Ok(repo.archived)
     }
 
     /// Fetch the file tree for a repo at a given SHA.

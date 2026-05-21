@@ -1,6 +1,6 @@
 # pinprick scoring rubric
 
-**Status:** draft (rubric version `0.3.0`)
+**Status:** draft (rubric version `0.4.0`)
 
 This document defines how pinprick computes a single score for a GitHub repository's Actions supply chain posture. It is the public specification that the `pinprick score` CLI subcommand implements against, and that any downstream tool wrapping the engine (dashboards, CI plugins, reporting pipelines) should implement against so scores stay portable and comparable.
 
@@ -58,12 +58,14 @@ These rules fire against properties of the referenced action itself. Most requir
 
 | ID                    | Condition                                                    | Severity | Points | Status   | Remediation                                      |
 |-----------------------|--------------------------------------------------------------|----------|--------|----------|--------------------------------------------------|
-| `source.archived`     | Referenced repo is archived                                  | high     |   10   | planned  | Migrate to an actively maintained replacement    |
+| `source.archived`     | Referenced repo is archived                                  | high     |   10   | live     | Migrate to an actively maintained replacement    |
 | `source.stale`        | Referenced SHA was committed >365 days ago and no newer tag  | medium   |    5   | planned  | Update to a newer maintained version             |
 | `source.advisory`     | Referenced version has a published GHSA advisory             | high     |   15   | planned  | Update to a patched version                      |
 | `source.unverified`   | Publisher is not in the baseline (`actions`, `github`) or the configured `trusted-owners` list | low | 1 | live | Confirm this publisher is trustworthy; add them to `trusted-owners` in `.pinprick.toml`, or fork the action into your own org and pin to that |
 
 `source.unverified` is configurable. The built-in baseline of trusted publishers is `actions` and `github`. Extend with `trusted-owners = ["my-org", "vendor"]` in `.pinprick.toml`. Case-insensitive, exact owner match.
+
+`source.archived` requires a GitHub token (`GITHUB_TOKEN` env var or `gh auth login`); without one, the offline rules still run. The check fires once per unique `action_ref` whose `owner/repo` is archived on GitHub. A repo lookup failure (network error, 404) is treated as "not archived" so a single bad reference doesn't abort the scan.
 
 ### Runtime-fetch rules (category: `runtime`)
 
@@ -79,7 +81,7 @@ These reuse findings from the existing `pinprick audit` pipeline applied to each
 Notes:
 
 - The audit pipeline already applies the `data format URL` and nearby-checksum adjustments. `runtime.*` scoring uses the post-adjustment severity, so double-counting doesn't happen.
-- v0.3.0 scans `run:` blocks in local workflow files (no GitHub token required). Runtime findings in the source of fetched actions themselves — where `pinprick audit` looks when a token is present — are not yet scored; that integration lands in a later rubric version.
+- Through v0.4.0 the runtime scan is limited to `run:` blocks in local workflow files (no GitHub token required). Runtime findings in the source of fetched actions themselves — where `pinprick audit` looks when a token is present — are not yet scored; that integration lands in a later rubric version.
 - Runtime findings are not deduplicated. Each pattern match emits one finding keyed to its `(workflow, line)` — each is a distinct fix in a distinct place.
 
 ### Workflow-level rules (category: `workflow`)
@@ -100,7 +102,7 @@ The `pull_request_target` and `workflow_run` rules fire on trigger *presence* in
 - `registry.*` — signals from the vetted-mirror layer once it exists (unvetted action used when a vetted equivalent is available).
 - `sbom.*` — SBOM / provenance attestation coverage.
 
-These are deliberately out of scope for v1 to keep the initial rubric defensible. Adding them bumps the rubric to `0.2.0`.
+These are deliberately out of scope for v1 to keep the initial rubric defensible. Adding any new category bumps the rubric minor version.
 
 ## Output
 
