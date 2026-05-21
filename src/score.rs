@@ -408,15 +408,32 @@ async fn enrich_with_source_archived(
         archived_cache.insert(key, archived);
     }
 
+    let new_findings = archived_findings(&action_repo, &archived_cache, &occurrences);
+    if !new_findings.is_empty() {
+        report.findings.extend(new_findings);
+        recompute_score(report);
+    }
+    Ok(())
+}
+
+/// Pure helper: build the `source.archived` findings for any `action_ref`
+/// whose `(owner, repo)` is marked archived. Pulled out of
+/// `enrich_with_source_archived` so the logic is reachable from unit tests
+/// without a live `GitHubClient`.
+fn archived_findings(
+    action_repo: &BTreeMap<String, (String, String)>,
+    archived: &BTreeMap<(String, String), bool>,
+    occurrences: &BTreeMap<String, Vec<Occurrence>>,
+) -> Vec<Finding> {
     let rule = RuleId::SourceArchived;
-    let mut added = false;
-    for (action_ref, owner_repo) in &action_repo {
-        if archived_cache.get(owner_repo) != Some(&true) {
+    let mut out = Vec::new();
+    for (action_ref, owner_repo) in action_repo {
+        if archived.get(owner_repo) != Some(&true) {
             continue;
         }
-        let mut occs = occurrences.remove(action_ref).unwrap_or_default();
+        let mut occs = occurrences.get(action_ref).cloned().unwrap_or_default();
         occs.sort_by(|a, b| a.workflow.cmp(&b.workflow).then(a.line.cmp(&b.line)));
-        report.findings.push(Finding {
+        out.push(Finding {
             id: rule.id(),
             category: rule.category(),
             severity: rule.severity(),
@@ -425,13 +442,8 @@ async fn enrich_with_source_archived(
             occurrences: occs,
             remediation: rule.remediation(),
         });
-        added = true;
     }
-
-    if added {
-        recompute_score(report);
-    }
-    Ok(())
+    out
 }
 
 /// Map an audit finding to the runtime.* rule it corresponds to. Pipe-to-shell
@@ -1081,6 +1093,105 @@ jobs:
         assert_eq!(rule.severity(), Severity::High);
         assert_eq!(rule.points(), 10);
         assert!(rule.remediation().contains("maintained"));
+    }
+
+    #[test]
+    fn archived_findings_skips_non_archived_repos() {
+        let mut action_repo = BTreeMap::new();
+        action_repo.insert(
+            "alive/action@v1".to_string(),
+            ("alive".to_string(), "action".to_string()),
+        );
+        action_repo.insert(
+            "dead/action@v1".to_string(),
+            ("dead".to_string(), "action".to_string()),
+        );
+
+        let mut archived = BTreeMap::new();
+        archived.insert(("alive".to_string(), "action".to_string()), false);
+        archived.insert(("dead".to_string(), "action".to_string()), true);
+
+        let mut occurrences = BTreeMap::new();
+        occurrences.insert(
+            "dead/action@v1".to_string(),
+            vec![Occurrence {
+                workflow: ".github/workflows/ci.yml".to_string(),
+                line: 12,
+            }],
+        );
+
+        let findings = archived_findings(&action_repo, &archived, &occurrences);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].id, "source.archived");
+        assert_eq!(findings[0].action_ref.as_deref(), Some("dead/action@v1"));
+        assert_eq!(findings[0].points, 10);
+        assert_eq!(findings[0].occurrences.len(), 1);
+    }
+
+    #[test]
+    fn archived_findings_sorts_occurrences_by_workflow_then_line() {
+        let mut action_repo = BTreeMap::new();
+        action_repo.insert(
+            "dead/action@v1".to_string(),
+            ("dead".to_string(), "action".to_string()),
+        );
+        let mut archived = BTreeMap::new();
+        archived.insert(("dead".to_string(), "action".to_string()), true);
+
+        // Intentionally inserted out of order — b.yml line 30, a.yml line 20,
+        // a.yml line 10. Expected order: a.yml:10, a.yml:20, b.yml:30.
+        let mut occurrences = BTreeMap::new();
+        occurrences.insert(
+            "dead/action@v1".to_string(),
+            vec![
+                Occurrence {
+                    workflow: ".github/workflows/b.yml".to_string(),
+                    line: 30,
+                },
+                Occurrence {
+                    workflow: ".github/workflows/a.yml".to_string(),
+                    line: 20,
+                },
+                Occurrence {
+                    workflow: ".github/workflows/a.yml".to_string(),
+                    line: 10,
+                },
+            ],
+        );
+
+        let findings = archived_findings(&action_repo, &archived, &occurrences);
+        let occs = &findings[0].occurrences;
+        assert_eq!(occs[0].workflow, ".github/workflows/a.yml");
+        assert_eq!(occs[0].line, 10);
+        assert_eq!(occs[1].workflow, ".github/workflows/a.yml");
+        assert_eq!(occs[1].line, 20);
+        assert_eq!(occs[2].workflow, ".github/workflows/b.yml");
+        assert_eq!(occs[2].line, 30);
+    }
+
+    #[test]
+    fn archived_findings_handles_missing_archived_entry() {
+        // An action_ref whose (owner, repo) isn't in the archived map at all
+        // (e.g., GitHub returned an error and we never cached a result) is
+        // treated as not archived — same behavior as `archived == Some(&false)`.
+        let mut action_repo = BTreeMap::new();
+        action_repo.insert(
+            "mystery/action@v1".to_string(),
+            ("mystery".to_string(), "action".to_string()),
+        );
+        let archived = BTreeMap::new();
+        let occurrences = BTreeMap::new();
+        let findings = archived_findings(&action_repo, &archived, &occurrences);
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn archived_findings_empty_when_nothing_archived() {
+        let action_repo = BTreeMap::new();
+        let archived = BTreeMap::new();
+        let occurrences = BTreeMap::new();
+        let findings = archived_findings(&action_repo, &archived, &occurrences);
+        assert!(findings.is_empty());
     }
 
     #[test]
