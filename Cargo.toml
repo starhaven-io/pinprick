@@ -28,6 +28,7 @@ anyhow = "1"
 thiserror = "2"
 colored = "3"
 toml = "1"
+semver = "1"
 
 [build-dependencies]
 serde = { version = "1", features = ["derive"] }

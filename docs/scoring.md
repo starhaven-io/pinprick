@@ -1,6 +1,6 @@
 # pinprick scoring rubric
 
-**Status:** draft (rubric version `0.4.0`)
+**Status:** draft (rubric version `0.5.0`)
 
 This document defines how pinprick computes a single score for a GitHub repository's Actions supply chain posture. It is the public specification that the `pinprick score` CLI subcommand implements against, and that any downstream tool wrapping the engine (dashboards, CI plugins, reporting pipelines) should implement against so scores stay portable and comparable.
 
@@ -60,12 +60,14 @@ These rules fire against properties of the referenced action itself. Most requir
 |-----------------------|--------------------------------------------------------------|----------|--------|----------|--------------------------------------------------|
 | `source.archived`     | Referenced repo is archived                                  | high     |   10   | live     | Migrate to an actively maintained replacement    |
 | `source.stale`        | Referenced SHA was committed >365 days ago and no newer tag  | medium   |    5   | planned  | Update to a newer maintained version             |
-| `source.advisory`     | Referenced version has a published GHSA advisory             | high     |   15   | planned  | Update to a patched version                      |
+| `source.advisory`     | Referenced version has a published GHSA advisory             | high     |   15   | live     | Update past the vulnerable version range; see the referenced GHSA |
 | `source.unverified`   | Publisher is not in the baseline (`actions`, `github`) or the configured `trusted-owners` list | low | 1 | live | Confirm this publisher is trustworthy; add them to `trusted-owners` in `.pinprick.toml`, or fork the action into your own org and pin to that |
 
 `source.unverified` is configurable. The built-in baseline of trusted publishers is `actions` and `github`. Extend with `trusted-owners = ["my-org", "vendor"]` in `.pinprick.toml`. Case-insensitive, exact owner match.
 
 `source.archived` requires a GitHub token (`GITHUB_TOKEN` env var or `gh auth login`); without one, the offline rules still run. The check fires once per unique `action_ref` whose `owner/repo` is archived on GitHub. A repo lookup failure (network error, 404) is treated as "not archived" so a single bad reference doesn't abort the scan.
+
+`source.advisory` also requires a token. For each tag-pinned action, the tag is matched against the `vulnerable_version_range` of every published GHSA advisory for the repo. SHA-pinned actions are resolved to a tag via the GitHub tags endpoint (first page only — pinned actions are virtually always on a recent release); when no tag pointing at the SHA is found, the action is silently skipped rather than guessed at. Sliding-tag (`@v4`) and branch refs are not version-precise, so they trigger `pin.sliding` / `pin.branch` but no advisory matching. Each (action, advisory) match emits its own finding with the GHSA id, severity, the matched range, any patched-version hint, and the advisory URL carried in the finding's `details` field.
 
 ### Runtime-fetch rules (category: `runtime`)
 
@@ -81,7 +83,7 @@ These reuse findings from the existing `pinprick audit` pipeline applied to each
 Notes:
 
 - The audit pipeline already applies the `data format URL` and nearby-checksum adjustments. `runtime.*` scoring uses the post-adjustment severity, so double-counting doesn't happen.
-- Through v0.4.0 the runtime scan is limited to `run:` blocks in local workflow files (no GitHub token required). Runtime findings in the source of fetched actions themselves — where `pinprick audit` looks when a token is present — are not yet scored; that integration lands in a later rubric version.
+- Through v0.5.0 the runtime scan is limited to `run:` blocks in local workflow files (no GitHub token required). Runtime findings in the source of fetched actions themselves — where `pinprick audit` looks when a token is present — are not yet scored; that integration lands in a later rubric version.
 - Runtime findings are not deduplicated. Each pattern match emits one finding keyed to its `(workflow, line)` — each is a distinct fix in a distinct place.
 
 ### Workflow-level rules (category: `workflow`)

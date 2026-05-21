@@ -957,6 +957,7 @@ dependencies = [
  "predicates",
  "regex",
  "reqwest",
+ "semver",
  "serde",
  "serde_json",
  "serde_norway",

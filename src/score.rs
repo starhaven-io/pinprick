@@ -15,11 +15,11 @@ use std::process::ExitCode;
 use crate::audit::{self, AuditCollector};
 use crate::auth;
 use crate::config::Config;
-use crate::github::GitHubClient;
+use crate::github::{GitHubClient, SecurityAdvisory};
 use crate::output::AuditFinding;
 use crate::workflow::{self, ActionRef, RefType};
 
-pub const RUBRIC_VERSION: &str = "0.4.0";
+pub const RUBRIC_VERSION: &str = "0.5.0";
 
 // ── Rule catalog ────────────────────────────────────────────────────────────
 
@@ -45,6 +45,7 @@ pub enum RuleId {
     PinBranch,
     PinSliding,
     PinFullTag,
+    SourceAdvisory,
     SourceArchived,
     SourceUnverified,
     RuntimePipeToShell,
@@ -62,6 +63,7 @@ impl RuleId {
             Self::PinBranch => "pin.branch",
             Self::PinSliding => "pin.sliding",
             Self::PinFullTag => "pin.full_tag",
+            Self::SourceAdvisory => "source.advisory",
             Self::SourceArchived => "source.archived",
             Self::SourceUnverified => "source.unverified",
             Self::RuntimePipeToShell => "runtime.pipe_to_shell",
@@ -77,7 +79,9 @@ impl RuleId {
     pub fn category(self) -> Category {
         match self {
             Self::PinBranch | Self::PinSliding | Self::PinFullTag => Category::Pin,
-            Self::SourceArchived | Self::SourceUnverified => Category::Source,
+            Self::SourceAdvisory | Self::SourceArchived | Self::SourceUnverified => {
+                Category::Source
+            }
             Self::RuntimePipeToShell
             | Self::RuntimeFetchHigh
             | Self::RuntimeFetchMedium
@@ -91,6 +95,7 @@ impl RuleId {
     pub fn severity(self) -> Severity {
         match self {
             Self::PinBranch
+            | Self::SourceAdvisory
             | Self::SourceArchived
             | Self::RuntimePipeToShell
             | Self::RuntimeFetchHigh
@@ -106,7 +111,7 @@ impl RuleId {
     pub fn points(self) -> u32 {
         match self {
             Self::RuntimePipeToShell => 20,
-            Self::PinBranch | Self::RuntimeFetchHigh => 15,
+            Self::PinBranch | Self::SourceAdvisory | Self::RuntimeFetchHigh => 15,
             Self::SourceArchived | Self::WorkflowPermissionsWriteAll => 10,
             Self::RuntimeFetchMedium => 8,
             Self::PinSliding | Self::WorkflowPullRequestTarget => 5,
@@ -120,6 +125,9 @@ impl RuleId {
         match self {
             Self::PinBranch | Self::PinSliding | Self::PinFullTag => {
                 "Pin to a full 40-char SHA; keep the tag as a comment"
+            }
+            Self::SourceAdvisory => {
+                "Update past the vulnerable version range; see the referenced GHSA"
             }
             Self::SourceArchived => "Migrate to an actively maintained replacement",
             Self::SourceUnverified => {
@@ -164,6 +172,11 @@ pub struct Finding {
     pub action_ref: Option<String>,
     pub occurrences: Vec<Occurrence>,
     pub remediation: &'static str,
+    /// Optional per-finding context (e.g., the GHSA id and URL behind a
+    /// `source.advisory` finding). Static rule metadata stays in the rule
+    /// id / remediation; this field carries the bits that vary per match.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -285,6 +298,7 @@ pub fn score_repo(repo_root: &Path, config: &Config) -> Result<ScoreReport> {
                         line: finding.line.unwrap_or(0),
                     }],
                     remediation: rule.remediation(),
+                    details: None,
                 });
             }
         }
@@ -302,6 +316,7 @@ pub fn score_repo(repo_root: &Path, config: &Config) -> Result<ScoreReport> {
             action_ref: Some(action_ref),
             occurrences,
             remediation: rule.remediation(),
+            details: None,
         });
     }
 
@@ -314,6 +329,7 @@ pub fn score_repo(repo_root: &Path, config: &Config) -> Result<ScoreReport> {
             action_ref: None,
             occurrences,
             remediation: rule.remediation(),
+            details: None,
         });
     }
 
@@ -441,9 +457,203 @@ fn archived_findings(
             action_ref: Some(action_ref.clone()),
             occurrences: occs,
             remediation: rule.remediation(),
+            details: None,
         });
     }
     out
+}
+
+/// Fire `source.advisory` findings for any pinned action whose resolved
+/// version falls inside the vulnerable range of a published repo advisory.
+///
+/// Tag-pinned and SHA-pinned actions are both eligible. SHAs are resolved
+/// to a tag via the GitHub tags endpoint; if no matching tag exists in the
+/// first page (100), the action is silently skipped — the alternative
+/// would be either over-flagging or making this rule O(repo) per scan,
+/// and neither is justifiable for an MVP.
+///
+/// Sliding-tag refs (`@v4`) and branch refs are not version-precise, so
+/// no advisory matching is attempted — those refs already trigger
+/// `pin.sliding` / `pin.branch`.
+async fn enrich_with_source_advisory(
+    report: &mut ScoreReport,
+    repo_root: &Path,
+    client: &GitHubClient,
+) -> Result<()> {
+    let files = workflow::find_workflows(repo_root)?;
+
+    let mut occurrences: BTreeMap<String, Vec<Occurrence>> = BTreeMap::new();
+    // action_ref -> (owner, repo, ref_string, ref_type)
+    let mut action_pins: BTreeMap<String, (String, String, String, RefType)> = BTreeMap::new();
+
+    for file in &files {
+        let display = workflow::display_path(file, repo_root);
+        let content = std::fs::read_to_string(file)
+            .map_err(|e| anyhow::anyhow!("reading {}: {e}", file.display()))?;
+        for a in workflow::scan_content(&content) {
+            let action_ref = format!("{}@{}", a.full_name(), a.ref_string);
+            action_pins.entry(action_ref.clone()).or_insert((
+                a.owner.clone(),
+                a.repo.clone(),
+                a.ref_string.clone(),
+                a.ref_type.clone(),
+            ));
+            occurrences.entry(action_ref).or_default().push(Occurrence {
+                workflow: display.clone(),
+                line: a.line_number,
+            });
+        }
+    }
+
+    // Resolve each pin to a concrete tag string. SHAs cost one tag lookup
+    // per unique (owner, repo, sha); tags resolve trivially to themselves.
+    let mut action_resolved: BTreeMap<String, (String, String, String)> = BTreeMap::new();
+    let mut sha_tag_cache: BTreeMap<(String, String, String), Option<String>> = BTreeMap::new();
+    for (action_ref, (owner, repo, ref_string, ref_type)) in &action_pins {
+        let resolved = match ref_type {
+            RefType::Sha => {
+                let key = (owner.clone(), repo.clone(), ref_string.clone());
+                if let Some(cached) = sha_tag_cache.get(&key) {
+                    cached.clone()
+                } else {
+                    let tag = client
+                        .sha_to_tag(owner, repo, ref_string)
+                        .await
+                        .ok()
+                        .flatten();
+                    sha_tag_cache.insert(key, tag.clone());
+                    tag
+                }
+            }
+            RefType::Tag => Some(ref_string.clone()),
+            RefType::SlidingTag | RefType::Branch => None,
+        };
+        if let Some(tag) = resolved {
+            action_resolved.insert(action_ref.clone(), (owner.clone(), repo.clone(), tag));
+        }
+    }
+
+    // Pull advisories once per (owner, repo) that has at least one resolved pin.
+    let mut advisories: BTreeMap<(String, String), Vec<SecurityAdvisory>> = BTreeMap::new();
+    for (owner, repo, _) in action_resolved.values() {
+        let key = (owner.clone(), repo.clone());
+        if advisories.contains_key(&key) {
+            continue;
+        }
+        let advs = client
+            .list_security_advisories(owner, repo)
+            .await
+            .unwrap_or_default();
+        advisories.insert(key, advs);
+    }
+
+    let new_findings = advisory_findings(&action_resolved, &advisories, &occurrences);
+    if !new_findings.is_empty() {
+        report.findings.extend(new_findings);
+        recompute_score(report);
+    }
+    Ok(())
+}
+
+/// Pure helper: emit `source.advisory` findings for any action whose
+/// resolved tag falls inside one of the vulnerable version ranges of a
+/// repo advisory. Extracted from `enrich_with_source_advisory` so the
+/// version-matching logic can be unit-tested against fixture data.
+fn advisory_findings(
+    action_resolved: &BTreeMap<String, (String, String, String)>,
+    advisories: &BTreeMap<(String, String), Vec<SecurityAdvisory>>,
+    occurrences: &BTreeMap<String, Vec<Occurrence>>,
+) -> Vec<Finding> {
+    let rule = RuleId::SourceAdvisory;
+    let mut out = Vec::new();
+    for (action_ref, (owner, repo, tag)) in action_resolved {
+        let Some(repo_advs) = advisories.get(&(owner.clone(), repo.clone())) else {
+            continue;
+        };
+        for adv in repo_advs {
+            let Some((matched_range, patched)) = adv.vulnerabilities.iter().find_map(|v| {
+                let range = v.vulnerable_version_range.as_deref()?;
+                if version_in_range(tag, range).unwrap_or(false) {
+                    Some((range.to_string(), v.patched_versions.clone()))
+                } else {
+                    None
+                }
+            }) else {
+                continue;
+            };
+            let mut occs = occurrences.get(action_ref).cloned().unwrap_or_default();
+            occs.sort_by(|a, b| a.workflow.cmp(&b.workflow).then(a.line.cmp(&b.line)));
+            out.push(Finding {
+                id: rule.id(),
+                category: rule.category(),
+                severity: rule.severity(),
+                points: rule.points(),
+                action_ref: Some(action_ref.clone()),
+                occurrences: occs,
+                remediation: rule.remediation(),
+                details: Some(format_advisory_details(
+                    adv,
+                    &matched_range,
+                    patched.as_deref(),
+                )),
+            });
+        }
+    }
+    out
+}
+
+/// Build the per-finding `details` blob for a `source.advisory` match.
+/// Includes severity, the vulnerable range we matched against, any
+/// `patched_versions` hint, the summary (truncated), and a link to the
+/// advisory.
+fn format_advisory_details(
+    adv: &SecurityAdvisory,
+    matched_range: &str,
+    patched: Option<&str>,
+) -> String {
+    let mut parts = vec![format!("{} ({})", adv.ghsa_id, adv.severity)];
+    parts.push(format!("vulnerable: {matched_range}"));
+    if let Some(p) = patched.filter(|s| !s.is_empty()) {
+        parts.push(format!("patched: {p}"));
+    }
+    let summary = adv.summary.trim();
+    if !summary.is_empty() {
+        let truncated: String = if summary.chars().count() > 120 {
+            let mut s: String = summary.chars().take(117).collect();
+            s.push_str("...");
+            s
+        } else {
+            summary.to_string()
+        };
+        parts.push(truncated);
+    }
+    parts.push(adv.html_url.clone());
+    parts.join(" — ")
+}
+
+/// Decide whether `version` falls inside `range`, after normalizing the
+/// `v` prefix that GitHub Actions tags and advisory ranges often carry.
+/// Returns `None` if either string can't be parsed as semver — callers
+/// treat that as "no match" rather than aborting the scan.
+fn version_in_range(version: &str, range: &str) -> Option<bool> {
+    let v = strip_v_prefix(version);
+    let r = normalize_range_string(range);
+    let ver = semver::Version::parse(v).ok()?;
+    let req = semver::VersionReq::parse(&r).ok()?;
+    Some(req.matches(&ver))
+}
+
+fn strip_v_prefix(s: &str) -> &str {
+    s.strip_prefix('v').unwrap_or(s)
+}
+
+/// Strip the `v` prefix from any version literal inside a semver range
+/// string. GitHub advisories return ranges like `< v40.2.3` or
+/// `>= v1.0.0, < v2.0.0`; the `semver` crate doesn't accept the prefix.
+fn normalize_range_string(s: &str) -> String {
+    static V_PREFIX_RE: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"(^|[\s,<>=!^~])v(\d)").unwrap());
+    V_PREFIX_RE.replace_all(s, "$1$2").to_string()
 }
 
 /// Map an audit finding to the runtime.* rule it corresponds to. Pipe-to-shell
@@ -538,6 +748,7 @@ pub async fn run(repo_root: &Path, json: bool, html: bool) -> Result<ExitCode> {
     if let Some(token) = auth::resolve_token().await {
         let client = GitHubClient::new(token);
         enrich_with_source_archived(&mut report, repo_root, &client).await?;
+        enrich_with_source_advisory(&mut report, repo_root, &client).await?;
     }
 
     if json {
@@ -924,6 +1135,7 @@ jobs:
             RuleId::PinBranch,
             RuleId::PinSliding,
             RuleId::PinFullTag,
+            RuleId::SourceAdvisory,
             RuleId::SourceArchived,
             RuleId::SourceUnverified,
             RuleId::RuntimePipeToShell,
@@ -1082,6 +1294,195 @@ jobs:
         assert!(report.findings.is_empty());
     }
 
+    fn make_adv(
+        ghsa: &str,
+        severity: &str,
+        range: &str,
+        patched: Option<&str>,
+        summary: &str,
+    ) -> SecurityAdvisory {
+        SecurityAdvisory {
+            ghsa_id: ghsa.to_string(),
+            html_url: format!("https://github.com/owner/repo/security/advisories/{ghsa}"),
+            severity: severity.to_string(),
+            summary: summary.to_string(),
+            vulnerabilities: vec![crate::github::AdvisoryVulnerability {
+                vulnerable_version_range: Some(range.to_string()),
+                patched_versions: patched.map(|s| s.to_string()),
+            }],
+        }
+    }
+
+    #[test]
+    fn version_in_range_handles_v_prefix() {
+        // Tag pinned `v40.2.0`, advisory range `< v40.2.3` → vulnerable.
+        assert_eq!(version_in_range("v40.2.0", "< v40.2.3"), Some(true));
+        // Tag pinned `v45.0.7`, advisory range `<= 45.0.7` → still vulnerable.
+        assert_eq!(version_in_range("v45.0.7", "<= 45.0.7"), Some(true));
+        // Patched: tag `v45.0.8`, range `<= 45.0.7` → not vulnerable.
+        assert_eq!(version_in_range("v45.0.8", "<= 45.0.7"), Some(false));
+    }
+
+    #[test]
+    fn version_in_range_handles_compound_range() {
+        assert_eq!(version_in_range("1.5.0", ">= 1.0.0, < 2.0.0"), Some(true));
+        assert_eq!(version_in_range("2.0.0", ">= 1.0.0, < 2.0.0"), Some(false));
+        assert_eq!(version_in_range("0.9.9", ">= 1.0.0, < 2.0.0"), Some(false));
+    }
+
+    #[test]
+    fn version_in_range_unparsable_returns_none() {
+        // Sliding tag like `v4` — not full semver. Don't crash, don't match.
+        assert_eq!(version_in_range("v4", "< 4.2.3"), None);
+        // Garbage in the range string.
+        assert_eq!(version_in_range("1.2.3", "not a range"), None);
+    }
+
+    #[test]
+    fn normalize_range_string_strips_v_prefix_only_on_version_literals() {
+        assert_eq!(normalize_range_string("< v40.2.3"), "< 40.2.3");
+        assert_eq!(
+            normalize_range_string(">= v1.0.0, < v2.0.0"),
+            ">= 1.0.0, < 2.0.0"
+        );
+        // Leading `v` at start of string also stripped.
+        assert_eq!(normalize_range_string("v1.2.3"), "1.2.3");
+        // No-op on already-clean ranges.
+        assert_eq!(normalize_range_string("<= 45.0.7"), "<= 45.0.7");
+    }
+
+    #[test]
+    fn advisory_findings_emits_per_match_with_details() {
+        let mut action_resolved = BTreeMap::new();
+        action_resolved.insert(
+            "owner/repo@SHA".to_string(),
+            (
+                "owner".to_string(),
+                "repo".to_string(),
+                "v1.5.0".to_string(),
+            ),
+        );
+        let mut advisories = BTreeMap::new();
+        advisories.insert(
+            ("owner".to_string(), "repo".to_string()),
+            vec![make_adv(
+                "GHSA-xxxx-yyyy-zzzz",
+                "high",
+                "< 2.0.0",
+                Some(">= 2.0.0"),
+                "Auth bypass in owner/repo",
+            )],
+        );
+        let mut occurrences = BTreeMap::new();
+        occurrences.insert(
+            "owner/repo@SHA".to_string(),
+            vec![Occurrence {
+                workflow: ".github/workflows/ci.yml".to_string(),
+                line: 7,
+            }],
+        );
+
+        let findings = advisory_findings(&action_resolved, &advisories, &occurrences);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].id, "source.advisory");
+        assert_eq!(findings[0].points, 15);
+        let details = findings[0].details.as_deref().unwrap();
+        assert!(details.contains("GHSA-xxxx-yyyy-zzzz"));
+        assert!(details.contains("vulnerable: < 2.0.0"));
+        assert!(details.contains("patched: >= 2.0.0"));
+        assert!(details.contains("Auth bypass"));
+        assert!(details.contains("https://github.com/owner/repo/security/advisories/"));
+    }
+
+    #[test]
+    fn advisory_findings_skips_non_matching_versions() {
+        let mut action_resolved = BTreeMap::new();
+        action_resolved.insert(
+            "owner/repo@SHA".to_string(),
+            (
+                "owner".to_string(),
+                "repo".to_string(),
+                "v3.0.0".to_string(),
+            ),
+        );
+        let mut advisories = BTreeMap::new();
+        advisories.insert(
+            ("owner".to_string(), "repo".to_string()),
+            vec![make_adv("GHSA-aaaa", "high", "< 2.0.0", None, "old bug")],
+        );
+        let occurrences = BTreeMap::new();
+        let findings = advisory_findings(&action_resolved, &advisories, &occurrences);
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn advisory_findings_emits_one_per_advisory_when_multiple_match() {
+        // Two advisories both cover this version → two findings.
+        let mut action_resolved = BTreeMap::new();
+        action_resolved.insert(
+            "owner/repo@SHA".to_string(),
+            (
+                "owner".to_string(),
+                "repo".to_string(),
+                "v1.0.0".to_string(),
+            ),
+        );
+        let mut advisories = BTreeMap::new();
+        advisories.insert(
+            ("owner".to_string(), "repo".to_string()),
+            vec![
+                make_adv("GHSA-aaaa", "high", "<= 1.0.0", None, "first"),
+                make_adv("GHSA-bbbb", "high", "< 2.0.0", None, "second"),
+            ],
+        );
+        let occurrences = BTreeMap::new();
+        let findings = advisory_findings(&action_resolved, &advisories, &occurrences);
+        assert_eq!(findings.len(), 2);
+        let ghsa_ids: Vec<&str> = findings
+            .iter()
+            .map(|f| f.details.as_deref().unwrap())
+            .collect();
+        assert!(ghsa_ids.iter().any(|d| d.contains("GHSA-aaaa")));
+        assert!(ghsa_ids.iter().any(|d| d.contains("GHSA-bbbb")));
+    }
+
+    #[test]
+    fn advisory_findings_skips_repo_with_no_advisories() {
+        let mut action_resolved = BTreeMap::new();
+        action_resolved.insert(
+            "owner/repo@SHA".to_string(),
+            (
+                "owner".to_string(),
+                "repo".to_string(),
+                "v1.0.0".to_string(),
+            ),
+        );
+        let advisories = BTreeMap::new();
+        let occurrences = BTreeMap::new();
+        let findings = advisory_findings(&action_resolved, &advisories, &occurrences);
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn format_advisory_details_truncates_long_summary() {
+        let long = "x".repeat(500);
+        let adv = make_adv("GHSA-cccc", "high", "< 1.0.0", None, &long);
+        let details = format_advisory_details(&adv, "< 1.0.0", None);
+        // 117 chars + ellipsis, not the full 500.
+        assert!(details.contains("..."));
+        assert!(!details.contains(&"x".repeat(500)));
+    }
+
+    #[test]
+    fn source_advisory_rule_metadata() {
+        let rule = RuleId::SourceAdvisory;
+        assert_eq!(rule.id(), "source.advisory");
+        assert_eq!(rule.category(), Category::Source);
+        assert_eq!(rule.severity(), Severity::High);
+        assert_eq!(rule.points(), 15);
+        assert!(rule.remediation().contains("vulnerable"));
+    }
+
     #[test]
     fn source_archived_rule_metadata() {
         // The rubric in docs/scoring.md is the contract: high, 10 points,
@@ -1221,6 +1622,7 @@ jobs:
                     action_ref: Some("actions/checkout@v4".to_string()),
                     occurrences: vec![],
                     remediation: "",
+                    details: None,
                 },
                 Finding {
                     id: "source.archived",
@@ -1230,6 +1632,7 @@ jobs:
                     action_ref: Some("dead/action@v1".to_string()),
                     occurrences: vec![],
                     remediation: "",
+                    details: None,
                 },
             ],
         };
@@ -1314,6 +1717,7 @@ jobs:
                     },
                 ],
                 remediation: "Pin to a full 40-char SHA; keep the tag as a comment",
+                details: None,
             }],
         };
         let html = render_html(&report);
@@ -1358,6 +1762,7 @@ jobs:
                     line: 1,
                 }],
                 remediation: "fix it",
+                details: None,
             }],
         };
         let html = render_html(&report);
@@ -1418,6 +1823,7 @@ jobs:
                         line: 10,
                     }],
                     remediation: "Pin to SHA",
+                    details: None,
                 },
                 Finding {
                     id: "pin.sliding",
@@ -1430,6 +1836,7 @@ jobs:
                         line: 12,
                     }],
                     remediation: "Pin to SHA",
+                    details: None,
                 },
                 Finding {
                     id: "workflow.permissions_write_all",
@@ -1442,6 +1849,7 @@ jobs:
                         line: 0,
                     }],
                     remediation: "Declare minimal permissions",
+                    details: None,
                 },
             ],
         };
