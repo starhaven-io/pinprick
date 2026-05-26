@@ -20,7 +20,10 @@ pinprick scans line by line. Each rule is an anchored regex, compiled once at st
 - **Trusted hosts exemption.** Unversioned-URL rules are downgraded to allowed matches when the URL host matches an entry in the user's [`trusted-hosts`](#trusted-hosts-exemption) list.
 - **Data-format exemption.** If a fetch targets a URL whose path ends in a known data-format extension (`.json`, `.yaml`, `.toml`, etc.), it is treated as a data fetch, not a code fetch, and downgraded to an allowed match instead of a finding. See [Data-format exemption](#data-format-exemption).
 - **Checksum downgrade.** A non-pipe finding followed within 3 lines by `sha256sum`, `shasum`, `openssl dgst`, `gpg --verify`, or `Get-FileHash` is downgraded one severity level (high → medium → low). The fetch is still reported.
-- **Pipe-to-shell is never downgraded.** A piped payload is never written to disk, so no checksum command can verify it.
+
+:::caution[Pipe-to-shell is never downgraded]
+A piped payload is never written to disk, so no checksum command can verify it. Trusted-host and data-format exemptions also do not apply — the risk is the execution model, not the source.
+:::
 
 ## Pipe-to-shell
 
@@ -184,7 +187,8 @@ git clone --depth 1 --branch v1.2.3 https://github.com/org/repo
 
 A bare `git clone` defaults to HEAD of the default branch, which is mutable. Pinning to a version tag via `--branch` makes the clone deterministic (at least to the tag level).
 
-**SHA checkout suppression:** if `git checkout <40-character-SHA>` appears within 3 lines after an unpinned `git clone`, the finding is fully suppressed (recorded as an allowed match visible under `--verbose`). The SHA checkout deterministically pins the repository content.
+:::tip[SHA checkout suppression]
+If `git checkout <40-character-SHA>` appears within 3 lines after an unpinned `git clone`, the finding is fully suppressed (recorded as an allowed match visible under `--verbose`). The SHA checkout deterministically pins the repository content.
 
 ```bash
 # This produces zero findings:
@@ -192,6 +196,8 @@ git clone https://github.com/org/repo
 cd repo
 git checkout abcdef1234567890abcdef1234567890abcdef12
 ```
+
+:::
 
 Also flagged in Dockerfile `RUN` instructions under the `pinprick/docker_unpinned` rule.
 
@@ -562,7 +568,11 @@ Rationale: a workflow fetching JSON for `jq` or YAML for parsing is a different 
 | Tabular  | `.csv`, `.tsv`, `.xml`       |
 | Text     | `.txt`, `.md`, `.rst`        |
 
-Matching is case-insensitive. Query strings (`?foo=bar`) and fragments (`#section`) are stripped before the extension check. `.html` and `.svg` are intentionally excluded — both can carry embedded scripts.
+Matching is case-insensitive. Query strings (`?foo=bar`) and fragments (`#section`) are stripped before the extension check.
+
+:::caution[`.html` and `.svg` are not data formats]
+Both can carry embedded scripts (`<script>` in HTML, `<script>` and event handlers in SVG), so an unversioned fetch ending in `.html` or `.svg` is still flagged. This is intentional — treating them as data would defeat the rule.
+:::
 
 The exemption applies only to the _unversioned-URL_ rules. `/latest/` URLs, pipe-to-shell, and `gh release download` without a tag still fire regardless of extension, because the risk there is about the _path_ being mutable, not about what the bytes decode to.
 
@@ -594,7 +604,9 @@ There are two distinct outcomes to be aware of:
 - **Allowed match** — the rule still matched, but the finding is recorded as allowed instead of emitted. Visible under `--verbose` with a reason, so a reviewer auditing the audit can still see what fired. Used by [`trusted-hosts`](#trusted-hosts), [`extra-data-formats`](#extra-data-formats), the [versioned-URL heuristic](#versioned-url-heuristic), the [data-format exemption](#data-format-exemption), and the [audited-actions list](/commands/audit#audited-actions-list).
 - **Removed finding** — the finding is dropped from the report entirely and is not visible under `--verbose`. Used by [`ignore.patterns`](#ignorepatterns), [`ignore.actions`](#ignoreactions), and [`severity`](#severity-threshold).
 
-Prefer _allowed match_ mechanisms when you can — they preserve the audit trail.
+:::tip[Prefer allowed matches over removed findings]
+Allowlist mechanisms (`trusted-hosts`, `extra-data-formats`) keep a record under `--verbose` of what fired and why. Removal mechanisms (`ignore.patterns`, `ignore.actions`, `severity`) drop the finding entirely. Reach for the audit-trail-preserving option whenever it fits.
+:::
 
 ### `trusted-hosts`
 

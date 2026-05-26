@@ -22,15 +22,13 @@ export default defineConfig({
       __PINPRICK_VERSION__: JSON.stringify(pinprickVersion),
     },
   },
-  redirects: {
-    '/': '/getting-started/introduction/',
-  },
   integrations: [
     starlight({
       title: 'pinprick',
       description: 'GitHub Actions supply chain security.',
       favicon: '/favicon.svg',
       customCss: ['./src/styles/custom.css'],
+      lastUpdated: true,
       components: {
         SocialIcons: './src/components/SocialIcons.astro',
         ThemeSelect: './src/components/ThemeSelect.astro',
@@ -58,7 +56,9 @@ export default defineConfig({
           items: [
             { label: 'audit', slug: 'commands/audit' },
             { label: 'clean', slug: 'commands/clean' },
+            { label: 'completions', slug: 'commands/completions' },
             { label: 'pin', slug: 'commands/pin' },
+            { label: 'score', slug: 'commands/score' },
             { label: 'update', slug: 'commands/update' },
           ],
         },
