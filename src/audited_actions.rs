@@ -118,16 +118,10 @@ impl AuditedActions {
 
         entries.push(serde_json::json!({ "sha": sha, "tag": tag }));
 
-        if std::fs::create_dir_all(&dir).is_ok() {
-            let lines: Vec<String> = entries
-                .iter()
-                .map(|e| {
-                    let sha = e["sha"].as_str().unwrap_or_default();
-                    let tag = e["tag"].as_str().unwrap_or_default();
-                    format!("  {{ \"sha\": \"{sha}\", \"tag\": \"{tag}\" }}")
-                })
-                .collect();
-            let _ = std::fs::write(&path, format!("[\n{}\n]\n", lines.join(",\n")));
+        if std::fs::create_dir_all(&dir).is_ok()
+            && let Some(json) = render_entries(&entries)
+        {
+            let _ = std::fs::write(&path, json);
         }
     }
 
@@ -173,7 +167,52 @@ fn parse_entries(json: &str) -> HashSet<String> {
     entries.into_iter().map(|e| e.sha).collect()
 }
 
+/// Serialize cache entries to their on-disk JSON form. Going through serde
+/// (rather than hand-formatting strings) guarantees valid output even when a
+/// `tag` contains quotes or backslashes — tags come from arbitrary `# comment`
+/// text on a `uses:` line, so they can't be assumed escape-safe.
+fn render_entries(entries: &[serde_json::Value]) -> Option<String> {
+    serde_json::to_string_pretty(entries)
+        .ok()
+        .map(|s| format!("{s}\n"))
+}
+
 pub fn cache_dir() -> Option<PathBuf> {
     let home = std::env::var("HOME").ok()?;
     Some(PathBuf::from(home).join(".cache/pinprick/audited"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn render_entries_round_trips() {
+        let entries = vec![
+            serde_json::json!({ "sha": "aaa", "tag": "v1" }),
+            serde_json::json!({ "sha": "bbb", "tag": "v2" }),
+        ];
+        let rendered = render_entries(&entries).unwrap();
+        assert!(rendered.ends_with('\n'));
+        let shas = parse_entries(&rendered);
+        assert!(shas.contains("aaa"));
+        assert!(shas.contains("bbb"));
+    }
+
+    #[test]
+    fn render_entries_escapes_adversarial_tag() {
+        // A tag with quotes and a backslash would corrupt hand-formatted JSON.
+        // serde escapes it, so the file stays valid and round-trips.
+        let entries = vec![serde_json::json!({
+            "sha": "abc123",
+            "tag": r#"v1 "stable" \ release"#,
+        })];
+        let rendered = render_entries(&entries).unwrap();
+        let parsed: Vec<serde_json::Value> =
+            serde_json::from_str(&rendered).expect("rendered cache must be valid JSON");
+        assert_eq!(parsed[0]["sha"], "abc123");
+        assert_eq!(parsed[0]["tag"], r#"v1 "stable" \ release"#);
+        // The reader still recovers the sha.
+        assert!(parse_entries(&rendered).contains("abc123"));
+    }
 }
