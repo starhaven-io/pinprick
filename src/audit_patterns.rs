@@ -527,12 +527,10 @@ pub fn ps_install_has_required_version(line: &str) -> bool {
     PS_VERSION.is_match(line)
 }
 
-/// Check if a `pip install git+https://...` line is pinned to an immutable
-/// ref. A full 40-char commit SHA or a version-like tag (`@v1.2.3`) counts as
-/// pinned; a branch ref (`@main`, `@develop`) does not — it tracks the branch
-/// HEAD, which is exactly the risk this rule flags. The greedy `\S+` anchors
-/// the capture at the *last* `@`, so a `user@host` userinfo prefix doesn't
-/// steal the ref. A `#egg=` fragment or trailing flag terminates the ref.
+/// Whether a `pip install git+https://…` line is pinned to an immutable ref: a
+/// full 40-char SHA or a version-like tag (`@v1.2.3`). A branch ref (`@main`) is
+/// not — it tracks HEAD, the risk this rule flags. The greedy `\S+` anchors on
+/// the last `@`, so a `user@host` prefix isn't mistaken for the ref.
 pub fn pip_git_url_has_ref(line: &str) -> bool {
     static GIT_URL_REF: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"\bgit\+https?://\S+@([^@#\s]+)").unwrap());
