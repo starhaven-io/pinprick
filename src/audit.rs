@@ -2000,4 +2000,21 @@ runs:
         );
         assert!(c.findings.is_empty());
     }
+
+    #[test]
+    fn shell_scan_pip_git_url_branch_ref_is_finding() {
+        // `@main` tracks the branch HEAD — not a pin, so it must still fire.
+        let mut c = AuditCollector::new(false);
+        scan_shell_content(
+            "pip install git+https://github.com/owner/repo.git@main",
+            "test.sh",
+            1,
+            "",
+            &mut c,
+            &DEFAULT_CONFIG,
+        );
+        assert_eq!(c.findings.len(), 1);
+        assert_eq!(c.findings[0].severity, "medium");
+        assert!(c.findings[0].description.contains("git+URL"));
+    }
 }

@@ -527,11 +527,25 @@ pub fn ps_install_has_required_version(line: &str) -> bool {
     PS_VERSION.is_match(line)
 }
 
-/// Check if a `pip install git+https://...` line has a ref (`@<ref>`) on the git URL.
+/// Check if a `pip install git+https://...` line is pinned to an immutable
+/// ref. A full 40-char commit SHA or a version-like tag (`@v1.2.3`) counts as
+/// pinned; a branch ref (`@main`, `@develop`) does not — it tracks the branch
+/// HEAD, which is exactly the risk this rule flags. The greedy `\S+` anchors
+/// the capture at the *last* `@`, so a `user@host` userinfo prefix doesn't
+/// steal the ref. A `#egg=` fragment or trailing flag terminates the ref.
 pub fn pip_git_url_has_ref(line: &str) -> bool {
     static GIT_URL_REF: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"\bgit\+https?://\S+@\S+").unwrap());
-    GIT_URL_REF.is_match(line)
+        LazyLock::new(|| Regex::new(r"\bgit\+https?://\S+@([^@#\s]+)").unwrap());
+    let Some(caps) = GIT_URL_REF.captures(line) else {
+        return false;
+    };
+    let git_ref = &caps[1];
+    is_full_sha(git_ref) || ref_looks_versioned(git_ref)
+}
+
+/// True if `s` is a full 40-character hex commit SHA.
+fn is_full_sha(s: &str) -> bool {
+    s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 pub fn category_str(c: &Category) -> &'static str {
@@ -1484,15 +1498,35 @@ mod tests {
     }
 
     #[test]
-    fn pip_install_git_url_with_ref_helper() {
+    fn pip_install_git_url_versioned_or_sha_is_pinned() {
+        // Version-like tag and a full 40-char SHA are immutable pins.
         assert!(pip_git_url_has_ref(
             "pip install git+https://github.com/owner/repo.git@v1.2.3"
         ));
         assert!(pip_git_url_has_ref(
+            "pip install git+https://github.com/owner/repo.git@de0fac2e4500dabe0009e67214ff5f5447ce83dd"
+        ));
+        // The ref terminates at a `#egg=` fragment.
+        assert!(pip_git_url_has_ref(
+            "pip install git+https://github.com/owner/repo.git@v1.2.3#egg=foo"
+        ));
+        // A `user@host` userinfo prefix must not be mistaken for the ref.
+        assert!(pip_git_url_has_ref(
+            "pip install git+https://git@github.com/owner/repo.git@v1.2.3"
+        ));
+    }
+
+    #[test]
+    fn pip_install_git_url_branch_ref_is_not_pinned() {
+        // A branch ref tracks HEAD — not a durable pin, so the rule still fires.
+        assert!(!pip_git_url_has_ref(
             "pip install git+https://github.com/owner/repo.git@main"
         ));
-        assert!(pip_git_url_has_ref(
-            "pip install git+https://github.com/owner/repo.git@abc1234567890abcdef1234567890abcdef123456"
+        assert!(!pip_git_url_has_ref(
+            "pip install git+https://github.com/owner/repo.git@develop"
+        ));
+        assert!(!pip_git_url_has_ref(
+            "pip install git+https://github.com/owner/repo.git@feature/foo"
         ));
     }
 
