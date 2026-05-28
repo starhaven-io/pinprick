@@ -3,6 +3,8 @@ use serde_norway::Value;
 use std::collections::HashSet;
 use std::path::Path;
 use std::process::ExitCode;
+use std::sync::Arc;
+use tokio::sync::Semaphore;
 
 use crate::audit_patterns::{
     self, DOCKER_PATTERNS, DOCKER_URL_PATTERNS, JS_PATTERNS, JS_URL_PATTERNS,
@@ -866,6 +868,62 @@ fn is_vendored_path(path: &str) -> bool {
         .any(|component| VENDORED_DIRS.contains(&component))
 }
 
+/// Max action source files fetched concurrently. Bounds the fan-out so a
+/// file-heavy action doesn't burst into a rate-limit-exhausting wave.
+const MAX_CONCURRENT_FILE_FETCHES: usize = 8;
+
+/// Which scanner handles a given action source file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourceFileKind {
+    ActionYml,
+    JavaScript,
+    Python,
+    Dockerfile,
+}
+
+/// Select the files in a fetched action tree worth scanning, each paired with
+/// the scanner that handles it, in tree order. Pure (no I/O) so the filtering
+/// — vendored-dir skips, subpath scoping, extension classification — is unit
+/// testable without a live GitHub client.
+fn select_source_files(
+    tree: &[crate::github::TreeEntry],
+    base: &str,
+) -> Vec<(String, SourceFileKind)> {
+    let mut targets = Vec::new();
+    for entry in tree {
+        if entry.entry_type != "blob" {
+            continue;
+        }
+        let path = &entry.path;
+        if is_vendored_path(path) {
+            continue;
+        }
+        if !base.is_empty() && !path.starts_with(base) {
+            continue;
+        }
+        let relative = if base.is_empty() {
+            path.as_str()
+        } else {
+            path.strip_prefix(base)
+                .unwrap_or(path)
+                .trim_start_matches('/')
+        };
+        let kind = if relative == "action.yml" || relative == "action.yaml" {
+            SourceFileKind::ActionYml
+        } else if path.ends_with(".js") || path.ends_with(".ts") {
+            SourceFileKind::JavaScript
+        } else if path.ends_with(".py") {
+            SourceFileKind::Python
+        } else if relative == "Dockerfile" || path.ends_with(".dockerfile") {
+            SourceFileKind::Dockerfile
+        } else {
+            continue;
+        };
+        targets.push((path.clone(), kind));
+    }
+    targets
+}
+
 async fn scan_action_source(
     client: &GitHubClient,
     action: &ActionRef,
@@ -878,59 +936,58 @@ async fn scan_action_source(
         .await?;
 
     let base = action.subpath.as_deref().unwrap_or("");
+    let targets = select_source_files(&tree, base);
+    if targets.is_empty() {
+        return Ok(());
+    }
 
-    for entry in &tree {
-        if entry.entry_type != "blob" {
-            continue;
+    // Fetch file contents concurrently (bounded by a semaphore), then scan in
+    // tree order so findings are deterministic regardless of which fetch lands
+    // first. A failed fetch leaves `None` and is skipped, matching the previous
+    // per-file behavior.
+    let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_FILE_FETCHES));
+    let mut fetches = tokio::task::JoinSet::new();
+    for (index, (path, _)) in targets.iter().enumerate() {
+        let client = client.clone();
+        let owner = action.owner.clone();
+        let repo = action.repo.clone();
+        let git_ref = action.ref_string.clone();
+        let path = path.clone();
+        let semaphore = Arc::clone(&semaphore);
+        fetches.spawn(async move {
+            let _permit = semaphore.acquire_owned().await.ok();
+            let content = client.fetch_file(&owner, &repo, &path, &git_ref).await.ok();
+            (index, content)
+        });
+    }
+
+    let mut contents: Vec<Option<String>> = vec![None; targets.len()];
+    while let Some(joined) = fetches.join_next().await {
+        if let Ok((index, content)) = joined {
+            contents[index] = content;
         }
+    }
 
-        let path = &entry.path;
-
-        if is_vendored_path(path) {
+    for ((path, kind), content) in targets.iter().zip(contents) {
+        let Some(content) = content else {
             continue;
-        }
-
-        if !base.is_empty() && !path.starts_with(base) {
-            continue;
-        }
-
-        let relative = if base.is_empty() {
-            path.as_str()
-        } else {
-            path.strip_prefix(base)
-                .unwrap_or(path)
-                .trim_start_matches('/')
         };
-
-        let is_action_yml = relative == "action.yml" || relative == "action.yaml";
-        let is_js = path.ends_with(".js") || path.ends_with(".ts");
-        let is_py = path.ends_with(".py");
-        let is_dockerfile = relative == "Dockerfile" || path.ends_with(".dockerfile");
-
-        if !is_action_yml && !is_js && !is_py && !is_dockerfile {
-            continue;
-        }
-
-        let content = match client
-            .fetch_file(&action.owner, &action.repo, path, &action.ref_string)
-            .await
-        {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-
         let source_label = format!("{} ({path})", action.full_name());
-
-        if is_action_yml {
-            if let Ok(yaml) = serde_norway::from_str::<Value>(&content) {
-                scan_action_yml_runs(&yaml, &source_label, &action_name, collector, config);
+        match kind {
+            SourceFileKind::ActionYml => {
+                if let Ok(yaml) = serde_norway::from_str::<Value>(&content) {
+                    scan_action_yml_runs(&yaml, &source_label, &action_name, collector, config);
+                }
             }
-        } else if is_js {
-            scan_js_content(&content, &source_label, &action_name, collector, config);
-        } else if is_py {
-            scan_py_content(&content, &source_label, &action_name, collector, config);
-        } else if is_dockerfile {
-            scan_dockerfile_content(&content, &source_label, &action_name, collector, config);
+            SourceFileKind::JavaScript => {
+                scan_js_content(&content, &source_label, &action_name, collector, config);
+            }
+            SourceFileKind::Python => {
+                scan_py_content(&content, &source_label, &action_name, collector, config);
+            }
+            SourceFileKind::Dockerfile => {
+                scan_dockerfile_content(&content, &source_label, &action_name, collector, config);
+            }
         }
     }
 
@@ -1865,6 +1922,67 @@ runs:
         assert!(!is_vendored_path("node_modules_helper.js"));
         assert!(!is_vendored_path("my_vendor/index.js"));
         assert!(!is_vendored_path("src/venvironment.py"));
+    }
+
+    // ── select_source_files ────────────────────────────────────────────
+
+    fn tree_entry(path: &str, entry_type: &str) -> crate::github::TreeEntry {
+        crate::github::TreeEntry {
+            path: path.into(),
+            entry_type: entry_type.into(),
+        }
+    }
+
+    #[test]
+    fn select_source_files_classifies_and_filters_in_order() {
+        let tree = vec![
+            tree_entry("action.yml", "blob"),
+            tree_entry("dist/index.js", "blob"), // bundled action code — kept
+            tree_entry("src/main.ts", "blob"),
+            tree_entry("setup.py", "blob"),
+            tree_entry("Dockerfile", "blob"),
+            tree_entry("README.md", "blob"), // not scannable
+            tree_entry("node_modules/dep/i.js", "blob"), // vendored — skipped
+            tree_entry("src", "tree"),       // directory entry — skipped
+        ];
+        let got = select_source_files(&tree, "");
+        assert_eq!(
+            got,
+            vec![
+                ("action.yml".to_string(), SourceFileKind::ActionYml),
+                ("dist/index.js".to_string(), SourceFileKind::JavaScript),
+                ("src/main.ts".to_string(), SourceFileKind::JavaScript),
+                ("setup.py".to_string(), SourceFileKind::Python),
+                ("Dockerfile".to_string(), SourceFileKind::Dockerfile),
+            ]
+        );
+    }
+
+    #[test]
+    fn select_source_files_scopes_to_subpath_base() {
+        let tree = vec![
+            tree_entry("action-a/action.yml", "blob"),
+            tree_entry("action-a/index.js", "blob"),
+            tree_entry("action-b/action.yml", "blob"), // different subpath — excluded
+        ];
+        let got = select_source_files(&tree, "action-a");
+        assert_eq!(
+            got,
+            vec![
+                ("action-a/action.yml".to_string(), SourceFileKind::ActionYml),
+                ("action-a/index.js".to_string(), SourceFileKind::JavaScript),
+            ]
+        );
+    }
+
+    #[test]
+    fn select_source_files_empty_when_nothing_scannable() {
+        let tree = vec![
+            tree_entry("README.md", "blob"),
+            tree_entry("LICENSE", "blob"),
+            tree_entry("node_modules/x/index.js", "blob"),
+        ];
+        assert!(select_source_files(&tree, "").is_empty());
     }
 
     #[test]
