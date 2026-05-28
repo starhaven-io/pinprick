@@ -3,15 +3,16 @@ use serde::Deserialize;
 use std::path::Path;
 
 #[derive(Debug, Default, Deserialize)]
-#[serde(rename_all = "kebab-case")]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct Config {
     /// Fetch audited-actions list from pinprick.rs (default: false)
     #[serde(default)]
     pub fetch_remote: bool,
 
-    /// Minimum severity to report: "low", "medium", or "high" (default: "low")
-    #[serde(default = "default_severity")]
-    pub severity: String,
+    /// Minimum severity to report (default: low). An unrecognized value is a
+    /// parse error, surfaced as a warning — not silently treated as "low".
+    #[serde(default)]
+    pub severity: SeverityFilter,
 
     /// Finding suppression rules
     #[serde(default)]
@@ -43,7 +44,20 @@ pub struct Config {
 /// in `.pinprick.toml`.
 const BASELINE_TRUSTED_OWNERS: &[&str] = &["actions", "github"];
 
+/// Minimum severity threshold for reporting, set via `severity` in
+/// `.pinprick.toml`. Deserializing rejects unknown values so a typo can't
+/// silently widen or narrow what gets reported.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SeverityFilter {
+    #[default]
+    Low,
+    Medium,
+    High,
+}
+
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IgnoreConfig {
     /// Skip audit for these actions entirely (e.g., "actions/checkout")
     #[serde(default)]
@@ -52,10 +66,6 @@ pub struct IgnoreConfig {
     /// Suppress findings whose description contains these strings
     #[serde(default)]
     pub patterns: Vec<String>,
-}
-
-fn default_severity() -> String {
-    "low".to_string()
 }
 
 impl Config {
@@ -75,10 +85,10 @@ impl Config {
 
     /// Returns the minimum severity level as a numeric value for comparison.
     pub fn severity_threshold(&self) -> u8 {
-        match self.severity.as_str() {
-            "high" => 2,
-            "medium" => 1,
-            _ => 0, // "low" or anything else
+        match self.severity {
+            SeverityFilter::High => 2,
+            SeverityFilter::Medium => 1,
+            SeverityFilter::Low => 0,
         }
     }
 
@@ -162,9 +172,23 @@ fn load_local(repo_root: &Path) -> Option<Config> {
     load_file(&repo_root.join(".pinprick.toml"))
 }
 
+/// Load and parse a config file. A missing or unreadable file is `None`
+/// (defaults apply, silently — no config is the normal case). A file that
+/// exists but fails to parse is also `None`, but warns to stderr first: a
+/// silently-dropped config would leave the user thinking their `ignore` /
+/// `severity` / `trusted-*` rules are active when they aren't.
 fn load_file(path: &Path) -> Option<Config> {
     let content = std::fs::read_to_string(path).ok()?;
-    toml::from_str(&content).ok()
+    match toml::from_str(&content) {
+        Ok(config) => Some(config),
+        Err(e) => {
+            eprintln!(
+                "warning: failed to parse {}, ignoring it:\n{e}",
+                path.display()
+            );
+            None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -308,5 +332,93 @@ trusted-hosts = ["artifacts.example.com", "releases.example.org"]
         let toml_content = "";
         let cfg: Config = toml::from_str(toml_content).unwrap();
         assert!(cfg.trusted_hosts.is_empty());
+    }
+
+    // ── severity validation ────────────────────────────────────────────
+
+    #[test]
+    fn severity_valid_values_parse() {
+        for (value, expected) in [
+            ("low", SeverityFilter::Low),
+            ("medium", SeverityFilter::Medium),
+            ("high", SeverityFilter::High),
+        ] {
+            let cfg: Config = toml::from_str(&format!("severity = \"{value}\"")).unwrap();
+            assert_eq!(cfg.severity, expected);
+        }
+    }
+
+    #[test]
+    fn severity_invalid_value_is_error() {
+        // A typo must fail loudly, not silently fall back to the most
+        // permissive threshold.
+        assert!(toml::from_str::<Config>("severity = \"higq\"").is_err());
+        assert!(toml::from_str::<Config>("severity = \"critical\"").is_err());
+    }
+
+    #[test]
+    fn default_severity_is_low() {
+        let cfg = Config::default();
+        assert_eq!(cfg.severity, SeverityFilter::Low);
+        assert_eq!(cfg.severity_threshold(), 0);
+    }
+
+    #[test]
+    fn severity_threshold_and_meets() {
+        let high = Config {
+            severity: SeverityFilter::High,
+            ..Config::default()
+        };
+        assert_eq!(high.severity_threshold(), 2);
+        assert!(high.meets_severity("high"));
+        assert!(!high.meets_severity("medium"));
+        assert!(!high.meets_severity("low"));
+
+        let low = Config::default();
+        assert!(low.meets_severity("low"));
+        assert!(low.meets_severity("high"));
+    }
+
+    // ── unknown keys ───────────────────────────────────────────────────
+
+    #[test]
+    fn unknown_top_level_key_is_error() {
+        // A misspelled key (e.g. `trusted-onwers`) must be rejected rather
+        // than silently ignored, so the user notices the rule isn't applied.
+        assert!(toml::from_str::<Config>("trusted-onwers = [\"acme\"]").is_err());
+        assert!(toml::from_str::<Config>("definitely-not-a-key = true").is_err());
+    }
+
+    #[test]
+    fn unknown_nested_ignore_key_is_error() {
+        assert!(toml::from_str::<Config>("[ignore]\nbogus = 1").is_err());
+    }
+
+    // ── load_file: warn vs silent ──────────────────────────────────────
+
+    #[test]
+    fn load_file_missing_is_none() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // No file written — absent config is silent, defaults apply.
+        assert!(load_file(&dir.path().join("config.toml")).is_none());
+    }
+
+    #[test]
+    fn load_file_malformed_is_none() {
+        // Present-but-unparsable returns None (warning goes to stderr).
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "severity = \"nope\"\n").unwrap();
+        assert!(load_file(&path).is_none());
+    }
+
+    #[test]
+    fn load_file_valid_is_parsed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "severity = \"high\"\nfetch-remote = true\n").unwrap();
+        let cfg = load_file(&path).expect("valid config should parse");
+        assert_eq!(cfg.severity, SeverityFilter::High);
+        assert!(cfg.fetch_remote);
     }
 }
