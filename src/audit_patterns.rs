@@ -482,6 +482,22 @@ pub fn has_git_checkout_sha(line: &str) -> bool {
     GIT_CHECKOUT_SHA.is_match(line)
 }
 
+/// The stage name a `FROM … AS <name>` line declares, lowercased. Tolerates a
+/// leading `--platform=…` flag by matching the trailing `AS <name>` rather than
+/// a fixed position. Returns `None` when the line declares no stage alias.
+pub fn dockerfile_stage_alias(line: &str) -> Option<String> {
+    static FROM_AS: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?i)^FROM\b.*\bAS\s+(\S+)\s*$").unwrap());
+    FROM_AS.captures(line).map(|c| c[1].to_ascii_lowercase())
+}
+
+/// The base image/stage a `FROM <base>` line references, lowercased. Returns
+/// `None` when the line is not a `FROM` instruction.
+pub fn dockerfile_from_base(line: &str) -> Option<String> {
+    static FROM_BASE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)^FROM\s+(\S+)").unwrap());
+    FROM_BASE.captures(line).map(|c| c[1].to_ascii_lowercase())
+}
+
 /// Check if a `pip install` line has a version specifier or uses `-r`.
 pub fn pip_install_has_version(line: &str) -> bool {
     static PIP_VERSION: LazyLock<Regex> = LazyLock::new(|| {
@@ -979,6 +995,49 @@ mod tests {
     #[test]
     fn docker_add_case_insensitive() {
         assert!(DOCKER_ADD_URL.is_match("add https://example.com/tool.tgz /opt/"));
+    }
+
+    // ── Dockerfile stage helpers ───────────────────────────────────────
+
+    #[test]
+    fn dockerfile_stage_alias_extracts_lowercased_name() {
+        assert_eq!(
+            dockerfile_stage_alias("FROM golang:1.21 AS builder").as_deref(),
+            Some("builder")
+        );
+        // Case-insensitive keyword, lowercased result.
+        assert_eq!(
+            dockerfile_stage_alias("from node:20 as Builder").as_deref(),
+            Some("builder")
+        );
+        // Tolerates a leading --platform flag.
+        assert_eq!(
+            dockerfile_stage_alias("FROM --platform=$BUILDPLATFORM golang:1.21 AS web").as_deref(),
+            Some("web")
+        );
+    }
+
+    #[test]
+    fn dockerfile_stage_alias_none_without_as() {
+        assert_eq!(dockerfile_stage_alias("FROM ubuntu:22.04"), None);
+        assert_eq!(dockerfile_stage_alias("RUN echo hello"), None);
+    }
+
+    #[test]
+    fn dockerfile_from_base_extracts_lowercased_base() {
+        assert_eq!(
+            dockerfile_from_base("FROM ubuntu:22.04").as_deref(),
+            Some("ubuntu:22.04")
+        );
+        assert_eq!(
+            dockerfile_from_base("FROM scratch").as_deref(),
+            Some("scratch")
+        );
+        assert_eq!(
+            dockerfile_from_base("FROM builder AS final").as_deref(),
+            Some("builder")
+        );
+        assert_eq!(dockerfile_from_base("RUN echo hello"), None);
     }
 
     // ── PowerShell patterns ────────────────────────────────────────────

@@ -667,6 +667,14 @@ fn scan_dockerfile_content(
 ) {
     let lines: Vec<&str> = content.lines().collect();
 
+    // Multi-stage builds name stages via `FROM … AS <name>`. Collect those
+    // names so a later `FROM <name>` is recognized as a stage reference, not an
+    // image pull — otherwise it false-positives as an untagged image.
+    let stage_names: HashSet<String> = lines
+        .iter()
+        .filter_map(|line| audit_patterns::dockerfile_stage_alias(line))
+        .collect();
+
     // Escalate `RUN curl ... | sh` from medium (DOCKER_RUN_CURL) to high.
     let mut pipe_shell_lines: HashSet<usize> = HashSet::new();
     for (i, line) in lines.iter().enumerate() {
@@ -692,6 +700,13 @@ fn scan_dockerfile_content(
             continue;
         }
         if pipe_shell_lines.contains(&line_num) {
+            continue;
+        }
+        // `FROM <stage>` (an earlier build stage) and `FROM scratch` (the empty
+        // base) are not unpinned image pulls — there's nothing to pin.
+        if let Some(base) = audit_patterns::dockerfile_from_base(line)
+            && (base == "scratch" || stage_names.contains(&base))
+        {
             continue;
         }
 
@@ -1678,6 +1693,85 @@ more stuff
             &DEFAULT_CONFIG,
         );
         assert_eq!(c.findings.len(), 1);
+    }
+
+    #[test]
+    fn dockerfile_from_named_stage_not_flagged() {
+        // `FROM builder` references the stage defined above, not an image pull.
+        let mut c = AuditCollector::new(false);
+        scan_dockerfile_content(
+            "FROM golang:1.21 AS builder\nRUN echo build\nFROM builder\nRUN echo package\n",
+            "Dockerfile",
+            "",
+            &mut c,
+            &DEFAULT_CONFIG,
+        );
+        assert!(
+            c.findings.is_empty(),
+            "findings: {:?}",
+            c.findings
+                .iter()
+                .map(|f| &f.description)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn dockerfile_from_scratch_not_flagged() {
+        let mut c = AuditCollector::new(false);
+        scan_dockerfile_content(
+            "FROM golang:1.21 AS builder\nFROM scratch\nCOPY --from=builder /app /app\n",
+            "Dockerfile",
+            "",
+            &mut c,
+            &DEFAULT_CONFIG,
+        );
+        assert!(
+            c.findings.is_empty(),
+            "findings: {:?}",
+            c.findings
+                .iter()
+                .map(|f| &f.description)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn dockerfile_stage_alias_collected_with_platform_flag() {
+        // The stage is declared with a --platform flag; the later `FROM builder`
+        // must still be recognized as a stage reference.
+        let mut c = AuditCollector::new(false);
+        scan_dockerfile_content(
+            "FROM --platform=$BUILDPLATFORM golang:1.21 AS builder\nFROM builder\n",
+            "Dockerfile",
+            "",
+            &mut c,
+            &DEFAULT_CONFIG,
+        );
+        assert!(
+            c.findings.is_empty(),
+            "findings: {:?}",
+            c.findings
+                .iter()
+                .map(|f| &f.description)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn dockerfile_untagged_base_with_stage_name_still_flagged() {
+        // `FROM ubuntu AS builder` pulls untagged ubuntu (implicitly :latest);
+        // naming the stage must not suppress the finding on the real base.
+        let mut c = AuditCollector::new(false);
+        scan_dockerfile_content(
+            "FROM ubuntu AS builder\nRUN echo hi\n",
+            "Dockerfile",
+            "",
+            &mut c,
+            &DEFAULT_CONFIG,
+        );
+        assert_eq!(c.findings.len(), 1);
+        assert!(c.findings[0].description.contains("FROM without tag"));
     }
 
     #[test]
