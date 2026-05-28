@@ -3,6 +3,10 @@ use reqwest::header::{ACCEPT, AUTHORIZATION, USER_AGENT};
 use serde::Deserialize;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+/// Cloning is cheap: `reqwest::Client` shares its connection pool across
+/// clones (it's `Arc`-backed internally), so clones reuse connections. This
+/// lets the audit fan out per-file fetches across concurrent tasks.
+#[derive(Clone)]
 pub struct GitHubClient {
     client: reqwest::Client,
     token: String,
