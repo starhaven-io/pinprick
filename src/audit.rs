@@ -839,6 +839,18 @@ fn check_patterns(
     }
 }
 
+/// Third-party dependency dirs, not the action's own source. An action that
+/// commits `node_modules/` would otherwise cost thousands of per-file fetches
+/// for zero signal. `dist/` is excluded — a bundled `dist/index.js` is the
+/// code that actually runs and must still be scanned.
+const VENDORED_DIRS: &[&str] = &["node_modules", "site-packages", ".venv", "venv"];
+
+/// Matches whole path components, so `node_modules_helper.js` is not affected.
+fn is_vendored_path(path: &str) -> bool {
+    path.split('/')
+        .any(|component| VENDORED_DIRS.contains(&component))
+}
+
 async fn scan_action_source(
     client: &GitHubClient,
     action: &ActionRef,
@@ -858,6 +870,10 @@ async fn scan_action_source(
         }
 
         let path = &entry.path;
+
+        if is_vendored_path(path) {
+            continue;
+        }
 
         if !base.is_empty() && !path.starts_with(base) {
             continue;
@@ -1725,6 +1741,36 @@ runs:
     #[test]
     fn short_sha_short() {
         assert_eq!(short_sha("abc"), "abc");
+    }
+
+    // ── vendored-path filtering ────────────────────────────────────────
+
+    #[test]
+    fn vendored_path_skips_dependency_dirs() {
+        assert!(is_vendored_path("node_modules/lodash/index.js"));
+        assert!(is_vendored_path("dist/node_modules/x.js")); // nested
+        assert!(is_vendored_path(
+            ".venv/lib/python3.12/site-packages/requests/api.py"
+        ));
+        assert!(is_vendored_path("venv/bin/thing.py"));
+        assert!(is_vendored_path("tools/site-packages/pkg.py"));
+    }
+
+    #[test]
+    fn vendored_path_keeps_action_code() {
+        // The action's own bundled/source files must still be scanned.
+        assert!(!is_vendored_path("dist/index.js"));
+        assert!(!is_vendored_path("src/main.ts"));
+        assert!(!is_vendored_path("action.yml"));
+        assert!(!is_vendored_path("scripts/setup.py"));
+    }
+
+    #[test]
+    fn vendored_path_matches_whole_components_only() {
+        // Substrings and lookalike names must not be skipped.
+        assert!(!is_vendored_path("node_modules_helper.js"));
+        assert!(!is_vendored_path("my_vendor/index.js"));
+        assert!(!is_vendored_path("src/venvironment.py"));
     }
 
     #[test]
