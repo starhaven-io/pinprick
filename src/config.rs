@@ -102,12 +102,15 @@ impl Config {
         level >= self.severity_threshold()
     }
 
-    /// Check if an action should be skipped (ignored) during audit.
+    /// Check if an action should be skipped (ignored) during audit. A pattern
+    /// matches when it equals the `owner/repo` exactly or names a prefix at a
+    /// path boundary, so `actions` (or `actions/`) ignores the whole org while
+    /// `actions/check` does not silently swallow `actions/checkout`.
     pub fn is_action_ignored(&self, action_name: &str) -> bool {
         self.ignore
             .actions
             .iter()
-            .any(|a| action_name.starts_with(a.as_str()))
+            .any(|pattern| ignore_pattern_matches(pattern, action_name))
     }
 
     /// Check if a finding should be suppressed based on its description.
@@ -157,6 +160,17 @@ impl Config {
                 .iter()
                 .any(|o| o.eq_ignore_ascii_case(owner))
     }
+}
+
+/// True if an `ignore.actions` pattern matches an action's `owner/repo` at a
+/// path boundary. A trailing slash on the pattern is ignored (`actions` and
+/// `actions/` behave identically); an empty pattern matches nothing.
+fn ignore_pattern_matches(pattern: &str, action_name: &str) -> bool {
+    let pattern = pattern.trim_end_matches('/');
+    if pattern.is_empty() {
+        return false;
+    }
+    action_name == pattern || action_name.starts_with(&format!("{pattern}/"))
 }
 
 fn load_global() -> Option<Config> {
@@ -420,5 +434,54 @@ trusted-hosts = ["artifacts.example.com", "releases.example.org"]
         let cfg = load_file(&path).expect("valid config should parse");
         assert_eq!(cfg.severity, SeverityFilter::High);
         assert!(cfg.fetch_remote);
+    }
+
+    // ── ignore.actions matching ────────────────────────────────────────
+
+    #[test]
+    fn ignore_pattern_exact_and_org_prefix() {
+        assert!(ignore_pattern_matches(
+            "actions/checkout",
+            "actions/checkout"
+        ));
+        // A bare owner ignores the whole org…
+        assert!(ignore_pattern_matches("actions", "actions/checkout"));
+        // …and a trailing slash behaves the same.
+        assert!(ignore_pattern_matches("actions/", "actions/setup-node"));
+    }
+
+    #[test]
+    fn ignore_pattern_respects_path_boundary() {
+        // The footgun: a partial name must not swallow a longer one.
+        assert!(!ignore_pattern_matches("actions/check", "actions/checkout"));
+        assert!(!ignore_pattern_matches(
+            "aws",
+            "aws-actions/configure-aws-credentials"
+        ));
+        assert!(!ignore_pattern_matches(
+            "actions/checkout",
+            "actions/checkout-action"
+        ));
+    }
+
+    #[test]
+    fn ignore_pattern_empty_matches_nothing() {
+        assert!(!ignore_pattern_matches("", "actions/checkout"));
+        assert!(!ignore_pattern_matches("/", "actions/checkout"));
+    }
+
+    #[test]
+    fn is_action_ignored_through_config() {
+        let cfg = Config {
+            ignore: IgnoreConfig {
+                actions: vec!["actions/checkout".to_string(), "aws-actions".to_string()],
+                patterns: vec![],
+            },
+            ..Config::default()
+        };
+        assert!(cfg.is_action_ignored("actions/checkout"));
+        assert!(cfg.is_action_ignored("aws-actions/configure-aws-credentials"));
+        assert!(!cfg.is_action_ignored("actions/setup-node"));
+        assert!(!cfg.is_action_ignored("actions/checkout-action"));
     }
 }
