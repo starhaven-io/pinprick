@@ -3,6 +3,28 @@ use serde::Serialize;
 
 use crate::audit_patterns::Severity;
 
+/// Neutralize terminal control sequences in untrusted strings before printing.
+///
+/// `audit` and `score` echo data taken from scanned workflows and from action
+/// source code fetched out of arbitrary GitHub repositories (matched lines,
+/// action refs, file paths). Those bytes must never reach the terminal
+/// verbatim: an ANSI/OSC escape embedded in a matched source line could hide or
+/// spoof a finding in the operator's terminal. Every control character (C0, C1,
+/// DEL) except tab is replaced with U+FFFD, which renders visibly and inertly.
+/// JSON and SARIF output are unaffected — serde already escapes these as
+/// `\uXXXX`, so machine consumers still see the true bytes.
+pub(crate) fn sanitize_for_terminal(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c == '\t' || !c.is_control() {
+                c
+            } else {
+                '\u{fffd}'
+            }
+        })
+        .collect()
+}
+
 // ── Pin output ──────────────────────────────────────────────────────────────
 
 #[derive(Serialize)]
@@ -241,16 +263,20 @@ impl AuditReport {
                 _ => "LOW".dimmed(),
             };
 
+            let source_file = sanitize_for_terminal(&f.source_file);
             let location = match f.line {
-                Some(n) => format!("{}:{n}", f.source_file),
-                None => f.source_file.clone(),
+                Some(n) => format!("{source_file}:{n}"),
+                None => source_file,
             };
 
             println!("{sev}  {}", location.bold());
             if !f.action.is_empty() {
-                println!("      action: {}", f.action.cyan());
+                println!("      action: {}", sanitize_for_terminal(&f.action).cyan());
             }
-            println!("      {}", f.pattern_matched.dimmed());
+            println!(
+                "      {}",
+                sanitize_for_terminal(&f.pattern_matched).dimmed()
+            );
             println!("      {}", f.description);
             println!();
         }
@@ -258,15 +284,19 @@ impl AuditReport {
         if verbose && !self.allowed.is_empty() {
             println!("{}", "Allowed (matched but passed check):".dimmed());
             for m in &self.allowed {
+                let source_file = sanitize_for_terminal(&m.source_file);
                 let location = match m.line {
-                    Some(n) => format!("{}:{n}", m.source_file),
-                    None => m.source_file.clone(),
+                    Some(n) => format!("{source_file}:{n}"),
+                    None => source_file,
                 };
                 println!("{}   {}", "OK".green().bold(), location.bold());
                 if !m.action.is_empty() {
-                    println!("      action: {}", m.action.cyan());
+                    println!("      action: {}", sanitize_for_terminal(&m.action).cyan());
                 }
-                println!("      {}", m.pattern_matched.dimmed());
+                println!(
+                    "      {}",
+                    sanitize_for_terminal(&m.pattern_matched).dimmed()
+                );
                 println!("      reason: {}", m.reason.dimmed());
                 println!();
             }
@@ -837,6 +867,23 @@ mod audit_summary_tests {
             .into_iter()
             .map(|s| strip_ansi(&s))
             .collect()
+    }
+
+    #[test]
+    fn sanitize_for_terminal_neutralizes_control_chars() {
+        // Plain text and non-control Unicode pass through untouched.
+        assert_eq!(sanitize_for_terminal("plain text"), "plain text");
+        assert_eq!(sanitize_for_terminal("café → núñez"), "café → núñez");
+        // Tabs are preserved; every other control char becomes U+FFFD.
+        assert_eq!(sanitize_for_terminal("keep\ttab"), "keep\ttab");
+        // An embedded ANSI clear-screen escape is defanged (ESC -> U+FFFD),
+        // leaving the rest inert and printable.
+        assert_eq!(sanitize_for_terminal("a\u{1b}[2Jb"), "a\u{fffd}[2Jb");
+        // Carriage return (overwrite), newline, BEL, and DEL are all replaced.
+        assert_eq!(
+            sanitize_for_terminal("x\ry\nz\u{7}\u{7f}"),
+            "x\u{fffd}y\u{fffd}z\u{fffd}\u{fffd}"
+        );
     }
 
     #[test]
