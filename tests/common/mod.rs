@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use std::fs;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tempfile::TempDir;
 
 /// Create a temporary repo directory with one workflow file.
@@ -30,14 +31,19 @@ pub fn repo_with_config(filename: &str, workflow: &str, config: &str) -> TempDir
     dir
 }
 
-/// Build an `assert_cmd::Command` for pinprick with token stripped, colors off,
-/// and HOME pointed at a temp location to avoid global config interference.
+/// Build an `assert_cmd::Command` for pinprick with the token stripped, colors
+/// off, and HOME pointed at a unique temp path per invocation. The per-call HOME
+/// isolates the audit cache (`~/.cache/pinprick`) and global config
+/// (`~/.config/pinprick`) so parallel test processes can't race on, or poison,
+/// a shared directory.
 pub fn pinprick_cmd() -> assert_cmd::Command {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
     let mut cmd = assert_cmd::Command::cargo_bin("pinprick").unwrap();
     cmd.env("GITHUB_TOKEN", "");
     cmd.env("GH_TOKEN", "");
-    cmd.env("HOME", "/tmp/pinprick-test-home");
-    cmd.env("XDG_CONFIG_HOME", "/tmp/pinprick-test-config");
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let home = std::env::temp_dir().join(format!("pinprick-test-{}-{n}", std::process::id()));
+    cmd.env("HOME", &home);
     cmd.arg("--color").arg("never");
     cmd
 }
