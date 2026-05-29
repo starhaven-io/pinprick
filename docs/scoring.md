@@ -85,6 +85,7 @@ Notes:
 - The audit pipeline already applies the `data format URL` and nearby-checksum adjustments. `runtime.*` scoring uses the post-adjustment severity, so double-counting doesn't happen.
 - Through v0.5.0 the runtime scan is limited to `run:` blocks in local workflow files (no GitHub token required). Runtime findings in the source of fetched actions themselves — where `pinprick audit` looks when a token is present — are not yet scored; that integration lands in a later rubric version.
 - Runtime findings are not deduplicated. Each pattern match emits one finding keyed to its `(workflow, line)` — each is a distinct fix in a distinct place.
+- Config interaction: `runtime.*` scoring honors `ignore.patterns` from `.pinprick.toml` (an explicitly accepted risk is not deducted), but **not** the `severity` display threshold — the posture score reflects every finding regardless of what `pinprick audit` is configured to print.
 
 ### Workflow-level rules (category: `workflow`)
 
