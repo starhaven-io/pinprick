@@ -54,7 +54,7 @@ impl AuditedActions {
         Self {
             bundled: load_bundled(),
             cache_dir: cache_dir(),
-            client: reqwest::Client::new(),
+            client: crate::github::build_client(),
             fetch_remote,
             local: HashMap::new(),
             remote: HashMap::new(),
@@ -150,8 +150,8 @@ impl AuditedActions {
             return None;
         }
 
-        let text = resp.text().await.ok()?;
-        Some(parse_entries(&text))
+        let bytes = crate::github::read_capped(resp).await.ok()?;
+        Some(parse_entries(&String::from_utf8_lossy(&bytes)))
     }
 }
 
