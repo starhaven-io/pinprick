@@ -47,7 +47,7 @@ pub async fn run(
                 continue;
             }
             let current_tag = match &action.tag_comment {
-                Some(t) => t.clone(),
+                Some(t) => leading_version_token(t),
                 None => continue,
             };
 
@@ -181,6 +181,23 @@ pub async fn run(
     } else {
         Ok(ExitCode::SUCCESS)
     }
+}
+
+/// Extract the version token a `# comment` leads with. pin/update and the bots
+/// write `# v1.2.3`, but humans annotate (`# v1.2.3 (pinned by renovate)`); the
+/// trailing words would defeat the `latest == current` fast-path and feed the
+/// lossy version parse. Take the leading `v?N…` token (up to the first space or
+/// `(`), falling back to the whole comment when it doesn't start with a version.
+fn leading_version_token(comment: &str) -> String {
+    let trimmed = comment.trim();
+    let rest = trimmed.strip_prefix('v').unwrap_or(trimmed);
+    if !rest.starts_with(|c: char| c.is_ascii_digit()) {
+        return trimmed.to_string();
+    }
+    let end = trimmed
+        .find(|c: char| c.is_whitespace() || c == '(')
+        .unwrap_or(trimmed.len());
+    trimmed[..end].to_string()
 }
 
 /// Simple version comparison: extract numeric components, then use the
@@ -331,5 +348,22 @@ mod tests {
     fn both_empty_after_parse() {
         // No numeric components at all
         assert!(!is_newer("alpha", "beta"));
+    }
+
+    #[test]
+    fn leading_version_token_extracts_version() {
+        assert_eq!(leading_version_token("v6.0.2"), "v6.0.2");
+        assert_eq!(leading_version_token("  v6.0.2  "), "v6.0.2");
+        assert_eq!(
+            leading_version_token("v6.0.2 (pinned by renovate)"),
+            "v6.0.2"
+        );
+        assert_eq!(
+            leading_version_token("v1.2.3-rc1 do not bump"),
+            "v1.2.3-rc1"
+        );
+        assert_eq!(leading_version_token("1.2.3"), "1.2.3");
+        // No leading version → fall back to the whole comment unchanged.
+        assert_eq!(leading_version_token("pinned manually"), "pinned manually");
     }
 }
