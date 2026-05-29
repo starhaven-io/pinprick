@@ -808,7 +808,7 @@ fn print_human(report: &ScoreReport) {
             sev,
             f.points,
             f.id.cyan(),
-            target.dimmed()
+            crate::output::sanitize_for_terminal(target).dimmed()
         );
     }
 

