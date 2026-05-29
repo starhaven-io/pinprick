@@ -15,7 +15,7 @@ use std::process::ExitCode;
 use crate::audit::{self, AuditCollector};
 use crate::auth;
 use crate::config::Config;
-use crate::github::{GitHubClient, SecurityAdvisory};
+use crate::github::{GitHubClient, GitHubError, SecurityAdvisory};
 use crate::output::AuditFinding;
 use crate::workflow::{self, ActionRef, RefType};
 
@@ -286,6 +286,13 @@ pub fn score_repo(repo_root: &Path, config: &Config) -> Result<ScoreReport> {
                 );
             }
             for finding in &collector.findings {
+                // Respect explicit `ignore.patterns` suppressions — an accepted
+                // risk shouldn't be deducted. The `severity` display threshold is
+                // deliberately NOT applied: the posture score reflects every
+                // finding regardless of what `audit` chooses to print.
+                if config.is_pattern_ignored(&finding.description) {
+                    continue;
+                }
                 let rule = runtime_rule_for(finding);
                 runtime_findings.push(Finding {
                     id: rule.id(),
@@ -370,6 +377,9 @@ fn recompute_score(report: &mut ScoreReport) {
                     .unwrap_or("")
                     .cmp(b.action_ref.as_deref().unwrap_or(""))
             })
+            // Two `source.advisory` findings for the same action share id, points,
+            // and action_ref; the details (GHSA id) make the order deterministic.
+            .then_with(|| a.details.cmp(&b.details))
     });
     let points_deducted: u32 = report.findings.iter().map(|f| f.points).sum();
     let score = 100u32.saturating_sub(points_deducted);
@@ -377,6 +387,26 @@ fn recompute_score(report: &mut ScoreReport) {
     report.totals.findings = report.findings.len();
     report.score = score;
     report.grade = grade_for(score);
+}
+
+/// A systemic GitHub failure — a rejected/expired token or a rate limit —
+/// as opposed to a per-repo 404 or transient network error. The token-gated
+/// enrichment passes must not silently grade a repo clean on one of these:
+/// it would turn an auth/rate-limit failure into a falsely high score.
+fn is_hard_github_error(e: &anyhow::Error) -> bool {
+    matches!(
+        e.downcast_ref::<GitHubError>(),
+        Some(GitHubError::AuthRequired | GitHubError::RateLimit)
+    )
+}
+
+/// Warn (to stderr, so `--json`/`--html` on stdout stay clean) that a
+/// token-gated rule could not complete. The score is still emitted, but the
+/// user is told it reflects only the rules that actually ran.
+fn warn_enrichment_incomplete(rule: &str, e: &anyhow::Error) {
+    eprintln!(
+        "warning: {rule} could not be evaluated ({e}); score reflects only the rules that ran"
+    );
 }
 
 /// Fire `source.archived` findings for any pinned action whose repo is
@@ -420,7 +450,15 @@ async fn enrich_with_source_archived(
         if archived_cache.contains_key(&key) {
             continue;
         }
-        let archived = client.is_archived(owner, repo).await.unwrap_or(false);
+        let archived = match client.is_archived(owner, repo).await {
+            Ok(archived) => archived,
+            Err(e) if is_hard_github_error(&e) => {
+                warn_enrichment_incomplete("source.archived", &e);
+                return Ok(());
+            }
+            // A per-repo 404 or network blip shouldn't nuke the whole scan.
+            Err(_) => false,
+        };
         archived_cache.insert(key, archived);
     }
 
@@ -516,11 +554,14 @@ async fn enrich_with_source_advisory(
                 if let Some(cached) = sha_tag_cache.get(&key) {
                     cached.clone()
                 } else {
-                    let tag = client
-                        .sha_to_tag(owner, repo, ref_string)
-                        .await
-                        .ok()
-                        .flatten();
+                    let tag = match client.sha_to_tag(owner, repo, ref_string).await {
+                        Ok(t) => t,
+                        Err(e) if is_hard_github_error(&e) => {
+                            warn_enrichment_incomplete("source.advisory", &e);
+                            return Ok(());
+                        }
+                        Err(_) => None,
+                    };
                     sha_tag_cache.insert(key, tag.clone());
                     tag
                 }
@@ -540,10 +581,14 @@ async fn enrich_with_source_advisory(
         if advisories.contains_key(&key) {
             continue;
         }
-        let advs = client
-            .list_security_advisories(owner, repo)
-            .await
-            .unwrap_or_default();
+        let advs = match client.list_security_advisories(owner, repo).await {
+            Ok(advs) => advs,
+            Err(e) if is_hard_github_error(&e) => {
+                warn_enrichment_incomplete("source.advisory", &e);
+                return Ok(());
+            }
+            Err(_) => Vec::new(),
+        };
         advisories.insert(key, advs);
     }
 
@@ -638,7 +683,21 @@ fn format_advisory_details(
 fn version_in_range(version: &str, range: &str) -> Option<bool> {
     let v = strip_v_prefix(version);
     let r = normalize_range_string(range);
-    let ver = semver::Version::parse(v).ok()?;
+    // A bare version literal (`1.2.3`) is an exact-match range, not semver's
+    // default caret (`^1.2.3`). GHSA ranges are normally comparator form, but
+    // when one is a bare version, caret would both over- and under-match.
+    let r = if r.trim_start().starts_with(|c: char| c.is_ascii_digit()) {
+        format!("={}", r.trim())
+    } else {
+        r
+    };
+    let mut ver = semver::Version::parse(v).ok()?;
+    // Advisory ranges describe release versions, and semver's `VersionReq`
+    // refuses to match a pre-release (`2.0.0-rc1`) unless the comparator names
+    // the same pre-release — which would silently miss a vulnerable pre-release
+    // pin. Match on the numeric version by dropping pre-release/build metadata.
+    ver.pre = semver::Prerelease::EMPTY;
+    ver.build = semver::BuildMetadata::EMPTY;
     let req = semver::VersionReq::parse(&r).ok()?;
     Some(req.matches(&ver))
 }
@@ -1336,6 +1395,79 @@ jobs:
         assert_eq!(version_in_range("v4", "< 4.2.3"), None);
         // Garbage in the range string.
         assert_eq!(version_in_range("1.2.3", "not a range"), None);
+    }
+
+    #[test]
+    fn version_in_range_matches_prerelease_pins() {
+        // A vulnerable pre-release pin must still match a release-version range;
+        // semver's VersionReq would otherwise refuse to match the pre-release.
+        assert_eq!(version_in_range("1.2.3-rc1", "< 2.0.0"), Some(true));
+        assert_eq!(
+            version_in_range("v1.9.0-beta", ">= 1.0.0, < 2.0.0"),
+            Some(true)
+        );
+        // Past the patched version, even as a pre-release → not vulnerable.
+        assert_eq!(version_in_range("2.1.0-rc1", "< 2.0.0"), Some(false));
+    }
+
+    #[test]
+    fn version_in_range_treats_bare_version_as_exact() {
+        // A comparator-less range is an exact match, not caret (`^1.2.3`).
+        assert_eq!(version_in_range("1.2.3", "1.2.3"), Some(true));
+        assert_eq!(version_in_range("1.9.0", "1.2.3"), Some(false));
+        assert_eq!(version_in_range("v2.0.0", "v2.0.0"), Some(true));
+    }
+
+    #[test]
+    fn is_hard_github_error_only_for_auth_and_rate_limit() {
+        assert!(is_hard_github_error(&anyhow::Error::new(
+            GitHubError::AuthRequired
+        )));
+        assert!(is_hard_github_error(&anyhow::Error::new(
+            GitHubError::RateLimit
+        )));
+        assert!(!is_hard_github_error(&anyhow::Error::new(
+            GitHubError::RepoNotFound {
+                owner: "o".into(),
+                repo: "r".into(),
+            }
+        )));
+        assert!(!is_hard_github_error(&anyhow::anyhow!("network blip")));
+    }
+
+    #[test]
+    fn recompute_score_orders_same_action_advisories_by_details() {
+        let finding = |details: &str| Finding {
+            id: "source.advisory",
+            category: Category::Source,
+            severity: Severity::High,
+            points: 15,
+            action_ref: Some("owner/repo@v1.0.0".to_string()),
+            occurrences: vec![],
+            remediation: "",
+            details: Some(details.to_string()),
+        };
+        let mut report = ScoreReport {
+            rubric_version: RUBRIC_VERSION,
+            pinprick_version: env!("CARGO_PKG_VERSION"),
+            target: Target {
+                kind: "repo",
+                path: ".".to_string(),
+            },
+            score: 100,
+            grade: "A",
+            totals: Totals {
+                points_deducted: 0,
+                findings: 0,
+                workflows_scanned: 1,
+                unique_actions: 1,
+            },
+            // Inserted in reverse-sorted details order; same id/points/action_ref.
+            findings: vec![finding("GHSA-bbbb"), finding("GHSA-aaaa")],
+        };
+        recompute_score(&mut report);
+        assert_eq!(report.findings[0].details.as_deref(), Some("GHSA-aaaa"));
+        assert_eq!(report.findings[1].details.as_deref(), Some("GHSA-bbbb"));
     }
 
     #[test]

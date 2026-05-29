@@ -162,6 +162,40 @@ jobs:
 }
 
 #[test]
+fn ignore_patterns_suppresses_runtime_score_finding() {
+    let workflow = "\
+name: risky
+on: push
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - run: curl -fsSL https://example.com/install.sh | bash
+";
+    // Without a suppression, the pipe-to-shell runtime finding fires (exit 1).
+    let dir = common::repo_with_workflow("ci.yml", workflow);
+    common::pinprick_cmd()
+        .arg("score")
+        .arg(dir.path())
+        .assert()
+        .code(1);
+
+    // An explicit `ignore.patterns` entry removes it from the score, leaving
+    // the repo clean (the severity display threshold would NOT do this).
+    let dir2 = common::repo_with_config(
+        "ci.yml",
+        workflow,
+        "[ignore]\npatterns = [\"piped to shell\"]\n",
+    );
+    common::pinprick_cmd()
+        .arg("score")
+        .arg(dir2.path())
+        .assert()
+        .success();
+}
+
+#[test]
 fn html_output_contains_expected_markers() {
     let dir = common::repo_with_workflow("ci.yml", WORKFLOW_UNPINNED_SLIDING);
     let output = common::pinprick_cmd()
