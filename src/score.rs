@@ -286,10 +286,8 @@ pub fn score_repo(repo_root: &Path, config: &Config) -> Result<ScoreReport> {
                 );
             }
             for finding in &collector.findings {
-                // Respect explicit `ignore.patterns` suppressions — an accepted
-                // risk shouldn't be deducted. The `severity` display threshold is
-                // deliberately NOT applied: the posture score reflects every
-                // finding regardless of what `audit` chooses to print.
+                // Honor `ignore.patterns` (an accepted risk shouldn't score) but
+                // not the `severity` display threshold — the score is complete.
                 if config.is_pattern_ignored(&finding.description) {
                     continue;
                 }
@@ -389,10 +387,8 @@ fn recompute_score(report: &mut ScoreReport) {
     report.grade = grade_for(score);
 }
 
-/// A systemic GitHub failure — a rejected/expired token or a rate limit —
-/// as opposed to a per-repo 404 or transient network error. The token-gated
-/// enrichment passes must not silently grade a repo clean on one of these:
-/// it would turn an auth/rate-limit failure into a falsely high score.
+/// A systemic failure (bad token, rate limit) vs. a per-repo 404/network blip —
+/// enrichment must not silently grade a repo clean on one of these.
 fn is_hard_github_error(e: &anyhow::Error) -> bool {
     matches!(
         e.downcast_ref::<GitHubError>(),
@@ -400,9 +396,8 @@ fn is_hard_github_error(e: &anyhow::Error) -> bool {
     )
 }
 
-/// Warn (to stderr, so `--json`/`--html` on stdout stay clean) that a
-/// token-gated rule could not complete. The score is still emitted, but the
-/// user is told it reflects only the rules that actually ran.
+/// Warn (to stderr, so JSON/HTML stdout stays clean) that a token-gated rule
+/// couldn't complete — the score still emits but is incomplete.
 fn warn_enrichment_incomplete(rule: &str, e: &anyhow::Error) {
     eprintln!(
         "warning: {rule} could not be evaluated ({e}); score reflects only the rules that ran"
@@ -688,18 +683,13 @@ fn format_advisory_details(
 fn version_in_range(version: &str, range: &str) -> Option<bool> {
     let v = strip_v_prefix(version);
     let mut ver = semver::Version::parse(v).ok()?;
-    // Advisory ranges describe release versions, and semver's `VersionReq`
-    // refuses to match a pre-release (`2.0.0-rc1`) unless the comparator names
-    // the same pre-release — which would silently miss a vulnerable pre-release
-    // pin. Match on the numeric version by dropping pre-release/build metadata.
+    // semver's VersionReq won't match a pre-release (`2.0.0-rc1`) unless the
+    // comparator names one, so match on the numeric version only.
     ver.pre = semver::Prerelease::EMPTY;
     ver.build = semver::BuildMetadata::EMPTY;
 
-    // GitHub expresses ranges with `or` (a union of clauses) and `and`/comma
-    // (intersection within a clause), e.g. `>= 3.26.11 and <= 3.28.2, or >= 2.x`.
-    // semver has no `or` and uses a comma for `and`, so evaluate each `or` clause
-    // independently and match if any holds. Returns `None` only when NO clause is
-    // parsable, so a truly unparsable range is still treated as "no match".
+    // GitHub uses `or` (union) and `and`/comma (intersection); semver has no
+    // `or`, so match if any `or`-clause holds. None only if nothing parses.
     let mut parsed_any = false;
     for clause in range.split(" or ") {
         let clause = clause
@@ -708,8 +698,7 @@ fn version_in_range(version: &str, range: &str) -> Option<bool> {
             .trim()
             .replace(" and ", ", ");
         let r = normalize_range_string(&clause);
-        // A bare version literal (`1.2.3`) is an exact match, not semver's
-        // default caret (`^1.2.3`), which would both over- and under-match.
+        // A bare version (`1.2.3`) means exact, not semver's caret default.
         let r = if r.trim_start().starts_with(|c: char| c.is_ascii_digit()) {
             format!("={}", r.trim())
         } else {
@@ -725,10 +714,9 @@ fn version_in_range(version: &str, range: &str) -> Option<bool> {
     parsed_any.then_some(false)
 }
 
-/// True if this vulnerability entry describes the action being scored. One
-/// advisory can list several affected packages (e.g. an action *and* a CLI);
-/// matching the action's version against a different package's range is a
-/// false positive. GitHub Actions packages are named `owner/repo`.
+/// True if this vulnerability entry is for the action being scored. An advisory
+/// can list several packages (an action *and* a CLI); matching against another
+/// package's range is a false positive. Actions packages are named `owner/repo`.
 fn vuln_is_for_action(v: &AdvisoryVulnerability, owner: &str, repo: &str) -> bool {
     v.package
         .as_ref()
@@ -793,7 +781,6 @@ fn pin_rule_for(a: &ActionRef) -> Option<RuleId> {
 fn workflow_rules_for(doc: &Value) -> Vec<RuleId> {
     let mut rules = Vec::new();
 
-    // Top-level `permissions: write-all`
     if let Some(Value::String(s)) = doc.get("permissions")
         && s == "write-all"
     {
@@ -807,7 +794,6 @@ fn workflow_rules_for(doc: &Value) -> Vec<RuleId> {
         rules.push(RuleId::WorkflowPullRequestTarget);
     }
 
-    // `on.workflow_run`
     if let Some(on) = doc.get("on")
         && trigger_present(on, "workflow_run")
     {

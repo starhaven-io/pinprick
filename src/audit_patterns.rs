@@ -980,10 +980,8 @@ mod tests {
 
     #[test]
     fn js_exec_spawn_curl_detected() {
-        // exec()/execSync() still match…
         assert!(JS_EXEC_SPAWN_CURL.is_match(r#"exec("curl -L https://example.com")"#));
         assert!(JS_EXEC_SPAWN_CURL.is_match(r#"execSync(`curl ${url}`)"#));
-        // …and spawn()/spawnSync() shelling out to curl/wget now match too.
         assert!(JS_EXEC_SPAWN_CURL.is_match(r#"spawn("curl", ["-L", url])"#));
         assert!(JS_EXEC_SPAWN_CURL.is_match(r#"spawnSync("wget", [url])"#));
     }

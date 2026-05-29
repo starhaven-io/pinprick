@@ -12,7 +12,6 @@ pub struct ActionRef {
     pub ref_type: RefType,
     pub tag_comment: Option<String>,
     pub line_number: usize,
-    /// The full original line text
     pub raw_line: String,
 }
 
@@ -52,9 +51,8 @@ pub fn parse_uses_line(line: &str, line_number: usize) -> Option<ActionRef> {
     let mut ref_string = caps.get(3)?.as_str().to_string();
     let tag_comment = caps.get(5).map(|m| m.as_str().trim().to_string());
 
-    // A quoted `uses:` value (`uses: "owner/repo@v4"`) lands the opening quote
-    // on the action path and the closing quote on the ref; strip a matched pair
-    // so owner/repo and the ref classify correctly.
+    // Strip a matched surrounding quote pair: `uses: "owner/repo@v4"` puts the
+    // quotes on the path and ref, which would break classification.
     for q in ['"', '\''] {
         if action_path.starts_with(q) && ref_string.ends_with(q) {
             action_path = &action_path[1..];
@@ -119,8 +117,8 @@ pub fn build_pinned_line(line: &str, sha: &str, original_tag: &str) -> Option<St
     let action_path = caps.get(2)?.as_str();
     let ref_str = caps.get(3)?.as_str();
 
-    // Preserve a surrounding quote pair so `uses: "owner/repo@v4"` stays quoted
-    // and valid; the resolved-tag comment goes after the closing quote.
+    // Keep a surrounding quote pair so `uses: "owner/repo@v4"` stays valid; the
+    // comment goes after the closing quote.
     if let Some(q) = action_path
         .chars()
         .next()
@@ -220,8 +218,8 @@ pub fn rewrite_actions(
     let content =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
 
-    // Preserve the file's line terminator: `str::lines()` strips `\r`, so a CRLF
-    // workflow would otherwise be silently rewritten as LF across every line.
+    // Preserve CRLF: `str::lines()` strips `\r`, so we'd otherwise rewrite the
+    // whole file to LF.
     let newline = if content.contains("\r\n") {
         "\r\n"
     } else {
@@ -248,7 +246,6 @@ pub fn rewrite_actions(
         }
     }
 
-    // Preserve trailing newline if original had one
     let mut output = lines.join(newline);
     if content.ends_with('\n') {
         output.push_str(newline);

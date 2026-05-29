@@ -72,11 +72,8 @@ impl Config {
     /// Load config from global (~/.config/pinprick/config.toml) and per-repo (.pinprick.toml).
     /// Per-repo overrides global. Missing files are fine — defaults are used.
     pub fn load(repo_root: &Path) -> Self {
-        // Per-repo takes precedence. A malformed per-repo file falls back to
-        // DEFAULTS, not the global config: the author meant to configure THIS
-        // repo, so silently substituting an unrelated global policy is more
-        // surprising than using documented defaults. Global is consulted only
-        // when there is no per-repo file at all.
+        // Per-repo wins; a malformed per-repo file falls back to defaults (not
+        // global) — the author meant to configure THIS repo.
         match load_local(repo_root) {
             ConfigLoad::Loaded(local) => local,
             ConfigLoad::Malformed => Config::default(),
@@ -87,7 +84,6 @@ impl Config {
         }
     }
 
-    /// Returns the minimum severity level as a numeric value for comparison.
     pub fn severity_threshold(&self) -> u8 {
         match self.severity {
             SeverityFilter::High => 2,
@@ -174,19 +170,15 @@ fn ignore_pattern_matches(pattern: &str, action_name: &str) -> bool {
     if pattern.is_empty() {
         return false;
     }
-    // GitHub owner/repo slugs are case-insensitive, and every sibling matcher
-    // (trusted-hosts, trusted-owners, data formats) ignores case — so this one
-    // must too, or an ignore entry silently fails to match a differently-cased
-    // `uses:` line.
+    // GitHub slugs are case-insensitive, so match case-insensitively (like the
+    // sibling matchers) — else an ignore entry silently misses.
     let pattern = pattern.to_ascii_lowercase();
     let action_name = action_name.to_ascii_lowercase();
     action_name == pattern || action_name.starts_with(&format!("{pattern}/"))
 }
 
-/// Outcome of attempting to load a config file: present and valid, present but
-/// unparsable, or absent. The caller distinguishes `Malformed` from `Absent`
-/// because a malformed per-repo file must fall back to defaults, not inherit
-/// the global config.
+/// Load outcome; the caller distinguishes `Malformed` from `Absent` so a bad
+/// per-repo file falls back to defaults rather than inheriting global config.
 enum ConfigLoad {
     Loaded(Config),
     Malformed,
@@ -208,11 +200,9 @@ fn load_local(repo_root: &Path) -> ConfigLoad {
     load_file(&repo_root.join(".pinprick.toml"))
 }
 
-/// Load and parse a config file. A missing or unreadable file is `Absent`
-/// (defaults apply, silently — no config is the normal case). A file that
-/// exists but fails to parse is `Malformed`, and warns to stderr first: a
-/// silently-dropped config would leave the user thinking their `ignore` /
-/// `severity` / `trusted-*` rules are active when they aren't.
+/// Load and parse a config file. Missing/unreadable is `Absent` (the normal
+/// case). Present-but-unparsable is `Malformed` and warns — a silently-dropped
+/// config would leave the user thinking their rules are active when they aren't.
 fn load_file(path: &Path) -> ConfigLoad {
     let content = match std::fs::read_to_string(path) {
         Ok(content) => content,
