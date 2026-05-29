@@ -3,16 +3,9 @@ use serde::Serialize;
 
 use crate::audit_patterns::Severity;
 
-/// Neutralize terminal control sequences in untrusted strings before printing.
-///
-/// `audit` and `score` echo data taken from scanned workflows and from action
-/// source code fetched out of arbitrary GitHub repositories (matched lines,
-/// action refs, file paths). Those bytes must never reach the terminal
-/// verbatim: an ANSI/OSC escape embedded in a matched source line could hide or
-/// spoof a finding in the operator's terminal. Every control character (C0, C1,
-/// DEL) except tab is replaced with U+FFFD, which renders visibly and inertly.
-/// JSON and SARIF output are unaffected — serde already escapes these as
-/// `\uXXXX`, so machine consumers still see the true bytes.
+/// Replace control chars (C0/C1/DEL, except tab) with U+FFFD so escape sequences
+/// in fetched action source can't spoof or hide findings in the terminal.
+/// JSON/SARIF are unaffected — serde already escapes control chars.
 pub(crate) fn sanitize_for_terminal(s: &str) -> String {
     s.chars()
         .map(|c| {
@@ -871,15 +864,11 @@ mod audit_summary_tests {
 
     #[test]
     fn sanitize_for_terminal_neutralizes_control_chars() {
-        // Plain text and non-control Unicode pass through untouched.
         assert_eq!(sanitize_for_terminal("plain text"), "plain text");
         assert_eq!(sanitize_for_terminal("café → núñez"), "café → núñez");
-        // Tabs are preserved; every other control char becomes U+FFFD.
+        // Tab is the one control char kept.
         assert_eq!(sanitize_for_terminal("keep\ttab"), "keep\ttab");
-        // An embedded ANSI clear-screen escape is defanged (ESC -> U+FFFD),
-        // leaving the rest inert and printable.
         assert_eq!(sanitize_for_terminal("a\u{1b}[2Jb"), "a\u{fffd}[2Jb");
-        // Carriage return (overwrite), newline, BEL, and DEL are all replaced.
         assert_eq!(
             sanitize_for_terminal("x\ry\nz\u{7}\u{7f}"),
             "x\u{fffd}y\u{fffd}z\u{fffd}\u{fffd}"

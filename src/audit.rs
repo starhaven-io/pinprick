@@ -90,8 +90,7 @@ pub async fn run(
         let content = match std::fs::read_to_string(file) {
             Ok(content) => content,
             Err(e) => {
-                // One unreadable or non-UTF-8 workflow must not abort the whole
-                // scan — skip it and keep auditing the rest.
+                // One unreadable/non-UTF-8 workflow shouldn't abort the scan.
                 eprintln!("  {} {display_name}: {e}", "skipped".yellow());
                 continue;
             }
@@ -111,9 +110,8 @@ pub async fn run(
                 }
             }
             Err(e) => {
-                // A workflow GitHub accepts but serde_norway rejects shouldn't
-                // sink the scan; skip its run-block extraction (the regex-based
-                // `uses:` scan below still runs on the same content).
+                // Unparsable YAML shouldn't sink the scan; the `uses:` regex
+                // scan below still runs.
                 eprintln!(
                     "  {} run-block scan of {display_name}: {e}",
                     "skipped".yellow()
@@ -801,11 +799,9 @@ fn check_url_patterns(
         if !pattern.regex.is_match(line) {
             continue;
         }
-        // Examine EVERY URL on the line, not just the first. The line is only
-        // "allowed" if all of its URLs are exempt (versioned, trusted host, or
-        // a data format); the first URL that is unversioned, untrusted, and not
-        // a data format makes it a finding. Checking only the first URL let a
-        // versioned/trusted decoy placed before the real fetch suppress it.
+        // Check EVERY URL, not just the first: a versioned/trusted decoy before
+        // the real fetch must not suppress the finding. Allowed only if all URLs
+        // are exempt; any unexempt one is a finding.
         let mut allowed_reason: Option<&str> = None;
         let mut dangerous = false;
         for url in extract_urls(line) {
@@ -834,8 +830,7 @@ fn check_url_patterns(
                 workflow_line: None,
             });
         } else if let Some(reason) = allowed_reason {
-            // Every URL on the line was exempt; record an allowed match
-            // (visible under --verbose) tagged with the first URL's reason.
+            // All URLs exempt — record an allowed match (shown under --verbose).
             collector.push_allowed(AuditMatch {
                 severity: output::severity_str(&pattern.severity).to_string(),
                 category: category_str(&pattern.category).to_string(),
@@ -846,8 +841,7 @@ fn check_url_patterns(
                 reason: reason.to_string(),
             });
         }
-        // No URL on the line: nothing to record (matches the prior behavior of
-        // skipping when no URL could be extracted).
+        // No URL on the line: nothing to record.
     }
 }
 
@@ -1723,7 +1717,7 @@ more stuff
     #[test]
     fn js_minified_line_splitting() {
         let mut c = AuditCollector::new(false);
-        // Build a line > 500 chars with a fetch call buried in it
+        // A >500-char minified line with a fetch buried inside.
         let padding = "a".repeat(450);
         let minified = format!(
             r#"{}; const r = await fetch("https://example.com/api/data"); {}"#,

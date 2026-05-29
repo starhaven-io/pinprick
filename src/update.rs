@@ -175,7 +175,6 @@ pub async fn run(
         report.print_human();
     }
 
-    // Exit code 1 if there are pending updates (dry-run mode)
     if has_updates && !apply {
         Ok(ExitCode::from(1))
     } else {
@@ -183,11 +182,9 @@ pub async fn run(
     }
 }
 
-/// Extract the version token a `# comment` leads with. pin/update and the bots
-/// write `# v1.2.3`, but humans annotate (`# v1.2.3 (pinned by renovate)`); the
-/// trailing words would defeat the `latest == current` fast-path and feed the
-/// lossy version parse. Take the leading `v?N…` token (up to the first space or
-/// `(`), falling back to the whole comment when it doesn't start with a version.
+/// The leading `v?N…` version token of a `# comment` (up to the first space or
+/// `(`), so an annotation like `# v1.2.3 (pinned)` doesn't break the comparison.
+/// Falls back to the whole comment when it doesn't start with a version.
 fn leading_version_token(comment: &str) -> String {
     let trimmed = comment.trim();
     let rest = trimmed.strip_prefix('v').unwrap_or(trimmed);
@@ -207,7 +204,6 @@ fn is_newer(current: &str, candidate: &str) -> bool {
     let (cur, cur_pre) = parse_version(current);
     let (cand, cand_pre) = parse_version(candidate);
 
-    // Compare component by component
     for (c, n) in cur.iter().zip(cand.iter()) {
         if n > c {
             return true;

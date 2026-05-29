@@ -19,23 +19,18 @@ const MAX_RATE_LIMIT_WAIT: Duration = Duration::from_secs(60);
 /// Delay before retrying a transient 5xx or network error.
 const TRANSIENT_RETRY_DELAY: Duration = Duration::from_millis(500);
 
-/// Total per-request timeout. Without one, a stalled connection hangs the whole
-/// run forever (the retry logic only fires on a completed response).
+/// Total per-request timeout — without one a stalled connection hangs forever.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Connection-establishment timeout.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Upper bound on a single buffered response body. Action source files and
-/// recursive trees are fetched from arbitrary repositories; a hostile or
-/// compromised endpoint could otherwise stream gigabytes into memory.
+/// Cap on a buffered response body — a hostile endpoint could otherwise stream
+/// gigabytes of "action source" into memory.
 pub(crate) const MAX_RESPONSE_BYTES: usize = 50 * 1024 * 1024;
 
-/// Build the shared HTTP client used for every outbound request: bounded
-/// request/connect timeouts so a stalled endpoint can't hang the run, and an
-/// explicit (bounded) redirect policy. reqwest strips the `Authorization`
-/// header on cross-host redirects, so following GitHub's content redirects is
-/// safe.
+/// Shared HTTP client with request/connect timeouts (a stalled endpoint can't
+/// hang the run) and a bounded redirect policy. reqwest strips `Authorization`
+/// on cross-host redirects, so following GitHub's content redirects is safe.
 pub(crate) fn build_client() -> reqwest::Client {
     reqwest::Client::builder()
         .timeout(REQUEST_TIMEOUT)
@@ -45,10 +40,9 @@ pub(crate) fn build_client() -> reqwest::Client {
         .expect("failed to build HTTP client")
 }
 
-/// Read a response body into memory, failing if it exceeds [`MAX_RESPONSE_BYTES`].
-/// Streams chunk-by-chunk so an oversized body is rejected before it is fully
-/// buffered. Use for the unbounded-size fetches (action source, file trees,
-/// the remote catalog); the fixed-shape GitHub API responses don't need it.
+/// Read a response body, rejecting it past [`MAX_RESPONSE_BYTES`] before it is
+/// fully buffered. For the unbounded-size fetches (action source, trees, the
+/// remote catalog).
 pub(crate) async fn read_capped(mut resp: reqwest::Response) -> Result<Vec<u8>> {
     let mut buf = Vec::new();
     while let Some(chunk) = resp.chunk().await.context("reading response body")? {
@@ -58,9 +52,8 @@ pub(crate) async fn read_capped(mut resp: reqwest::Response) -> Result<Vec<u8>> 
     Ok(buf)
 }
 
-/// Error if appending `incoming` bytes to a buffer already holding `current`
-/// would exceed `max`. Split out from [`read_capped`] so the boundary logic is
-/// unit-testable without constructing a streaming response.
+/// The cap check, split from [`read_capped`] so it's unit-testable without a
+/// streaming response.
 fn within_cap(current: usize, incoming: usize, max: usize) -> Result<()> {
     if current + incoming > max {
         bail!("response body exceeds {max} bytes — refusing to buffer");
@@ -227,9 +220,8 @@ impl GitHubClient {
                     bail!(GitHubError::RateLimit);
                 }
                 403 | 429 if retry_after(&resp).is_some() => {
-                    // Secondary/abuse rate limit: GitHub returns 403/429 with a
-                    // `Retry-After` header and no zeroed `x-ratelimit-remaining`.
-                    // The concurrent source-fetch fan-out is what trips these.
+                    // Secondary/abuse rate limit: `Retry-After` with no zeroed
+                    // `x-ratelimit-remaining` (the concurrent fan-out trips these).
                     if let Some(wait) = retry_after(&resp)
                         && wait <= MAX_RATE_LIMIT_WAIT
                         && !last_attempt
@@ -264,7 +256,6 @@ impl GitHubClient {
 
         let git_ref: GitRef = resp.json().await.context("parsing tag ref response")?;
 
-        // If it's an annotated tag, follow to the commit
         if git_ref.object.object_type == "tag" {
             let tag_url = format!(
                 "https://api.github.com/repos/{owner}/{repo}/git/tags/{}",
