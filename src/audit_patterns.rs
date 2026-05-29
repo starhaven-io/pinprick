@@ -56,7 +56,7 @@ re!(
 
 re!(
     SH_PIPE_SHELL,
-    r"(?i)\b(curl|wget)\b[^|]*\|\s*(?:sudo\s+)?(bash|sh|zsh|dash|ash|ksh|fish|python3?)\b"
+    r"(?i)\b(curl|wget)\b[^|]*\|\s*(?:(?:sudo|env|command|xargs)\s+)*(?:\S*/)?(bash|sh|zsh|dash|ash|ksh|fish|python3?|node(?:js)?|ruby|perl|pwsh|powershell)\b"
 );
 re!(
     SH_PROC_SUB_FETCH,
@@ -64,7 +64,7 @@ re!(
 );
 re!(
     SH_CMD_SUB_FETCH,
-    r#"(?i)\b(bash|sh|zsh|eval)\b[^"']*["']?\$\(\s*(curl|wget)\b"#
+    r#"(?i)\b(bash|sh|zsh|dash|ash|ksh|fish|eval)\b.*?["']?\$\(\s*(curl|wget)\b"#
 );
 re!(
     SH_IEX_FETCH,
@@ -192,7 +192,10 @@ re!(JS_FETCH_LATEST, r#"fetch\s*\(.*[/=]latest[/\s"']"#);
 re!(JS_AXIOS_LATEST, r#"axios\.\w+\s*\(.*[/=]latest[/\s"']"#);
 re!(JS_GOT_LATEST, r#"got\s*\(.*[/=]latest[/\s"']"#);
 re!(JS_HTTP_LATEST, r#"https?\.get\s*\(.*[/=]latest[/\s"']"#);
-re!(JS_EXEC_CURL, r"exec\w*\s*\(.*\bcurl\b");
+re!(
+    JS_EXEC_SPAWN_CURL,
+    r"\b(?:exec|spawn)\w*\s*\(.*\b(curl|wget)\b"
+);
 re!(JS_CHILD_PROC_CURL, r"child_process.*\bcurl\b");
 re!(JS_FETCH_URL, r#"fetch\s*\(\s*["'`]https?://"#);
 re!(JS_AXIOS_URL, r#"axios\.\w+\s*\(\s*["'`]https?://"#);
@@ -224,10 +227,10 @@ pub static JS_PATTERNS: LazyLock<Vec<Pattern>> = LazyLock::new(|| {
             description: "http.get() to 'latest' URL",
         },
         Pattern {
-            regex: &JS_EXEC_CURL,
+            regex: &JS_EXEC_SPAWN_CURL,
             severity: Severity::High,
             category: Category::JavaScriptFetch,
-            description: "exec() shelling out to curl — runtime fetch bypasses pinning",
+            description: "exec()/spawn() shelling out to curl/wget — runtime fetch bypasses pinning",
         },
         Pattern {
             regex: &JS_CHILD_PROC_CURL,
@@ -376,7 +379,7 @@ pub static PY_URL_PATTERNS: LazyLock<Vec<Pattern>> = LazyLock::new(|| {
 
 re!(
     CHECKSUM_VERIFY,
-    r"(?i)(sha256sum|sha512sum|shasum|openssl\s+dgst|gpg\s+--verify|Get-FileHash)"
+    r"(?i)(sha256sum|sha512sum|shasum|openssl\s+dgst|gpg\b[^\n]*--verify|cosign\s+verify|minisign\s+-V|Get-FileHash)"
 );
 
 /// Check if a line contains a checksum verification command.
@@ -394,9 +397,29 @@ pub fn has_checksum_verify(line: &str) -> bool {
 static VERSION_SEGMENT: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"[/=]v?\d+(\.\d+)+[/\s"]"#).unwrap());
 
-/// Check if a URL-like string contains a version segment.
+/// Check if a URL contains a version segment in its **path or query** — not
+/// its host. Scanning the authority too would let a versioned-looking host (a
+/// bare IP like `10.0.0.1`, or a date-stamped hostname) whitelist an otherwise
+/// unpinned fetch, which is a detection bypass.
 pub fn url_has_version(s: &str) -> bool {
-    VERSION_SEGMENT.is_match(s)
+    VERSION_SEGMENT.is_match(url_path_and_query(s))
+}
+
+/// Return the path+query+fragment of an `http(s)://` URL (everything from the
+/// first `/` after the authority). Returns `""` for a URL with no path, and
+/// the input unchanged for a string that is not an `http(s)://` URL.
+fn url_path_and_query(url: &str) -> &str {
+    let Some(rest) = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+    else {
+        return url;
+    };
+    let after_userinfo = rest.split_once('@').map(|(_, r)| r).unwrap_or(rest);
+    match after_userinfo.find('/') {
+        Some(i) => &after_userinfo[i..],
+        None => "",
+    }
 }
 
 /// File extensions whose contents are parsed as data rather than executed.
@@ -438,11 +461,11 @@ pub fn url_is_data_format(url: &str) -> bool {
         .any(|e| ext.eq_ignore_ascii_case(e))
 }
 
-/// Extract the first URL from a line.
-pub fn extract_url(line: &str) -> Option<&str> {
-    static URL_RE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r#"https?://[^\s"'`)>]+"#).unwrap());
-    URL_RE.find(line).map(|m| m.as_str())
+static URL_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"https?://[^\s"'`)>]+"#).unwrap());
+
+/// Extract every URL from a line, in order of appearance.
+pub fn extract_urls(line: &str) -> impl Iterator<Item = &str> {
+    URL_RE.find_iter(line).map(|m| m.as_str())
 }
 
 /// Check if a `gh release download` line has a version tag argument.
@@ -607,6 +630,16 @@ mod tests {
     fn single_number_not_version() {
         // A single number segment like /v4/ is not multi-component, so not matched
         assert!(!url_has_version("https://example.com/v4/resource"));
+    }
+
+    #[test]
+    fn versioned_looking_host_not_counted() {
+        // A bare-IP host (or a version-shaped authority) must NOT register as a
+        // pinned version — only the path/query is scanned, so these still fire.
+        assert!(!url_has_version("https://10.0.0.1/install.sh"));
+        assert!(!url_has_version("https://1.2.3.4/get.sh"));
+        // …but a real version in the path still counts.
+        assert!(url_has_version("https://10.0.0.1/v1.2.3/install.sh"));
     }
 
     // ── url_extension ───────────────────────────────────────────────────
@@ -796,23 +829,36 @@ mod tests {
         ));
     }
 
-    // ── extract_url ─────────────────────────────────────────────────────
+    // ── extract_urls ────────────────────────────────────────────────────
 
     #[test]
     fn extract_url_from_curl() {
         let line = r#"curl -L "https://example.com/file.tar.gz" -o out"#;
-        assert_eq!(extract_url(line), Some("https://example.com/file.tar.gz"));
+        assert_eq!(
+            extract_urls(line).next(),
+            Some("https://example.com/file.tar.gz")
+        );
     }
 
     #[test]
     fn extract_url_single_quotes() {
         let line = "wget 'https://example.com/file'";
-        assert_eq!(extract_url(line), Some("https://example.com/file"));
+        assert_eq!(extract_urls(line).next(), Some("https://example.com/file"));
     }
 
     #[test]
     fn no_url() {
-        assert!(extract_url("echo hello world").is_none());
+        assert!(extract_urls("echo hello world").next().is_none());
+    }
+
+    #[test]
+    fn extract_urls_returns_all_urls_in_order() {
+        let line = "curl https://a.example/v1.2.3/x https://b.example/y -o out";
+        let urls: Vec<&str> = extract_urls(line).collect();
+        assert_eq!(
+            urls,
+            vec!["https://a.example/v1.2.3/x", "https://b.example/y"]
+        );
     }
 
     // ── Shell patterns ──────────────────────────────────────────────────
@@ -933,8 +979,13 @@ mod tests {
     }
 
     #[test]
-    fn js_exec_curl_detected() {
-        assert!(JS_EXEC_CURL.is_match(r#"exec("curl -L https://example.com")"#));
+    fn js_exec_spawn_curl_detected() {
+        // exec()/execSync() still match…
+        assert!(JS_EXEC_SPAWN_CURL.is_match(r#"exec("curl -L https://example.com")"#));
+        assert!(JS_EXEC_SPAWN_CURL.is_match(r#"execSync(`curl ${url}`)"#));
+        // …and spawn()/spawnSync() shelling out to curl/wget now match too.
+        assert!(JS_EXEC_SPAWN_CURL.is_match(r#"spawn("curl", ["-L", url])"#));
+        assert!(JS_EXEC_SPAWN_CURL.is_match(r#"spawnSync("wget", [url])"#));
     }
 
     // ── Docker patterns ─────────────────────────────────────────────────
@@ -1138,6 +1189,31 @@ mod tests {
     }
 
     #[test]
+    fn pipe_shell_alternate_interpreters_matched() {
+        for interp in ["node", "nodejs", "ruby", "perl", "pwsh", "powershell"] {
+            assert!(
+                SH_PIPE_SHELL.is_match(&format!("curl -fsSL https://x.example/i | {interp}")),
+                "pipe to {interp} should be flagged as pipe-to-shell"
+            );
+        }
+    }
+
+    #[test]
+    fn pipe_shell_wrapped_interpreter_matched() {
+        // A path-qualified interpreter or an env/sudo/xargs wrapper must not evade detection.
+        assert!(SH_PIPE_SHELL.is_match("curl -fsSL https://x.example/i | /bin/bash"));
+        assert!(SH_PIPE_SHELL.is_match("curl -fsSL https://x.example/i | env bash"));
+        assert!(SH_PIPE_SHELL.is_match("curl -fsSL https://x.example/i | xargs bash"));
+        assert!(SH_PIPE_SHELL.is_match("wget -qO- https://x.example/i | sudo /usr/bin/python3"));
+    }
+
+    #[test]
+    fn pipe_shell_non_interpreter_path_not_matched() {
+        // A path that merely contains "node" but is not an interpreter must not match.
+        assert!(!SH_PIPE_SHELL.is_match("curl https://x.example/i | node_modules/.bin/tool"));
+    }
+
+    #[test]
     fn proc_sub_bash_curl_matched() {
         assert!(SH_PROC_SUB_FETCH.is_match("bash <(curl https://example.com/install.sh)"));
     }
@@ -1167,6 +1243,15 @@ mod tests {
     #[test]
     fn cmd_sub_local_not_matched() {
         assert!(!SH_CMD_SUB_FETCH.is_match(r#"bash -c "$(pwd)""#));
+    }
+
+    #[test]
+    fn cmd_sub_with_quoted_arg_matched() {
+        // A quoted argument before the command substitution must not hide it.
+        assert!(
+            SH_CMD_SUB_FETCH
+                .is_match(r#"bash --rcfile "x" -c "$(curl -fsSL https://example.com/install.sh)""#)
+        );
     }
 
     #[test]
@@ -1208,6 +1293,22 @@ mod tests {
     #[test]
     fn checksum_gpg_detected() {
         assert!(has_checksum_verify("gpg --verify file.sig file.tar.gz"));
+    }
+
+    #[test]
+    fn checksum_gpg_with_intermediate_flags_detected() {
+        // Flags between `gpg` and `--verify` must not defeat recognition.
+        assert!(has_checksum_verify(
+            "gpg --batch --verify file.sig file.tar.gz"
+        ));
+    }
+
+    #[test]
+    fn checksum_cosign_and_minisign_detected() {
+        assert!(has_checksum_verify(
+            "cosign verify-blob --signature s.sig artifact"
+        ));
+        assert!(has_checksum_verify("minisign -V -m file.tar.gz"));
     }
 
     #[test]
