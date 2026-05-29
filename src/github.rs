@@ -19,6 +19,55 @@ const MAX_RATE_LIMIT_WAIT: Duration = Duration::from_secs(60);
 /// Delay before retrying a transient 5xx or network error.
 const TRANSIENT_RETRY_DELAY: Duration = Duration::from_millis(500);
 
+/// Total per-request timeout. Without one, a stalled connection hangs the whole
+/// run forever (the retry logic only fires on a completed response).
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Connection-establishment timeout.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Upper bound on a single buffered response body. Action source files and
+/// recursive trees are fetched from arbitrary repositories; a hostile or
+/// compromised endpoint could otherwise stream gigabytes into memory.
+pub(crate) const MAX_RESPONSE_BYTES: usize = 50 * 1024 * 1024;
+
+/// Build the shared HTTP client used for every outbound request: bounded
+/// request/connect timeouts so a stalled endpoint can't hang the run, and an
+/// explicit (bounded) redirect policy. reqwest strips the `Authorization`
+/// header on cross-host redirects, so following GitHub's content redirects is
+/// safe.
+pub(crate) fn build_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(REQUEST_TIMEOUT)
+        .connect_timeout(CONNECT_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .build()
+        .expect("failed to build HTTP client")
+}
+
+/// Read a response body into memory, failing if it exceeds [`MAX_RESPONSE_BYTES`].
+/// Streams chunk-by-chunk so an oversized body is rejected before it is fully
+/// buffered. Use for the unbounded-size fetches (action source, file trees,
+/// the remote catalog); the fixed-shape GitHub API responses don't need it.
+pub(crate) async fn read_capped(mut resp: reqwest::Response) -> Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    while let Some(chunk) = resp.chunk().await.context("reading response body")? {
+        within_cap(buf.len(), chunk.len(), MAX_RESPONSE_BYTES)?;
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
+}
+
+/// Error if appending `incoming` bytes to a buffer already holding `current`
+/// would exceed `max`. Split out from [`read_capped`] so the boundary logic is
+/// unit-testable without constructing a streaming response.
+fn within_cap(current: usize, incoming: usize, max: usize) -> Result<()> {
+    if current + incoming > max {
+        bail!("response body exceeds {max} bytes — refusing to buffer");
+    }
+    Ok(())
+}
+
 #[derive(Deserialize)]
 struct GitRef {
     object: GitObject,
@@ -119,7 +168,7 @@ pub enum GitHubError {
 impl GitHubClient {
     pub fn new(token: String) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: build_client(),
             token,
         }
     }
@@ -160,6 +209,19 @@ impl GitHubClient {
                         && !last_attempt
                     {
                         // +1s so we don't wake exactly at reset and race the clock.
+                        tokio::time::sleep(wait + Duration::from_secs(1)).await;
+                        continue;
+                    }
+                    bail!(GitHubError::RateLimit);
+                }
+                403 | 429 if retry_after(&resp).is_some() => {
+                    // Secondary/abuse rate limit: GitHub returns 403/429 with a
+                    // `Retry-After` header and no zeroed `x-ratelimit-remaining`.
+                    // The concurrent source-fetch fan-out is what trips these.
+                    if let Some(wait) = retry_after(&resp)
+                        && wait <= MAX_RATE_LIMIT_WAIT
+                        && !last_attempt
+                    {
                         tokio::time::sleep(wait + Duration::from_secs(1)).await;
                         continue;
                     }
@@ -327,7 +389,14 @@ impl GitHubClient {
         let url =
             format!("https://api.github.com/repos/{owner}/{repo}/git/trees/{sha}?recursive=1");
         let resp = self.get(&url).await?;
-        let tree: Tree = resp.json().await.context("parsing tree")?;
+        if resp.status().as_u16() == 404 {
+            bail!(GitHubError::RepoNotFound {
+                owner: owner.into(),
+                repo: repo.into(),
+            });
+        }
+        let bytes = read_capped(resp).await?;
+        let tree: Tree = serde_json::from_slice(&bytes).context("parsing tree")?;
         Ok(tree.tree)
     }
 
@@ -356,7 +425,8 @@ impl GitHubClient {
             bail!("File {path} not found in {owner}/{repo} at {git_ref}");
         }
 
-        resp.text().await.context("reading file content")
+        let bytes = read_capped(resp).await?;
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
 }
 
@@ -382,4 +452,54 @@ fn rate_limit_wait(resp: &reqwest::Response) -> Option<Duration> {
         .ok()?;
     let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
     Some(Duration::from_secs(reset_at.saturating_sub(now)))
+}
+
+/// Parse the `Retry-After` header (an integer count of seconds) that GitHub
+/// sends on secondary/abuse rate limits. Returns `None` if the header is absent
+/// or in the HTTP-date form (which GitHub does not use for these limits).
+fn retry_after(resp: &reqwest::Response) -> Option<Duration> {
+    parse_retry_after(resp.headers().get("retry-after")?.to_str().ok()?)
+}
+
+/// Parse a `Retry-After` header value as an integer count of seconds. Returns
+/// `None` for the HTTP-date form, which GitHub does not use for these limits.
+fn parse_retry_after(value: &str) -> Option<Duration> {
+    value.trim().parse::<u64>().ok().map(Duration::from_secs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn within_cap_allows_up_to_the_limit() {
+        assert!(within_cap(0, 100, 100).is_ok());
+        assert!(within_cap(90, 10, 100).is_ok());
+        assert!(within_cap(0, 0, 0).is_ok());
+    }
+
+    #[test]
+    fn within_cap_rejects_overflow() {
+        assert!(within_cap(0, 101, 100).is_err());
+        assert!(within_cap(100, 1, 100).is_err());
+    }
+
+    #[test]
+    fn parse_retry_after_accepts_integer_seconds() {
+        assert_eq!(parse_retry_after("42"), Some(Duration::from_secs(42)));
+        assert_eq!(parse_retry_after("  7 "), Some(Duration::from_secs(7)));
+        assert_eq!(parse_retry_after("0"), Some(Duration::from_secs(0)));
+    }
+
+    #[test]
+    fn parse_retry_after_rejects_non_integer() {
+        assert!(parse_retry_after("Wed, 21 Oct 2015 07:28:00 GMT").is_none());
+        assert!(parse_retry_after("").is_none());
+        assert!(parse_retry_after("12.5").is_none());
+    }
+
+    #[test]
+    fn build_client_does_not_panic() {
+        let _ = build_client();
+    }
 }
