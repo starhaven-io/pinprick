@@ -96,7 +96,7 @@ These fire once per workflow, not per action use.
 | `workflow.pull_request_target` | Workflow uses the `pull_request_target` trigger     | high     |    5   | live   | Validate the checkout ref; avoid running PR code with elevated tokens |
 | `workflow.workflow_run`     | Workflow uses the `workflow_run` trigger              | medium   |    3   | live   | Explicitly validate trigger provenance                |
 
-The `pull_request_target` and `workflow_run` rules fire on trigger *presence* in v0.1.0. A future release may narrow to "without explicit guardrails" once the parser can recognize common safe patterns (e.g., validating the checkout ref).
+The `pull_request_target` and `workflow_run` rules fire on trigger *presence* as of v0.5.0. A future release may narrow to "without explicit guardrails" once the parser can recognize common safe patterns (e.g., validating the checkout ref).
 
 ### Future categories (not in v1)
 
@@ -114,7 +114,7 @@ These are deliberately out of scope for v1 to keep the initial rubric defensible
 
 ```jsonc
 {
-  "rubric_version": "0.1.0",
+  "rubric_version": "0.5.0",
   "pinprick_version": "…",
   "scanned_at": "2026-04-22T20:00:00Z",
   "target": { "kind": "repo", "path": "./" },
@@ -149,7 +149,7 @@ These are deliberately out of scope for v1 to keep the initial rubric defensible
 A compact summary:
 
 ```
-pinprick score  v0.1.0 rubric
+pinprick score  v0.5.0 rubric
 
   Grade:  C   (72 / 100)
 

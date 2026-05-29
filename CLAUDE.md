@@ -49,7 +49,7 @@ pinprick/
 - `pinprick pin [PATH] [--write]` — Scan `.github/workflows/*.yml`, resolve action tag refs to full SHAs via GitHub API. Dry-run by default (exits 1 when there are unpinned actions). `--write` rewrites files with `@sha # tag` format. Skips already-pinned (SHA) refs. Warns on branch refs (`@main`) and sliding tags (`@v4`), resolving sliding tags to exact versions.
 - `pinprick update [PATH] [--write] [--only PATTERN]` — Check SHA-pinned actions for newer releases. Dry-run by default, `--write` to apply changes. `--only` restricts the check to actions whose `owner/repo` contains the given substring.
 - `pinprick audit [PATH] [--verbose] [--sarif]` — Scan for runtime fetch patterns that bypass pinning. Without a GitHub token, scans only local `run:` blocks. With a token, also fetches and scans action source code (JS/TS, Python, Dockerfiles, action.yml). `--verbose` shows allowed matches. `--sarif` outputs SARIF 2.1.0 for GitHub code scanning.
-- `pinprick score [PATH] [--html]` — Compute a supply-chain posture score (0–100, letter grade A–F) for a repository's workflows. Implements the public rubric in `docs/scoring.md`. v0.3.0 emits `pin.*`, `workflow.*`, `source.unverified`, and `runtime.*` findings (all offline, no token required). `runtime.*` rules reuse the `audit` shell pipeline against each workflow's `run:` blocks, distinguishing pipe-to-shell (-20) from severity-graded fetches (-15/-8/-3). `source.unverified` uses a baseline of trusted publishers (`actions`, `github`) extended by `trusted-owners` in `.pinprick.toml`. Exits 1 when any findings exist (matches `audit` for CI gating); outputs JSON with `--json` or a self-contained HTML report with `--html` (mutually exclusive with `--json`).
+- `pinprick score [PATH] [--html]` — Compute a supply-chain posture score (0–100, letter grade A–F) for a repository's workflows. Implements the public rubric in `docs/scoring.md` (rubric v0.5.0). The offline rules (`pin.*`, `workflow.*`, `source.unverified`, `runtime.*`) need no token; with a token it additionally emits the token-gated `source.archived` and `source.advisory` rules. `runtime.*` rules reuse the `audit` shell pipeline against each workflow's `run:` blocks, distinguishing pipe-to-shell (-20) from severity-graded fetches (-15/-8/-3). `source.unverified` uses a baseline of trusted publishers (`actions`, `github`) extended by `trusted-owners` in `.pinprick.toml`. Exits 1 when any findings exist (matches `audit` for CI gating); outputs JSON with `--json` or a self-contained HTML report with `--html` (mutually exclusive with `--json`).
 - `pinprick clean` — Remove locally cached audit results (`~/.cache/pinprick/audited/`).
 - `pinprick completions <SHELL>` — Generate shell completions for bash, zsh, fish, etc.
 
@@ -112,11 +112,14 @@ Git clone ref pinning: `git clone` without `--branch`/`-b` or with a branch name
 ## CI workflows (.github/workflows/)
 
 - **audit-actions.yml** — Weekly scan of tracked actions for new releases, automated PRs for clean entries
-- **ci.yml** — Dynamic matrix PR checks: conventional commits, clippy + rustfmt + typos, cargo test, site format + build, audited-actions verification, zizmor
-- **codeql.yml** — CodeQL security analysis on push to main
+- **bump-cargo-tools.yml** — Weekly check for newer versions of the cargo-installed CI lint tools (typos, cargo-deny, cargo-nextest, cargo-llvm-cov); opens a PR bumping the pins in ci.yml
+- **ci.yml** — Dynamic matrix PR checks: conventional commits, clippy + rustfmt + typos, cargo test, coverage, site format + build, audited-actions verification, zizmor
+- **codeql.yml** — CodeQL security analysis (actions queries) on push to main
 - **deploy-site.yml** — Build and deploy Astro site to Cloudflare Workers
-- **release.yml** — Manual dispatch: build cross-platform binaries (linux-amd64, linux-arm64, darwin-arm64), create GitHub release with build provenance attestations, publish the crate to crates.io
+- **link-check.yml** — Weekly lychee broken-link check across the built site and README
 - **pinprick-audit.yml** — Run pinprick audit on its own workflows with SARIF upload
+- **refresh-cargo-lockfile.yml** — Weekly `cargo update` to pick up transitive dependency bumps Dependabot does not file PRs for; opens a PR
+- **release.yml** — Manual dispatch: build cross-platform binaries (linux-amd64, linux-arm64, darwin-arm64), create GitHub release with build provenance attestations, publish the crate to crates.io, bump the Homebrew cask
 - **zizmor.yml** — GitHub Actions security audit on push to main
 
 ## Commit conventions
