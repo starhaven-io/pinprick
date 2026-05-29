@@ -15,7 +15,7 @@ use std::process::ExitCode;
 use crate::audit::{self, AuditCollector};
 use crate::auth;
 use crate::config::Config;
-use crate::github::{GitHubClient, GitHubError, SecurityAdvisory};
+use crate::github::{AdvisoryVulnerability, GitHubClient, GitHubError, SecurityAdvisory};
 use crate::output::AuditFinding;
 use crate::workflow::{self, ActionRef, RefType};
 
@@ -617,6 +617,11 @@ fn advisory_findings(
         };
         for adv in repo_advs {
             let Some((matched_range, patched)) = adv.vulnerabilities.iter().find_map(|v| {
+                // Only the entry for THIS action's package — a co-listed package
+                // (e.g. a CLI) can carry a range that false-matches the action.
+                if !vuln_is_for_action(v, owner, repo) {
+                    return None;
+                }
                 let range = v.vulnerable_version_range.as_deref()?;
                 if version_in_range(tag, range).unwrap_or(false) {
                     Some((range.to_string(), v.patched_versions.clone()))
@@ -682,15 +687,6 @@ fn format_advisory_details(
 /// treat that as "no match" rather than aborting the scan.
 fn version_in_range(version: &str, range: &str) -> Option<bool> {
     let v = strip_v_prefix(version);
-    let r = normalize_range_string(range);
-    // A bare version literal (`1.2.3`) is an exact-match range, not semver's
-    // default caret (`^1.2.3`). GHSA ranges are normally comparator form, but
-    // when one is a bare version, caret would both over- and under-match.
-    let r = if r.trim_start().starts_with(|c: char| c.is_ascii_digit()) {
-        format!("={}", r.trim())
-    } else {
-        r
-    };
     let mut ver = semver::Version::parse(v).ok()?;
     // Advisory ranges describe release versions, and semver's `VersionReq`
     // refuses to match a pre-release (`2.0.0-rc1`) unless the comparator names
@@ -698,8 +694,46 @@ fn version_in_range(version: &str, range: &str) -> Option<bool> {
     // pin. Match on the numeric version by dropping pre-release/build metadata.
     ver.pre = semver::Prerelease::EMPTY;
     ver.build = semver::BuildMetadata::EMPTY;
-    let req = semver::VersionReq::parse(&r).ok()?;
-    Some(req.matches(&ver))
+
+    // GitHub expresses ranges with `or` (a union of clauses) and `and`/comma
+    // (intersection within a clause), e.g. `>= 3.26.11 and <= 3.28.2, or >= 2.x`.
+    // semver has no `or` and uses a comma for `and`, so evaluate each `or` clause
+    // independently and match if any holds. Returns `None` only when NO clause is
+    // parsable, so a truly unparsable range is still treated as "no match".
+    let mut parsed_any = false;
+    for clause in range.split(" or ") {
+        let clause = clause
+            .trim()
+            .trim_end_matches(',')
+            .trim()
+            .replace(" and ", ", ");
+        let r = normalize_range_string(&clause);
+        // A bare version literal (`1.2.3`) is an exact match, not semver's
+        // default caret (`^1.2.3`), which would both over- and under-match.
+        let r = if r.trim_start().starts_with(|c: char| c.is_ascii_digit()) {
+            format!("={}", r.trim())
+        } else {
+            r
+        };
+        if let Ok(req) = semver::VersionReq::parse(&r) {
+            parsed_any = true;
+            if req.matches(&ver) {
+                return Some(true);
+            }
+        }
+    }
+    parsed_any.then_some(false)
+}
+
+/// True if this vulnerability entry describes the action being scored. One
+/// advisory can list several affected packages (e.g. an action *and* a CLI);
+/// matching the action's version against a different package's range is a
+/// false positive. GitHub Actions packages are named `owner/repo`.
+fn vuln_is_for_action(v: &AdvisoryVulnerability, owner: &str, repo: &str) -> bool {
+    v.package
+        .as_ref()
+        .and_then(|p| p.name.as_deref())
+        .is_some_and(|name| name.eq_ignore_ascii_case(&format!("{owner}/{repo}")))
 }
 
 fn strip_v_prefix(s: &str) -> &str {
@@ -1366,6 +1400,9 @@ jobs:
             severity: severity.to_string(),
             summary: summary.to_string(),
             vulnerabilities: vec![crate::github::AdvisoryVulnerability {
+                package: Some(crate::github::AdvisoryPackage {
+                    name: Some("owner/repo".to_string()),
+                }),
                 vulnerable_version_range: Some(range.to_string()),
                 patched_versions: patched.map(|s| s.to_string()),
             }],
@@ -1416,6 +1453,20 @@ jobs:
         assert_eq!(version_in_range("1.2.3", "1.2.3"), Some(true));
         assert_eq!(version_in_range("1.9.0", "1.2.3"), Some(false));
         assert_eq!(version_in_range("v2.0.0", "v2.0.0"), Some(true));
+    }
+
+    #[test]
+    fn version_in_range_handles_github_and_or_syntax() {
+        // GitHub's union/intersection range form (as returned for GHSA-vqf5).
+        let range = ">= 3.26.11 and <= 3.28.2, or >= 2.26.11 and < 3";
+        // A current major (v4) is in neither clause.
+        assert_eq!(version_in_range("4.35.5", range), Some(false));
+        // Inside the second clause (`>= 2.26.11 and < 3`).
+        assert_eq!(version_in_range("2.27.0", range), Some(true));
+        // Inside the first clause (`>= 3.26.11 and <= 3.28.2`).
+        assert_eq!(version_in_range("3.27.0", range), Some(true));
+        // Between the two clauses → not vulnerable.
+        assert_eq!(version_in_range("3.28.3", range), Some(false));
     }
 
     #[test]
@@ -1593,6 +1644,97 @@ jobs:
         let occurrences = BTreeMap::new();
         let findings = advisory_findings(&action_resolved, &advisories, &occurrences);
         assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn advisory_findings_ignores_other_packages_in_advisory() {
+        // Regression for the codeql-action false positive: GHSA-vqf5 lists both
+        // `github/codeql-action` and the `CodeQL CLI`. The CLI's open-ended
+        // `>= 2.9.2` must not match the action's v4 pin, and the action's own
+        // range (GitHub `and`/`or` syntax) excludes v4 too → zero findings.
+        let mut action_resolved = BTreeMap::new();
+        action_resolved.insert(
+            "github/codeql-action@SHA".to_string(),
+            (
+                "github".to_string(),
+                "codeql-action".to_string(),
+                "v4.35.5".to_string(),
+            ),
+        );
+        let adv = SecurityAdvisory {
+            ghsa_id: "GHSA-vqf5-2xx6-9wfm".to_string(),
+            html_url: "https://github.com/github/codeql-action/security/advisories/GHSA-vqf5"
+                .to_string(),
+            severity: "high".to_string(),
+            summary: "PAT written to debug artifacts".to_string(),
+            vulnerabilities: vec![
+                crate::github::AdvisoryVulnerability {
+                    package: Some(crate::github::AdvisoryPackage {
+                        name: Some("github/codeql-action".to_string()),
+                    }),
+                    vulnerable_version_range: Some(
+                        ">= 3.26.11 and <= 3.28.2, or >= 2.26.11 and < 3".to_string(),
+                    ),
+                    patched_versions: None,
+                },
+                crate::github::AdvisoryVulnerability {
+                    package: Some(crate::github::AdvisoryPackage {
+                        name: Some("CodeQL CLI".to_string()),
+                    }),
+                    vulnerable_version_range: Some(">= 2.9.2".to_string()),
+                    patched_versions: None,
+                },
+            ],
+        };
+        let mut advisories = BTreeMap::new();
+        advisories.insert(
+            ("github".to_string(), "codeql-action".to_string()),
+            vec![adv],
+        );
+        let occurrences = BTreeMap::new();
+        let findings = advisory_findings(&action_resolved, &advisories, &occurrences);
+        assert!(
+            findings.is_empty(),
+            "a patched v4 action must not match a v2-era advisory or a co-listed package"
+        );
+    }
+
+    #[test]
+    fn advisory_findings_matches_action_via_github_range_syntax() {
+        // The same advisory DOES flag a genuinely-vulnerable action version
+        // expressed in GitHub's `and`/`or` syntax (the second clause).
+        let mut action_resolved = BTreeMap::new();
+        action_resolved.insert(
+            "github/codeql-action@SHA".to_string(),
+            (
+                "github".to_string(),
+                "codeql-action".to_string(),
+                "v2.27.0".to_string(),
+            ),
+        );
+        let adv = SecurityAdvisory {
+            ghsa_id: "GHSA-vqf5-2xx6-9wfm".to_string(),
+            html_url: "https://example.test/adv".to_string(),
+            severity: "high".to_string(),
+            summary: "x".to_string(),
+            vulnerabilities: vec![crate::github::AdvisoryVulnerability {
+                package: Some(crate::github::AdvisoryPackage {
+                    name: Some("github/codeql-action".to_string()),
+                }),
+                vulnerable_version_range: Some(
+                    ">= 3.26.11 and <= 3.28.2, or >= 2.26.11 and < 3".to_string(),
+                ),
+                patched_versions: None,
+            }],
+        };
+        let mut advisories = BTreeMap::new();
+        advisories.insert(
+            ("github".to_string(), "codeql-action".to_string()),
+            vec![adv],
+        );
+        let occurrences = BTreeMap::new();
+        let findings = advisory_findings(&action_resolved, &advisories, &occurrences);
+        assert_eq!(findings.len(), 1, "v2.27.0 is inside `>= 2.26.11 and < 3`");
     }
 
     #[test]
