@@ -12,7 +12,7 @@ use crate::audit_patterns::{
     SH_CARGO_INSTALL_UNVERSIONED, SH_GEM_INSTALL_UNVERSIONED, SH_GH_RELEASE_LATEST, SH_GIT_CLONE,
     SH_NPM_UNVERSIONED, SH_NPX_UNVERSIONED, SH_PIP_GIT_URL_UNVERSIONED, SH_PIP_UNVERSIONED,
     SHELL_PATTERNS, SHELL_PIPE_PATTERNS, SHELL_URL_PATTERNS, cargo_install_has_version,
-    category_str, extract_url, gem_install_has_version, gh_release_has_tag,
+    category_str, extract_urls, gem_install_has_version, gh_release_has_tag,
     git_clone_has_pinned_ref, has_checksum_verify, has_git_checkout_sha, npm_install_has_version,
     npx_has_version, pip_git_url_has_ref, pip_install_has_version, ps_install_has_required_version,
     url_has_version,
@@ -782,40 +782,27 @@ fn check_url_patterns(
         if !pattern.regex.is_match(line) {
             continue;
         }
-        let Some(url) = extract_url(line) else {
-            continue;
-        };
-        if url_has_version(url) {
-            collector.push_allowed(AuditMatch {
-                severity: output::severity_str(&pattern.severity).to_string(),
-                category: category_str(&pattern.category).to_string(),
-                action: action_name.to_string(),
-                source_file: source_file.to_string(),
-                line: Some(line_num),
-                pattern_matched: line.trim().to_string(),
-                reason: "versioned URL".to_string(),
-            });
-        } else if config.is_host_trusted(url) {
-            collector.push_allowed(AuditMatch {
-                severity: output::severity_str(&pattern.severity).to_string(),
-                category: category_str(&pattern.category).to_string(),
-                action: action_name.to_string(),
-                source_file: source_file.to_string(),
-                line: Some(line_num),
-                pattern_matched: line.trim().to_string(),
-                reason: "trusted host".to_string(),
-            });
-        } else if config.is_data_format_exempt(url) {
-            collector.push_allowed(AuditMatch {
-                severity: output::severity_str(&pattern.severity).to_string(),
-                category: category_str(&pattern.category).to_string(),
-                action: action_name.to_string(),
-                source_file: source_file.to_string(),
-                line: Some(line_num),
-                pattern_matched: line.trim().to_string(),
-                reason: "data format URL".to_string(),
-            });
-        } else {
+        // Examine EVERY URL on the line, not just the first. The line is only
+        // "allowed" if all of its URLs are exempt (versioned, trusted host, or
+        // a data format); the first URL that is unversioned, untrusted, and not
+        // a data format makes it a finding. Checking only the first URL let a
+        // versioned/trusted decoy placed before the real fetch suppress it.
+        let mut allowed_reason: Option<&str> = None;
+        let mut dangerous = false;
+        for url in extract_urls(line) {
+            if url_has_version(url) {
+                allowed_reason.get_or_insert("versioned URL");
+            } else if config.is_host_trusted(url) {
+                allowed_reason.get_or_insert("trusted host");
+            } else if config.is_data_format_exempt(url) {
+                allowed_reason.get_or_insert("data format URL");
+            } else {
+                dangerous = true;
+                break;
+            }
+        }
+
+        if dangerous {
             collector.push_finding(AuditFinding {
                 severity: output::severity_str(&pattern.severity).to_string(),
                 category: category_str(&pattern.category).to_string(),
@@ -827,7 +814,21 @@ fn check_url_patterns(
                 workflow_file: None,
                 workflow_line: None,
             });
+        } else if let Some(reason) = allowed_reason {
+            // Every URL on the line was exempt; record an allowed match
+            // (visible under --verbose) tagged with the first URL's reason.
+            collector.push_allowed(AuditMatch {
+                severity: output::severity_str(&pattern.severity).to_string(),
+                category: category_str(&pattern.category).to_string(),
+                action: action_name.to_string(),
+                source_file: source_file.to_string(),
+                line: Some(line_num),
+                pattern_matched: line.trim().to_string(),
+                reason: reason.to_string(),
+            });
         }
+        // No URL on the line: nothing to record (matches the prior behavior of
+        // skipping when no URL could be extracted).
     }
 }
 
