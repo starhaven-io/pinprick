@@ -72,14 +72,18 @@ impl Config {
     /// Load config from global (~/.config/pinprick/config.toml) and per-repo (.pinprick.toml).
     /// Per-repo overrides global. Missing files are fine — defaults are used.
     pub fn load(repo_root: &Path) -> Self {
-        let global = load_global();
-        let local = load_local(repo_root);
-
-        // Per-repo takes precedence; fall back to global; fall back to defaults
-        match (global, local) {
-            (_, Some(local)) => local,
-            (Some(global), None) => global,
-            (None, None) => Config::default(),
+        // Per-repo takes precedence. A malformed per-repo file falls back to
+        // DEFAULTS, not the global config: the author meant to configure THIS
+        // repo, so silently substituting an unrelated global policy is more
+        // surprising than using documented defaults. Global is consulted only
+        // when there is no per-repo file at all.
+        match load_local(repo_root) {
+            ConfigLoad::Loaded(local) => local,
+            ConfigLoad::Malformed => Config::default(),
+            ConfigLoad::Absent => match load_global() {
+                ConfigLoad::Loaded(global) => global,
+                ConfigLoad::Malformed | ConfigLoad::Absent => Config::default(),
+            },
         }
     }
 
@@ -170,11 +174,29 @@ fn ignore_pattern_matches(pattern: &str, action_name: &str) -> bool {
     if pattern.is_empty() {
         return false;
     }
+    // GitHub owner/repo slugs are case-insensitive, and every sibling matcher
+    // (trusted-hosts, trusted-owners, data formats) ignores case — so this one
+    // must too, or an ignore entry silently fails to match a differently-cased
+    // `uses:` line.
+    let pattern = pattern.to_ascii_lowercase();
+    let action_name = action_name.to_ascii_lowercase();
     action_name == pattern || action_name.starts_with(&format!("{pattern}/"))
 }
 
-fn load_global() -> Option<Config> {
-    let home = std::env::var("HOME").ok()?;
+/// Outcome of attempting to load a config file: present and valid, present but
+/// unparsable, or absent. The caller distinguishes `Malformed` from `Absent`
+/// because a malformed per-repo file must fall back to defaults, not inherit
+/// the global config.
+enum ConfigLoad {
+    Loaded(Config),
+    Malformed,
+    Absent,
+}
+
+fn load_global() -> ConfigLoad {
+    let Ok(home) = std::env::var("HOME") else {
+        return ConfigLoad::Absent;
+    };
     let path = Path::new(&home)
         .join(".config")
         .join("pinprick")
@@ -182,25 +204,28 @@ fn load_global() -> Option<Config> {
     load_file(&path)
 }
 
-fn load_local(repo_root: &Path) -> Option<Config> {
+fn load_local(repo_root: &Path) -> ConfigLoad {
     load_file(&repo_root.join(".pinprick.toml"))
 }
 
-/// Load and parse a config file. A missing or unreadable file is `None`
+/// Load and parse a config file. A missing or unreadable file is `Absent`
 /// (defaults apply, silently — no config is the normal case). A file that
-/// exists but fails to parse is also `None`, but warns to stderr first: a
+/// exists but fails to parse is `Malformed`, and warns to stderr first: a
 /// silently-dropped config would leave the user thinking their `ignore` /
 /// `severity` / `trusted-*` rules are active when they aren't.
-fn load_file(path: &Path) -> Option<Config> {
-    let content = std::fs::read_to_string(path).ok()?;
+fn load_file(path: &Path) -> ConfigLoad {
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(_) => return ConfigLoad::Absent,
+    };
     match toml::from_str(&content) {
-        Ok(config) => Some(config),
+        Ok(config) => ConfigLoad::Loaded(config),
         Err(e) => {
             eprintln!(
-                "warning: failed to parse {}, ignoring it:\n{e}",
+                "warning: failed to parse {}, using defaults:\n{e}",
                 path.display()
             );
-            None
+            ConfigLoad::Malformed
         }
     }
 }
@@ -411,19 +436,23 @@ trusted-hosts = ["artifacts.example.com", "releases.example.org"]
     // ── load_file: warn vs silent ──────────────────────────────────────
 
     #[test]
-    fn load_file_missing_is_none() {
+    fn load_file_missing_is_absent() {
         let dir = tempfile::TempDir::new().unwrap();
         // No file written — absent config is silent, defaults apply.
-        assert!(load_file(&dir.path().join("config.toml")).is_none());
+        assert!(matches!(
+            load_file(&dir.path().join("config.toml")),
+            ConfigLoad::Absent
+        ));
     }
 
     #[test]
-    fn load_file_malformed_is_none() {
-        // Present-but-unparsable returns None (warning goes to stderr).
+    fn load_file_malformed_is_distinct_from_absent() {
+        // Present-but-unparsable is `Malformed` (warning goes to stderr), NOT
+        // `Absent` — so a bad per-repo file falls back to defaults, not global.
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("config.toml");
         std::fs::write(&path, "severity = \"nope\"\n").unwrap();
-        assert!(load_file(&path).is_none());
+        assert!(matches!(load_file(&path), ConfigLoad::Malformed));
     }
 
     #[test]
@@ -431,9 +460,22 @@ trusted-hosts = ["artifacts.example.com", "releases.example.org"]
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("config.toml");
         std::fs::write(&path, "severity = \"high\"\nfetch-remote = true\n").unwrap();
-        let cfg = load_file(&path).expect("valid config should parse");
+        let ConfigLoad::Loaded(cfg) = load_file(&path) else {
+            panic!("valid config should parse");
+        };
         assert_eq!(cfg.severity, SeverityFilter::High);
         assert!(cfg.fetch_remote);
+    }
+
+    #[test]
+    fn ignore_pattern_is_case_insensitive() {
+        // GitHub slugs are case-insensitive, so an ignore entry must match
+        // regardless of the casing used on the `uses:` line.
+        assert!(ignore_pattern_matches(
+            "actions/checkout",
+            "Actions/Checkout"
+        ));
+        assert!(ignore_pattern_matches("Actions", "actions/setup-node"));
     }
 
     // ── ignore.actions matching ────────────────────────────────────────
