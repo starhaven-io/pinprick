@@ -145,8 +145,20 @@ pub struct SecurityAdvisory {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AdvisoryVulnerability {
+    /// The affected package. One advisory can list several packages (e.g. an
+    /// action *and* a CLI); the scorer must only match the entry for the action
+    /// it is checking, or a different package's range can false-match.
+    #[serde(default)]
+    pub package: Option<AdvisoryPackage>,
     pub vulnerable_version_range: Option<String>,
     pub patched_versions: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AdvisoryPackage {
+    /// For the GitHub Actions ecosystem this is `owner/repo`.
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
