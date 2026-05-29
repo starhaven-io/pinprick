@@ -48,9 +48,20 @@ static RUN_BLOCK_RE: LazyLock<Regex> =
 pub fn parse_uses_line(line: &str, line_number: usize) -> Option<ActionRef> {
     let caps = USES_RE.captures(line)?;
 
-    let action_path = caps.get(2)?.as_str();
-    let ref_string = caps.get(3)?.as_str().to_string();
+    let mut action_path = caps.get(2)?.as_str();
+    let mut ref_string = caps.get(3)?.as_str().to_string();
     let tag_comment = caps.get(5).map(|m| m.as_str().trim().to_string());
+
+    // A quoted `uses:` value (`uses: "owner/repo@v4"`) lands the opening quote
+    // on the action path and the closing quote on the ref; strip a matched pair
+    // so owner/repo and the ref classify correctly.
+    for q in ['"', '\''] {
+        if action_path.starts_with(q) && ref_string.ends_with(q) {
+            action_path = &action_path[1..];
+            ref_string.pop();
+            break;
+        }
+    }
 
     if action_path.starts_with('.') {
         return None;
@@ -106,6 +117,19 @@ pub fn build_pinned_line(line: &str, sha: &str, original_tag: &str) -> Option<St
     let caps = USES_RE.captures(line)?;
     let prefix = caps.get(1)?.as_str();
     let action_path = caps.get(2)?.as_str();
+    let ref_str = caps.get(3)?.as_str();
+
+    // Preserve a surrounding quote pair so `uses: "owner/repo@v4"` stays quoted
+    // and valid; the resolved-tag comment goes after the closing quote.
+    if let Some(q) = action_path
+        .chars()
+        .next()
+        .filter(|c| *c == '"' || *c == '\'')
+        && ref_str.ends_with(q)
+    {
+        let inner = &action_path[1..];
+        return Some(format!("{prefix}{q}{inner}@{sha}{q} # {original_tag}"));
+    }
     Some(format!("{prefix}{action_path}@{sha} # {original_tag}"))
 }
 
@@ -196,6 +220,13 @@ pub fn rewrite_actions(
     let content =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
 
+    // Preserve the file's line terminator: `str::lines()` strips `\r`, so a CRLF
+    // workflow would otherwise be silently rewritten as LF across every line.
+    let newline = if content.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
     let mut lines: Vec<String> = content.lines().map(String::from).collect();
     let mut seen: std::collections::HashSet<usize> =
         std::collections::HashSet::with_capacity(replacements.len());
@@ -218,9 +249,9 @@ pub fn rewrite_actions(
     }
 
     // Preserve trailing newline if original had one
-    let mut output = lines.join("\n");
+    let mut output = lines.join(newline);
     if content.ends_with('\n') {
-        output.push('\n');
+        output.push_str(newline);
     }
 
     std::fs::write(path, &output).with_context(|| format!("writing {}", path.display()))?;
@@ -278,6 +309,24 @@ mod tests {
         assert_eq!(r.repo, "codeql-action");
         assert_eq!(r.subpath.as_deref(), Some("init"));
         assert_eq!(r.full_name(), "github/codeql-action/init");
+    }
+
+    #[test]
+    fn parse_double_quoted_uses_ref() {
+        let r = parse_uses_line("      - uses: \"actions/checkout@v4\"", 1).unwrap();
+        assert_eq!(r.owner, "actions");
+        assert_eq!(r.repo, "checkout");
+        assert_eq!(r.ref_string, "v4");
+        assert_eq!(r.ref_type, RefType::SlidingTag);
+    }
+
+    #[test]
+    fn parse_single_quoted_uses_ref_with_comment() {
+        let r = parse_uses_line("      - uses: 'actions/checkout@v4.2.1' # pinned", 1).unwrap();
+        assert_eq!(r.owner, "actions");
+        assert_eq!(r.ref_string, "v4.2.1");
+        assert_eq!(r.ref_type, RefType::Tag);
+        assert_eq!(r.tag_comment.as_deref(), Some("pinned"));
     }
 
     #[test]
@@ -342,6 +391,13 @@ mod tests {
             result,
             "      - uses: github/codeql-action/init@sha123 # v3"
         );
+    }
+
+    #[test]
+    fn pin_preserves_surrounding_quotes() {
+        let line = "      - uses: \"actions/checkout@v4\"";
+        let result = build_pinned_line(line, "abc123", "v4").unwrap();
+        assert_eq!(result, "      - uses: \"actions/checkout@abc123\" # v4");
     }
 
     // ── full_name / owner_repo ──────────────────────────────────────────
@@ -519,6 +575,18 @@ jobs:
         let result = std::fs::read_to_string(&file).unwrap();
         assert!(result.ends_with('\n'));
         assert_eq!(result, "replaced\nline2\n");
+    }
+
+    #[test]
+    fn rewrite_preserves_crlf() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = dir.path().join("test.yml");
+        std::fs::write(&file, "line1\r\nline2\r\n").unwrap();
+        let count = rewrite_actions(&file, &[(1, "replaced".to_string())]).unwrap();
+        assert_eq!(count, 1);
+        let result = std::fs::read_to_string(&file).unwrap();
+        // The targeted line is replaced and every line keeps its CRLF ending.
+        assert_eq!(result, "replaced\r\nline2\r\n");
     }
 
     #[test]

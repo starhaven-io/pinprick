@@ -87,19 +87,38 @@ pub async fn run(
             eprintln!("Scanning {display_name}");
         }
 
-        let content =
-            std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
+        let content = match std::fs::read_to_string(file) {
+            Ok(content) => content,
+            Err(e) => {
+                // One unreadable or non-UTF-8 workflow must not abort the whole
+                // scan — skip it and keep auditing the rest.
+                eprintln!("  {} {display_name}: {e}", "skipped".yellow());
+                continue;
+            }
+        };
 
-        let run_blocks = extract_run_blocks(file, &content)?;
-        for (line_offset, run_content) in &run_blocks {
-            scan_shell_content(
-                run_content,
-                &display_name,
-                *line_offset,
-                "",
-                &mut collector,
-                config,
-            );
+        match extract_run_blocks(file, &content) {
+            Ok(run_blocks) => {
+                for (line_offset, run_content) in &run_blocks {
+                    scan_shell_content(
+                        run_content,
+                        &display_name,
+                        *line_offset,
+                        "",
+                        &mut collector,
+                        config,
+                    );
+                }
+            }
+            Err(e) => {
+                // A workflow GitHub accepts but serde_norway rejects shouldn't
+                // sink the scan; skip its run-block extraction (the regex-based
+                // `uses:` scan below still runs on the same content).
+                eprintln!(
+                    "  {} run-block scan of {display_name}: {e}",
+                    "skipped".yellow()
+                );
+            }
         }
 
         if let Some(client) = &client {

