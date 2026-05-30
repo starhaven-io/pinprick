@@ -129,8 +129,8 @@ Conventional Commits format: `type(scope): description`
 Common types: `feat`, `fix`, `refactor`, `docs`, `ci`, `chore`
 
 All commits must:
-- Use `git commit -s` for DCO sign-off
-- Include a `Co-authored-by: Claude Opus 4.8 <noreply@anthropic.com>` trailer when authored with Claude (bump the version as newer models ship)
+- Sign off every commit with `git commit -s` for DCO (enforced by the `.githooks/commit-msg` hook — run `just install-hooks` once per clone to enable it).
+- Add a `Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>` trailer when authored with Claude, placed after `Signed-off-by`. Bump the model version as newer ones ship.
 
 ## Git workflow
 

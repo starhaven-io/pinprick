@@ -174,3 +174,7 @@ check:
         failed=1
     fi
     exit $failed
+
+# Install git hooks (DCO sign-off + pre-push checks) — run once per clone
+install-hooks:
+    git config core.hooksPath .githooks

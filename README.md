@@ -214,11 +214,12 @@ just fmt            # Format code
 just typos          # Check for typos
 just audit          # Audit GitHub Actions workflows
 just check          # Run all checks (clippy, fmt, typos, zizmor, test, site)
+just install-hooks  # Install git hooks: pre-push check + DCO sign-off (once per clone)
 ```
 
 ## Contributing
 
-Commits must follow [Conventional Commits](https://www.conventionalcommits.org/) format and include a DCO sign-off (`git commit -s`).
+Commits must follow [Conventional Commits](https://www.conventionalcommits.org/) format and include a DCO sign-off (`git commit -s`). Run `just install-hooks` once per clone to enable the git hooks (a pre-push `just check` and DCO sign-off enforcement).
 
 ## Acknowledgements
 
