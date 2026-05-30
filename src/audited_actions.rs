@@ -1,6 +1,6 @@
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const BUNDLED_JSON: &str = include_str!(concat!(env!("OUT_DIR"), "/bundled_audited_actions.json"));
 const REMOTE_URL: &str = "https://pinprick.rs/audited-actions";
@@ -79,7 +79,7 @@ impl AuditedActions {
         }
 
         if !self.local.contains_key(&key) {
-            let shas = self.load_local_cache(&key);
+            let shas = self.load_local_cache(owner, repo);
             self.local.insert(key.clone(), shas);
         }
         if self.local.get(&key).is_some_and(|shas| shas.contains(sha)) {
@@ -104,9 +104,10 @@ impl AuditedActions {
         let Some(cache_dir) = &self.cache_dir else {
             return;
         };
-
+        let Some(path) = cache_path(cache_dir, owner, repo) else {
+            return;
+        };
         let dir = cache_dir.join(owner);
-        let path = dir.join(format!("{repo}.json"));
 
         let mut entries: Vec<serde_json::Value> = std::fs::read_to_string(&path)
             .ok()
@@ -129,11 +130,13 @@ impl AuditedActions {
         }
     }
 
-    fn load_local_cache(&self, action_key: &str) -> HashSet<String> {
+    fn load_local_cache(&self, owner: &str, repo: &str) -> HashSet<String> {
         let Some(cache_dir) = &self.cache_dir else {
             return HashSet::new();
         };
-        let path = cache_dir.join(format!("{action_key}.json"));
+        let Some(path) = cache_path(cache_dir, owner, repo) else {
+            return HashSet::new();
+        };
         let Ok(content) = std::fs::read_to_string(path) else {
             return HashSet::new();
         };
@@ -186,9 +189,52 @@ pub fn cache_dir() -> Option<PathBuf> {
     Some(PathBuf::from(home).join(".cache/pinprick/audited"))
 }
 
+/// Build the on-disk cache path for an action, returning `None` if either
+/// segment could escape the cache directory. `owner`/`repo` come from `uses:`
+/// parsing and are well-formed in practice — this is defense in depth so a
+/// crafted ref (`..`, an embedded separator) can't resolve outside the cache.
+fn cache_path(cache_dir: &Path, owner: &str, repo: &str) -> Option<PathBuf> {
+    (is_safe_segment(owner) && is_safe_segment(repo))
+        .then(|| cache_dir.join(owner).join(format!("{repo}.json")))
+}
+
+/// A path segment is safe if it is non-empty, not a `.`/`..` traversal token,
+/// and contains no path separator.
+fn is_safe_segment(s: &str) -> bool {
+    !s.is_empty() && s != "." && s != ".." && !s.contains(['/', '\\'])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn safe_segments_accepted() {
+        for s in ["actions", "checkout", "setup-node", "a.b", "..foo", "v1"] {
+            assert!(is_safe_segment(s), "{s} should be safe");
+        }
+    }
+
+    #[test]
+    fn unsafe_segments_rejected() {
+        for s in ["", ".", "..", "a/b", "a\\b", "/etc", "..\\.."] {
+            assert!(!is_safe_segment(s), "{s} should be rejected");
+        }
+    }
+
+    #[test]
+    fn cache_path_stays_inside_cache_dir() {
+        let base = Path::new("/cache");
+        assert_eq!(
+            cache_path(base, "actions", "checkout"),
+            Some(PathBuf::from("/cache/actions/checkout.json"))
+        );
+        // A traversal token or separator in either segment yields no path,
+        // so the caller silently skips the cache rather than escaping it.
+        assert_eq!(cache_path(base, "..", "checkout"), None);
+        assert_eq!(cache_path(base, "actions", "../../etc/passwd"), None);
+        assert_eq!(cache_path(base, "", "checkout"), None);
+    }
 
     #[test]
     fn render_entries_round_trips() {

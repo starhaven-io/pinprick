@@ -29,10 +29,20 @@ fn walk_dir(base: &Path, dir: &Path, data: &mut HashMap<String, Vec<String>>) {
         } else if path.extension().is_some_and(|e| e == "json")
             && let Some(key) = path_to_key(base, &path)
             && let Ok(content) = fs::read_to_string(&path)
-            && let Ok(entries) = serde_json::from_str::<Vec<Entry>>(&content)
         {
-            let shas: Vec<String> = entries.into_iter().map(|e| e.sha).collect();
-            data.insert(key, shas);
+            match serde_json::from_str::<Vec<Entry>>(&content) {
+                Ok(entries) => {
+                    let shas: Vec<String> = entries.into_iter().map(|e| e.sha).collect();
+                    data.insert(key, shas);
+                }
+                // A malformed file would otherwise be silently dropped from the
+                // bundle; surface it so a bad edit is caught at build time.
+                Err(e) => {
+                    println!(
+                        "cargo:warning=audited-actions/{key}.json: skipped, invalid JSON ({e})"
+                    );
+                }
+            }
         }
     }
 }
