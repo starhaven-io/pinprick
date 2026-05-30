@@ -10,7 +10,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 pub struct GitHubClient {
     client: reqwest::Client,
     token: String,
+    /// API origin, always `https://api.github.com` in production. The
+    /// `#[cfg(test)]` constructor is the only way to point this elsewhere, so
+    /// production code can never be aimed at an attacker-controlled host.
+    base: String,
 }
+
+const GITHUB_API_BASE: &str = "https://api.github.com";
 
 /// Cap on how long we'll sleep waiting for a rate-limit reset. Longer waits
 /// would make `pin` / `update` appear hung from the user's perspective.
@@ -175,6 +181,19 @@ impl GitHubClient {
         Self {
             client: build_client(),
             token,
+            base: GITHUB_API_BASE.to_string(),
+        }
+    }
+
+    /// Build a client pointed at an arbitrary API origin. Test-only: it exists
+    /// to aim the client at a local mock server, and is gated so production
+    /// code keeps the `https://api.github.com` invariant.
+    #[cfg(test)]
+    pub(crate) fn with_base(token: String, base: String) -> Self {
+        Self {
+            client: build_client(),
+            token,
+            base,
         }
     }
 
@@ -243,7 +262,7 @@ impl GitHubClient {
 
     /// Resolve a tag to its commit SHA, following annotated tag objects.
     pub async fn resolve_tag(&self, owner: &str, repo: &str, tag: &str) -> Result<String> {
-        let url = format!("https://api.github.com/repos/{owner}/{repo}/git/ref/tags/{tag}");
+        let url = format!("{}/repos/{owner}/{repo}/git/ref/tags/{tag}", self.base);
         let resp = self.get(&url).await?;
 
         if resp.status().as_u16() == 404 {
@@ -258,8 +277,8 @@ impl GitHubClient {
 
         if git_ref.object.object_type == "tag" {
             let tag_url = format!(
-                "https://api.github.com/repos/{owner}/{repo}/git/tags/{}",
-                git_ref.object.sha
+                "{}/repos/{owner}/{repo}/git/tags/{}",
+                self.base, git_ref.object.sha
             );
             let tag_resp = self.get(&tag_url).await?;
             let tag_obj: TagObject = tag_resp.json().await.context("parsing tag object")?;
@@ -279,7 +298,8 @@ impl GitHubClient {
         original_tag: &str,
     ) -> String {
         let url = format!(
-            "https://api.github.com/repos/{owner}/{repo}/git/matching-refs/tags/{original_tag}"
+            "{}/repos/{owner}/{repo}/git/matching-refs/tags/{original_tag}",
+            self.base
         );
         let Ok(resp) = self.get(&url).await else {
             return original_tag.to_string();
@@ -306,7 +326,7 @@ impl GitHubClient {
     }
 
     async fn resolve_annotated_tag(&self, owner: &str, repo: &str, tag_sha: &str) -> String {
-        let url = format!("https://api.github.com/repos/{owner}/{repo}/git/tags/{tag_sha}");
+        let url = format!("{}/repos/{owner}/{repo}/git/tags/{tag_sha}", self.base);
         let Ok(resp) = self.get(&url).await else {
             return String::new();
         };
@@ -318,7 +338,7 @@ impl GitHubClient {
 
     /// List releases for a repo (first page, most recent first).
     pub async fn list_releases(&self, owner: &str, repo: &str) -> Result<Vec<Release>> {
-        let url = format!("https://api.github.com/repos/{owner}/{repo}/releases?per_page=30");
+        let url = format!("{}/repos/{owner}/{repo}/releases?per_page=30", self.base);
         let resp = self.get(&url).await?;
 
         if resp.status().as_u16() == 404 {
@@ -336,7 +356,7 @@ impl GitHubClient {
     /// the first 100 tags only — pinned actions are virtually always on a
     /// recent release tag, and paginating further isn't worth the latency.
     pub async fn sha_to_tag(&self, owner: &str, repo: &str, sha: &str) -> Result<Option<String>> {
-        let url = format!("https://api.github.com/repos/{owner}/{repo}/tags?per_page=100");
+        let url = format!("{}/repos/{owner}/{repo}/tags?per_page=100", self.base);
         let resp = self.get(&url).await?;
         if resp.status().as_u16() == 404 {
             bail!(GitHubError::RepoNotFound {
@@ -359,7 +379,8 @@ impl GitHubClient {
         repo: &str,
     ) -> Result<Vec<SecurityAdvisory>> {
         let url = format!(
-            "https://api.github.com/repos/{owner}/{repo}/security-advisories?state=published&per_page=100"
+            "{}/repos/{owner}/{repo}/security-advisories?state=published&per_page=100",
+            self.base
         );
         let resp = self.get(&url).await?;
         if resp.status().as_u16() == 404 {
@@ -373,7 +394,7 @@ impl GitHubClient {
 
     /// Return `true` if the repo is archived on GitHub.
     pub async fn is_archived(&self, owner: &str, repo: &str) -> Result<bool> {
-        let url = format!("https://api.github.com/repos/{owner}/{repo}");
+        let url = format!("{}/repos/{owner}/{repo}", self.base);
         let resp = self.get(&url).await?;
 
         if resp.status().as_u16() == 404 {
@@ -389,8 +410,10 @@ impl GitHubClient {
 
     /// Fetch the file tree for a repo at a given SHA.
     pub async fn fetch_tree(&self, owner: &str, repo: &str, sha: &str) -> Result<Vec<TreeEntry>> {
-        let url =
-            format!("https://api.github.com/repos/{owner}/{repo}/git/trees/{sha}?recursive=1");
+        let url = format!(
+            "{}/repos/{owner}/{repo}/git/trees/{sha}?recursive=1",
+            self.base
+        );
         let resp = self.get(&url).await?;
         if resp.status().as_u16() == 404 {
             bail!(GitHubError::RepoNotFound {
@@ -411,8 +434,10 @@ impl GitHubClient {
         path: &str,
         git_ref: &str,
     ) -> Result<String> {
-        let url =
-            format!("https://api.github.com/repos/{owner}/{repo}/contents/{path}?ref={git_ref}");
+        let url = format!(
+            "{}/repos/{owner}/{repo}/contents/{path}?ref={git_ref}",
+            self.base
+        );
         let resp = self
             .client
             .get(&url)
@@ -504,5 +529,254 @@ mod tests {
     #[test]
     fn build_client_does_not_panic() {
         let _ = build_client();
+    }
+
+    mod network {
+        use super::*;
+        use serde_json::json;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        async fn client_for(server: &MockServer) -> GitHubClient {
+            GitHubClient::with_base("test-token".into(), server.uri())
+        }
+
+        #[tokio::test]
+        async fn resolve_tag_lightweight() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/repos/o/r/git/ref/tags/v1"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "object": { "sha": "deadbeef", "type": "commit" }
+                })))
+                .mount(&server)
+                .await;
+
+            let sha = client_for(&server)
+                .await
+                .resolve_tag("o", "r", "v1")
+                .await
+                .unwrap();
+            assert_eq!(sha, "deadbeef");
+        }
+
+        #[tokio::test]
+        async fn resolve_tag_follows_annotated_object() {
+            let server = MockServer::start().await;
+            // A `tag` object type means the ref points at an annotated tag; the
+            // commit lives behind a second dereference.
+            Mock::given(method("GET"))
+                .and(path("/repos/o/r/git/ref/tags/v1"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "object": { "sha": "tagobjsha", "type": "tag" }
+                })))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/repos/o/r/git/tags/tagobjsha"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "object": { "sha": "commitsha" }
+                })))
+                .mount(&server)
+                .await;
+
+            let sha = client_for(&server)
+                .await
+                .resolve_tag("o", "r", "v1")
+                .await
+                .unwrap();
+            assert_eq!(sha, "commitsha");
+        }
+
+        #[tokio::test]
+        async fn resolve_tag_missing_is_tag_not_found() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/repos/o/r/git/ref/tags/nope"))
+                .respond_with(ResponseTemplate::new(404))
+                .mount(&server)
+                .await;
+
+            let err = client_for(&server)
+                .await
+                .resolve_tag("o", "r", "nope")
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                err.downcast_ref::<GitHubError>(),
+                Some(GitHubError::TagNotFound { .. })
+            ));
+        }
+
+        #[tokio::test]
+        async fn list_releases_parses_and_404_is_repo_not_found() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/repos/o/r/releases"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                    { "tag_name": "v2", "draft": false, "prerelease": false, "html_url": "u2" },
+                    { "tag_name": "v1", "draft": false, "prerelease": false, "html_url": null }
+                ])))
+                .mount(&server)
+                .await;
+            let releases = client_for(&server)
+                .await
+                .list_releases("o", "r")
+                .await
+                .unwrap();
+            assert_eq!(releases.len(), 2);
+            assert_eq!(releases[0].tag_name, "v2");
+
+            let missing = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/repos/o/r/releases"))
+                .respond_with(ResponseTemplate::new(404))
+                .mount(&missing)
+                .await;
+            let err = client_for(&missing)
+                .await
+                .list_releases("o", "r")
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                err.downcast_ref::<GitHubError>(),
+                Some(GitHubError::RepoNotFound { .. })
+            ));
+        }
+
+        #[tokio::test]
+        async fn sha_to_tag_finds_match_or_none() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/repos/o/r/tags"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                    { "name": "v1", "commit": { "sha": "aaa" } },
+                    { "name": "v2", "commit": { "sha": "bbb" } }
+                ])))
+                .mount(&server)
+                .await;
+            let c = client_for(&server).await;
+            assert_eq!(
+                c.sha_to_tag("o", "r", "bbb").await.unwrap().as_deref(),
+                Some("v2")
+            );
+            assert_eq!(c.sha_to_tag("o", "r", "zzz").await.unwrap(), None);
+        }
+
+        #[tokio::test]
+        async fn is_archived_reads_repo_metadata() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/repos/o/r"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "archived": true })))
+                .mount(&server)
+                .await;
+            assert!(
+                client_for(&server)
+                    .await
+                    .is_archived("o", "r")
+                    .await
+                    .unwrap()
+            );
+        }
+
+        #[tokio::test]
+        async fn list_security_advisories_404_is_empty() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/repos/o/r/security-advisories"))
+                .respond_with(ResponseTemplate::new(404))
+                .mount(&server)
+                .await;
+            let advs = client_for(&server)
+                .await
+                .list_security_advisories("o", "r")
+                .await
+                .unwrap();
+            assert!(advs.is_empty());
+        }
+
+        #[tokio::test]
+        async fn fetch_tree_and_file() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/repos/o/r/git/trees/sha"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "tree": [ { "path": "action.yml", "type": "blob" } ]
+                })))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/repos/o/r/contents/action.yml"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_string("runs:\n  using: node20\n"),
+                )
+                .mount(&server)
+                .await;
+
+            let c = client_for(&server).await;
+            let tree = c.fetch_tree("o", "r", "sha").await.unwrap();
+            assert_eq!(tree[0].path, "action.yml");
+            let body = c.fetch_file("o", "r", "action.yml", "sha").await.unwrap();
+            assert!(body.contains("using: node20"));
+        }
+
+        #[tokio::test]
+        async fn primary_rate_limit_bails_when_reset_is_far_off() {
+            let server = MockServer::start().await;
+            // remaining=0 with a reset well beyond MAX_RATE_LIMIT_WAIT: the
+            // client must surface RateLimit immediately rather than sleep.
+            let reset = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                + 9_999;
+            Mock::given(method("GET"))
+                .and(path("/repos/o/r/git/ref/tags/v1"))
+                .respond_with(
+                    ResponseTemplate::new(403)
+                        .insert_header("x-ratelimit-remaining", "0")
+                        .insert_header("x-ratelimit-reset", reset.to_string().as_str()),
+                )
+                .mount(&server)
+                .await;
+            let err = client_for(&server)
+                .await
+                .resolve_tag("o", "r", "v1")
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                err.downcast_ref::<GitHubError>(),
+                Some(GitHubError::RateLimit)
+            ));
+        }
+
+        #[tokio::test]
+        async fn transient_5xx_is_retried_then_succeeds() {
+            let server = MockServer::start().await;
+            // First attempt 500 (higher priority, single-use), second 200.
+            Mock::given(method("GET"))
+                .and(path("/repos/o/r/git/ref/tags/v1"))
+                .respond_with(ResponseTemplate::new(500))
+                .up_to_n_times(1)
+                .with_priority(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/repos/o/r/git/ref/tags/v1"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "object": { "sha": "recovered", "type": "commit" }
+                })))
+                .with_priority(2)
+                .mount(&server)
+                .await;
+
+            let sha = client_for(&server)
+                .await
+                .resolve_tag("o", "r", "v1")
+                .await
+                .unwrap();
+            assert_eq!(sha, "recovered");
+        }
     }
 }

@@ -47,6 +47,9 @@ pub struct AuditedActions {
     fetch_remote: bool,
     local: HashMap<String, HashSet<String>>,
     remote: HashMap<String, HashSet<String>>,
+    /// Remote catalog origin, [`REMOTE_URL`] in production. Only the in-module
+    /// tests repoint it (at a local mock), so the production host is fixed.
+    remote_url: String,
 }
 
 impl AuditedActions {
@@ -58,6 +61,7 @@ impl AuditedActions {
             fetch_remote,
             local: HashMap::new(),
             remote: HashMap::new(),
+            remote_url: REMOTE_URL.to_string(),
         }
     }
 
@@ -137,7 +141,7 @@ impl AuditedActions {
     }
 
     async fn fetch_remote_list(&self, action_key: &str) -> Option<HashSet<String>> {
-        let url = format!("{REMOTE_URL}/{action_key}.json");
+        let url = format!("{}/{action_key}.json", self.remote_url);
         let resp = self
             .client
             .get(&url)
@@ -214,5 +218,68 @@ mod tests {
         assert_eq!(parsed[0]["tag"], r#"v1 "stable" \ release"#);
         // The reader still recovers the sha.
         assert!(parse_entries(&rendered).contains("abc123"));
+    }
+
+    mod remote {
+        use super::*;
+        use serde_json::json;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        #[tokio::test]
+        async fn fetch_remote_list_parses_entries() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/actions/checkout.json"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                    { "sha": "aaa", "tag": "v1" },
+                    { "sha": "bbb", "tag": "v2" }
+                ])))
+                .mount(&server)
+                .await;
+
+            let mut aa = AuditedActions::new(true);
+            aa.remote_url = server.uri();
+            let shas = aa.fetch_remote_list("actions/checkout").await.unwrap();
+            assert!(shas.contains("aaa"));
+            assert!(shas.contains("bbb"));
+        }
+
+        #[tokio::test]
+        async fn fetch_remote_list_non_success_is_none() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/actions/missing.json"))
+                .respond_with(ResponseTemplate::new(404))
+                .mount(&server)
+                .await;
+
+            let mut aa = AuditedActions::new(true);
+            aa.remote_url = server.uri();
+            assert!(aa.fetch_remote_list("actions/missing").await.is_none());
+        }
+
+        #[tokio::test]
+        async fn check_falls_through_to_remote_layer() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/some/action.json"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                    { "sha": "feedface", "tag": "v3" }
+                ])))
+                .mount(&server)
+                .await;
+
+            let mut aa = AuditedActions::new(true);
+            aa.remote_url = server.uri();
+            aa.cache_dir = None; // don't consult the real ~/.cache during the test
+            // Not bundled, no local cache hit → resolved by the remote layer.
+            assert_eq!(
+                aa.check("some", "action", "feedface").await,
+                Some(AuditSource::Remote)
+            );
+            // A SHA the remote list doesn't contain stays unaudited.
+            assert_eq!(aa.check("some", "action", "0000").await, None);
+        }
     }
 }
