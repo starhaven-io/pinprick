@@ -2124,4 +2124,127 @@ jobs:
         let _ = severity_label(Severity::Medium);
         let _ = severity_label(Severity::High);
     }
+
+    mod enrichment {
+        use super::*;
+        use serde_json::json;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        /// Write a single workflow pinning `o/r` at a 40-char SHA tagged v1.0.0,
+        /// then produce the offline base report the enrichers extend.
+        fn base_report(dir: &std::path::Path) -> ScoreReport {
+            let wfdir = dir.join(".github").join("workflows");
+            std::fs::create_dir_all(&wfdir).unwrap();
+            let sha = "a".repeat(40);
+            let yaml = format!(
+                "name: x\non: push\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: o/r@{sha} # v1.0.0\n"
+            );
+            std::fs::write(wfdir.join("ci.yml"), yaml).unwrap();
+            score_repo(dir, &Config::default()).unwrap()
+        }
+
+        #[tokio::test]
+        async fn source_archived_fires_when_repo_is_archived() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let mut report = base_report(dir.path());
+
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/repos/o/r"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "archived": true })))
+                .mount(&server)
+                .await;
+            let client = GitHubClient::with_base("t".into(), server.uri());
+
+            enrich_with_source_archived(&mut report, dir.path(), &client)
+                .await
+                .unwrap();
+            assert!(report.findings.iter().any(|f| f.id == "source.archived"));
+        }
+
+        #[tokio::test]
+        async fn source_advisory_fires_when_pin_is_in_vulnerable_range() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let mut report = base_report(dir.path());
+
+            let server = MockServer::start().await;
+            // The SHA pin resolves to v1.0.0 via the tags endpoint...
+            Mock::given(method("GET"))
+                .and(path("/repos/o/r/tags"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                    { "name": "v1.0.0", "commit": { "sha": "a".repeat(40) } }
+                ])))
+                .mount(&server)
+                .await;
+            // ...which falls inside this advisory's vulnerable range.
+            Mock::given(method("GET"))
+                .and(path("/repos/o/r/security-advisories"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                    {
+                        "ghsa_id": "GHSA-test",
+                        "html_url": "https://github.com/advisories/GHSA-test",
+                        "severity": "high",
+                        "summary": "vulnerable",
+                        "vulnerabilities": [
+                            {
+                                "package": { "name": "o/r" },
+                                "vulnerable_version_range": "< 1.1.0",
+                                "patched_versions": "1.1.0"
+                            }
+                        ]
+                    }
+                ])))
+                .mount(&server)
+                .await;
+            let client = GitHubClient::with_base("t".into(), server.uri());
+
+            enrich_with_source_advisory(&mut report, dir.path(), &client)
+                .await
+                .unwrap();
+            assert!(report.findings.iter().any(|f| f.id == "source.advisory"));
+        }
+
+        #[tokio::test]
+        async fn source_advisory_skips_when_package_does_not_match() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let mut report = base_report(dir.path());
+
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/repos/o/r/tags"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                    { "name": "v1.0.0", "commit": { "sha": "a".repeat(40) } }
+                ])))
+                .mount(&server)
+                .await;
+            // Advisory range covers v1.0.0 but is for a *co-listed* package, not
+            // the action — the #216 false-match guard must keep this silent.
+            Mock::given(method("GET"))
+                .and(path("/repos/o/r/security-advisories"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                    {
+                        "ghsa_id": "GHSA-other",
+                        "html_url": "https://github.com/advisories/GHSA-other",
+                        "severity": "high",
+                        "summary": "different package",
+                        "vulnerabilities": [
+                            {
+                                "package": { "name": "o/some-cli" },
+                                "vulnerable_version_range": "< 1.1.0",
+                                "patched_versions": "1.1.0"
+                            }
+                        ]
+                    }
+                ])))
+                .mount(&server)
+                .await;
+            let client = GitHubClient::with_base("t".into(), server.uri());
+
+            enrich_with_source_advisory(&mut report, dir.path(), &client)
+                .await
+                .unwrap();
+            assert!(!report.findings.iter().any(|f| f.id == "source.advisory"));
+        }
+    }
 }
