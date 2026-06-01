@@ -352,10 +352,10 @@ impl GitHubClient {
         Ok(releases)
     }
 
-    /// Find a tag name pointing at the given commit SHA, if any. Queries
-    /// the first 100 tags only — pinned actions are virtually always on a
-    /// recent release tag, and paginating further isn't worth the latency.
-    pub async fn sha_to_tag(&self, owner: &str, repo: &str, sha: &str) -> Result<Option<String>> {
+    /// Fetch the tag list for a repo (first page, up to 100 tags). Pinned
+    /// actions are virtually always on a recent tag, so paginating further
+    /// isn't worth the latency.
+    async fn fetch_tags(&self, owner: &str, repo: &str) -> Result<Vec<TagListEntry>> {
         let url = format!("{}/repos/{owner}/{repo}/tags?per_page=100", self.base);
         let resp = self.get(&url).await?;
         if resp.status().as_u16() == 404 {
@@ -364,11 +364,29 @@ impl GitHubClient {
                 repo: repo.into(),
             });
         }
-        let tags: Vec<TagListEntry> = resp.json().await.context("parsing tags")?;
-        Ok(tags
+        resp.json().await.context("parsing tags")
+    }
+
+    /// Find a tag name pointing at the given commit SHA, if any.
+    pub async fn sha_to_tag(&self, owner: &str, repo: &str, sha: &str) -> Result<Option<String>> {
+        Ok(self
+            .fetch_tags(owner, repo)
+            .await?
             .into_iter()
             .find(|t| t.commit.sha == sha)
             .map(|t| t.name))
+    }
+
+    /// List tag names for a repo. The `update` command falls back to this when
+    /// a repo publishes tags but no GitHub Releases (e.g.
+    /// `actions/upload-code-coverage`), so the release feed reports nothing.
+    pub async fn list_tags(&self, owner: &str, repo: &str) -> Result<Vec<String>> {
+        Ok(self
+            .fetch_tags(owner, repo)
+            .await?
+            .into_iter()
+            .map(|t| t.name)
+            .collect())
     }
 
     /// List published security advisories for the repo. Draft and withdrawn
@@ -661,6 +679,21 @@ mod tests {
                 Some("v2")
             );
             assert_eq!(c.sha_to_tag("o", "r", "zzz").await.unwrap(), None);
+        }
+
+        #[tokio::test]
+        async fn list_tags_returns_names() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/repos/o/r/tags"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                    { "name": "v1.3.0", "commit": { "sha": "aaa" } },
+                    { "name": "v1", "commit": { "sha": "aaa" } }
+                ])))
+                .mount(&server)
+                .await;
+            let tags = client_for(&server).await.list_tags("o", "r").await.unwrap();
+            assert_eq!(tags, vec!["v1.3.0".to_string(), "v1".to_string()]);
         }
 
         #[tokio::test]
