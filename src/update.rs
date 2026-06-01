@@ -26,6 +26,7 @@ pub async fn run(
 
     let mut releases_cache: HashMap<String, Vec<Release>> = HashMap::new();
     let mut releases_failed: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut tags_cache: HashMap<String, Vec<String>> = HashMap::new();
     let mut tag_sha_cache: HashMap<String, String> = HashMap::new();
 
     for file in &files {
@@ -87,52 +88,47 @@ pub async fn run(
                 }
             };
 
-            // Filter to tags that look like version numbers (rejects non-action
-            // releases like codeql-bundle-*) and pick the highest version rather
-            // than the most-recently-created release (handles backport releases
-            // like v3.1.0-node20 published after v8.0.1).
-            let latest = releases
-                .iter()
-                .filter(|r| {
-                    !r.draft
-                        && !r.prerelease
-                        && r.tag_name
-                            .strip_prefix('v')
-                            .unwrap_or(&r.tag_name)
-                            .starts_with(|c: char| c.is_ascii_digit())
-                })
-                .reduce(|best, r| {
-                    if is_newer(&best.tag_name, &r.tag_name) {
-                        r
-                    } else {
-                        best
-                    }
-                });
-
-            let latest = match latest {
-                Some(r) => r,
+            // Fall back to tags when there's no usable release — some actions
+            // tag versions but never cut a GitHub Release.
+            let (latest_tag, release_url) = match pick_latest_release(&releases) {
+                Some(r) => (r.tag_name.clone(), r.html_url.clone()),
                 None => {
-                    report.up_to_date += 1;
-                    continue;
+                    let tags = match tags_cache.get(&owner_repo) {
+                        Some(cached) => cached.clone(),
+                        None => match client.list_tags(&action.owner, &action.repo).await {
+                            Ok(t) => {
+                                tags_cache.insert(owner_repo.clone(), t.clone());
+                                t
+                            }
+                            Err(_) => continue,
+                        },
+                    };
+                    match pick_latest_tag(&tags) {
+                        Some(t) => (t.clone(), None),
+                        None => {
+                            report.up_to_date += 1;
+                            continue;
+                        }
+                    }
                 }
             };
 
-            if latest.tag_name == current_tag {
+            if latest_tag == current_tag {
                 report.up_to_date += 1;
                 continue;
             }
 
-            if !is_newer(&current_tag, &latest.tag_name) {
+            if !is_newer(&current_tag, &latest_tag) {
                 report.up_to_date += 1;
                 continue;
             }
 
-            let tag_key = format!("{}@{}", owner_repo, latest.tag_name);
+            let tag_key = format!("{owner_repo}@{latest_tag}");
             let new_sha = if let Some(cached) = tag_sha_cache.get(&tag_key) {
                 cached.clone()
             } else {
                 match client
-                    .resolve_tag(&action.owner, &action.repo, &latest.tag_name)
+                    .resolve_tag(&action.owner, &action.repo, &latest_tag)
                     .await
                 {
                     Ok(sha) => {
@@ -148,15 +144,15 @@ pub async fn run(
                 action: action.full_name(),
                 current_tag: current_tag.clone(),
                 current_sha: action.ref_string.clone(),
-                latest_tag: latest.tag_name.clone(),
+                latest_tag: latest_tag.clone(),
                 latest_sha: new_sha.clone(),
                 line: action.line_number,
-                release_url: latest.html_url.clone(),
+                release_url,
             });
 
             if apply
                 && let Some(new_line) =
-                    workflow::build_pinned_line(&action.raw_line, &new_sha, &latest.tag_name)
+                    workflow::build_pinned_line(&action.raw_line, &new_sha, &latest_tag)
             {
                 replacements.push((action.line_number, new_line));
             }
@@ -180,6 +176,38 @@ pub async fn run(
     } else {
         Ok(ExitCode::SUCCESS)
     }
+}
+
+/// Pick the highest version-like release. Rejects drafts, prereleases, and
+/// non-version tags (e.g. `codeql-bundle-*`), then takes the highest version
+/// rather than the most-recently-created release — this handles backport
+/// releases like `v3.1.0-node20` published after `v8.0.1`.
+fn pick_latest_release(releases: &[Release]) -> Option<&Release> {
+    releases
+        .iter()
+        .filter(|r| !r.draft && !r.prerelease && is_version_like(&r.tag_name))
+        .reduce(|best, r| {
+            if is_newer(&best.tag_name, &r.tag_name) {
+                r
+            } else {
+                best
+            }
+        })
+}
+
+/// Pick the highest version-like tag name. The release-less fallback path.
+fn pick_latest_tag(tags: &[String]) -> Option<&String> {
+    tags.iter()
+        .filter(|t| is_version_like(t))
+        .reduce(|best, t| if is_newer(best, t) { t } else { best })
+}
+
+/// Whether a tag looks like a version (`v1.2.3`, `2.0`) rather than a moving
+/// pointer or a non-version tag like `codeql-bundle-*`.
+fn is_version_like(tag: &str) -> bool {
+    tag.strip_prefix('v')
+        .unwrap_or(tag)
+        .starts_with(|c: char| c.is_ascii_digit())
 }
 
 /// The leading `v?N…` version token of a `# comment` (up to the first space or
@@ -344,6 +372,50 @@ mod tests {
     fn both_empty_after_parse() {
         // No numeric components at all
         assert!(!is_newer("alpha", "beta"));
+    }
+
+    #[test]
+    fn pick_latest_tag_takes_highest_version() {
+        let tags = vec![
+            "v1".to_string(),
+            "v1.0.0".to_string(),
+            "v1.3.0".to_string(),
+            "v1.2.0".to_string(),
+            "nightly".to_string(),
+        ];
+        assert_eq!(pick_latest_tag(&tags).unwrap(), "v1.3.0");
+    }
+
+    #[test]
+    fn pick_latest_tag_ignores_non_version_tags() {
+        let tags = vec!["latest".to_string(), "stable".to_string()];
+        assert_eq!(pick_latest_tag(&tags), None);
+        assert_eq!(pick_latest_tag(&[]), None);
+    }
+
+    #[test]
+    fn pick_latest_release_skips_drafts_and_prereleases() {
+        let rel = |tag: &str, draft: bool, prerelease: bool| Release {
+            tag_name: tag.to_string(),
+            draft,
+            prerelease,
+            html_url: None,
+        };
+        let releases = vec![
+            rel("v2.0.0", false, false),
+            rel("v3.0.0", true, false),           // draft, skipped
+            rel("v2.5.0", false, true),           // prerelease, skipped
+            rel("codeql-bundle-x", false, false), // non-version, skipped
+        ];
+        assert_eq!(pick_latest_release(&releases).unwrap().tag_name, "v2.0.0");
+    }
+
+    #[test]
+    fn is_version_like_matches_digit_after_optional_v() {
+        assert!(is_version_like("v1.2.3"));
+        assert!(is_version_like("2.0"));
+        assert!(!is_version_like("latest"));
+        assert!(!is_version_like("codeql-bundle-v1"));
     }
 
     #[test]
