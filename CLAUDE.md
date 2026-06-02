@@ -118,7 +118,6 @@ Git clone ref pinning: `git clone` without `--branch`/`-b` or with a branch name
 - **deploy-site.yml** — Build and deploy Astro site to Cloudflare Workers
 - **link-check.yml** — Weekly lychee broken-link check across the built site and README
 - **pinprick-audit.yml** — Run pinprick audit on its own workflows with SARIF upload
-- **refresh-cargo-lockfile.yml** — Weekly `cargo update` to pick up transitive dependency bumps Dependabot does not file PRs for; opens a PR
 - **release.yml** — Manual dispatch: build cross-platform binaries (linux-amd64, linux-arm64, darwin-arm64), create GitHub release with build provenance attestations, publish the crate to crates.io, bump the Homebrew cask
 - **zizmor.yml** — GitHub Actions security audit on push to main
 
