@@ -24,6 +24,8 @@ updates:
 
   - package-ecosystem: "cargo"
     directory: "/"
+    allow:
+      - dependency-type: "all"
     schedule:
       interval: "daily"
     cooldown:
