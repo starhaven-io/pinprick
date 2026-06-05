@@ -8,4 +8,6 @@
     "binding": "ASSETS",
     "directory": "./dist/client",
   },
+  // Astro sessions KV: pin the id so the SESSION binding is explicit, not inherited from the live Worker.
+  "kv_namespaces": [{ "binding": "SESSION", "id": "8053289ef6d64c7786e52ce98720cf49" }],
 }
