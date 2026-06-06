@@ -28,9 +28,10 @@ confidence-threshold = 0.95
 unused-allowed-license = "allow"
 
 [advisories]
-# Flag unmaintained crates anywhere in the tree, not just workspace members
-# (cargo-deny's default for this check is "workspace").
+# Scan the whole dep tree for unmaintained crates, not just workspace members (default: workspace).
 unmaintained = "all"
+# A yank usually signals a release pulled for a security or correctness problem (default: warn).
+yanked = "deny"
 
 [sources]
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
