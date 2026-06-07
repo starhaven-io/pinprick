@@ -7,6 +7,9 @@ on:
     branches:
       - main
 
+env:
+  CARGO_INCREMENTAL: 0
+
 defaults:
   run:
     shell: bash -xeuo pipefail {0}
@@ -115,7 +118,6 @@ jobs:
             ~/.cargo/git/db/
             target/
           key: ${{ runner.os }}-${{ runner.arch }}-cargo-debug-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-${{ runner.arch }}-cargo-debug-
 
       - name: Restore coverage tools cache
         id: cov-tools-cache
