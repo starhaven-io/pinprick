@@ -202,7 +202,7 @@ jobs:
 
       - name: Install typos-cli
         if: matrix.check == 'lint'
-        run: cargo install typos-cli --locked --version 1.47.0
+        run: cargo install typos-cli --locked --version 1.47.2
 
       - name: Install cargo-deny
         if: matrix.check == 'lint'
