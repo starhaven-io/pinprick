@@ -21,6 +21,12 @@ pub async fn run(repo_root: &Path, json: bool, apply: bool) -> Result<ExitCode> 
 
     let mut resolve_cache: HashMap<String, (String, String)> = HashMap::new();
 
+    // Actions that remain unpinned after the run: branch refs (which need a
+    // manual pin) and refs whose resolution failed. A dry run must exit 1 for
+    // these too — they are exactly what a CI gate exists to catch. Sliding-tag
+    // skips are excluded: those are warnings attached to a successful pin.
+    let mut unpinnable = 0usize;
+
     for file in &files {
         let display_name = workflow::display_path(file, repo_root);
         if !json {
@@ -34,6 +40,7 @@ pub async fn run(repo_root: &Path, json: bool, apply: bool) -> Result<ExitCode> 
             match action.ref_type {
                 RefType::Sha => {}
                 RefType::Branch => {
+                    unpinnable += 1;
                     report.skipped.push(PinSkip {
                         file: workflow::display_path(file, repo_root),
                         action: format!("{}@{}", action.full_name(), action.ref_string),
@@ -112,6 +119,7 @@ pub async fn run(repo_root: &Path, json: bool, apply: bool) -> Result<ExitCode> 
                             }
                         }
                         Err(e) => {
+                            unpinnable += 1;
                             report.skipped.push(PinSkip {
                                 file: workflow::display_path(file, repo_root),
                                 action: format!("{}@{}", action.full_name(), action.ref_string),
@@ -135,7 +143,7 @@ pub async fn run(repo_root: &Path, json: bool, apply: bool) -> Result<ExitCode> 
         report.print_human();
     }
 
-    if !apply && !report.pinned.is_empty() {
+    if !apply && (!report.pinned.is_empty() || unpinnable > 0) {
         Ok(ExitCode::from(1))
     } else {
         Ok(ExitCode::SUCCESS)

@@ -186,3 +186,17 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - run: git clone --depth 1 --branch v1.2.3 https://github.com/org/repo
 ";
+
+/// One branch-ref action next to a SHA-pinned one. `pin` skips the branch ref
+/// without any network call, so this is usable with a dummy token.
+pub const WORKFLOW_BRANCH_REF: &str = "\
+name: branch-ref
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: owner/repo@main
+      - run: echo \"Hello World\"
+";
