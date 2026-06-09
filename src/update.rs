@@ -47,9 +47,25 @@ pub async fn run(
             {
                 continue;
             }
-            let current_tag = match &action.tag_comment {
-                Some(t) => leading_version_token(t),
-                None => continue,
+            // Prefer the `# tag` comment; for a bare SHA pin without one (or a
+            // non-version annotation like `# pinned manually`), ask GitHub
+            // which tag points at the SHA instead of silently skipping — or,
+            // worse, comparing against the annotation text.
+            let comment_tag = action
+                .tag_comment
+                .as_deref()
+                .map(leading_version_token)
+                .filter(|t| is_version_like(t));
+            let current_tag = match comment_tag {
+                Some(t) => t,
+                None => match client
+                    .sha_to_tag(&action.owner, &action.repo, &action.ref_string)
+                    .await
+                {
+                    Ok(Some(tag)) => leading_version_token(&tag),
+                    // Unknown SHA or fetch failure — nothing to compare against.
+                    _ => continue,
+                },
             };
 
             if !json {
@@ -139,6 +155,14 @@ pub async fn run(
                 }
             };
 
+            // The "newer" tag can resolve to the commit already pinned (e.g. a
+            // sliding `# v4` comment next to the latest release's SHA) — that
+            // is not an update, just a different name for the same content.
+            if new_sha == action.ref_string {
+                report.up_to_date += 1;
+                continue;
+            }
+
             report.updates.push(UpdateResult {
                 file: workflow::display_path(file, repo_root),
                 action: action.full_name(),
@@ -196,10 +220,15 @@ fn pick_latest_release(releases: &[Release]) -> Option<&Release> {
 }
 
 /// Pick the highest version-like tag name. The release-less fallback path.
+/// Prefers stable tags — unlike releases, tags carry no `prerelease` flag, so
+/// a bare `v2.1.0-rc1` would otherwise win over `v2.0.0` and propose an RC.
 fn pick_latest_tag(tags: &[String]) -> Option<&String> {
-    tags.iter()
-        .filter(|t| is_version_like(t))
-        .reduce(|best, t| if is_newer(best, t) { t } else { best })
+    let pick = |stable_only: bool| {
+        tags.iter()
+            .filter(|t| is_version_like(t) && (!stable_only || !parse_version(t).1))
+            .reduce(|best, t| if is_newer(best, t) { t } else { best })
+    };
+    pick(true).or_else(|| pick(false))
 }
 
 /// Whether a tag looks like a version (`v1.2.3`, `2.0`) rather than a moving
@@ -391,6 +420,18 @@ mod tests {
         let tags = vec!["latest".to_string(), "stable".to_string()];
         assert_eq!(pick_latest_tag(&tags), None);
         assert_eq!(pick_latest_tag(&[]), None);
+    }
+
+    #[test]
+    fn pick_latest_tag_prefers_stable_over_newer_prerelease() {
+        let tags = vec!["v2.0.0".to_string(), "v2.1.0-rc1".to_string()];
+        assert_eq!(pick_latest_tag(&tags).unwrap(), "v2.0.0");
+    }
+
+    #[test]
+    fn pick_latest_tag_falls_back_to_prerelease_when_no_stable() {
+        let tags = vec!["v0.1.0-beta".to_string(), "v0.2.0-rc1".to_string()];
+        assert_eq!(pick_latest_tag(&tags).unwrap(), "v0.2.0-rc1");
     }
 
     #[test]

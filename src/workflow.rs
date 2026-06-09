@@ -65,6 +65,13 @@ pub fn parse_uses_line(line: &str, line_number: usize) -> Option<ActionRef> {
         return None;
     }
 
+    // `docker://image@sha256:…` is a container reference, not a GitHub repo —
+    // parsing it would misread `docker:` as an owner and a digest-pinned image
+    // as an unpinned branch ref.
+    if action_path.contains("://") {
+        return None;
+    }
+
     // Parse owner/repo[/subpath]
     let parts: Vec<&str> = action_path.splitn(3, '/').collect();
     if parts.len() < 2 {
@@ -251,7 +258,18 @@ pub fn rewrite_actions(
         output.push_str(newline);
     }
 
-    std::fs::write(path, &output).with_context(|| format!("writing {}", path.display()))?;
+    // Write to a sibling temp file and rename over the original so a crash or
+    // full disk mid-write can't leave a truncated workflow behind.
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("workflow");
+    let tmp = path.with_file_name(format!(".{file_name}.pinprick-tmp"));
+    std::fs::write(&tmp, &output).with_context(|| format!("writing {}", tmp.display()))?;
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("replacing {}", path.display()));
+    }
     Ok(count)
 }
 
@@ -260,6 +278,14 @@ mod tests {
     use super::*;
 
     // ── parse_uses_line ─────────────────────────────────────────────────
+
+    #[test]
+    fn parse_docker_ref_skipped() {
+        // A digest-pinned container reference is not a GitHub action and must
+        // not be misread as owner `docker:` with a branch ref.
+        assert!(parse_uses_line("      - uses: docker://alpine:3.20@sha256:abc123", 1).is_none());
+        assert!(parse_uses_line("      - uses: docker://ghcr.io/owner/image:v1", 1).is_none());
+    }
 
     #[test]
     fn parse_sliding_tag() {
