@@ -31,40 +31,52 @@ macro_rules! re {
     };
 }
 
-re!(SH_CURL_LATEST, r#"curl\b.*[/=]latest[/\s"]"#);
-re!(SH_WGET_LATEST, r#"wget\b.*[/=]latest[/\s"]"#);
+re!(SH_CURL_LATEST, r#"curl\b.*[/=]latest(?:[/\s"]|$)"#);
+re!(SH_WGET_LATEST, r#"wget\b.*[/=]latest(?:[/\s"]|$)"#);
 re!(SH_GH_RELEASE_LATEST, r"gh\s+release\s+download\s");
 re!(SH_CURL_UNVERSIONED, r#"curl\b.*https?://[^\s"']+"#);
 re!(SH_WGET_UNVERSIONED, r#"wget\b.*https?://[^\s"']+"#);
+// Install rules tolerate flags between `install` and the package
+// (`pip install -U requests`, `npm i -g yarn`) — flag-first is the common
+// workflow idiom and skipping it was a blind spot.
 re!(
     SH_PIP_UNVERSIONED,
-    r"pip3?\s+install\s+[a-zA-Z][a-zA-Z0-9_-]*(\s|$)"
+    r"pip3?\s+install\s+(?:-\S+\s+)*[a-zA-Z][a-zA-Z0-9_-]*(\s|$)"
 );
 re!(
     SH_NPM_UNVERSIONED,
-    r"npm\s+install\s+(@[a-zA-Z][a-zA-Z0-9_-]*/)?[a-zA-Z][a-zA-Z0-9_-]*(\s|$)"
+    r"npm\s+(?:install|i)\s+(?:-\S+\s+)*(@[a-zA-Z][a-zA-Z0-9_-]*/)?[a-zA-Z][a-zA-Z0-9_-]*(\s|$)"
 );
-re!(SH_GO_INSTALL_LATEST, r"go\s+install\s+\S+@latest");
+re!(
+    SH_GO_INSTALL_LATEST,
+    r"go\s+install\s+\S+@(?:latest|main|master)\b"
+);
 re!(
     SH_IWR_LATEST,
-    r#"(?i)(Invoke-WebRequest|iwr|Invoke-RestMethod|irm)\b.*[/=]latest[/\s"]"#
+    r#"(?i)\b(Invoke-WebRequest|iwr|Invoke-RestMethod|irm)\b.*[/=]latest(?:[/\s"]|$)"#
 );
 re!(
     SH_IWR_UNVERSIONED,
-    r#"(?i)(Invoke-WebRequest|iwr|Invoke-RestMethod|irm)\b.*https?://[^\s"']+"#
+    r#"(?i)\b(Invoke-WebRequest|iwr|Invoke-RestMethod|irm)\b.*https?://[^\s"']+"#
 );
 
+// The shell may sit any number of pipe stages after the fetch — `curl … | tr
+// -d '\r' | bash` is as executable as a direct pipe.
 re!(
     SH_PIPE_SHELL,
-    r"(?i)\b(curl|wget)\b[^|]*\|\s*(?:(?:sudo|env|command|xargs)\s+)*(?:\S*/)?(bash|sh|zsh|dash|ash|ksh|fish|python3?|node(?:js)?|ruby|perl|pwsh|powershell)\b"
+    r"(?i)\b(curl|wget)\b[^|]*(?:\|[^|]*)*\|\s*(?:(?:sudo|env|command|xargs)\s+)*(?:\S*/)?(bash|sh|zsh|dash|ash|ksh|fish|python3?|node(?:js)?|ruby|perl|pwsh|powershell)\b"
 );
 re!(
     SH_PROC_SUB_FETCH,
-    r"(?i)\b(bash|sh|zsh|dash|ash|ksh|fish|python3?)\s+<\(\s*(curl|wget)\b"
+    r"(?i)\b(bash|sh|zsh|dash|ash|ksh|fish|python3?|source)\s+<\(\s*(curl|wget)\b"
 );
+// Requires an execution context — `bash … -c "$( … )"` or `eval "$( … )"`.
+// A bare `script.sh "$(curl …)"` passes fetched bytes as an argument, which
+// does not execute them, and `sh` matching inside the script's filename made
+// that a high-severity false positive.
 re!(
     SH_CMD_SUB_FETCH,
-    r#"(?i)\b(bash|sh|zsh|dash|ash|ksh|fish|eval)\b.*?["']?\$\(\s*(curl|wget)\b"#
+    r#"(?i)\b(?:(?:bash|sh|zsh|dash|ash|ksh|fish)\b[^|&;]*?\s-\w*c\s+|eval\b[^|&;]*?)["']?\$\(\s*(curl|wget)\b"#
 );
 re!(
     SH_IEX_FETCH,
@@ -75,11 +87,11 @@ re!(SH_GIT_CLONE, r"git\s+clone\s");
 re!(GIT_CHECKOUT_SHA, r"git\s+checkout\s+[0-9a-f]{40}\b");
 re!(
     SH_CARGO_INSTALL_UNVERSIONED,
-    r"cargo\s+install\s+[a-zA-Z][a-zA-Z0-9_-]*(\s|$)"
+    r"cargo\s+install\s+(?:-\S+\s+)*[a-zA-Z][a-zA-Z0-9_-]*(\s|$)"
 );
 re!(
     SH_GEM_INSTALL_UNVERSIONED,
-    r"gem\s+install\s+[a-zA-Z][a-zA-Z0-9_-]*(\s|$)"
+    r"gem\s+install\s+(?:-\S+\s+)*[a-zA-Z][a-zA-Z0-9_-]*(\s|$)"
 );
 re!(
     SH_NPX_UNVERSIONED,
@@ -113,7 +125,7 @@ pub static SHELL_PATTERNS: LazyLock<Vec<Pattern>> = LazyLock::new(|| {
             regex: &SH_GO_INSTALL_LATEST,
             severity: Severity::Medium,
             category: Category::ShellFetch,
-            description: "go install @latest — not version-pinned",
+            description: "go install @latest/@main — not version-pinned",
         },
         Pattern {
             regex: &SH_IWR_LATEST,
@@ -260,12 +272,13 @@ pub static JS_URL_PATTERNS: LazyLock<Vec<Pattern>> = LazyLock::new(|| {
 
 // ── Docker patterns ─────────────────────────────────────────────────────────
 
-re!(DOCKER_FROM_LATEST, r"(?i)^FROM\s+\S+:latest\b");
+// `FROM` may carry flags (`--platform=…`) before the image reference.
+re!(DOCKER_FROM_LATEST, r"(?i)^FROM\s+(?:--\S+\s+)*\S+:latest\b");
 re!(
     DOCKER_FROM_UNTAGGED,
-    r"(?i)^FROM\s+[a-z][a-z0-9._/-]*(\s|$)"
+    r"(?i)^FROM\s+(?:--\S+\s+)*[a-z][a-z0-9._/-]*(\s|$)"
 );
-re!(DOCKER_FROM_DIGEST, r"(?i)^FROM\s+\S+@sha256:");
+re!(DOCKER_FROM_DIGEST, r"(?i)^FROM\s+(?:--\S+\s+)*\S+@sha256:");
 re!(DOCKER_RUN_CURL, r"(?i)^RUN\b.*\bcurl\b");
 re!(DOCKER_RUN_WGET, r"(?i)^RUN\b.*\bwget\b");
 re!(DOCKER_ADD_URL, r"(?i)^ADD\b[^#]*\bhttps?://\S+");
@@ -394,8 +407,11 @@ pub fn has_checksum_verify(line: &str) -> bool {
 // That is intentional — a single-digit major is a sliding namespace, not a
 // release. Callers who want to exempt such hosts should use the
 // `trusted-hosts` config instead of relaxing this regex.
+// Leading `-`/`_` admit versions embedded in filenames (`tool-1.2.3.tar.gz`);
+// the trailing class admits a following extension dot, suffix (`-rc1`), or end
+// of string (a URL whose path ends at the version, e.g. `/download/v1.2.3`).
 static VERSION_SEGMENT: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#"[/=]v?\d+(\.\d+)+[/\s"]"#).unwrap());
+    LazyLock::new(|| Regex::new(r#"[-_/=]v?\d+(\.\d+)+(?:[-_./\s"]|$)"#).unwrap());
 
 /// Check if a URL contains a version segment in its **path or query** — not
 /// its host. Scanning the authority too would let a versioned-looking host (a
@@ -470,12 +486,49 @@ pub fn extract_urls(line: &str) -> impl Iterator<Item = &str> {
 
 /// Check if a `gh release download` line has a version tag argument.
 /// `gh release download v1.2.3 --pattern ...` is pinned (positional).
-/// `gh release download --tag v1.2.3 --pattern ...` is pinned (flag).
-/// `gh release download --pattern ...` grabs latest.
+/// `gh release download -R owner/repo v1.2.3 ...` is pinned (flags may
+/// precede the tag). `gh release download --pattern ...` grabs latest.
 pub fn gh_release_has_tag(line: &str) -> bool {
-    static GH_RELEASE_TAG: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"gh\s+release\s+download\s+(v?\d|--tag\s+v?\d)").unwrap());
-    GH_RELEASE_TAG.is_match(line)
+    static GH_RELEASE_ARGS: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"gh\s+release\s+download\s+(.+)").unwrap());
+    let Some(caps) = GH_RELEASE_ARGS.captures(line) else {
+        return false;
+    };
+    // `gh release download` flags that consume a value; the tag itself is
+    // positional only, so skip flags (and their values) to find it.
+    const VALUE_FLAGS: &[&str] = &[
+        "-R",
+        "--repo",
+        "-p",
+        "--pattern",
+        "-D",
+        "--dir",
+        "-O",
+        "--output",
+        "-A",
+        "--archive",
+    ];
+    let mut tokens = caps[1].split_whitespace();
+    while let Some(tok) = tokens.next() {
+        // `--tag` isn't a real gh flag, but honor its value as the tag for
+        // lines written against tools that accept it.
+        if tok == "--tag" {
+            return tokens.next().is_some_and(looks_like_version_token);
+        }
+        if VALUE_FLAGS.contains(&tok) {
+            tokens.next(); // skip the flag's value
+        } else if !tok.starts_with('-') {
+            // First positional argument is the release tag.
+            return looks_like_version_token(tok);
+        }
+    }
+    false
+}
+
+/// `v1.2.3`, `1.2.3`, `v2` — a token that starts like a version tag.
+fn looks_like_version_token(tok: &str) -> bool {
+    let digits = tok.strip_prefix('v').unwrap_or(tok);
+    digits.starts_with(|c: char| c.is_ascii_digit())
 }
 
 /// Check if a ref argument looks like a version tag rather than a branch name.
@@ -517,14 +570,18 @@ pub fn dockerfile_stage_alias(line: &str) -> Option<String> {
 /// The base image/stage a `FROM <base>` line references, lowercased. Returns
 /// `None` when the line is not a `FROM` instruction.
 pub fn dockerfile_from_base(line: &str) -> Option<String> {
-    static FROM_BASE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)^FROM\s+(\S+)").unwrap());
+    static FROM_BASE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?i)^FROM\s+(?:--\S+\s+)*(\S+)").unwrap());
     FROM_BASE.captures(line).map(|c| c[1].to_ascii_lowercase())
 }
 
 /// Check if a `pip install` line has a version specifier or uses `-r`.
 pub fn pip_install_has_version(line: &str) -> bool {
     static PIP_VERSION: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"pip3?\s+install\s+\S*[=>~]=|pip3?\s+install\s+-r\s").unwrap()
+        Regex::new(
+            r"pip3?\s+install\s+(?:-\S+\s+)*\S*[=>~]=|pip3?\s+install\b.*\s(-r|--requirement)\s",
+        )
+        .unwrap()
     });
     PIP_VERSION.is_match(line)
 }
@@ -533,14 +590,14 @@ pub fn pip_install_has_version(line: &str) -> bool {
 /// Scoped packages (`@babel/core`) are not version-pinned; `@babel/core@1.0.0` is.
 pub fn npm_install_has_version(line: &str) -> bool {
     static NPM_VERSION: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"npm\s+install\s+\S+@\d").unwrap());
+        LazyLock::new(|| Regex::new(r"npm\s+(?:install|i)\s+(?:-\S+\s+)*\S+@\d").unwrap());
     NPM_VERSION.is_match(line)
 }
 
 /// Check if a `cargo install` line has a version pin (`@version` or `--version`).
 pub fn cargo_install_has_version(line: &str) -> bool {
     static CARGO_VERSION: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"cargo\s+install\s+\S+@\d|cargo\s+install\s+.*--version\s").unwrap()
+        Regex::new(r"cargo\s+install\s+(?:-\S+\s+)*\S+@\d|cargo\s+install\s+.*--version\s").unwrap()
     });
     CARGO_VERSION.is_match(line)
 }
@@ -630,6 +687,25 @@ mod tests {
     fn single_number_not_version() {
         // A single number segment like /v4/ is not multi-component, so not matched
         assert!(!url_has_version("https://example.com/v4/resource"));
+    }
+
+    #[test]
+    fn versioned_final_path_segment() {
+        // Version as the last path segment — nothing follows it.
+        assert!(url_has_version("https://example.com/download/v1.2.3"));
+    }
+
+    #[test]
+    fn versioned_in_filename() {
+        assert!(url_has_version("https://example.com/dl/tool-1.2.3.tar.gz"));
+        assert!(url_has_version("https://example.com/openssl_3.0.13.tar.gz"));
+    }
+
+    #[test]
+    fn arch_suffix_not_version() {
+        // `x86_64` must not read as a version — no dotted component.
+        assert!(!url_has_version("https://example.com/setup-x86_64.sh"));
+        assert!(!url_has_version("https://example.com/tool-linux-amd64.sh"));
     }
 
     #[test]
@@ -915,6 +991,28 @@ mod tests {
     }
 
     #[test]
+    fn gh_release_download_flag_first_versioned() {
+        // Flags (with values) may precede the positional tag.
+        assert!(gh_release_has_tag(
+            "gh release download -R owner/repo v1.2.3 -p '*.tar.gz'"
+        ));
+        assert!(gh_release_has_tag(
+            "gh release download --repo owner/repo --pattern '*.tar.gz' v1.2.3"
+        ));
+    }
+
+    #[test]
+    fn gh_release_download_flag_first_unversioned() {
+        // A flag's value must not be mistaken for the tag.
+        assert!(!gh_release_has_tag(
+            "gh release download -R owner/repo -p '*.tar.gz'"
+        ));
+        assert!(!gh_release_has_tag(
+            "gh release download --clobber -D out -p '*.tar.gz'"
+        ));
+    }
+
+    #[test]
     fn go_install_latest_detected() {
         assert!(
             SH_GO_INSTALL_LATEST
@@ -928,6 +1026,13 @@ mod tests {
             !SH_GO_INSTALL_LATEST
                 .is_match("go install github.com/golangci/golangci-lint/cmd/golangci-lint@v1.55.0")
         );
+    }
+
+    #[test]
+    fn go_install_branch_ref_detected() {
+        // @main/@master track HEAD exactly like @latest.
+        assert!(SH_GO_INSTALL_LATEST.is_match("go install example.com/tool@main"));
+        assert!(SH_GO_INSTALL_LATEST.is_match("go install example.com/tool@master"));
     }
 
     #[test]
@@ -953,6 +1058,19 @@ mod tests {
     }
 
     #[test]
+    fn npm_install_flag_first_detected() {
+        assert!(SH_NPM_UNVERSIONED.is_match("npm install -g yarn"));
+        assert!(SH_NPM_UNVERSIONED.is_match("npm i -g yarn"));
+        assert!(SH_NPM_UNVERSIONED.is_match("npm install --global @angular/cli"));
+    }
+
+    #[test]
+    fn npm_install_flag_first_version_pinned_not_flagged() {
+        assert!(npm_install_has_version("npm install -g yarn@1.22.19"));
+        assert!(npm_install_has_version("npm i -g yarn@1.22.19"));
+    }
+
+    #[test]
     fn pip_install_unversioned_detected() {
         assert!(SH_PIP_UNVERSIONED.is_match("pip install requests"));
         assert!(SH_PIP_UNVERSIONED.is_match("pip3 install flask"));
@@ -966,6 +1084,38 @@ mod tests {
     #[test]
     fn pip_install_requirements_not_flagged() {
         assert!(!SH_PIP_UNVERSIONED.is_match("pip install -r requirements.txt"));
+    }
+
+    #[test]
+    fn pip_install_flag_first_detected() {
+        assert!(SH_PIP_UNVERSIONED.is_match("pip install -U requests"));
+        assert!(SH_PIP_UNVERSIONED.is_match("pip3 install --upgrade flask"));
+    }
+
+    #[test]
+    fn pip_install_flag_first_versioned_recognized() {
+        assert!(pip_install_has_version("pip install -U requests==2.31.0"));
+        assert!(pip_install_has_version(
+            "pip install --no-cache-dir -r requirements.txt"
+        ));
+    }
+
+    #[test]
+    fn cargo_install_flag_first_detected() {
+        // `--locked` respects the crate's lockfile but does not pin the
+        // crate version itself.
+        assert!(SH_CARGO_INSTALL_UNVERSIONED.is_match("cargo install --locked cargo-audit"));
+        assert!(!cargo_install_has_version(
+            "cargo install --locked cargo-audit"
+        ));
+        assert!(cargo_install_has_version(
+            "cargo install --locked cargo-audit@0.21.0"
+        ));
+    }
+
+    #[test]
+    fn gem_install_flag_first_detected() {
+        assert!(SH_GEM_INSTALL_UNVERSIONED.is_match("gem install -N rails"));
     }
 
     // ── JavaScript patterns ─────────────────────────────────────────────
@@ -1015,6 +1165,21 @@ mod tests {
         assert!(DOCKER_FROM_DIGEST.is_match(
             "FROM ubuntu@sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abcd"
         ));
+    }
+
+    #[test]
+    fn docker_from_platform_flag_detected() {
+        // A `--platform` flag must not hide the image reference.
+        assert!(DOCKER_FROM_LATEST.is_match("FROM --platform=linux/amd64 node:latest"));
+        assert!(DOCKER_FROM_UNTAGGED.is_match("FROM --platform=$BUILDPLATFORM ubuntu"));
+        assert!(!DOCKER_FROM_UNTAGGED.is_match("FROM --platform=linux/amd64 ubuntu:24.04"));
+        assert!(DOCKER_FROM_DIGEST.is_match(
+            "FROM --platform=linux/arm64 ubuntu@sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abcd"
+        ));
+        assert_eq!(
+            dockerfile_from_base("FROM --platform=linux/amd64 ubuntu:24.04"),
+            Some("ubuntu:24.04".to_string())
+        );
     }
 
     #[test]
@@ -1227,6 +1392,24 @@ mod tests {
     }
 
     #[test]
+    fn proc_sub_source_matched() {
+        // `source <(curl …)` executes fetched content in the current shell.
+        assert!(SH_PROC_SUB_FETCH.is_match("source <(curl -fsSL https://example.com/setup.sh)"));
+    }
+
+    #[test]
+    fn pipe_through_intermediate_stage_matched() {
+        // The shell may sit several pipe stages after the fetch.
+        assert!(SH_PIPE_SHELL.is_match("curl -fsSL https://example.com/install.sh | cat | sh"));
+        assert!(SH_PIPE_SHELL.is_match(r"curl https://example.com/i.sh | tr -d '\r' | bash"));
+    }
+
+    #[test]
+    fn pipe_multi_stage_without_shell_not_matched() {
+        assert!(!SH_PIPE_SHELL.is_match("curl https://api.example.com/data | jq . | tee out.json"));
+    }
+
+    #[test]
     fn cmd_sub_bash_c_curl_matched() {
         assert!(
             SH_CMD_SUB_FETCH.is_match(r#"bash -c "$(curl -fsSL https://example.com/install.sh)""#)
@@ -1250,6 +1433,36 @@ mod tests {
             SH_CMD_SUB_FETCH
                 .is_match(r#"bash --rcfile "x" -c "$(curl -fsSL https://example.com/install.sh)""#)
         );
+    }
+
+    #[test]
+    fn cmd_sub_script_argument_not_matched() {
+        // Fetched bytes passed as a script argument are not executed; `sh`
+        // inside the filename must not satisfy the interpreter alternation.
+        assert!(
+            !SH_CMD_SUB_FETCH
+                .is_match(r#"./notify.sh "$(curl -s https://api.example.com/status)""#)
+        );
+    }
+
+    #[test]
+    fn cmd_sub_flag_cluster_matched() {
+        // `-c` folded into a flag cluster still executes the substitution.
+        assert!(
+            SH_CMD_SUB_FETCH.is_match(r#"bash -ec "$(curl -fsSL https://example.com/install.sh)""#)
+        );
+    }
+
+    #[test]
+    fn iwr_inside_word_not_matched() {
+        // `irm` as a suffix of an ordinary word (confirm) must not fire.
+        assert!(!SH_IWR_UNVERSIONED.is_match(r#"echo "Please confirm https://example.com/terms""#));
+        assert!(!SH_IWR_LATEST.is_match("echo confirm https://example.com/releases/latest/x"));
+    }
+
+    #[test]
+    fn curl_latest_at_end_of_line_matched() {
+        assert!(SH_CURL_LATEST.is_match("curl -LO https://example.com/releases/latest"));
     }
 
     #[test]
