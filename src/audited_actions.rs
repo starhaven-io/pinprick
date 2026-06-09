@@ -1,9 +1,17 @@
+use minisign_verify::{PublicKey, Signature};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 const BUNDLED_JSON: &str = include_str!(concat!(env!("OUT_DIR"), "/bundled_audited_actions.json"));
 const REMOTE_URL: &str = "https://pinprick.rs/audited-actions";
+
+/// Minisign public key for the remote catalog, committed at the repo root and
+/// embedded at compile time. The remote layer is fail-closed: without a valid
+/// key in the build (or a valid signature on the fetched catalog), remote
+/// entries are never honored — a compromised CDN must not be able to mark
+/// malicious SHAs as audited.
+const CATALOG_PUBKEY_FILE: &str = include_str!("../catalog-minisign.pub");
 
 #[derive(Deserialize)]
 struct AuditedEntry {
@@ -39,10 +47,16 @@ impl AuditSource {
 /// 2. **Local cache** — `~/.cache/pinprick/audited/{owner}/{repo}.json`
 /// 3. **Remote** — `https://pinprick.rs/audited-actions/{owner}/{repo}.json` (opt-in)
 ///
-/// All failures are silent — a miss means "not audited, scan it via GitHub".
+/// Misses are silent — "not audited" just means the action is scanned via
+/// GitHub. The exception is a remote catalog that fails signature
+/// verification, which warns: that is either misconfigured serving
+/// infrastructure or tampering, and should not pass unnoticed.
 pub struct AuditedActions {
     bundled: HashMap<String, HashSet<String>>,
     cache_dir: Option<PathBuf>,
+    /// Key used to verify remote catalog signatures. `None` (a build without
+    /// a real public key) disables the remote layer entirely.
+    catalog_key: Option<PublicKey>,
     client: reqwest::Client,
     fetch_remote: bool,
     local: HashMap<String, HashSet<String>>,
@@ -54,9 +68,16 @@ pub struct AuditedActions {
 
 impl AuditedActions {
     pub fn new(fetch_remote: bool) -> Self {
+        let catalog_key = parse_catalog_key(CATALOG_PUBKEY_FILE);
+        if fetch_remote && catalog_key.is_none() {
+            eprintln!(
+                "warning: remote audited-actions catalog disabled — this build carries no catalog public key"
+            );
+        }
         Self {
             bundled: load_bundled(),
             cache_dir: cache_dir(),
+            catalog_key,
             client: crate::github::build_client(),
             fetch_remote,
             local: HashMap::new(),
@@ -144,10 +165,42 @@ impl AuditedActions {
     }
 
     async fn fetch_remote_list(&self, action_key: &str) -> Option<HashSet<String>> {
+        // No public key in this build → the remote layer stays dark.
+        let key = self.catalog_key.as_ref()?;
+
         let url = format!("{}/{action_key}.json", self.remote_url);
+        let bytes = self.fetch_url(&url).await?;
+
+        // The signature is served next to the catalog file (minisign's `.minisig`
+        // convention). A catalog without a valid signature is not honored — a
+        // 404 on the catalog itself above is a normal miss, but a present
+        // catalog with a missing or bad signature is worth a warning: it means
+        // either serving infra is misconfigured or someone tampered with it.
+        let sig_bytes = match self.fetch_url(&format!("{url}.minisig")).await {
+            Some(b) => b,
+            None => {
+                eprintln!(
+                    "warning: remote catalog for {action_key} has no signature — ignoring it"
+                );
+                return None;
+            }
+        };
+        let sig_text = String::from_utf8_lossy(&sig_bytes);
+        if !verify_catalog_signature(key, &bytes, &sig_text) {
+            eprintln!(
+                "warning: remote catalog for {action_key} failed signature verification — ignoring it"
+            );
+            return None;
+        }
+
+        Some(parse_entries(&String::from_utf8_lossy(&bytes)))
+    }
+
+    /// GET a URL and return the (size-capped) body, or `None` on any failure.
+    async fn fetch_url(&self, url: &str) -> Option<Vec<u8>> {
         let resp = self
             .client
-            .get(&url)
+            .get(url)
             .header("User-Agent", "pinprick")
             .send()
             .await
@@ -157,8 +210,25 @@ impl AuditedActions {
             return None;
         }
 
-        let bytes = crate::github::read_capped(resp).await.ok()?;
-        Some(parse_entries(&String::from_utf8_lossy(&bytes)))
+        crate::github::read_capped(resp).await.ok()
+    }
+}
+
+/// Parse the embedded `.pub` file into a verification key. Comment lines (and
+/// the placeholder file, which is all comments) yield `None`.
+fn parse_catalog_key(content: &str) -> Option<PublicKey> {
+    let line = content
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty() && !l.starts_with("untrusted comment:"))?;
+    PublicKey::from_base64(line).ok()
+}
+
+/// True when `sig_text` is a valid minisign signature over `data` by `key`.
+fn verify_catalog_signature(key: &PublicKey, data: &[u8], sig_text: &str) -> bool {
+    match Signature::decode(sig_text) {
+        Ok(sig) => key.verify(data, &sig, true).is_ok(),
+        Err(_) => false,
     }
 }
 
@@ -266,25 +336,80 @@ mod tests {
         assert!(parse_entries(&rendered).contains("abc123"));
     }
 
+    #[test]
+    fn embedded_pubkey_parses() {
+        // The committed catalog key must parse, or every release silently
+        // ships with the remote layer disabled.
+        assert!(parse_catalog_key(CATALOG_PUBKEY_FILE).is_some());
+    }
+
+    #[test]
+    fn comment_only_pubkey_yields_no_key() {
+        // A placeholder file (all comment lines) must not parse — it keeps
+        // the remote layer disabled rather than panicking.
+        assert!(parse_catalog_key("untrusted comment: nothing here\n").is_none());
+        assert!(parse_catalog_key("").is_none());
+    }
+
+    #[test]
+    fn real_pubkey_parses() {
+        // Key from the minisign-verify documentation — format-validity only.
+        let file = "untrusted comment: minisign public key\n\
+                    RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3\n";
+        assert!(parse_catalog_key(file).is_some());
+    }
+
     mod remote {
         use super::*;
         use serde_json::json;
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        #[tokio::test]
-        async fn fetch_remote_list_parses_entries() {
-            let server = MockServer::start().await;
+        /// Ephemeral signing identity for tests: the verification key (as
+        /// parsed from a real `.pub` rendering) and a signer closure.
+        fn test_identity() -> (PublicKey, impl Fn(&[u8]) -> String) {
+            let minisign::KeyPair { pk, sk } =
+                minisign::KeyPair::generate_unencrypted_keypair().unwrap();
+            let verify_key = parse_catalog_key(&pk.to_box().unwrap().to_string())
+                .expect("generated public key must parse");
+            let signer = move |data: &[u8]| {
+                minisign::sign(None, &sk, std::io::Cursor::new(data), None, None)
+                    .unwrap()
+                    .to_string()
+            };
+            (verify_key, signer)
+        }
+
+        /// Mount a catalog body and its signature at `{key}.json[.minisig]`.
+        async fn mount_signed(server: &MockServer, action_key: &str, body: &str, sig: &str) {
             Mock::given(method("GET"))
-                .and(path("/actions/checkout.json"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(json!([
-                    { "sha": "aaa", "tag": "v1" },
-                    { "sha": "bbb", "tag": "v2" }
-                ])))
-                .mount(&server)
+                .and(path(format!("/{action_key}.json")))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_raw(body.to_string(), "application/json"),
+                )
+                .mount(server)
                 .await;
+            Mock::given(method("GET"))
+                .and(path(format!("/{action_key}.json.minisig")))
+                .respond_with(ResponseTemplate::new(200).set_body_string(sig.to_string()))
+                .mount(server)
+                .await;
+        }
+
+        #[tokio::test]
+        async fn fetch_remote_list_parses_signed_entries() {
+            let (key, sign) = test_identity();
+            let body = serde_json::to_string(&json!([
+                { "sha": "aaa", "tag": "v1" },
+                { "sha": "bbb", "tag": "v2" }
+            ]))
+            .unwrap();
+
+            let server = MockServer::start().await;
+            mount_signed(&server, "actions/checkout", &body, &sign(body.as_bytes())).await;
 
             let mut aa = AuditedActions::new(true);
+            aa.catalog_key = Some(key);
             aa.remote_url = server.uri();
             let shas = aa.fetch_remote_list("actions/checkout").await.unwrap();
             assert!(shas.contains("aaa"));
@@ -293,6 +418,7 @@ mod tests {
 
         #[tokio::test]
         async fn fetch_remote_list_non_success_is_none() {
+            let (key, _) = test_identity();
             let server = MockServer::start().await;
             Mock::given(method("GET"))
                 .and(path("/actions/missing.json"))
@@ -301,22 +427,96 @@ mod tests {
                 .await;
 
             let mut aa = AuditedActions::new(true);
+            aa.catalog_key = Some(key);
             aa.remote_url = server.uri();
             assert!(aa.fetch_remote_list("actions/missing").await.is_none());
         }
 
         #[tokio::test]
-        async fn check_falls_through_to_remote_layer() {
+        async fn fetch_remote_list_missing_signature_is_none() {
+            let (key, _) = test_identity();
+            let body = serde_json::to_string(&json!([{ "sha": "aaa", "tag": "v1" }])).unwrap();
+
             let server = MockServer::start().await;
             Mock::given(method("GET"))
-                .and(path("/some/action.json"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(json!([
-                    { "sha": "feedface", "tag": "v3" }
-                ])))
+                .and(path("/actions/unsigned.json"))
+                .respond_with(ResponseTemplate::new(200).set_body_raw(body, "application/json"))
                 .mount(&server)
                 .await;
+            // No .minisig mock → 404 on the signature.
 
             let mut aa = AuditedActions::new(true);
+            aa.catalog_key = Some(key);
+            aa.remote_url = server.uri();
+            assert!(aa.fetch_remote_list("actions/unsigned").await.is_none());
+        }
+
+        #[tokio::test]
+        async fn fetch_remote_list_tampered_body_is_none() {
+            let (key, sign) = test_identity();
+            let signed_body =
+                serde_json::to_string(&json!([{ "sha": "aaa", "tag": "v1" }])).unwrap();
+            let tampered_body =
+                serde_json::to_string(&json!([{ "sha": "evil", "tag": "v1" }])).unwrap();
+
+            let server = MockServer::start().await;
+            // Signature is over the original body; the server returns a
+            // different one — verification must reject it.
+            mount_signed(
+                &server,
+                "actions/tampered",
+                &tampered_body,
+                &sign(signed_body.as_bytes()),
+            )
+            .await;
+
+            let mut aa = AuditedActions::new(true);
+            aa.catalog_key = Some(key);
+            aa.remote_url = server.uri();
+            assert!(aa.fetch_remote_list("actions/tampered").await.is_none());
+        }
+
+        #[tokio::test]
+        async fn fetch_remote_list_wrong_key_is_none() {
+            let (_, sign) = test_identity();
+            let (other_key, _) = test_identity();
+            let body = serde_json::to_string(&json!([{ "sha": "aaa", "tag": "v1" }])).unwrap();
+
+            let server = MockServer::start().await;
+            mount_signed(&server, "actions/wrongkey", &body, &sign(body.as_bytes())).await;
+
+            let mut aa = AuditedActions::new(true);
+            aa.catalog_key = Some(other_key);
+            aa.remote_url = server.uri();
+            assert!(aa.fetch_remote_list("actions/wrongkey").await.is_none());
+        }
+
+        #[tokio::test]
+        async fn keyless_build_never_fetches() {
+            // Even with a perfectly signed catalog available, a build without
+            // a public key must not honor remote entries.
+            let (_, sign) = test_identity();
+            let body = serde_json::to_string(&json!([{ "sha": "aaa", "tag": "v1" }])).unwrap();
+
+            let server = MockServer::start().await;
+            mount_signed(&server, "actions/keyless", &body, &sign(body.as_bytes())).await;
+
+            let mut aa = AuditedActions::new(true);
+            aa.catalog_key = None;
+            aa.remote_url = server.uri();
+            assert!(aa.fetch_remote_list("actions/keyless").await.is_none());
+        }
+
+        #[tokio::test]
+        async fn check_falls_through_to_remote_layer() {
+            let (key, sign) = test_identity();
+            let body = serde_json::to_string(&json!([{ "sha": "feedface", "tag": "v3" }])).unwrap();
+
+            let server = MockServer::start().await;
+            mount_signed(&server, "some/action", &body, &sign(body.as_bytes())).await;
+
+            let mut aa = AuditedActions::new(true);
+            aa.catalog_key = Some(key);
             aa.remote_url = server.uri();
             aa.cache_dir = None; // don't consult the real ~/.cache during the test
             // Not bundled, no local cache hit → resolved by the remote layer.

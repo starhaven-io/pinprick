@@ -12,6 +12,12 @@ pinprick maintains a list of GitHub Actions that have been scanned and confirmed
 3. **Remote** — `https://pinprick.rs/audited-actions/`. Opt-in via `fetch-remote = true` in your [config file](/configuration/config-file).
 4. **GitHub API** — full source fetch and scan as last resort.
 
+## Remote catalog signing
+
+A remote catalog entry tells pinprick to _skip scanning_ a SHA, so its integrity matters more than TLS alone can guarantee — a compromised CDN must not be able to mark malicious SHAs as audited. Every catalog file is therefore signed with [minisign](https://jedisct1.github.io/minisign/): the signature is served next to the file (`….json.minisig`), and the pinprick binary verifies it against a public key embedded at build time before honoring any entry.
+
+Verification is fail-closed. A missing or invalid signature — or a binary built without the public key — disables the remote layer entirely, and pinprick falls back to scanning via the GitHub API. Nothing is silently trusted.
+
 ## What "audited" means
 
 Each SHA was scanned for **unversioned runtime fetch patterns**. Specifically:
