@@ -25,6 +25,10 @@ use crate::output::{self, AuditFinding, AuditMatch, AuditReport};
 use crate::workflow::{self, ActionRef};
 use colored::Colorize;
 
+/// Reason string for matches allowed via the `trusted-hosts` config list.
+/// Shared between the allow site and the repo-config notice that counts them.
+pub(crate) const REASON_TRUSTED_HOST: &str = "trusted host";
+
 /// Accumulates findings and (when verbose) allowed matches during a scan.
 ///
 /// `push_allowed` is a no-op when `verbose` is false, so callers can record
@@ -33,6 +37,9 @@ pub struct AuditCollector {
     pub findings: Vec<AuditFinding>,
     pub allowed: Vec<AuditMatch>,
     pub verbose: bool,
+    /// Matches allowed via `trusted-hosts` — counted regardless of verbosity
+    /// so the repo-config notice doesn't depend on `--verbose`.
+    pub trusted_host_allowed: usize,
 }
 
 impl AuditCollector {
@@ -41,6 +48,7 @@ impl AuditCollector {
             findings: Vec::new(),
             allowed: Vec::new(),
             verbose,
+            trusted_host_allowed: 0,
         }
     }
 
@@ -49,6 +57,9 @@ impl AuditCollector {
     }
 
     pub fn push_allowed(&mut self, allowed: AuditMatch) {
+        if allowed.reason == REASON_TRUSTED_HOST {
+            self.trusted_host_allowed += 1;
+        }
         if self.verbose {
             self.allowed.push(allowed);
         }
@@ -231,9 +242,33 @@ pub async fn run(
         eprintln!();
     }
 
+    let before_filters = collector.findings.len();
     collector.findings.retain(|f| {
         config.meets_severity(&f.severity) && !config.is_pattern_ignored(&f.description)
     });
+    let suppressed = before_filters - collector.findings.len();
+
+    // When auditing a repo you don't control, its own .pinprick.toml must not
+    // silently set audit policy — say what it changed and how to opt out.
+    if config.is_repo_local() {
+        let trusted_host_allowed = collector.trusted_host_allowed;
+        let mut parts = Vec::new();
+        if suppressed > 0 {
+            parts.push(format!("findings suppressed: {suppressed}"));
+        }
+        if ignored > 0 {
+            parts.push(format!("actions skipped: {ignored}"));
+        }
+        if trusted_host_allowed > 0 {
+            parts.push(format!("trusted-host fetches: {trusted_host_allowed}"));
+        }
+        if !parts.is_empty() {
+            eprintln!(
+                "note: the scanned repo's .pinprick.toml affected results ({}) — rerun with --no-repo-config to ignore it",
+                parts.join(", ")
+            );
+        }
+    }
 
     collector
         .findings
@@ -826,7 +861,7 @@ fn check_url_patterns(
             if url_has_version(url) {
                 allowed_reason.get_or_insert("versioned URL");
             } else if config.is_host_trusted(url) {
-                allowed_reason.get_or_insert("trusted host");
+                allowed_reason.get_or_insert(REASON_TRUSTED_HOST);
             } else if config.is_data_format_exempt(url) {
                 allowed_reason.get_or_insert("data format URL");
             } else {

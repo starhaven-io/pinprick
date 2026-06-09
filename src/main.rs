@@ -59,6 +59,11 @@ enum Command {
         /// Output findings as SARIF 2.1.0 (for github/codeql-action/upload-sarif)
         #[arg(long, conflicts_with = "json")]
         sarif: bool,
+
+        /// Ignore the scanned repository's .pinprick.toml and use the global
+        /// config (or defaults) — for auditing repositories you don't control
+        #[arg(long)]
+        no_repo_config: bool,
     },
     /// Remove locally cached audit results
     Clean,
@@ -88,6 +93,11 @@ enum Command {
         /// If `--json` is also set, JSON wins (global flags take precedence).
         #[arg(long)]
         html: bool,
+
+        /// Ignore the scanned repository's .pinprick.toml and use the global
+        /// config (or defaults) — for scoring repositories you don't control
+        #[arg(long)]
+        no_repo_config: bool,
     },
     /// Check for updates to pinned actions
     Update {
@@ -121,8 +131,9 @@ async fn main() -> ExitCode {
             path,
             verbose,
             sarif,
+            no_repo_config,
         } => {
-            let config = config::Config::load(path);
+            let config = config::Config::load(path, !no_repo_config);
             audit::run(path, cli.json, *sarif, *verbose, &config).await
         }
         Command::Clean => {
@@ -151,7 +162,11 @@ async fn main() -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Command::Pin { path, apply } => pin::run(path, cli.json, *apply).await,
-        Command::Score { path, html } => score::run(path, cli.json, *html).await,
+        Command::Score {
+            path,
+            html,
+            no_repo_config,
+        } => score::run(path, cli.json, *html, *no_repo_config).await,
         Command::Update { path, apply, only } => {
             update::run(path, *apply, cli.json, only.as_deref()).await
         }
