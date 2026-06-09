@@ -42,6 +42,13 @@ jobs:
               echo "::warning::Could not resolve latest version for ${TOOL}, skipping"
               continue
             fi
+            # The version flows into the sed replacements below — reject anything
+            # that isn't plain X.Y.Z so a hostile registry response can't inject
+            # arbitrary content into ci.yml.
+            if [[ ! "${LATEST}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::warning::Unexpected version format for ${TOOL}: ${LATEST}, skipping"
+              continue
+            fi
 
             # Extract the currently pinned version, if any.
             CURRENT=$(grep -oE "cargo install ${TOOL} --locked --version [0-9]+\.[0-9]+\.[0-9]+" .github/workflows/ci.yml | awk '{print $NF}' | head -1 || true)

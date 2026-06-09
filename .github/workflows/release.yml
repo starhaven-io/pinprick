@@ -16,6 +16,10 @@ permissions: {}
 jobs:
   build:
     name: Build (${{ matrix.target }})
+    # Releases come from main only — a dispatch from any other branch would
+    # tag and publish whatever that branch contains. Guarding the entry job
+    # skips the whole chain via `needs`.
+    if: github.ref == 'refs/heads/main'
     environment:
       name: release
       deployment: false
