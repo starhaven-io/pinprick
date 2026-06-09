@@ -45,6 +45,30 @@ jobs:
         working-directory: site
         run: npm run build
 
+      # Sign the built audited-actions catalog files so the pinprick binary
+      # can verify them against its embedded public key (fail-closed: an
+      # unsigned or tampered catalog is ignored by clients). Signing the dist
+      # output covers exactly the bytes Cloudflare will serve.
+      - name: Sign audited-actions catalog
+        env:
+          CATALOG_SIGNING_KEY: ${{ secrets.CATALOG_SIGNING_KEY }}
+        run: |
+          if [[ -z "${CATALOG_SIGNING_KEY}" ]]; then
+            echo "::warning::CATALOG_SIGNING_KEY not configured; catalog ships unsigned and clients will ignore the remote layer"
+            exit 0
+          fi
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq minisign
+          KEYFILE="${RUNNER_TEMP}/catalog.key"
+          printf '%s\n' "${CATALOG_SIGNING_KEY}" > "${KEYFILE}"
+          find site/dist -path '*audited-actions*' -name '*.json' -print0 \
+            | while IFS= read -r -d '' f; do
+                minisign -S -s "${KEYFILE}" -m "${f}" -x "${f}.minisig"
+              done
+          rm -f "${KEYFILE}"
+          COUNT=$(find site/dist -name '*.json.minisig' | wc -l)
+          echo "Signed ${COUNT} catalog files"
+
       - name: Deploy to Cloudflare Workers
         working-directory: site
         run: npm run deploy

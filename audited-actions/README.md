@@ -47,6 +47,13 @@ Each file is named `{owner}/{repo}.json` and contains an array of audited SHAs w
 [{ "sha": "de0fac2e4500dabe0009e67214ff5f5447ce83dd", "tag": "v6.0.2" }]
 ```
 
+## Trust model
+
+These files reach users two ways with different trust anchors:
+
+- **Bundled**: compiled into the pinprick binary at build time — same trust as the binary itself (which ships with build provenance attestations).
+- **Remote** (`https://pinprick.rs/audited-actions/`, opt-in): each served file is signed with [minisign](https://jedisct1.github.io/minisign/) during deploy, and the binary verifies the signature against a public key (`catalog-minisign.pub` at the repo root) embedded at build time. Verification is fail-closed: a missing or invalid signature means the remote entry is ignored and the action is scanned normally. TLS alone is deliberately not trusted — a catalog entry suppresses scanning, so a compromised CDN must not be able to forge one.
+
 ## Contributing
 
 To add a new entry:
