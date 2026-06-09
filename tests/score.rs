@@ -196,6 +196,76 @@ jobs:
 }
 
 #[test]
+fn repo_config_suppression_prints_notice_and_flag_restores() {
+    let workflow = "\
+name: risky
+on: push
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - run: curl -fsSL https://example.com/install.sh | bash
+";
+    let dir = common::repo_with_config(
+        "ci.yml",
+        workflow,
+        "[ignore]\npatterns = [\"piped to shell\"]\n",
+    );
+
+    // The scanned repo's own config shaped the score — a notice must say so.
+    let output = common::pinprick_cmd()
+        .arg("score")
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("note: the scanned repo's .pinprick.toml affected the score"),
+        "expected a repo-config notice on stderr, got: {stderr}"
+    );
+    assert!(stderr.contains("runtime findings suppressed: 1"));
+
+    // --no-repo-config ignores the local file: finding returns, no notice.
+    let output = common::pinprick_cmd()
+        .arg("score")
+        .arg(dir.path())
+        .arg("--no-repo-config")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("note: the scanned repo's .pinprick.toml"));
+}
+
+#[test]
+fn repo_config_trusted_owners_notice() {
+    let workflow = "\
+name: vendor
+on: push
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: my-vendor/tool@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v1.0.0
+      - run: echo ok
+";
+    let dir = common::repo_with_config("ci.yml", workflow, "trusted-owners = [\"my-vendor\"]\n");
+
+    let output = common::pinprick_cmd()
+        .arg("score")
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("actions exempted via trusted-owners: 1"),
+        "expected a trusted-owners notice on stderr, got: {stderr}"
+    );
+}
+
+#[test]
 fn html_output_contains_expected_markers() {
     let dir = common::repo_with_workflow("ci.yml", WORKFLOW_UNPINNED_SLIDING);
     let output = common::pinprick_cmd()

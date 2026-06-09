@@ -216,9 +216,22 @@ pub fn grade_for(score: u32) -> &'static str {
     }
 }
 
+/// What the active config file changed about the score — used to surface a
+/// notice when the scanned repo's own `.pinprick.toml` shaped its own grade.
+#[derive(Default)]
+pub struct ConfigImpact {
+    /// Runtime findings dropped via `ignore.patterns`.
+    pub findings_suppressed: usize,
+    /// Unique action refs exempted from `source.unverified` via the
+    /// configured `trusted-owners` list (baseline owners not counted).
+    pub actions_exempted: usize,
+}
+
 /// Collect findings across all workflows, dedupe by rule + target, and roll
-/// up into a single report.
-pub fn score_repo(repo_root: &Path, config: &Config) -> Result<ScoreReport> {
+/// up into a single report, alongside what the config changed about it.
+pub fn score_repo(repo_root: &Path, config: &Config) -> Result<(ScoreReport, ConfigImpact)> {
+    let mut impact = ConfigImpact::default();
+    let mut exempted_refs: std::collections::BTreeSet<String> = Default::default();
     let files = workflow::find_workflows(repo_root)?;
 
     // Accumulate action-level findings keyed by (rule, action_ref).
@@ -254,6 +267,9 @@ pub fn score_repo(repo_root: &Path, config: &Config) -> Result<ScoreReport> {
                     workflow: display.clone(),
                     line: a.line_number,
                 });
+            } else if config.is_owner_trusted_by_config(&a.owner) {
+                // Trusted via the config file, not the baseline — attributable.
+                exempted_refs.insert(action_ref.clone());
             }
         }
 
@@ -289,6 +305,7 @@ pub fn score_repo(repo_root: &Path, config: &Config) -> Result<ScoreReport> {
                 // Honor `ignore.patterns` (an accepted risk shouldn't score) but
                 // not the `severity` display threshold — the score is complete.
                 if config.is_pattern_ignored(&finding.description) {
+                    impact.findings_suppressed += 1;
                     continue;
                 }
                 let rule = runtime_rule_for(finding);
@@ -358,7 +375,8 @@ pub fn score_repo(repo_root: &Path, config: &Config) -> Result<ScoreReport> {
         findings,
     };
     recompute_score(&mut report);
-    Ok(report)
+    impact.actions_exempted = exempted_refs.len();
+    Ok((report, impact))
 }
 
 /// Sort findings (highest deduction first, then by rule id, then by action ref)
@@ -818,9 +836,38 @@ fn trigger_present(on: &Value, name: &str) -> bool {
 
 // ── CLI entry point ─────────────────────────────────────────────────────────
 
-pub async fn run(repo_root: &Path, json: bool, html: bool) -> Result<ExitCode> {
-    let config = Config::load(repo_root);
-    let mut report = score_repo(repo_root, &config)?;
+pub async fn run(
+    repo_root: &Path,
+    json: bool,
+    html: bool,
+    no_repo_config: bool,
+) -> Result<ExitCode> {
+    let config = Config::load(repo_root, !no_repo_config);
+    let (mut report, impact) = score_repo(repo_root, &config)?;
+
+    // When scoring a repo you don't control, its own .pinprick.toml must not
+    // silently inflate its own grade — say what it changed and how to opt out.
+    if config.is_repo_local() {
+        let mut parts = Vec::new();
+        if impact.findings_suppressed > 0 {
+            parts.push(format!(
+                "runtime findings suppressed: {}",
+                impact.findings_suppressed
+            ));
+        }
+        if impact.actions_exempted > 0 {
+            parts.push(format!(
+                "actions exempted via trusted-owners: {}",
+                impact.actions_exempted
+            ));
+        }
+        if !parts.is_empty() {
+            eprintln!(
+                "note: the scanned repo's .pinprick.toml affected the score ({}) — rerun with --no-repo-config to ignore it",
+                parts.join(", ")
+            );
+        }
+    }
 
     // Rules that need the GitHub API run after the offline scan. Without a
     // token we silently skip them — same behavior as `audit`.
@@ -1149,7 +1196,7 @@ jobs:
 "#;
         std::fs::write(wfdir.join("ci.yml"), yaml).unwrap();
 
-        let report = score_repo(dir.path(), &Config::default()).unwrap();
+        let (report, _) = score_repo(dir.path(), &Config::default()).unwrap();
         // pin.sliding (5) + pin.full_tag (2) + pin.branch (15)
         //   + workflow.permissions_write_all (10)
         //   + source.unverified for some-org/custom-action (1)
@@ -1177,7 +1224,7 @@ jobs:
 "#;
         std::fs::write(wfdir.join("ci.yml"), yaml).unwrap();
 
-        let report = score_repo(dir.path(), &Config::default()).unwrap();
+        let (report, _) = score_repo(dir.path(), &Config::default()).unwrap();
         assert_eq!(report.score, 100);
         assert_eq!(report.grade, "A");
         assert!(report.findings.is_empty());
@@ -1192,7 +1239,7 @@ jobs:
         std::fs::write(wfdir.join("a.yml"), yaml).unwrap();
         std::fs::write(wfdir.join("b.yml"), yaml).unwrap();
 
-        let report = score_repo(dir.path(), &Config::default()).unwrap();
+        let (report, _) = score_repo(dir.path(), &Config::default()).unwrap();
         // Two workflows, same sliding-tag action -> ONE finding with 2 occurrences.
         let pin_findings: Vec<_> = report
             .findings
@@ -1259,7 +1306,7 @@ jobs:
 "#;
         std::fs::write(wfdir.join("ci.yml"), yaml).unwrap();
 
-        let report = score_repo(dir.path(), &Config::default()).unwrap();
+        let (report, _) = score_repo(dir.path(), &Config::default()).unwrap();
         let ids: Vec<_> = report.findings.iter().map(|f| f.id).collect();
         assert!(ids.contains(&"workflow.pull_request_target"));
         assert!(ids.contains(&"workflow.workflow_run"));
@@ -1290,7 +1337,7 @@ jobs:
 "#;
         std::fs::write(wfdir.join("risky.yml"), yaml).unwrap();
 
-        let report = score_repo(dir.path(), &Config::default()).unwrap();
+        let (report, _) = score_repo(dir.path(), &Config::default()).unwrap();
         let ids: Vec<_> = report.findings.iter().map(|f| f.id).collect();
         assert!(ids.contains(&"runtime.pipe_to_shell"), "ids: {ids:?}");
         assert!(ids.contains(&"runtime.fetch.high"), "ids: {ids:?}");
@@ -1337,7 +1384,7 @@ jobs:
         let yaml = "name: x\non: push\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: random-vendor/tool@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v1\n";
         std::fs::write(wfdir.join("ci.yml"), yaml).unwrap();
 
-        let report = score_repo(dir.path(), &Config::default()).unwrap();
+        let (report, _) = score_repo(dir.path(), &Config::default()).unwrap();
         let ids: Vec<_> = report.findings.iter().map(|f| f.id).collect();
         assert_eq!(ids, vec!["source.unverified"]);
         assert_eq!(report.score, 99);
@@ -1352,7 +1399,7 @@ jobs:
         let yaml = "name: x\non: push\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6\n      - uses: github/codeql-action/init@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v3\n";
         std::fs::write(wfdir.join("ci.yml"), yaml).unwrap();
 
-        let report = score_repo(dir.path(), &Config::default()).unwrap();
+        let (report, _) = score_repo(dir.path(), &Config::default()).unwrap();
         assert!(report.findings.is_empty());
         assert_eq!(report.score, 100);
     }
@@ -1369,8 +1416,11 @@ jobs:
             trusted_owners: vec!["my-vendor".to_string()],
             ..Config::default()
         };
-        let report = score_repo(dir.path(), &cfg).unwrap();
+        let (report, impact) = score_repo(dir.path(), &cfg).unwrap();
         assert!(report.findings.is_empty());
+        // The exemption is attributed to the config, not the baseline.
+        assert_eq!(impact.actions_exempted, 1);
+        assert_eq!(impact.findings_suppressed, 0);
     }
 
     fn make_adv(
@@ -2141,7 +2191,7 @@ jobs:
                 "name: x\non: push\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: o/r@{sha} # v1.0.0\n"
             );
             std::fs::write(wfdir.join("ci.yml"), yaml).unwrap();
-            score_repo(dir, &Config::default()).unwrap()
+            score_repo(dir, &Config::default()).unwrap().0
         }
 
         #[tokio::test]

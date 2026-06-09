@@ -39,6 +39,11 @@ When no GitHub token is available, audit scans only workflow `run:` blocks. Acti
 - `--json`: machine-readable JSON for CI integration
 - `--sarif`: SARIF 2.1.0 for upload to GitHub code scanning
 - `--verbose`: also report _allowed_ matches (fetches that fired a rule but were dropped because the URL is versioned)
+- `--no-repo-config`: ignore the scanned repository's `.pinprick.toml` and use the global config (or defaults)
+
+## Auditing repositories you don't control
+
+The scanned repository's own `.pinprick.toml` applies during an audit — `ignore` rules, `trusted-hosts`, and `severity` can all suppress findings. That's the right behavior for your own CI, but when auditing a third-party repository it means the target sets its own audit policy. Whenever a repo-local config changes the results, pinprick prints a note to stderr saying what it suppressed; pass `--no-repo-config` to ignore the file entirely.
 
 ## Example
 

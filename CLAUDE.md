@@ -73,7 +73,7 @@ Rate-limit handling: `github::get` retries once on network/5xx errors and sleeps
 
 ### Configuration
 
-A `.pinprick.toml` at the repo root (or `~/.config/pinprick/config.toml`) customizes behavior. Keys are all optional: `severity`, `fetch-remote`, `trusted-hosts`, `extra-data-formats`, `ignore.actions`, `ignore.patterns`. Per-repo wholly overrides global (no field-level merge).
+A `.pinprick.toml` at the repo root (or `~/.config/pinprick/config.toml`) customizes behavior. Keys are all optional: `severity`, `fetch-remote`, `trusted-hosts`, `trusted-owners`, `extra-data-formats`, `ignore.actions`, `ignore.patterns`. Per-repo wholly overrides global (no field-level merge). Because the scanned repo's own config applies, `audit`/`score` print a stderr notice whenever a repo-local config suppressed findings or extended trust, and accept `--no-repo-config` to ignore the repo's file (for scanning repositories you don't control).
 
 ### Audit patterns
 

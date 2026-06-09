@@ -37,6 +37,21 @@ pub struct Config {
     /// to the built-in baseline (`actions`, `github`). Case-insensitive.
     #[serde(default)]
     pub trusted_owners: Vec<String>,
+
+    /// Where this configuration was loaded from. Not part of the file format —
+    /// used to attribute suppressions to the scanned repo's own config, which
+    /// matters when auditing a repository you don't control.
+    #[serde(skip)]
+    pub source: ConfigSource,
+}
+
+/// Where the active configuration was loaded from.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ConfigSource {
+    #[default]
+    Default,
+    Global,
+    RepoLocal,
 }
 
 /// Baseline list of trusted action publishers. GitHub's own orgs are
@@ -71,17 +86,35 @@ pub struct IgnoreConfig {
 impl Config {
     /// Load config from global (~/.config/pinprick/config.toml) and per-repo (.pinprick.toml).
     /// Per-repo overrides global. Missing files are fine — defaults are used.
-    pub fn load(repo_root: &Path) -> Self {
+    /// With `use_repo_config` false the per-repo file is ignored entirely —
+    /// the right mode when scanning a repository you don't control, whose
+    /// config would otherwise set its own audit policy.
+    pub fn load(repo_root: &Path, use_repo_config: bool) -> Self {
         // Per-repo wins; a malformed per-repo file falls back to defaults (not
         // global) — the author meant to configure THIS repo.
-        match load_local(repo_root) {
-            ConfigLoad::Loaded(local) => local,
-            ConfigLoad::Malformed => Config::default(),
-            ConfigLoad::Absent => match load_global() {
-                ConfigLoad::Loaded(global) => global,
-                ConfigLoad::Malformed | ConfigLoad::Absent => Config::default(),
-            },
+        if use_repo_config {
+            match load_local(repo_root) {
+                ConfigLoad::Loaded(mut local) => {
+                    local.source = ConfigSource::RepoLocal;
+                    return local;
+                }
+                ConfigLoad::Malformed => return Config::default(),
+                ConfigLoad::Absent => {}
+            }
         }
+        match load_global() {
+            ConfigLoad::Loaded(mut global) => {
+                global.source = ConfigSource::Global;
+                global
+            }
+            ConfigLoad::Malformed | ConfigLoad::Absent => Config::default(),
+        }
+    }
+
+    /// Whether the active config came from the scanned repo's own
+    /// `.pinprick.toml`.
+    pub fn is_repo_local(&self) -> bool {
+        self.source == ConfigSource::RepoLocal
     }
 
     pub fn severity_threshold(&self) -> u8 {
@@ -155,10 +188,16 @@ impl Config {
         BASELINE_TRUSTED_OWNERS
             .iter()
             .any(|b| b.eq_ignore_ascii_case(owner))
-            || self
-                .trusted_owners
-                .iter()
-                .any(|o| o.eq_ignore_ascii_case(owner))
+            || self.is_owner_trusted_by_config(owner)
+    }
+
+    /// Whether `owner` is trusted via the configured `trusted-owners` list
+    /// specifically (not the built-in baseline). Used to attribute
+    /// `source.unverified` exemptions to the active config file.
+    pub fn is_owner_trusted_by_config(&self, owner: &str) -> bool {
+        self.trusted_owners
+            .iter()
+            .any(|o| o.eq_ignore_ascii_case(owner))
     }
 }
 
@@ -223,6 +262,24 @@ fn load_file(path: &Path) -> ConfigLoad {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn load_without_repo_config_ignores_local_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join(".pinprick.toml"),
+            "trusted-hosts = [\"x.example\"]\n",
+        )
+        .unwrap();
+
+        let with = Config::load(dir.path(), true);
+        assert!(with.is_repo_local());
+        assert!(with.is_host_trusted("https://x.example/tool"));
+
+        let without = Config::load(dir.path(), false);
+        assert!(!without.is_repo_local());
+        assert!(!without.is_host_trusted("https://x.example/tool"));
+    }
 
     #[test]
     fn is_data_format_exempt_built_in() {

@@ -576,6 +576,95 @@ fn config_ignore_patterns() {
 }
 
 #[test]
+fn repo_config_suppression_prints_notice() {
+    let dir = common::repo_with_config(
+        "ci.yml",
+        common::WORKFLOW_PIPE_TO_SHELL,
+        "[ignore]\npatterns = [\"piped to shell\"]\n",
+    );
+
+    let output = common::pinprick_cmd()
+        .arg("audit")
+        .arg(dir.path())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("note: the scanned repo's .pinprick.toml affected results"),
+        "expected a repo-config notice on stderr, got: {stderr}"
+    );
+    assert!(stderr.contains("findings suppressed: 1"));
+    assert!(stderr.contains("--no-repo-config"));
+}
+
+#[test]
+fn no_repo_config_ignores_local_file() {
+    // Same suppressing config, but --no-repo-config must restore the finding
+    // (exit 1) and print no notice.
+    let dir = common::repo_with_config(
+        "ci.yml",
+        common::WORKFLOW_PIPE_TO_SHELL,
+        "[ignore]\npatterns = [\"piped to shell\"]\n",
+    );
+
+    let output = common::pinprick_cmd()
+        .arg("audit")
+        .arg(dir.path())
+        .arg("--no-repo-config")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("note: the scanned repo's .pinprick.toml"));
+}
+
+#[test]
+fn repo_config_trusted_host_notice_without_verbose() {
+    // The trusted-host count must not depend on --verbose.
+    let dir = common::repo_with_config(
+        "ci.yml",
+        common::WORKFLOW_TRUSTED_HOST,
+        "trusted-hosts = [\"artifacts.internal.example.com\"]\n",
+    );
+
+    let output = common::pinprick_cmd()
+        .arg("audit")
+        .arg(dir.path())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("trusted-host fetches: 1"),
+        "expected a trusted-host notice on stderr, got: {stderr}"
+    );
+}
+
+#[test]
+fn repo_config_clean_repo_prints_no_notice() {
+    // A repo-local config that changes nothing must stay silent.
+    let dir = common::repo_with_config(
+        "ci.yml",
+        common::WORKFLOW_CLEAN,
+        "[ignore]\npatterns = [\"piped to shell\"]\n",
+    );
+
+    let output = common::pinprick_cmd()
+        .arg("audit")
+        .arg(dir.path())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("note:"));
+}
+
+#[test]
 fn config_trusted_hosts() {
     let dir = common::repo_with_config(
         "ci.yml",

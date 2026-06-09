@@ -24,6 +24,7 @@ pinprick score --html > report.html
 - Default: a compact human-readable summary with grade, finding counts by severity, and top remediations
 - `--json`: the full finding list as JSON for CI integration or downstream processing
 - `--html`: a self-contained HTML report (mutually exclusive with `--json`)
+- `--no-repo-config`: ignore the scanned repository's `.pinprick.toml` and use the global config (or defaults)
 
 ## Rule catalog
 
@@ -56,6 +57,8 @@ trusted-owners = ["my-org", "vendor"]
 ```
 
 Matching is exact owner, case-insensitive. See [Config File](/configuration/config-file) for the full set of options.
+
+Because the scanned repository's own `.pinprick.toml` applies, a third-party repo can shape its own grade (`trusted-owners`, `ignore` rules). Whenever a repo-local config changes the score, pinprick prints a note to stderr saying what it changed; pass `--no-repo-config` to ignore the file entirely.
 
 ## Example
 
