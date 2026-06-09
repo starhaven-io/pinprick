@@ -346,7 +346,11 @@ fn join_continuations(content: &str) -> Vec<(usize, String)> {
     let mut pending: Option<(usize, String)> = None;
     for (i, raw) in content.lines().enumerate() {
         let trimmed_end = raw.trim_end();
-        let is_continuation = trimmed_end.ends_with('\\');
+        // A comment never continues onto the next line — a trailing backslash
+        // is just comment text, so the next line is a new command. Joining it
+        // into the comment would hide it from the scan.
+        let is_continuation =
+            trimmed_end.ends_with('\\') && !(pending.is_none() && is_shell_comment_line(raw));
         let body = if is_continuation {
             &trimmed_end[..trimmed_end.len() - 1]
         } else {
@@ -379,21 +383,23 @@ pub fn scan_shell_content(
     collector: &mut AuditCollector,
     config: &Config,
 ) {
-    let lines: Vec<&str> = content.lines().collect();
+    // All passes scan logical lines — a command split across physical lines
+    // with trailing backslashes is one shell command, and scanning the pieces
+    // separately would let `curl … \` + `<url>` evade every two-part pattern.
+    let logical = join_continuations(content);
 
     // Pipe-to-shell pass runs first so its findings land before `findings_before`
-    // and escape the checksum downgrade loop below. Continuations are joined so
-    // the pipe can sit on a later physical line than the curl.
+    // and escape the checksum downgrade loop below.
     let mut pipe_shell_lines: HashSet<usize> = HashSet::new();
-    for (start, joined) in join_continuations(content) {
-        if is_shell_comment_line(&joined) {
+    for (start, joined) in &logical {
+        if is_shell_comment_line(joined) {
             continue;
         }
         let line_num = base_line + start;
         let before = collector.findings.len();
         check_patterns(
             &SHELL_PIPE_PATTERNS,
-            &joined,
+            joined,
             source_file,
             line_num,
             action_name,
@@ -406,11 +412,12 @@ pub fn scan_shell_content(
 
     let findings_before = collector.findings.len();
 
-    for (i, line) in lines.iter().enumerate() {
+    for (li, (start, line)) in logical.iter().enumerate() {
+        let line = line.as_str();
         if is_shell_comment_line(line) {
             continue;
         }
-        let line_num = base_line + i;
+        let line_num = base_line + start;
         if pipe_shell_lines.contains(&line_num) {
             continue;
         }
@@ -456,8 +463,11 @@ pub fn scan_shell_content(
         }
 
         if SH_GIT_CLONE.is_match(line) && !git_clone_has_pinned_ref(line) {
-            let has_sha_checkout = (1..=3)
-                .any(|offset| i + offset < lines.len() && has_git_checkout_sha(lines[i + offset]));
+            // Offset 0 covers a one-liner `git clone … && git checkout <sha>`,
+            // which pins the content just as deterministically.
+            let has_sha_checkout = (0..=3).any(|offset| {
+                li + offset < logical.len() && has_git_checkout_sha(&logical[li + offset].1)
+            });
 
             if has_sha_checkout {
                 collector.push_allowed(AuditMatch {
@@ -566,11 +576,15 @@ pub fn scan_shell_content(
 
     // Downgrade severity for findings followed by checksum verification.
     // Pipe-shell findings sit below `findings_before`, so they are exempt.
+    // Offset 0 covers a one-liner `curl -o f … && sha256sum -c …`.
     for finding in collector.findings.iter_mut().skip(findings_before) {
         if let Some(finding_line) = finding.line {
             let rel = finding_line.saturating_sub(base_line);
-            for offset in 1..=3 {
-                if rel + offset < lines.len() && has_checksum_verify(lines[rel + offset]) {
+            let Some(li) = logical.iter().position(|(start, _)| *start == rel) else {
+                continue;
+            };
+            for offset in 0..=3 {
+                if li + offset < logical.len() && has_checksum_verify(&logical[li + offset].1) {
                     finding.severity = downgrade_severity(&finding.severity);
                     finding.description = format!("{} (checksum verified)", finding.description);
                     break;
@@ -684,20 +698,23 @@ fn scan_dockerfile_content(
     collector: &mut AuditCollector,
     config: &Config,
 ) {
-    let lines: Vec<&str> = content.lines().collect();
+    // Dockerfile RUN instructions lean heavily on trailing-backslash
+    // continuations; scan logical lines so a fetch split across physical
+    // lines is still seen whole.
+    let logical = join_continuations(content);
 
     // Multi-stage builds name stages via `FROM … AS <name>`. Collect those
     // names so a later `FROM <name>` is recognized as a stage reference, not an
     // image pull — otherwise it false-positives as an untagged image.
-    let stage_names: HashSet<String> = lines
+    let stage_names: HashSet<String> = logical
         .iter()
-        .filter_map(|line| audit_patterns::dockerfile_stage_alias(line))
+        .filter_map(|(_, line)| audit_patterns::dockerfile_stage_alias(line))
         .collect();
 
     // Escalate `RUN curl ... | sh` from medium (DOCKER_RUN_CURL) to high.
     let mut pipe_shell_lines: HashSet<usize> = HashSet::new();
-    for (i, line) in lines.iter().enumerate() {
-        let line_num = i + 1;
+    for (start, line) in &logical {
+        let line_num = start + 1;
         let before = collector.findings.len();
         check_patterns(
             &SHELL_PIPE_PATTERNS,
@@ -712,8 +729,9 @@ fn scan_dockerfile_content(
         }
     }
 
-    for (i, line) in lines.iter().enumerate() {
-        let line_num = i + 1;
+    for (start, line) in &logical {
+        let line = line.as_str();
+        let line_num = start + 1;
 
         if audit_patterns::DOCKER_FROM_DIGEST.is_match(line) {
             continue;
@@ -1423,6 +1441,37 @@ more stuff
         assert_eq!(c.findings.len(), 1);
         assert_eq!(c.findings[0].severity, "high");
         assert!(c.findings[0].description.contains("piped to shell"));
+    }
+
+    #[test]
+    fn dockerfile_scan_pipe_shell_across_continuation() {
+        // RUN instructions lean on backslash continuations — the fetch and
+        // the pipe may sit on different physical lines.
+        let mut c = AuditCollector::new(false);
+        scan_dockerfile_content(
+            "FROM ubuntu:22.04\nRUN curl -sSL https://example.com/install.sh \\\n    | sh\n",
+            "Dockerfile",
+            "",
+            &mut c,
+            &DEFAULT_CONFIG,
+        );
+        assert_eq!(c.findings.len(), 1);
+        assert_eq!(c.findings[0].severity, "high");
+        assert_eq!(c.findings[0].line, Some(2));
+    }
+
+    #[test]
+    fn dockerfile_scan_from_platform_latest_is_finding() {
+        let mut c = AuditCollector::new(false);
+        scan_dockerfile_content(
+            "FROM --platform=linux/amd64 node:latest\n",
+            "Dockerfile",
+            "",
+            &mut c,
+            &DEFAULT_CONFIG,
+        );
+        assert_eq!(c.findings.len(), 1);
+        assert_eq!(c.findings[0].severity, "high");
     }
 
     #[test]
@@ -2152,6 +2201,140 @@ runs:
             &DEFAULT_CONFIG,
         );
         assert_eq!(c.findings.len(), 1);
+    }
+
+    #[test]
+    fn git_clone_same_line_sha_checkout_is_allowed() {
+        let mut c = AuditCollector::new(true);
+        scan_shell_content(
+            "git clone https://github.com/org/repo && cd repo && git checkout abcdef1234567890abcdef1234567890abcdef12",
+            "test.sh",
+            1,
+            "",
+            &mut c,
+            &DEFAULT_CONFIG,
+        );
+        assert!(c.findings.is_empty());
+        assert_eq!(c.allowed.len(), 1);
+        assert_eq!(c.allowed[0].reason, "followed by SHA checkout");
+    }
+
+    #[test]
+    fn shell_scan_catches_fetch_split_across_continuation() {
+        // A two-part pattern (command + URL) split across a backslash
+        // continuation is one shell command and must be seen whole.
+        let mut c = AuditCollector::new(false);
+        scan_shell_content(
+            "curl -L \\\n  https://example.com/install.sh -o install.sh\n",
+            "test.sh",
+            1,
+            "",
+            &mut c,
+            &DEFAULT_CONFIG,
+        );
+        assert_eq!(c.findings.len(), 1);
+        assert_eq!(c.findings[0].severity, "medium");
+        assert_eq!(c.findings[0].line, Some(1));
+    }
+
+    #[test]
+    fn shell_scan_pipe_through_intermediate_stage_single_high_finding() {
+        let mut c = AuditCollector::new(false);
+        scan_shell_content(
+            "curl -fsSL https://example.com/install.sh | tr -d '\\r' | bash",
+            "test.sh",
+            1,
+            "",
+            &mut c,
+            &DEFAULT_CONFIG,
+        );
+        assert_eq!(c.findings.len(), 1);
+        assert_eq!(c.findings[0].severity, "high");
+    }
+
+    #[test]
+    fn shell_scan_comment_backslash_does_not_hide_next_line() {
+        // A trailing backslash on a comment is comment text — the next line
+        // is a new command and must still be scanned.
+        let mut c = AuditCollector::new(false);
+        scan_shell_content(
+            "# see docs \\\ncurl https://example.com/install.sh | sh\n",
+            "test.sh",
+            1,
+            "",
+            &mut c,
+            &DEFAULT_CONFIG,
+        );
+        assert_eq!(c.findings.len(), 1);
+        assert_eq!(c.findings[0].severity, "high");
+        assert_eq!(c.findings[0].line, Some(2));
+    }
+
+    #[test]
+    fn shell_scan_same_line_checksum_downgrades() {
+        let mut c = AuditCollector::new(false);
+        scan_shell_content(
+            "curl -o tool.tgz https://example.com/tool.tgz && sha256sum -c tool.tgz.sha256",
+            "test.sh",
+            1,
+            "",
+            &mut c,
+            &DEFAULT_CONFIG,
+        );
+        assert_eq!(c.findings.len(), 1);
+        assert_eq!(c.findings[0].severity, "low");
+        assert!(c.findings[0].description.contains("checksum verified"));
+    }
+
+    #[test]
+    fn shell_scan_script_arg_cmd_sub_not_a_pipe_finding() {
+        // Fetched bytes passed as a script argument are not executed — this
+        // used to fire the high-severity command-substitution rule via the
+        // `sh` in the filename. The data-format URL keeps the unversioned
+        // rule quiet too, so the line is fully clean.
+        let mut c = AuditCollector::new(true);
+        scan_shell_content(
+            r#"./notify.sh "$(curl -s https://api.example.com/status.json)""#,
+            "test.sh",
+            1,
+            "",
+            &mut c,
+            &DEFAULT_CONFIG,
+        );
+        assert!(c.findings.is_empty());
+        assert_eq!(c.allowed.len(), 1);
+        assert_eq!(c.allowed[0].reason, "data format URL");
+    }
+
+    #[test]
+    fn shell_scan_versioned_url_at_end_of_line_allowed() {
+        let mut c = AuditCollector::new(true);
+        scan_shell_content(
+            "curl -LO https://example.com/download/v1.2.3",
+            "test.sh",
+            1,
+            "",
+            &mut c,
+            &DEFAULT_CONFIG,
+        );
+        assert!(c.findings.is_empty());
+        assert_eq!(c.allowed.len(), 1);
+        assert_eq!(c.allowed[0].reason, "versioned URL");
+    }
+
+    #[test]
+    fn shell_scan_curl_latest_at_end_of_line_is_high() {
+        let mut c = AuditCollector::new(false);
+        scan_shell_content(
+            "curl -LO https://example.com/releases/latest",
+            "test.sh",
+            1,
+            "",
+            &mut c,
+            &DEFAULT_CONFIG,
+        );
+        assert_eq!(c.findings.len(), 1);
+        assert_eq!(c.findings[0].severity, "high");
     }
 
     #[test]
