@@ -18,6 +18,11 @@ pub struct GitHubClient {
 
 const GITHUB_API_BASE: &str = "https://api.github.com";
 
+const ACCEPT_JSON: &str = "application/vnd.github+json";
+
+/// Asks the contents API for the raw file body instead of the base64 wrapper.
+const ACCEPT_RAW: &str = "application/vnd.github.raw+json";
+
 /// Cap on how long we'll sleep waiting for a rate-limit reset. Longer waits
 /// would make `pin` / `update` appear hung from the user's perspective.
 const MAX_RATE_LIMIT_WAIT: Duration = Duration::from_secs(60);
@@ -197,24 +202,28 @@ impl GitHubClient {
         }
     }
 
-    async fn send_once(&self, url: &str) -> reqwest::Result<reqwest::Response> {
+    async fn send_once(&self, url: &str, accept: &str) -> reqwest::Result<reqwest::Response> {
         self.client
             .get(url)
             .header(USER_AGENT, "pinprick")
             .header(AUTHORIZATION, format!("Bearer {}", self.token))
-            .header(ACCEPT, "application/vnd.github+json")
+            .header(ACCEPT, accept)
             .header("X-GitHub-Api-Version", "2022-11-28")
             .send()
             .await
     }
 
     async fn get(&self, url: &str) -> Result<reqwest::Response> {
+        self.get_with_accept(url, ACCEPT_JSON).await
+    }
+
+    async fn get_with_accept(&self, url: &str, accept: &str) -> Result<reqwest::Response> {
         // Up to two attempts: the first may hit a transient error or a
         // rate-limit reset that's imminent; the second is the real answer.
         for attempt in 0..2u8 {
             let last_attempt = attempt == 1;
 
-            let resp = match self.send_once(url).await {
+            let resp = match self.send_once(url, accept).await {
                 Ok(r) => r,
                 Err(e) if last_attempt => {
                     return Err(e).context("GitHub API request failed");
@@ -456,16 +465,7 @@ impl GitHubClient {
             "{}/repos/{owner}/{repo}/contents/{path}?ref={git_ref}",
             self.base
         );
-        let resp = self
-            .client
-            .get(&url)
-            .header(USER_AGENT, "pinprick")
-            .header(AUTHORIZATION, format!("Bearer {}", self.token))
-            .header(ACCEPT, "application/vnd.github.raw+json")
-            .header("X-GitHub-Api-Version", "2022-11-28")
-            .send()
-            .await
-            .context("fetching file content")?;
+        let resp = self.get_with_accept(&url, ACCEPT_RAW).await?;
 
         if resp.status().as_u16() == 404 {
             bail!("File {path} not found in {owner}/{repo} at {git_ref}");
@@ -552,7 +552,7 @@ mod tests {
     mod network {
         use super::*;
         use serde_json::json;
-        use wiremock::matchers::{method, path};
+        use wiremock::matchers::{header, method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         async fn client_for(server: &MockServer) -> GitHubClient {
@@ -782,6 +782,37 @@ mod tests {
                 err.downcast_ref::<GitHubError>(),
                 Some(GitHubError::RateLimit)
             ));
+        }
+
+        #[tokio::test]
+        async fn fetch_file_retries_secondary_rate_limit() {
+            let server = MockServer::start().await;
+            // Secondary rate limit (Retry-After without a zeroed
+            // x-ratelimit-remaining) on the raw-content path: fetch_file must
+            // share get()'s wait-and-retry instead of surfacing the 403 body.
+            Mock::given(method("GET"))
+                .and(path("/repos/o/r/contents/action.yml"))
+                .respond_with(ResponseTemplate::new(403).insert_header("retry-after", "1"))
+                .up_to_n_times(1)
+                .with_priority(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/repos/o/r/contents/action.yml"))
+                .and(header("accept", "application/vnd.github.raw+json"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_string("runs:\n  using: node20\n"),
+                )
+                .with_priority(2)
+                .mount(&server)
+                .await;
+
+            let body = client_for(&server)
+                .await
+                .fetch_file("o", "r", "action.yml", "sha")
+                .await
+                .unwrap();
+            assert!(body.contains("using: node20"));
         }
 
         #[tokio::test]
