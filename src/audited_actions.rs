@@ -353,9 +353,12 @@ mod tests {
 
     #[test]
     fn real_pubkey_parses() {
-        // Key from the minisign-verify documentation — format-validity only.
+        // The production catalog key in the format minisign writes —
+        // exercises comment-stripping on a literal, independent of the
+        // embedded file. (The minisign-verify docs key would also do, but
+        // its base64 trips the typos linter.)
         let file = "untrusted comment: minisign public key\n\
-                    RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3\n";
+                    RWRwyp1ae8MrgHSws68tQDd94KGWt1cqdTYZOEcIcPh+cQo9rWJIgC0x\n";
         assert!(parse_catalog_key(file).is_some());
     }
 
