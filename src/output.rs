@@ -340,13 +340,8 @@ impl AuditReport {
         }
     }
 
-    /// Build the summary of how actions were audited. Up to four lines,
-    /// each omitted when its count is zero:
-    ///
-    /// 1. `Audited N actions: X bundled, Y local cache, Z pinprick.rs, W scanned fresh.`
-    /// 2. `N sliding tags scanned. Run `pinprick pin` to resolve.`
-    /// 3. `M branch refs scanned. Pin to a SHA manually.`
-    /// 4. `K actions ignored per config.`
+    /// Build the summary of how actions were audited; lines with a zero
+    /// count are omitted.
     fn audit_summary_lines(&self) -> Vec<String> {
         let trusted_total = self.audited_bundled
             + self.audited_local_cache
@@ -477,6 +472,8 @@ impl AuditReport {
                         physical_location: SarifPhysicalLocation {
                             artifact_location: SarifArtifactLocation { uri },
                             region: SarifRegion {
+                                // SARIF requires startLine >= 1; 0 is the
+                                // internal "not located" sentinel.
                                 start_line: start_line.max(1),
                             },
                         },

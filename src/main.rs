@@ -31,7 +31,7 @@ enum ColorMode {
     propagate_version = true
 )]
 struct Cli {
-    /// When to use colors: auto, always, never
+    /// When to use colors
     #[arg(long, default_value = "auto", global = true)]
     color: ColorMode,
 
@@ -57,7 +57,7 @@ enum Command {
         verbose: bool,
 
         /// Output findings as SARIF 2.1.0 (for github/codeql-action/upload-sarif)
-        #[arg(long, conflicts_with = "json")]
+        #[arg(long)]
         sarif: bool,
 
         /// Ignore the scanned repository's .pinprick.toml and use the global
@@ -88,9 +88,8 @@ enum Command {
         #[arg(default_value = ".")]
         path: PathBuf,
 
-        /// Emit a self-contained HTML report to stdout
-        ///
-        /// If `--json` is also set, JSON wins (global flags take precedence).
+        /// Emit a self-contained HTML report to stdout (mutually exclusive
+        /// with --json)
         #[arg(long)]
         html: bool,
 
@@ -124,6 +123,20 @@ async fn main() -> ExitCode {
         ColorMode::Always => control::set_override(true),
         ColorMode::Never => control::set_override(false),
         ColorMode::Auto => {}
+    }
+
+    // clap can't enforce these conflicts: --json is a global arg on the parent
+    // command, and conflicts_with does not reach across the subcommand boundary.
+    let conflicting_flag = match &cli.command {
+        Command::Audit { sarif: true, .. } if cli.json => Some("--sarif"),
+        Command::Score { html: true, .. } if cli.json => Some("--html"),
+        _ => None,
+    };
+    if let Some(flag) = conflicting_flag {
+        // --json is necessarily set for either conflict to fire.
+        let err = serde_json::json!({ "error": format!("{flag} cannot be combined with --json") });
+        eprintln!("{err}");
+        return ExitCode::from(2);
     }
 
     let result = match &cli.command {

@@ -51,6 +51,7 @@ fn walk_dir(base: &Path, dir: &Path, data: &mut HashMap<String, Vec<String>>) {
 fn path_to_key(base: &Path, path: &Path) -> Option<String> {
     let rel = path.strip_prefix(base).ok()?;
     let s = rel.with_extension("").to_string_lossy().to_string();
+    // Windows yields `\`-separated relative paths; keys are always `/`-joined.
     Some(s.replace('\\', "/"))
 }
 

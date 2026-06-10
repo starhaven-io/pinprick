@@ -40,6 +40,7 @@ static USES_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^(\s*-?\s*uses:\s*)([^\s@]+)@(\S+?)(\s*#\s*(.+?))?\s*$").unwrap()
 });
 
+// `run: |` / `run: >` openers, including indent/chomping indicators (`|2-`, `>+`).
 static RUN_BLOCK_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^(\s*)(?:-\s+)?run\s*:\s*[|>][0-9+\-]*\s*$").unwrap());
 
@@ -72,7 +73,6 @@ pub fn parse_uses_line(line: &str, line_number: usize) -> Option<ActionRef> {
         return None;
     }
 
-    // Parse owner/repo[/subpath]
     let parts: Vec<&str> = action_path.splitn(3, '/').collect();
     if parts.len() < 2 {
         return None;
@@ -608,7 +608,6 @@ jobs:
         let count = rewrite_actions(&file, &[(1, "replaced".to_string())]).unwrap();
         assert_eq!(count, 1);
         let result = std::fs::read_to_string(&file).unwrap();
-        // The targeted line is replaced and every line keeps its CRLF ending.
         assert_eq!(result, "replaced\r\nline2\r\n");
     }
 
@@ -644,8 +643,7 @@ jobs:
     #[test]
     #[cfg(not(debug_assertions))]
     fn rewrite_duplicate_line_skipped_in_release() {
-        // In release builds a duplicate is dropped rather than clobbering
-        // the earlier entry. In debug builds this case is an assertion.
+        // Release builds drop the duplicate instead of clobbering the earlier entry.
         let dir = tempfile::TempDir::new().unwrap();
         let file = dir.path().join("test.yml");
         std::fs::write(&file, "line1\nline2\n").unwrap();

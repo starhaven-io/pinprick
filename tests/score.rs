@@ -111,7 +111,6 @@ fn json_output_shape() {
 
 #[test]
 fn no_workflows_directory_errors() {
-    // Temp dir with no .github/workflows/ — score should fail cleanly.
     let dir = tempfile::TempDir::new().unwrap();
     common::pinprick_cmd()
         .arg("score")
@@ -263,6 +262,22 @@ jobs:
         stderr.contains("actions exempted via trusted-owners: 1"),
         "expected a trusted-owners notice on stderr, got: {stderr}"
     );
+}
+
+#[test]
+fn html_conflicts_with_json() {
+    let dir = common::repo_with_workflow("ci.yml", common::WORKFLOW_CLEAN);
+    let output = common::pinprick_cmd()
+        .arg("--json")
+        .arg("score")
+        .arg(dir.path())
+        .arg("--html")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    let json: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert!(json["error"].as_str().unwrap().contains("--html"));
 }
 
 #[test]

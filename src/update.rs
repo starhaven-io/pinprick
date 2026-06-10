@@ -387,8 +387,8 @@ mod tests {
 
     #[test]
     fn empty_segments_skipped() {
-        // "v1..3" splits into ["1", "", "3"], empty string fails parse → [1, 3]
-        assert!(is_newer("v1.2", "v1.3"));
+        // "v1..3" splits into ["1", "", "3"]; the empty segment is dropped → [1, 3].
+        assert!(is_newer("v1..2", "v1..3"));
     }
 
     #[test]
@@ -399,7 +399,6 @@ mod tests {
 
     #[test]
     fn both_empty_after_parse() {
-        // No numeric components at all
         assert!(!is_newer("alpha", "beta"));
     }
 

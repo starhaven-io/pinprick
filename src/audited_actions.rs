@@ -30,7 +30,6 @@ pub enum AuditSource {
 }
 
 impl AuditSource {
-    /// Short human-readable label for terminal output.
     pub fn label(&self) -> &'static str {
         match self {
             Self::Bundled => "bundled",
@@ -224,9 +223,9 @@ fn parse_catalog_key(content: &str) -> Option<PublicKey> {
     PublicKey::from_base64(line).ok()
 }
 
-/// True when `sig_text` is a valid minisign signature over `data` by `key`.
 fn verify_catalog_signature(key: &PublicKey, data: &[u8], sig_text: &str) -> bool {
     match Signature::decode(sig_text) {
+        // true: also accept legacy (non-prehashed) signatures.
         Ok(sig) => key.verify(data, &sig, true).is_ok(),
         Err(_) => false,
     }
@@ -268,8 +267,6 @@ fn cache_path(cache_dir: &Path, owner: &str, repo: &str) -> Option<PathBuf> {
         .then(|| cache_dir.join(owner).join(format!("{repo}.json")))
 }
 
-/// A path segment is safe if it is non-empty, not a `.`/`..` traversal token,
-/// and contains no path separator.
 fn is_safe_segment(s: &str) -> bool {
     !s.is_empty() && s != "." && s != ".." && !s.contains(['/', '\\'])
 }
