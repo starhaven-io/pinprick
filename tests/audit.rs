@@ -476,7 +476,9 @@ fn sarif_no_findings() {
 }
 
 #[test]
-fn sarif_takes_precedence_over_json() {
+fn sarif_conflicts_with_json() {
+    // Enforced at dispatch — clap's conflicts_with can't reach the global
+    // --json on the parent command.
     let dir = common::repo_with_workflow("ci.yml", common::WORKFLOW_CLEAN);
     let output = common::pinprick_cmd()
         .arg("--json")
@@ -486,9 +488,9 @@ fn sarif_takes_precedence_over_json() {
         .output()
         .unwrap();
 
-    assert!(output.status.success());
-    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(json["version"], "2.1.0");
+    assert_eq!(output.status.code(), Some(2));
+    let json: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert!(json["error"].as_str().unwrap().contains("--sarif"));
 }
 
 // ── Verbose output ──────────────────────────────────────────────────────────

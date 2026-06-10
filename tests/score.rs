@@ -265,6 +265,22 @@ jobs:
 }
 
 #[test]
+fn html_conflicts_with_json() {
+    let dir = common::repo_with_workflow("ci.yml", common::WORKFLOW_CLEAN);
+    let output = common::pinprick_cmd()
+        .arg("--json")
+        .arg("score")
+        .arg(dir.path())
+        .arg("--html")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    let json: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert!(json["error"].as_str().unwrap().contains("--html"));
+}
+
+#[test]
 fn html_output_contains_expected_markers() {
     let dir = common::repo_with_workflow("ci.yml", WORKFLOW_UNPINNED_SLIDING);
     let output = common::pinprick_cmd()
