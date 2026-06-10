@@ -1,6 +1,8 @@
 use anyhow::{Result, bail};
 
 pub async fn resolve_token() -> Option<String> {
+    // A set-but-empty GITHUB_TOKEN (common in CI) counts as absent — fall
+    // through to gh.
     if let Ok(token) = std::env::var("GITHUB_TOKEN")
         && !token.is_empty()
     {

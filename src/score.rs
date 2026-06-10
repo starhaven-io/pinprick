@@ -427,8 +427,7 @@ fn warn_enrichment_incomplete(rule: &str, e: &anyhow::Error) {
 ///
 /// API calls are cached per `(owner, repo)` since archived status is a
 /// repo-level property. A failed lookup (404, network) is silently treated
-/// as "not archived" — same degradation pattern as `audit` when remote
-/// fetches fail. We don't want one bad repo to nuke the whole scan.
+/// as "not archived" — one bad repo must not nuke the whole scan.
 async fn enrich_with_source_archived(
     report: &mut ScoreReport,
     repo_root: &Path,
@@ -469,7 +468,6 @@ async fn enrich_with_source_archived(
                 warn_enrichment_incomplete("source.archived", &e);
                 return Ok(());
             }
-            // A per-repo 404 or network blip shouldn't nuke the whole scan.
             Err(_) => false,
         };
         archived_cache.insert(key, archived);
@@ -630,8 +628,6 @@ fn advisory_findings(
         };
         for adv in repo_advs {
             let Some((matched_range, patched)) = adv.vulnerabilities.iter().find_map(|v| {
-                // Only the entry for THIS action's package — a co-listed package
-                // (e.g. a CLI) can carry a range that false-matches the action.
                 if !vuln_is_for_action(v, owner, repo) {
                     return None;
                 }
@@ -666,9 +662,6 @@ fn advisory_findings(
 }
 
 /// Build the per-finding `details` blob for a `source.advisory` match.
-/// Includes severity, the vulnerable range we matched against, any
-/// `patched_versions` hint, the summary (truncated), and a link to the
-/// advisory.
 fn format_advisory_details(
     adv: &SecurityAdvisory,
     matched_range: &str,
@@ -1176,9 +1169,8 @@ mod tests {
 
     #[test]
     fn worked_example_from_spec() {
-        // Reproduces the worked example in docs/scoring.md.
-        // One workflow with: sliding tag (5) + full tag (2) + branch (15) +
-        // permissions: write-all (10). No runtime rules implemented yet.
+        // Reproduces the worked example in docs/scoring.md: sliding tag (5) +
+        // full tag (2) + branch (15) + permissions: write-all (10).
         let dir = tempfile::TempDir::new().unwrap();
         let wfdir = dir.path().join(".github").join("workflows");
         std::fs::create_dir_all(&wfdir).unwrap();
@@ -1286,8 +1278,6 @@ jobs:
 
     #[test]
     fn pull_request_target_and_workflow_run_score_end_to_end() {
-        // Covers the id/points/remediation arms for PullRequestTarget and
-        // WorkflowRun by firing both rules through score_repo.
         let dir = tempfile::TempDir::new().unwrap();
         let wfdir = dir.path().join(".github").join("workflows");
         std::fs::create_dir_all(&wfdir).unwrap();
@@ -1447,11 +1437,8 @@ jobs:
 
     #[test]
     fn version_in_range_handles_v_prefix() {
-        // Tag pinned `v40.2.0`, advisory range `< v40.2.3` → vulnerable.
         assert_eq!(version_in_range("v40.2.0", "< v40.2.3"), Some(true));
-        // Tag pinned `v45.0.7`, advisory range `<= 45.0.7` → still vulnerable.
         assert_eq!(version_in_range("v45.0.7", "<= 45.0.7"), Some(true));
-        // Patched: tag `v45.0.8`, range `<= 45.0.7` → not vulnerable.
         assert_eq!(version_in_range("v45.0.8", "<= 45.0.7"), Some(false));
     }
 

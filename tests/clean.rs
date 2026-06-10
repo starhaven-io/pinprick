@@ -14,7 +14,7 @@ fn reports_nothing_to_clean_when_cache_absent() {
 
 #[test]
 fn reports_cache_cleaned_when_present() {
-    // Seed a cache directory under an isolated HOME, then clean it.
+    // Builds its own command (not pinprick_cmd) so the seeded HOME is the one cleaned.
     let home = tempfile::TempDir::new().unwrap();
     let cache = home.path().join(".cache/pinprick/audited");
     std::fs::create_dir_all(&cache).unwrap();

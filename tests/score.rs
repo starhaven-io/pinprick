@@ -111,7 +111,6 @@ fn json_output_shape() {
 
 #[test]
 fn no_workflows_directory_errors() {
-    // Temp dir with no .github/workflows/ — score should fail cleanly.
     let dir = tempfile::TempDir::new().unwrap();
     common::pinprick_cmd()
         .arg("score")

@@ -33,12 +33,12 @@ macro_rules! re {
 
 re!(SH_CURL_LATEST, r#"curl\b.*[/=]latest(?:[/\s"]|$)"#);
 re!(SH_WGET_LATEST, r#"wget\b.*[/=]latest(?:[/\s"]|$)"#);
+// Matches every `gh release download`; gh_release_has_tag decides pinned vs latest.
 re!(SH_GH_RELEASE_LATEST, r"gh\s+release\s+download\s");
 re!(SH_CURL_UNVERSIONED, r#"curl\b.*https?://[^\s"']+"#);
 re!(SH_WGET_UNVERSIONED, r#"wget\b.*https?://[^\s"']+"#);
-// Install rules tolerate flags between `install` and the package
-// (`pip install -U requests`, `npm i -g yarn`) — flag-first is the common
-// workflow idiom and skipping it was a blind spot.
+// Install rules tolerate flags between `install` and the package —
+// flag-first (`pip install -U requests`, `npm i -g yarn`) is the common idiom.
 re!(
     SH_PIP_UNVERSIONED,
     r"pip3?\s+install\s+(?:-\S+\s+)*[a-zA-Z][a-zA-Z0-9_-]*(\s|$)"
@@ -274,6 +274,8 @@ pub static JS_URL_PATTERNS: LazyLock<Vec<Pattern>> = LazyLock::new(|| {
 
 // `FROM` may carry flags (`--platform=…`) before the image reference.
 re!(DOCKER_FROM_LATEST, r"(?i)^FROM\s+(?:--\S+\s+)*\S+:latest\b");
+// The image char class omits `:` and `@`, so tagged or digest-pinned
+// references fail the trailing boundary and don't match.
 re!(
     DOCKER_FROM_UNTAGGED,
     r"(?i)^FROM\s+(?:--\S+\s+)*[a-z][a-z0-9._/-]*(\s|$)"
@@ -395,7 +397,6 @@ re!(
     r"(?i)(sha256sum|sha512sum|shasum|openssl\s+dgst|gpg\b[^\n]*--verify|cosign\s+verify|minisign\s+-V|Get-FileHash)"
 );
 
-/// Check if a line contains a checksum verification command.
 pub fn has_checksum_verify(line: &str) -> bool {
     CHECKSUM_VERIFY.is_match(line)
 }
@@ -477,6 +478,8 @@ pub fn url_is_data_format(url: &str) -> bool {
         .any(|e| ext.eq_ignore_ascii_case(e))
 }
 
+// URLs end at whitespace, quotes, backticks, `)`, or `>` so string-literal and
+// markdown-link syntax never rides into the version/extension/host checks.
 static URL_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"https?://[^\s"'`)>]+"#).unwrap());
 
 /// Extract every URL from a line, in order of appearance.
@@ -1399,7 +1402,6 @@ mod tests {
 
     #[test]
     fn pipe_through_intermediate_stage_matched() {
-        // The shell may sit several pipe stages after the fetch.
         assert!(SH_PIPE_SHELL.is_match("curl -fsSL https://example.com/install.sh | cat | sh"));
         assert!(SH_PIPE_SHELL.is_match(r"curl https://example.com/i.sh | tr -d '\r' | bash"));
     }

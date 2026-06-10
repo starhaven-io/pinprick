@@ -477,7 +477,6 @@ fn sarif_no_findings() {
 
 #[test]
 fn sarif_takes_precedence_over_json() {
-    // When both --json and --sarif are passed, SARIF output wins.
     let dir = common::repo_with_workflow("ci.yml", common::WORKFLOW_CLEAN);
     let output = common::pinprick_cmd()
         .arg("--json")

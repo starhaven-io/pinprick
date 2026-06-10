@@ -31,7 +31,7 @@ enum ColorMode {
     propagate_version = true
 )]
 struct Cli {
-    /// When to use colors: auto, always, never
+    /// When to use colors
     #[arg(long, default_value = "auto", global = true)]
     color: ColorMode,
 

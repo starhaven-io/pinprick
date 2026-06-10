@@ -90,8 +90,8 @@ impl Config {
     /// the right mode when scanning a repository you don't control, whose
     /// config would otherwise set its own audit policy.
     pub fn load(repo_root: &Path, use_repo_config: bool) -> Self {
-        // Per-repo wins; a malformed per-repo file falls back to defaults (not
-        // global) — the author meant to configure THIS repo.
+        // A malformed per-repo file falls back to defaults (not global) — the
+        // author meant to configure THIS repo.
         if use_repo_config {
             match load_local(repo_root) {
                 ConfigLoad::Loaded(mut local) => {
@@ -125,7 +125,6 @@ impl Config {
         }
     }
 
-    /// Check if a finding severity meets the configured threshold.
     pub fn meets_severity(&self, severity: &str) -> bool {
         let level = match severity {
             "high" => 2,
@@ -146,7 +145,6 @@ impl Config {
             .any(|pattern| ignore_pattern_matches(pattern, action_name))
     }
 
-    /// Check if a finding should be suppressed based on its description.
     pub fn is_pattern_ignored(&self, description: &str) -> bool {
         self.ignore
             .patterns

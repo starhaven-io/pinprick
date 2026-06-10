@@ -27,7 +27,6 @@ const ACCEPT_RAW: &str = "application/vnd.github.raw+json";
 /// would make `pin` / `update` appear hung from the user's perspective.
 const MAX_RATE_LIMIT_WAIT: Duration = Duration::from_secs(60);
 
-/// Delay before retrying a transient 5xx or network error.
 const TRANSIENT_RETRY_DELAY: Duration = Duration::from_millis(500);
 
 /// Total per-request timeout — without one a stalled connection hangs forever.
@@ -500,15 +499,13 @@ fn rate_limit_wait(resp: &reqwest::Response) -> Option<Duration> {
     Some(Duration::from_secs(reset_at.saturating_sub(now)))
 }
 
-/// Parse the `Retry-After` header (an integer count of seconds) that GitHub
-/// sends on secondary/abuse rate limits. Returns `None` if the header is absent
-/// or in the HTTP-date form (which GitHub does not use for these limits).
 fn retry_after(resp: &reqwest::Response) -> Option<Duration> {
     parse_retry_after(resp.headers().get("retry-after")?.to_str().ok()?)
 }
 
-/// Parse a `Retry-After` header value as an integer count of seconds. Returns
-/// `None` for the HTTP-date form, which GitHub does not use for these limits.
+/// Parse a `Retry-After` value as an integer count of seconds — the form
+/// GitHub sends on secondary/abuse rate limits. Returns `None` for the
+/// HTTP-date form, which GitHub does not use for these limits.
 fn parse_retry_after(value: &str) -> Option<Duration> {
     value.trim().parse::<u64>().ok().map(Duration::from_secs)
 }

