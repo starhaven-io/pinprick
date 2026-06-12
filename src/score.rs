@@ -19,7 +19,7 @@ use crate::github::{AdvisoryVulnerability, GitHubClient, GitHubError, SecurityAd
 use crate::output::AuditFinding;
 use crate::workflow::{self, ActionRef, RefType};
 
-pub const RUBRIC_VERSION: &str = "0.5.0";
+pub const RUBRIC_VERSION: &str = "0.6.0";
 
 // ── Rule catalog ────────────────────────────────────────────────────────────
 
@@ -117,7 +117,12 @@ impl RuleId {
             Self::PinSliding | Self::WorkflowPullRequestTarget => 5,
             Self::RuntimeFetchLow | Self::WorkflowWorkflowRun => 3,
             Self::PinFullTag => 2,
-            Self::SourceUnverified => 1,
+            // Informational: no evidence input distinguishes an established
+            // vendor from a week-old account, so deducting points here would
+            // score config curation rather than posture. The evidence-backed
+            // publisher risks (source.archived / source.advisory) carry the
+            // points; this note survives as the per-publisher review prompt.
+            Self::SourceUnverified => 0,
         }
     }
 
@@ -131,7 +136,7 @@ impl RuleId {
             }
             Self::SourceArchived => "Migrate to an actively maintained replacement",
             Self::SourceUnverified => {
-                "Confirm this publisher is trustworthy. Add them to `trusted-owners` in .pinprick.toml, or fork the action into your own org and pin to that."
+                "Informational — no points deducted. Review the publisher once; add trusted publishers to `trusted-owners` in .pinprick.toml to clear this note."
             }
             Self::RuntimePipeToShell => {
                 "Download the payload to disk, verify it (checksum or signature), then execute. Never pipe directly to a shell."
@@ -880,13 +885,22 @@ pub async fn run(
         print_human(&report);
     }
 
-    // Exit 1 whenever findings exist — matches `audit`'s convention so the
-    // subcommand gates CI cleanly. Grade bands are a presentation detail.
-    if report.findings.is_empty() {
-        Ok(ExitCode::SUCCESS)
-    } else {
+    // Exit 1 whenever any finding deducts points — matches `audit`'s
+    // convention so the subcommand gates CI cleanly. Zero-point findings
+    // (informational notes like source.unverified) never fail a gate: a
+    // deduction-free repo is a passing repo. Grade bands are a
+    // presentation detail.
+    if has_deductions(&report) {
         Ok(ExitCode::from(1))
+    } else {
+        Ok(ExitCode::SUCCESS)
     }
+}
+
+/// True when at least one finding actually deducts points. Zero-point
+/// findings are informational and must not fail a CI gate.
+fn has_deductions(report: &ScoreReport) -> bool {
+    report.findings.iter().any(|f| f.points > 0)
 }
 
 fn print_human(report: &ScoreReport) {
@@ -1191,11 +1205,12 @@ jobs:
         let (report, _) = score_repo(dir.path(), &Config::default()).unwrap();
         // pin.sliding (5) + pin.full_tag (2) + pin.branch (15)
         //   + workflow.permissions_write_all (10)
-        //   + source.unverified for some-org/custom-action (1)
-        //   = 33; score = 67; grade = D
-        assert_eq!(report.totals.points_deducted, 33);
-        assert_eq!(report.score, 67);
+        //   + source.unverified for some-org/custom-action (0, informational)
+        //   = 32; score = 68; grade = D
+        assert_eq!(report.totals.points_deducted, 32);
+        assert_eq!(report.score, 68);
         assert_eq!(report.grade, "D");
+        assert!(has_deductions(&report));
     }
 
     #[test]
@@ -1269,7 +1284,18 @@ jobs:
                 !rule.remediation().is_empty(),
                 "rule {rule:?} has empty remediation"
             );
-            assert!(rule.points() > 0, "rule {rule:?} has zero points");
+            // Every rule deducts points except the explicitly informational
+            // ones — zero-point notes that inventory rather than score.
+            let informational = matches!(rule, RuleId::SourceUnverified);
+            if informational {
+                assert_eq!(
+                    rule.points(),
+                    0,
+                    "informational rule {rule:?} must not deduct points"
+                );
+            } else {
+                assert!(rule.points() > 0, "rule {rule:?} has zero points");
+            }
             // Just call category/severity to exercise every match arm.
             let _ = rule.category();
             let _ = rule.severity();
@@ -1377,7 +1403,11 @@ jobs:
         let (report, _) = score_repo(dir.path(), &Config::default()).unwrap();
         let ids: Vec<_> = report.findings.iter().map(|f| f.id).collect();
         assert_eq!(ids, vec!["source.unverified"]);
-        assert_eq!(report.score, 99);
+        // Informational: the note is emitted but deducts nothing — an
+        // otherwise-clean repo still scores 100 and passes a CI gate.
+        assert_eq!(report.findings[0].points, 0);
+        assert_eq!(report.score, 100);
+        assert!(!has_deductions(&report));
     }
 
     #[test]
