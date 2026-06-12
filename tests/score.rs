@@ -35,6 +35,18 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 ";
 
+// SHA-pinned (no pin.* finding) but from a publisher outside the trusted
+// baseline — produces only the zero-point source.unverified note.
+const WORKFLOW_UNVERIFIED_ONLY: &str = "\
+name: unverified
+on: push
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: some-vendor/tool@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v1.0.0
+";
+
 #[test]
 fn clean_repo_exits_zero() {
     let dir = common::repo_with_workflow("ci.yml", common::WORKFLOW_CLEAN);
@@ -56,6 +68,20 @@ fn sliding_tag_exits_one() {
         .assert()
         .code(1)
         .stdout(predicate::str::contains("pin.sliding"));
+}
+
+#[test]
+fn informational_only_findings_exit_zero() {
+    // source.unverified is a zero-point informational note: it must appear
+    // in the output without denting the score or failing the CI gate.
+    let dir = common::repo_with_workflow("ci.yml", WORKFLOW_UNVERIFIED_ONLY);
+    common::pinprick_cmd()
+        .arg("score")
+        .arg(dir.path())
+        .assert()
+        .code(0)
+        .stdout(predicate::str::contains("source.unverified"))
+        .stdout(predicate::str::contains("100 / 100"));
 }
 
 #[test]
@@ -93,7 +119,7 @@ fn json_output_shape() {
     assert_eq!(output.status.code(), Some(1));
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
 
-    assert_eq!(json["rubric_version"], "0.5.0");
+    assert_eq!(json["rubric_version"], "0.6.0");
     assert_eq!(json["grade"], "A");
     assert_eq!(json["score"], 95);
     assert_eq!(json["totals"]["findings"], 1);
