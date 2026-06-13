@@ -19,7 +19,7 @@ use crate::github::{AdvisoryVulnerability, GitHubClient, GitHubError, SecurityAd
 use crate::output::AuditFinding;
 use crate::workflow::{self, ActionRef, RefType};
 
-pub const RUBRIC_VERSION: &str = "0.6.0";
+pub const RUBRIC_VERSION: &str = "0.7.0";
 
 // ── Rule catalog ────────────────────────────────────────────────────────────
 

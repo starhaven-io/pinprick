@@ -167,7 +167,7 @@ pub static SHELL_URL_PATTERNS: LazyLock<Vec<Pattern>> = LazyLock::new(|| {
 });
 
 // Scanned before (and pre-empt) the regular shell patterns so `curl ... | sh`
-// produces a single high-severity finding. Not subject to checksum downgrade —
+// produces a single high-severity finding. Not subject to checksum suppression —
 // a piped payload is never written to disk and cannot be verified.
 pub static SHELL_PIPE_PATTERNS: LazyLock<Vec<Pattern>> = LazyLock::new(|| {
     vec![

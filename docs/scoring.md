@@ -1,6 +1,6 @@
 # pinprick scoring rubric
 
-**Status:** draft (rubric version `0.6.0`)
+**Status:** draft (rubric version `0.7.0`)
 
 This document defines how pinprick computes a single score for a GitHub repository's Actions supply chain posture. It is the public specification that the `pinprick score` CLI subcommand implements against, and that any downstream tool wrapping the engine (dashboards, CI plugins, reporting pipelines) should implement against so scores stay portable and comparable.
 
@@ -84,7 +84,7 @@ These reuse findings from the existing `pinprick audit` pipeline applied to each
 
 Notes:
 
-- The audit pipeline already applies the `data format URL` and nearby-checksum adjustments. `runtime.*` scoring uses the post-adjustment severity, so double-counting doesn't happen.
+- The audit pipeline already suppresses `data format URL` and checksum-verified fetches to allowed matches and applies the trusted-host exemption before `runtime.*` scoring runs, so those never deduct points and there's no double-counting. (Checksum-verified fetches are suppressed as of rubric 0.7.0; they were downgraded one severity level through 0.6.0.)
 - Through v0.5.0 the runtime scan is limited to `run:` blocks in local workflow files (no GitHub token required). Runtime findings in the source of fetched actions themselves — where `pinprick audit` looks when a token is present — are not yet scored; that integration lands in a later rubric version.
 - Runtime findings are not deduplicated. Each pattern match emits one finding keyed to its `(workflow, line)` — each is a distinct fix in a distinct place.
 - Config interaction: `runtime.*` scoring honors `ignore.patterns` from `.pinprick.toml` (an explicitly accepted risk is not deducted), but **not** the `severity` display threshold — the posture score reflects every finding regardless of what `pinprick audit` is configured to print.
@@ -117,7 +117,7 @@ These are deliberately out of scope for v1 to keep the initial rubric defensible
 
 ```jsonc
 {
-  "rubric_version": "0.6.0",
+  "rubric_version": "0.7.0",
   "pinprick_version": "…",
   "scanned_at": "2026-04-22T20:00:00Z",
   "target": { "kind": "repo", "path": "./" },
@@ -152,7 +152,7 @@ These are deliberately out of scope for v1 to keep the initial rubric defensible
 A compact summary:
 
 ```
-pinprick score  v0.6.0 rubric
+pinprick score  v0.7.0 rubric
 
   Grade:  C   (72 / 100)
 
