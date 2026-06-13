@@ -401,6 +401,22 @@ pub fn has_checksum_verify(line: &str) -> bool {
     CHECKSUM_VERIFY.is_match(line)
 }
 
+// ── Fetch-to-jq detection ───────────────────────────────────────────────────
+
+// A pipe into `jq`. The trailing `\b` keeps `jqfoo` (and a path-qualified
+// `| /usr/bin/jq`, deliberately) from matching — erring toward flagging.
+re!(SH_PIPE_JQ, r"\|\s*jq\b");
+
+/// Whether a line pipes a fetch into `jq`. `jq` parses JSON and errors on
+/// anything else, so the fetched bytes are data, not executable code — the same
+/// rationale as the data-format-extension exemption, but for an API endpoint
+/// that carries no file extension (e.g. `https://crates.io/api/v1/crates/<x>`).
+/// Pipe-to-shell matches and pre-empts the URL rules, so a
+/// `curl … | jq … | bash` line never reaches this check.
+pub fn fetch_piped_to_jq(line: &str) -> bool {
+    SH_PIPE_JQ.is_match(line)
+}
+
 // ── URL version detection ───────────────────────────────────────────────────
 
 // Requires at least one dotted component (e.g. `v1.2`, `1.2.3`) so that a
@@ -1409,6 +1425,44 @@ mod tests {
     #[test]
     fn pipe_multi_stage_without_shell_not_matched() {
         assert!(!SH_PIPE_SHELL.is_match("curl https://api.example.com/data | jq . | tee out.json"));
+    }
+
+    #[test]
+    fn pipe_shell_jq_then_shell_still_matched() {
+        // `jq` in the pipeline must not make a fetch that ultimately reaches a
+        // shell look safe — pipe-to-shell still fires (and pre-empts the jq
+        // data-fetch exemption).
+        assert!(SH_PIPE_SHELL.is_match("curl https://x.example/c | jq -r .url | bash"));
+    }
+
+    // ── fetch_piped_to_jq ──────────────────────────────────────────────
+
+    #[test]
+    fn fetch_piped_to_jq_matches() {
+        assert!(fetch_piped_to_jq(
+            r#"curl -fsSL "https://crates.io/api/v1/crates/typos-cli" | jq -r '.crate.max_stable_version'"#
+        ));
+        assert!(fetch_piped_to_jq(
+            "curl https://api.example.com/data | jq ."
+        ));
+        // No space after the pipe.
+        assert!(fetch_piped_to_jq(
+            "wget -qO- https://api.example.com/data |jq"
+        ));
+    }
+
+    #[test]
+    fn fetch_piped_to_jq_rejects_non_jq() {
+        assert!(!fetch_piped_to_jq(
+            "curl https://example.com/install.sh -o install.sh"
+        ));
+        assert!(!fetch_piped_to_jq(
+            "curl https://api.example.com/d | grep foo"
+        ));
+        // `jq` must be a whole word, not a prefix of another command.
+        assert!(!fetch_piped_to_jq(
+            "curl https://api.example.com/d | jqlang"
+        ));
     }
 
     #[test]

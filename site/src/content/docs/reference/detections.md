@@ -578,6 +578,18 @@ The exemption applies only to the _unversioned-URL_ rules. `/latest/` URLs, pipe
 
 The list can be extended via `extra-data-formats` in [`.pinprick.toml`](/configuration/config-file#extra-data-formats) to add project-specific extensions (e.g., `.proto`, `.graphql`).
 
+## Piped-to-`jq` exemption
+
+A `curl`/`wget` whose output is piped into `jq` is recorded as an allowed match with reason `piped to jq` rather than emitted as a finding — even when the URL has no data-format extension. `jq` parses JSON and errors on anything else, so the fetched bytes are consumed as data, never executed.
+
+This covers the case the [data-format exemption](#data-format-exemption) misses: a REST API endpoint that returns JSON but carries no `.json` in its path. Resolving the latest release of a crate from the registry API is a real example:
+
+```sh
+curl -fsSL "https://crates.io/api/v1/crates/ripgrep" | jq -r '.crate.max_stable_version'
+```
+
+**Pipe-to-shell still takes precedence.** A `curl … | jq -r .url | bash` line is flagged as pipe-to-shell (high severity) before this exemption is considered — routing a fetch through `jq` on its way to a shell does not make it safe. This exemption needs no configuration; it is always on.
+
 ## Trusted hosts exemption
 
 Unversioned-URL rules are downgraded to allowed matches when the URL host matches an entry in the user's [`trusted-hosts`](/configuration/config-file#trusted-hosts) list. Configured via `.pinprick.toml`:
@@ -601,7 +613,7 @@ When a finding is intentional and you want `pinprick audit` to stop flagging it,
 
 There are two distinct outcomes to be aware of:
 
-- **Allowed match** — the rule still matched, but the finding is recorded as allowed instead of emitted. Visible under `--verbose` with a reason, so a reviewer auditing the audit can still see what fired. Used by [`trusted-hosts`](#trusted-hosts), [`extra-data-formats`](#extra-data-formats), the [versioned-URL heuristic](#versioned-url-heuristic), the [data-format exemption](#data-format-exemption), and the [audited-actions list](/commands/audit#audited-actions-list).
+- **Allowed match** — the rule still matched, but the finding is recorded as allowed instead of emitted. Visible under `--verbose` with a reason, so a reviewer auditing the audit can still see what fired. Used by [`trusted-hosts`](#trusted-hosts), [`extra-data-formats`](#extra-data-formats), the [versioned-URL heuristic](#versioned-url-heuristic), the [data-format exemption](#data-format-exemption), the [piped-to-`jq` exemption](#piped-to-jq-exemption), and the [audited-actions list](/commands/audit#audited-actions-list).
 - **Removed finding** — the finding is dropped from the report entirely and is not visible under `--verbose`. Used by [`ignore.patterns`](#ignorepatterns), [`ignore.actions`](#ignoreactions), and [`severity`](#severity-threshold).
 
 :::tip[Prefer allowed matches over removed findings]

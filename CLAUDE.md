@@ -91,6 +91,8 @@ URL "versioned" heuristic: a URL is considered versioned if any path segment mat
 
 Data-format exemption: unversioned-URL rules (shell, JS, Python) do **not** fire when the URL's path ends in a data-format extension (`.json`/`.jsonl`/`.ndjson`, `.yaml`/`.yml`/`.toml`, `.csv`/`.tsv`/`.xml`, `.txt`/`.md`/`.rst`). Matches are recorded as allowed (visible under `--verbose`) with reason `data format URL`. Applies only to the unversioned-URL rules — `/latest/` URLs, pipe-to-shell, and `gh release download` without a tag still fire regardless of extension. `.html` and `.svg` are intentionally excluded because both can carry embedded scripts.
 
+Piped-to-jq exemption: an unversioned-URL fetch whose line pipes into `jq` is recorded as allowed with reason `piped to jq` — the same data-not-code rationale as the data-format exemption, but for JSON API endpoints that carry no file extension (e.g. `curl …/api/v1/crates/<x> | jq …`). The `jq\b` match keeps `jqfoo` from qualifying. Pipe-to-shell matches and pre-empts the URL rules, so `curl … | jq … | bash` is flagged high, never exempted.
+
 Checksum verification: findings followed within 3 lines by `sha256sum`, `shasum`, `openssl dgst`, `gpg --verify`, or `Get-FileHash` are downgraded one severity level. Pipe-to-shell findings are exempt — the piped payload is never written to disk, so a nearby checksum command cannot verify it.
 
 Git clone ref pinning: `git clone` without `--branch`/`-b` or with a branch name (main, develop, feature/foo) is flagged medium severity. `--branch v1.2.3` (version-like ref) suppresses the finding. A `git checkout <40-char-SHA>` within 3 lines fully suppresses the finding (recorded as allowed, visible under `--verbose`), since the SHA checkout deterministically pins the repo content.

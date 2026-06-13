@@ -1,9 +1,0 @@
-# Hosts whose unversioned URL fetches are recorded as allowed matches.
-# Pinprick still records the match (visible under `--verbose`); it just
-# does not surface as a finding.
-#
-# - crates.io: the bump-cargo-tools workflow queries the registry API to
-#   resolve the latest stable version of each cargo-installed lint tool.
-#   Bad data from crates.io would only result in a reviewable PR being
-#   opened against `ci.yml`, not direct exploitation.
-trusted-hosts = ["crates.io"]
