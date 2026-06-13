@@ -619,31 +619,40 @@ pub fn scan_shell_content(
         }
     }
 
-    // Downgrade severity for findings followed by checksum verification.
-    // Pipe-shell findings sit below `findings_before`, so they are exempt.
-    // Offset 0 covers a one-liner `curl -o f … && sha256sum -c …`.
-    for finding in collector.findings.iter_mut().skip(findings_before) {
-        if let Some(finding_line) = finding.line {
+    // Suppress findings immediately followed by checksum verification: a
+    // sha256sum / gpg --verify check deterministically detects a tampered
+    // download, so the fetch is mitigated, not merely less severe. Recorded as
+    // an allowed match (visible under --verbose), mirroring the SHA-checkout
+    // suppression above. Pipe-shell findings sit below `findings_before` and are
+    // exempt — the piped payload is never written to disk for a checksum to
+    // verify. Offset 0 covers a one-liner `curl -o f … && sha256sum -c …`.
+    let mut idx = findings_before;
+    while idx < collector.findings.len() {
+        let verified = collector.findings[idx].line.is_some_and(|finding_line| {
             let rel = finding_line.saturating_sub(base_line);
-            let Some(li) = logical.iter().position(|(start, _)| *start == rel) else {
-                continue;
-            };
-            for offset in 0..=3 {
-                if li + offset < logical.len() && has_checksum_verify(&logical[li + offset].1) {
-                    finding.severity = downgrade_severity(&finding.severity);
-                    finding.description = format!("{} (checksum verified)", finding.description);
-                    break;
-                }
-            }
+            logical
+                .iter()
+                .position(|(start, _)| *start == rel)
+                .is_some_and(|li| {
+                    (0..=3).any(|offset| {
+                        li + offset < logical.len() && has_checksum_verify(&logical[li + offset].1)
+                    })
+                })
+        });
+        if verified {
+            let finding = collector.findings.remove(idx);
+            collector.push_allowed(AuditMatch {
+                severity: finding.severity,
+                category: finding.category,
+                action: finding.action,
+                source_file: finding.source_file,
+                line: finding.line,
+                pattern_matched: finding.pattern_matched,
+                reason: "followed by checksum verification".to_string(),
+            });
+        } else {
+            idx += 1;
         }
-    }
-}
-
-fn downgrade_severity(severity: &str) -> String {
-    match severity {
-        "high" => "medium".to_string(),
-        "medium" => "low".to_string(),
-        _ => severity.to_string(),
     }
 }
 
@@ -1175,7 +1184,7 @@ mod tests {
     #[test]
     fn find_run_line_advances_past_earlier_match() {
         // Two `run:` blocks both start with `echo hello`. The second one must
-        // map to its own line, not the first occurrence, so severity-downgrade
+        // map to its own line, not the first occurrence, so checksum-suppression
         // windows and SARIF locations stay anchored correctly.
         let yaml = "\
 jobs:
@@ -1452,7 +1461,7 @@ more stuff
     }
 
     #[test]
-    fn shell_scan_pipe_to_sh_not_downgraded_by_checksum() {
+    fn shell_scan_pipe_to_sh_not_suppressed_by_checksum() {
         let mut c = AuditCollector::new(false);
         scan_shell_content(
             "curl -sSL https://example.com/install.sh | sh\nsha256sum -c checksums.txt",
@@ -1462,12 +1471,10 @@ more stuff
             &mut c,
             &DEFAULT_CONFIG,
         );
+        // Pipe-to-shell is exempt: the payload is never written to disk, so a
+        // nearby checksum cannot verify it. The finding stands at high severity.
         assert_eq!(c.findings.len(), 1);
         assert_eq!(c.findings[0].severity, "high");
-        assert!(
-            !c.findings[0].description.contains("checksum verified"),
-            "pipe-shell must not be downgraded by a nearby checksum"
-        );
     }
 
     #[test]
@@ -2044,16 +2051,6 @@ runs:
     }
 
     #[test]
-    fn downgrade_low_stays_low() {
-        assert_eq!(downgrade_severity("low"), "low");
-    }
-
-    #[test]
-    fn downgrade_unknown_unchanged() {
-        assert_eq!(downgrade_severity("info"), "info");
-    }
-
-    #[test]
     fn short_sha_full() {
         assert_eq!(
             short_sha("abcdef1234567890abcdef1234567890abcdef12"),
@@ -2267,8 +2264,8 @@ runs:
     }
 
     #[test]
-    fn checksum_at_boundary_of_three_lines() {
-        let mut c = AuditCollector::new(false);
+    fn checksum_at_boundary_of_three_lines_suppresses() {
+        let mut c = AuditCollector::new(true);
         scan_shell_content(
             "curl -L https://example.com/releases/latest/download/tool -o tool\necho step1\necho step2\nsha256sum --check tool.sha256",
             "test.sh",
@@ -2277,13 +2274,15 @@ runs:
             &mut c,
             &DEFAULT_CONFIG,
         );
-        assert_eq!(c.findings.len(), 1);
-        assert_eq!(c.findings[0].severity, "medium");
-        assert!(c.findings[0].description.contains("checksum verified"));
+        // Checksum on the third line after the fetch still lands inside the
+        // window, so the finding is suppressed and recorded as allowed.
+        assert!(c.findings.is_empty());
+        assert_eq!(c.allowed.len(), 1);
+        assert_eq!(c.allowed[0].reason, "followed by checksum verification");
     }
 
     #[test]
-    fn checksum_beyond_three_lines_no_downgrade() {
+    fn checksum_beyond_three_lines_not_suppressed() {
         let mut c = AuditCollector::new(false);
         scan_shell_content(
             "curl -L https://example.com/releases/latest/download/tool -o tool\necho 1\necho 2\necho 3\nsha256sum --check tool.sha256",
@@ -2293,6 +2292,8 @@ runs:
             &mut c,
             &DEFAULT_CONFIG,
         );
+        // Checksum is on the fourth line — beyond the window — so the fetch is
+        // still flagged at full severity.
         assert_eq!(c.findings.len(), 1);
         assert_eq!(c.findings[0].severity, "high");
     }
@@ -2455,8 +2456,8 @@ runs:
     }
 
     #[test]
-    fn shell_scan_same_line_checksum_downgrades() {
-        let mut c = AuditCollector::new(false);
+    fn shell_scan_same_line_checksum_suppressed() {
+        let mut c = AuditCollector::new(true);
         scan_shell_content(
             "curl -o tool.tgz https://example.com/tool.tgz && sha256sum -c tool.tgz.sha256",
             "test.sh",
@@ -2465,9 +2466,10 @@ runs:
             &mut c,
             &DEFAULT_CONFIG,
         );
-        assert_eq!(c.findings.len(), 1);
-        assert_eq!(c.findings[0].severity, "low");
-        assert!(c.findings[0].description.contains("checksum verified"));
+        // One-liner fetch-then-verify (offset 0) is suppressed.
+        assert!(c.findings.is_empty());
+        assert_eq!(c.allowed.len(), 1);
+        assert_eq!(c.allowed[0].reason, "followed by checksum verification");
     }
 
     #[test]

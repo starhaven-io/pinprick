@@ -125,7 +125,7 @@ HIGH  .github/workflows/ci.yml:42
 
 Without a GitHub token, audit scans local `run:` blocks only. With a token (via `GITHUB_TOKEN` or `gh auth`), it also fetches and scans action source code — JavaScript, Python, Dockerfiles, and composite action steps.
 
-Pass `--sarif` to emit SARIF 2.1.0 for upload to [GitHub code scanning](https://docs.github.com/en/code-security/code-scanning). Pass `--verbose` to see every match, including ones that passed the version check or were downgraded to an allowed match by the trusted-host, data-format, or jq-pipe rules.
+Pass `--sarif` to emit SARIF 2.1.0 for upload to [GitHub code scanning](https://docs.github.com/en/code-security/code-scanning). Pass `--verbose` to see every match, including ones that passed the version check or were downgraded to an allowed match by the trusted-host, data-format, jq-pipe, or checksum rules.
 
 ### Configuration
 
@@ -191,7 +191,7 @@ Pipe-to-shell is flagged even when the URL is versioned — a piped payload is n
 
 Unversioned-URL rules don't fire when the URL's path ends in a data-format extension (`.json`, `.yaml`, `.toml`, `.csv`, etc.), or when the fetch is piped into `jq` — the payload is consumed as data, not executed. These matches are only visible under `--verbose`. (Pipe-to-shell takes precedence, so `curl … | jq … | bash` is still flagged.)
 
-Findings followed by checksum verification (`sha256sum`, `gpg --verify`, etc.) within 3 lines are downgraded one severity level. Pipe-to-shell findings are exempt.
+Findings followed by checksum verification (`sha256sum`, `gpg --verify`, etc.) within 3 lines are suppressed and recorded as allowed matches (shown under `--verbose`) — the checksum deterministically detects tampering, so the download is pinned by content. Pipe-to-shell findings are exempt; the piped payload is never written to disk for a checksum to verify.
 
 ## Exit codes
 

@@ -226,7 +226,7 @@ fn data_format_exempt() {
 }
 
 #[test]
-fn checksum_downgrade() {
+fn checksum_suppressed() {
     let dir = common::repo_with_workflow("ci.yml", common::WORKFLOW_CHECKSUM);
     let output = common::pinprick_cmd()
         .arg("--json")
@@ -235,18 +235,12 @@ fn checksum_downgrade() {
         .output()
         .unwrap();
 
-    // Still a finding, but severity should be downgraded from high to medium.
-    assert_eq!(output.status.code(), Some(1));
+    // The fetch is verified by sha256sum on the next line, so it is suppressed
+    // (recorded as an allowed match) rather than flagged — the run is clean.
+    assert!(output.status.success());
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     let findings = json["findings"].as_array().unwrap();
-    assert_eq!(findings.len(), 1);
-    assert_eq!(findings[0]["severity"], "medium");
-    assert!(
-        findings[0]["description"]
-            .as_str()
-            .unwrap()
-            .contains("checksum verified")
-    );
+    assert!(findings.is_empty());
 }
 
 #[test]
