@@ -198,17 +198,24 @@ pub async fn run(
 
                 let findings_before = collector.findings.len();
                 match scan_action_source(client, action, &mut collector, config).await {
-                    Ok(()) => {
-                        match action.ref_type {
-                            workflow::RefType::Sha | workflow::RefType::Tag => {
-                                scanned_fresh += 1;
+                    Ok(scan_status) => {
+                        if scan_status == ActionScanStatus::Complete {
+                            match action.ref_type {
+                                workflow::RefType::Sha | workflow::RefType::Tag => {
+                                    scanned_fresh += 1;
+                                }
+                                workflow::RefType::SlidingTag => {
+                                    scanned_unpinned_sliding += 1;
+                                }
+                                workflow::RefType::Branch => {
+                                    scanned_unpinned_branch += 1;
+                                }
                             }
-                            workflow::RefType::SlidingTag => {
-                                scanned_unpinned_sliding += 1;
-                            }
-                            workflow::RefType::Branch => {
-                                scanned_unpinned_branch += 1;
-                            }
+                        } else {
+                            eprintln!(
+                                "warning: incomplete scan of {}; clean verdict not cached",
+                                action.full_name()
+                            );
                         }
                         // Anchor remote-scan findings to the loading `uses:` line
                         // so SARIF results land inside the scanning repo.
@@ -218,7 +225,8 @@ pub async fn run(
                         }
                         // Only cache clean verdicts for SHA refs — tag and branch
                         // contents can move after the verdict.
-                        if collector.findings.len() == findings_before
+                        if scan_status == ActionScanStatus::Complete
+                            && collector.findings.len() == findings_before
                             && action.ref_type == workflow::RefType::Sha
                         {
                             let tag = action.tag_comment.as_deref().unwrap_or(&action.ref_string);
@@ -949,6 +957,24 @@ enum SourceFileKind {
     Dockerfile,
 }
 
+/// Whether all selected action source files were fetched and parsed well
+/// enough to support a durable "clean" verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActionScanStatus {
+    Complete,
+    Incomplete,
+}
+
+impl ActionScanStatus {
+    fn from_complete(complete: bool) -> Self {
+        if complete {
+            Self::Complete
+        } else {
+            Self::Incomplete
+        }
+    }
+}
+
 /// Select the files in a fetched action tree worth scanning, each paired with
 /// its scanner, in tree order. Pure (no I/O) so the filtering is unit testable.
 fn select_source_files(
@@ -964,7 +990,7 @@ fn select_source_files(
         if is_vendored_path(path) {
             continue;
         }
-        if !base.is_empty() && !path.starts_with(base) {
+        if !base.is_empty() && path != base && !path.starts_with(&format!("{base}/")) {
             continue;
         }
         let relative = if base.is_empty() {
@@ -995,7 +1021,7 @@ async fn scan_action_source(
     action: &ActionRef,
     collector: &mut AuditCollector,
     config: &Config,
-) -> Result<()> {
+) -> Result<ActionScanStatus> {
     let action_name = format!("{}@{}", action.full_name(), short_sha(&action.ref_string));
     let tree = client
         .fetch_tree(&action.owner, &action.repo, &action.ref_string)
@@ -1004,12 +1030,12 @@ async fn scan_action_source(
     let base = action.subpath.as_deref().unwrap_or("");
     let targets = select_source_files(&tree, base);
     if targets.is_empty() {
-        return Ok(());
+        return Ok(ActionScanStatus::Complete);
     }
 
     // Fetch concurrently, then scan in tree order so findings are
-    // deterministic regardless of which fetch lands first; a failed fetch is
-    // skipped.
+    // deterministic regardless of which fetch lands first. A failed fetch
+    // makes the scan incomplete, so the caller will not cache a clean verdict.
     let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_FILE_FETCHES));
     let mut fetches = tokio::task::JoinSet::new();
     for (index, (path, _)) in targets.iter().enumerate() {
@@ -1021,29 +1047,42 @@ async fn scan_action_source(
         let semaphore = Arc::clone(&semaphore);
         fetches.spawn(async move {
             let _permit = semaphore.acquire_owned().await.ok();
-            let content = client.fetch_file(&owner, &repo, &path, &git_ref).await.ok();
+            let content = client.fetch_file(&owner, &repo, &path, &git_ref).await;
             (index, content)
         });
     }
 
-    let mut contents: Vec<Option<String>> = vec![None; targets.len()];
+    let mut contents: Vec<Option<Result<String>>> = (0..targets.len()).map(|_| None).collect();
+    let mut complete = true;
     while let Some(joined) = fetches.join_next().await {
-        if let Ok((index, content)) = joined {
-            contents[index] = content;
+        match joined {
+            Ok((index, content)) => {
+                if content.is_err() {
+                    complete = false;
+                }
+                contents[index] = Some(content);
+            }
+            Err(_) => {
+                complete = false;
+            }
         }
     }
 
     for ((path, kind), content) in targets.iter().zip(contents) {
-        let Some(content) = content else {
-            continue;
+        let content = match content {
+            Some(Ok(content)) => content,
+            _ => continue,
         };
         let source_label = format!("{} ({path})", action.full_name());
         match kind {
-            SourceFileKind::ActionYml => {
-                if let Ok(yaml) = serde_norway::from_str::<Value>(&content) {
+            SourceFileKind::ActionYml => match serde_norway::from_str::<Value>(&content) {
+                Ok(yaml) => {
                     scan_action_yml_runs(&yaml, &source_label, &action_name, collector, config);
                 }
-            }
+                Err(_) => {
+                    complete = false;
+                }
+            },
             SourceFileKind::JavaScript => {
                 scan_js_content(&content, &source_label, &action_name, collector, config);
             }
@@ -1056,7 +1095,7 @@ async fn scan_action_source(
         }
     }
 
-    Ok(())
+    Ok(ActionScanStatus::from_complete(complete))
 }
 
 fn scan_action_yml_runs(
@@ -2072,6 +2111,24 @@ runs:
     }
 
     #[test]
+    fn select_source_files_subpath_base_requires_path_boundary() {
+        let tree = vec![
+            tree_entry("action-a/action.yml", "blob"),
+            tree_entry("action-a/index.js", "blob"),
+            tree_entry("action-abcd/action.yml", "blob"),
+            tree_entry("action-abcd/index.js", "blob"),
+        ];
+        let got = select_source_files(&tree, "action-a");
+        assert_eq!(
+            got,
+            vec![
+                ("action-a/action.yml".to_string(), SourceFileKind::ActionYml),
+                ("action-a/index.js".to_string(), SourceFileKind::JavaScript),
+            ]
+        );
+    }
+
+    #[test]
     fn select_source_files_empty_when_nothing_scannable() {
         let tree = vec![
             tree_entry("README.md", "blob"),
@@ -2113,6 +2170,63 @@ runs:
         );
         assert_eq!(c.findings.len(), 1);
         assert_eq!(c.findings[0].action, "actions/checkout@abc1234");
+    }
+
+    #[tokio::test]
+    async fn scan_action_source_reports_incomplete_when_any_file_fetch_fails() {
+        use serde_json::json;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/repos/o/r/git/trees/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "tree": [
+                    { "path": "action.yml", "type": "blob" },
+                    { "path": "dist/index.js", "type": "blob" }
+                ]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/contents/action.yml"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("runs:\n  using: node20\n  main: dist/index.js\n"),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/contents/dist/index.js"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let client = GitHubClient::with_base("t".into(), server.uri());
+        let action = ActionRef {
+            owner: "o".into(),
+            repo: "r".into(),
+            subpath: None,
+            ref_string: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            ref_type: workflow::RefType::Sha,
+            tag_comment: Some("v1.0.0".into()),
+            line_number: 1,
+            raw_line: String::new(),
+        };
+        let mut collector = AuditCollector::new(false);
+
+        let status = scan_action_source(&client, &action, &mut collector, &DEFAULT_CONFIG)
+            .await
+            .unwrap();
+
+        assert_eq!(status, ActionScanStatus::Incomplete);
+        assert!(
+            collector.findings.is_empty(),
+            "failed fetch should not invent findings, only block clean caching"
+        );
     }
 
     #[test]

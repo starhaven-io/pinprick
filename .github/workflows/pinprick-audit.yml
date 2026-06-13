@@ -62,6 +62,7 @@ jobs:
           set +e
           ./target/debug/pinprick audit --sarif . > pinprick.sarif
           EXIT=$?
+          echo "PINPRICK_AUDIT_EXIT=${EXIT}" >> "${GITHUB_ENV}"
           # 0 = clean, 1 = findings (still upload), 2+ = real error
           if [[ "${EXIT}" -gt 1 ]]; then
             echo "::error::pinprick audit errored with exit code ${EXIT}"
@@ -69,7 +70,14 @@ jobs:
           fi
 
       - name: Upload SARIF
+        if: always() && (env.PINPRICK_AUDIT_EXIT == '0' || env.PINPRICK_AUDIT_EXIT == '1')
         uses: github/codeql-action/upload-sarif@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v4.36.2
         with:
           sarif_file: pinprick.sarif
           category: pinprick
+
+      - name: Fail on findings
+        if: always() && env.PINPRICK_AUDIT_EXIT == '1'
+        run: |
+          echo "::error::pinprick audit found runtime fetch risks"
+          exit 1
