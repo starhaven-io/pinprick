@@ -797,9 +797,7 @@ fn pin_rule_for(a: &ActionRef) -> Option<RuleId> {
 fn workflow_rules_for(doc: &Value) -> Vec<RuleId> {
     let mut rules = Vec::new();
 
-    if let Some(Value::String(s)) = doc.get("permissions")
-        && s == "write-all"
-    {
+    if permissions_write_all(doc) {
         rules.push(RuleId::WorkflowPermissionsWriteAll);
     }
 
@@ -817,6 +815,20 @@ fn workflow_rules_for(doc: &Value) -> Vec<RuleId> {
     }
 
     rules
+}
+
+fn permissions_write_all(doc: &Value) -> bool {
+    if matches!(doc.get("permissions"), Some(Value::String(s)) if s == "write-all") {
+        return true;
+    }
+
+    doc.get("jobs")
+        .and_then(|jobs| jobs.as_mapping())
+        .is_some_and(|jobs| {
+            jobs.values().any(
+                |job| matches!(job.get("permissions"), Some(Value::String(s)) if s == "write-all"),
+            )
+        })
 }
 
 fn trigger_present(on: &Value, name: &str) -> bool {
@@ -1132,6 +1144,15 @@ mod tests {
     }
 
     #[test]
+    fn workflow_rules_job_permissions_write_all() {
+        let yaml =
+            "on: push\njobs:\n  a:\n    runs-on: ubuntu-latest\n    permissions: write-all\n";
+        let doc: Value = serde_norway::from_str(yaml).unwrap();
+        let rules = workflow_rules_for(&doc);
+        assert!(rules.contains(&RuleId::WorkflowPermissionsWriteAll));
+    }
+
+    #[test]
     fn workflow_rules_no_permissions_block() {
         let yaml = "on: push\njobs:\n  a:\n    runs-on: ubuntu-latest\n";
         let doc: Value = serde_norway::from_str(yaml).unwrap();
@@ -1143,6 +1164,14 @@ mod tests {
     fn workflow_rules_permissions_map_is_fine() {
         let yaml =
             "on: push\npermissions:\n  contents: read\njobs:\n  a:\n    runs-on: ubuntu-latest\n";
+        let doc: Value = serde_norway::from_str(yaml).unwrap();
+        let rules = workflow_rules_for(&doc);
+        assert!(!rules.contains(&RuleId::WorkflowPermissionsWriteAll));
+    }
+
+    #[test]
+    fn workflow_rules_job_permissions_map_is_fine() {
+        let yaml = "on: push\njobs:\n  a:\n    runs-on: ubuntu-latest\n    permissions:\n      contents: read\n";
         let doc: Value = serde_norway::from_str(yaml).unwrap();
         let rules = workflow_rules_for(&doc);
         assert!(!rules.contains(&RuleId::WorkflowPermissionsWriteAll));
@@ -1330,6 +1359,30 @@ jobs:
         assert_eq!(report.totals.points_deducted, 8);
         assert_eq!(report.score, 92);
         assert_eq!(report.grade, "A");
+    }
+
+    #[test]
+    fn job_permissions_write_all_scores_end_to_end() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let wfdir = dir.path().join(".github").join("workflows");
+        std::fs::create_dir_all(&wfdir).unwrap();
+        let yaml = r#"
+name: x
+on: push
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    permissions: write-all
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+"#;
+        std::fs::write(wfdir.join("ci.yml"), yaml).unwrap();
+
+        let (report, _) = score_repo(dir.path(), &Config::default()).unwrap();
+        let ids: Vec<_> = report.findings.iter().map(|f| f.id).collect();
+        assert!(ids.contains(&"workflow.permissions_write_all"));
+        assert_eq!(report.totals.points_deducted, 10);
+        assert_eq!(report.score, 90);
     }
 
     #[test]

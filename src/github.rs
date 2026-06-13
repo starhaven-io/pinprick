@@ -469,6 +469,12 @@ impl GitHubClient {
         if resp.status().as_u16() == 404 {
             bail!("File {path} not found in {owner}/{repo} at {git_ref}");
         }
+        if !resp.status().is_success() {
+            bail!(
+                "GitHub API returned {} while fetching {path} in {owner}/{repo} at {git_ref}",
+                resp.status()
+            );
+        }
 
         let bytes = read_capped(resp).await?;
         Ok(String::from_utf8_lossy(&bytes).into_owned())
@@ -810,6 +816,23 @@ mod tests {
                 .await
                 .unwrap();
             assert!(body.contains("using: node20"));
+        }
+
+        #[tokio::test]
+        async fn fetch_file_non_success_is_error() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/repos/o/r/contents/action.yml"))
+                .respond_with(ResponseTemplate::new(500).set_body_string("oops"))
+                .mount(&server)
+                .await;
+
+            let err = client_for(&server)
+                .await
+                .fetch_file("o", "r", "action.yml", "sha")
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("GitHub API returned 500"));
         }
 
         #[tokio::test]
