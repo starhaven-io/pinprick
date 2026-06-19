@@ -138,6 +138,15 @@ impl AuditedActions {
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
 
+        // Drop entries written by other pinprick versions before the dedup
+        // check. The reader (`parse_local_cache_entries`) already ignores them,
+        // so without this a stale same-SHA entry would block the write — the
+        // cache would never re-warm after an upgrade. Pruning here also keeps
+        // the file from accumulating dead entries.
+        entries.retain(|e| {
+            e.get("pinprick_version").and_then(|v| v.as_str()) == Some(LOCAL_CACHE_PINPRICK_VERSION)
+        });
+
         if entries
             .iter()
             .any(|e| e.get("sha").and_then(|s| s.as_str()) == Some(sha))
@@ -368,6 +377,32 @@ mod tests {
         })])
         .unwrap();
         assert!(parse_local_cache_entries(&rendered).contains("aaa"));
+    }
+
+    #[test]
+    fn cache_clean_rewarms_after_version_change() {
+        // A legacy entry (written by an older pinprick, no version field) must
+        // not permanently block re-warming. The reader already ignores it, so
+        // re-recording the same SHA has to replace it under the current version
+        // rather than dedup-skipping — otherwise the cache never re-warms.
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut aa = AuditedActions::new(false);
+        aa.cache_dir = Some(dir.path().to_path_buf());
+
+        let path = cache_path(dir.path(), "owner", "repo").unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, r#"[{ "sha": "aaa", "tag": "v1" }]"#).unwrap();
+        // Pre-state: the legacy entry is invisible to the reader.
+        assert!(!aa.load_local_cache("owner", "repo").contains("aaa"));
+
+        aa.cache_clean("owner", "repo", "aaa", "v1");
+
+        // The SHA is now cached under the current version…
+        assert!(aa.load_local_cache("owner", "repo").contains("aaa"));
+        // …and the stale legacy entry was pruned rather than duplicated.
+        let on_disk: Vec<serde_json::Value> =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(on_disk.len(), 1);
     }
 
     #[test]
