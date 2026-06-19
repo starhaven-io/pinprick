@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use regex::Regex;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::LazyLock;
 
 #[derive(Debug, Clone)]
@@ -40,9 +40,22 @@ static USES_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^(\s*-?\s*uses:\s*)([^\s@]+)@(\S+?)(\s*#\s*(.+?))?\s*$").unwrap()
 });
 
-// `run: |` / `run: >` openers, including indent/chomping indicators (`|2-`, `>+`).
-static RUN_BLOCK_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^(\s*)(?:-\s+)?run\s*:\s*[|>][0-9+\-]*\s*$").unwrap());
+static LOCAL_USES_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"^\s*-?\s*uses:\s*(?:"([^"]+)"|'([^']+)'|([^#\s]+))\s*(?:#.*)?$"#).unwrap()
+});
+
+// YAML block scalar openers (`run: |`, `script: >`, etc.), including
+// indent/chomping indicators (`|2-`, `>+`). Every block body is skipped so
+// literal docs or scripts cannot false-match on `uses:` text.
+static BLOCK_SCALAR_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^(\s*)(?:-\s+)?[A-Za-z0-9_-]+\s*:\s*[|>][0-9+\-]*\s*(?:#.*)?$").unwrap()
+});
+
+#[derive(Debug, Clone)]
+pub struct LocalActionRef {
+    pub path: String,
+    pub line_number: usize,
+}
 
 /// Parse a single line into an ActionRef, if it's a `uses:` line with an external action.
 pub fn parse_uses_line(line: &str, line_number: usize) -> Option<ActionRef> {
@@ -100,6 +113,35 @@ pub fn parse_uses_line(line: &str, line_number: usize) -> Option<ActionRef> {
     })
 }
 
+/// Parse a single line into a local action reference (`uses: ./path`), if any.
+pub fn parse_local_uses_line(line: &str, line_number: usize) -> Option<LocalActionRef> {
+    let caps = LOCAL_USES_RE.captures(line)?;
+    let path = caps
+        .get(1)
+        .or_else(|| caps.get(2))
+        .or_else(|| caps.get(3))?
+        .as_str();
+
+    if !path.starts_with("./") || !is_safe_local_action_path(path) {
+        return None;
+    }
+
+    Some(LocalActionRef {
+        path: path.to_string(),
+        line_number,
+    })
+}
+
+fn is_safe_local_action_path(path: &str) -> bool {
+    let Some(rel) = path.strip_prefix("./") else {
+        return false;
+    };
+    !rel.is_empty()
+        && Path::new(rel)
+            .components()
+            .all(|c| matches!(c, Component::Normal(_)))
+}
+
 fn classify_ref(r: &str) -> RefType {
     if r.len() == 40 && r.chars().all(|c| c.is_ascii_hexdigit()) {
         return RefType::Sha;
@@ -140,9 +182,8 @@ pub fn build_pinned_line(line: &str, sha: &str, original_tag: &str) -> Option<St
 
 /// Scan workflow YAML text and return all external action references.
 ///
-/// Lines inside `run:` block scalars are skipped so that shell heredocs and
-/// inline scripts can't false-match on literal `- uses:` text (e.g. a workflow
-/// that generates a test workflow on the fly).
+/// Lines inside block scalars are skipped so that shell heredocs, inline docs,
+/// and `with: script: |` snippets can't false-match on literal `- uses:` text.
 pub fn scan_content(content: &str) -> Vec<ActionRef> {
     let mut refs = Vec::new();
     let mut block_parent_col: Option<usize> = None;
@@ -158,12 +199,45 @@ pub fn scan_content(content: &str) -> Vec<ActionRef> {
             block_parent_col = None;
         }
 
-        if let Some(caps) = RUN_BLOCK_RE.captures(line) {
+        if let Some(caps) = BLOCK_SCALAR_RE.captures(line) {
             block_parent_col = Some(caps.get(1).unwrap().as_str().len());
             continue;
         }
 
         if let Some(r) = parse_uses_line(line, line_num) {
+            refs.push(r);
+        }
+    }
+
+    refs
+}
+
+/// Scan workflow YAML text and return local action references (`uses: ./path`).
+///
+/// Only references in the workflow itself are returned. A composite action that
+/// references another local action from its own `action.yml` is not followed —
+/// such a nested action is scanned only if a workflow also uses it directly.
+pub fn scan_local_actions(content: &str) -> Vec<LocalActionRef> {
+    let mut refs = Vec::new();
+    let mut block_parent_col: Option<usize> = None;
+
+    for (i, line) in content.lines().enumerate() {
+        let line_num = i + 1;
+
+        if let Some(start_col) = block_parent_col {
+            let indent = line.chars().take_while(|c| *c == ' ').count();
+            if line.trim().is_empty() || indent > start_col {
+                continue;
+            }
+            block_parent_col = None;
+        }
+
+        if let Some(caps) = BLOCK_SCALAR_RE.captures(line) {
+            block_parent_col = Some(caps.get(1).unwrap().as_str().len());
+            continue;
+        }
+
+        if let Some(r) = parse_local_uses_line(line, line_num) {
             refs.push(r);
         }
     }
@@ -370,6 +444,26 @@ mod tests {
     }
 
     #[test]
+    fn parse_local_action() {
+        let r = parse_local_uses_line("      - uses: ./.github/actions/my-action", 7).unwrap();
+        assert_eq!(r.path, "./.github/actions/my-action");
+        assert_eq!(r.line_number, 7);
+    }
+
+    #[test]
+    fn parse_quoted_local_action_with_comment() {
+        let r = parse_local_uses_line("      - uses: \"./.github/actions/my-action\" # local", 7)
+            .unwrap();
+        assert_eq!(r.path, "./.github/actions/my-action");
+    }
+
+    #[test]
+    fn local_action_rejects_parent_escape() {
+        assert!(parse_local_uses_line("      - uses: ../actions/my-action", 1).is_none());
+        assert!(parse_local_uses_line("      - uses: ./../actions/my-action", 1).is_none());
+    }
+
+    #[test]
     fn skip_non_uses_line() {
         assert!(parse_uses_line("      - run: echo hello", 1).is_none());
         assert!(parse_uses_line("name: CI", 1).is_none());
@@ -478,6 +572,43 @@ jobs:
             );
             assert_eq!(refs[0].full_name(), "good/action");
         }
+    }
+
+    #[test]
+    fn scan_skips_uses_inside_non_run_block_scalar() {
+        let yaml = r#"
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+        with:
+          script: |
+            const text = `
+            - uses: bad/action@v1
+            `;
+      - uses: good/action@v2
+"#;
+        let refs = scan_content(yaml);
+        assert_eq!(refs.len(), 2);
+        assert_eq!(refs[0].full_name(), "actions/github-script");
+        assert_eq!(refs[1].full_name(), "good/action");
+    }
+
+    #[test]
+    fn scan_local_actions_skips_block_scalars() {
+        let yaml = r#"
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          - uses: ./.github/actions/fake
+      - uses: ./.github/actions/real
+"#;
+        let refs = scan_local_actions(yaml);
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].path, "./.github/actions/real");
     }
 
     #[test]
