@@ -118,7 +118,7 @@ struct Repository {
     archived: bool,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 pub struct TreeEntry {
     pub path: String,
     #[serde(rename = "type")]
@@ -280,6 +280,7 @@ impl GitHubClient {
                 tag: tag.into(),
             });
         }
+        ensure_success(&resp, format!("resolving tag {tag} in {owner}/{repo}"))?;
 
         let git_ref: GitRef = resp.json().await.context("parsing tag ref response")?;
 
@@ -289,6 +290,10 @@ impl GitHubClient {
                 self.base, git_ref.object.sha
             );
             let tag_resp = self.get(&tag_url).await?;
+            ensure_success(
+                &tag_resp,
+                format!("resolving annotated tag {tag} in {owner}/{repo}"),
+            )?;
             let tag_obj: TagObject = tag_resp.json().await.context("parsing tag object")?;
             Ok(tag_obj.object.sha)
         } else {
@@ -355,6 +360,7 @@ impl GitHubClient {
                 repo: repo.into(),
             });
         }
+        ensure_success(&resp, format!("listing releases for {owner}/{repo}"))?;
 
         let releases: Vec<Release> = resp.json().await.context("parsing releases")?;
         Ok(releases)
@@ -372,6 +378,7 @@ impl GitHubClient {
                 repo: repo.into(),
             });
         }
+        ensure_success(&resp, format!("listing tags for {owner}/{repo}"))?;
         resp.json().await.context("parsing tags")
     }
 
@@ -413,6 +420,10 @@ impl GitHubClient {
             // Some repos disable advisories or don't have any — treat as empty.
             return Ok(Vec::new());
         }
+        ensure_success(
+            &resp,
+            format!("listing security advisories for {owner}/{repo}"),
+        )?;
         let advisories: Vec<SecurityAdvisory> =
             resp.json().await.context("parsing security advisories")?;
         Ok(advisories)
@@ -429,6 +440,7 @@ impl GitHubClient {
                 repo: repo.into(),
             });
         }
+        ensure_success(&resp, format!("fetching metadata for {owner}/{repo}"))?;
 
         let repo: Repository = resp.json().await.context("parsing repository metadata")?;
         Ok(repo.archived)
@@ -447,6 +459,7 @@ impl GitHubClient {
                 repo: repo.into(),
             });
         }
+        ensure_success(&resp, format!("fetching tree for {owner}/{repo}@{sha}"))?;
         let bytes = read_capped(resp).await?;
         let tree: Tree = serde_json::from_slice(&bytes).context("parsing tree")?;
         Ok(tree.tree)
@@ -479,6 +492,13 @@ impl GitHubClient {
         let bytes = read_capped(resp).await?;
         Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
+}
+
+fn ensure_success(resp: &reqwest::Response, operation: String) -> Result<()> {
+    if !resp.status().is_success() {
+        bail!("GitHub API returned {} while {operation}", resp.status());
+    }
+    Ok(())
 }
 
 /// True if the response's `x-ratelimit-remaining` is exactly zero — GitHub's
@@ -666,6 +686,24 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn list_releases_non_success_is_error_before_parse() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/repos/o/r/releases"))
+                .respond_with(ResponseTemplate::new(422).set_body_string("not json"))
+                .mount(&server)
+                .await;
+
+            let err = client_for(&server)
+                .await
+                .list_releases("o", "r")
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("GitHub API returned 422"));
+            assert!(err.to_string().contains("listing releases"));
+        }
+
+        #[tokio::test]
         async fn sha_to_tag_finds_match_or_none() {
             let server = MockServer::start().await;
             Mock::given(method("GET"))
@@ -755,6 +793,24 @@ mod tests {
             assert_eq!(tree[0].path, "action.yml");
             let body = c.fetch_file("o", "r", "action.yml", "sha").await.unwrap();
             assert!(body.contains("using: node20"));
+        }
+
+        #[tokio::test]
+        async fn fetch_tree_non_success_is_error_before_parse() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/repos/o/r/git/trees/sha"))
+                .respond_with(ResponseTemplate::new(422).set_body_string("not json"))
+                .mount(&server)
+                .await;
+
+            let err = client_for(&server)
+                .await
+                .fetch_tree("o", "r", "sha")
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("GitHub API returned 422"));
+            assert!(err.to_string().contains("fetching tree"));
         }
 
         #[tokio::test]
