@@ -3,7 +3,7 @@
 [![CI](https://github.com/starhaven-io/pinprick/actions/workflows/ci.yml/badge.svg)](https://github.com/starhaven-io/pinprick/actions/workflows/ci.yml)
 [![License: AGPL-3.0-only](https://img.shields.io/badge/License-AGPL--3.0--only-blue.svg)](LICENSE)
 
-A CLI tool for GitHub Actions supply chain security. Pins action references to full SHAs, checks for updates, and audits pinned actions for runtime fetch patterns that bypass pinning.
+A CLI tool for GitHub Actions supply chain security. Pins action references to full SHAs, checks for updates, audits runtime fetch patterns that bypass pinning, and scores repository posture.
 
 The name: **pin** (SHA pinning) + **prick** (a small, sharp probe finding tiny holes in your supply chain).
 
@@ -11,7 +11,7 @@ The name: **pin** (SHA pinning) + **prick** (a small, sharp probe finding tiny h
 
 For static analysis of your workflow files — template injection, excessive permissions, credential leaks — use [zizmor](https://github.com/zizmorcore/zizmor). It's excellent.
 
-pinprick picks up where static analysis leaves off. SHA-pinning actions is table stakes, but even a pinned action can `curl` down `releases/latest` at runtime. pinprick pins your actions, keeps them updated, and audits their source code for unversioned runtime fetches in shell scripts, JavaScript, Python, and Dockerfiles.
+pinprick picks up where static analysis leaves off. SHA-pinning actions is table stakes, but even a pinned action can `curl` down `releases/latest` at runtime. pinprick pins your actions, keeps them updated, audits source code for unversioned runtime fetches in shell scripts, JavaScript, Python, and Dockerfiles, and gives you a single score to track over time.
 
 ## Installation
 
@@ -71,6 +71,13 @@ pinprick audit --verbose
 # Emit SARIF 2.1.0 for GitHub code scanning
 pinprick audit --sarif > pinprick.sarif
 
+# Score a repository's Actions supply chain posture
+pinprick score
+
+# Emit the full score report as JSON or a self-contained HTML report
+pinprick --json score
+pinprick score --html > report.html
+
 # Clear locally cached audit results
 pinprick clean
 
@@ -123,9 +130,29 @@ HIGH  .github/workflows/ci.yml:42
 1 finding (1 high, 0 medium, 0 low)
 ```
 
-Without a GitHub token, audit scans local `run:` blocks only. With a token (via `GITHUB_TOKEN` or `gh auth`), it also fetches and scans action source code — JavaScript, Python, Dockerfiles, and composite action steps.
+Without a GitHub token, audit scans local workflow `run:` blocks and local actions referenced with `uses: ./...`. With a token (via `GITHUB_TOKEN` or `gh auth`), it also fetches and scans external action source code — JavaScript, Python, Dockerfiles, and composite action steps.
 
 Pass `--sarif` to emit SARIF 2.1.0 for upload to [GitHub code scanning](https://docs.github.com/en/code-security/code-scanning). Pass `--verbose` to see every match, including ones that passed the version check or were downgraded to an allowed match by the trusted-host, data-format, jq-pipe, or checksum rules.
+
+### Score
+
+Compute a posture grade against the public, versioned rubric in [`docs/scoring.md`](docs/scoring.md):
+
+```
+$ pinprick score
+pinprick score  v0.7.0 rubric
+
+  Grade:  A   (95 / 100)
+
+  Findings (1 unique, 1 occurrences):
+    medium  -5    pin.sliding                       actions/checkout@v4
+
+  3 workflows scanned, 8 unique actions.
+
+  Run with --json for the full report.
+```
+
+`source.unverified` is informational: it inventories publishers outside the baseline trusted set (`actions`, `github`) and your configured `trusted-owners`, but it deducts zero points and does not fail CI. `score` exits 1 only when at least one finding deducts points. Use `pinprick score --html > report.html` for a shareable static report.
 
 ### Configuration
 
@@ -142,6 +169,9 @@ fetch-remote = false
 # Hosts whose unversioned URL fetches are downgraded to allowed matches.
 # Case-insensitive exact match. Only applies to the unversioned-URL rules.
 trusted-hosts = ["crates.io"]
+
+# Additional GitHub owners trusted for the source.unverified scoring note.
+trusted-owners = ["my-org"]
 
 # Extra file extensions (beyond .json/.yaml/.toml/.csv/.tsv/.xml/.md/.rst/.txt)
 # to treat as data formats for the unversioned-URL exemption.
@@ -198,7 +228,7 @@ Findings followed by checksum verification (`sha256sum`, `gpg --verify`, etc.) w
 | Code | Meaning |
 |------|---------|
 | 0 | Clean — no findings, no pending updates |
-| 1 | Findings present (audit) or updates available (update dry-run) |
+| 1 | Findings present (audit), score deductions present, or updates available (update dry-run) |
 | 2 | Error |
 
 ## Building
