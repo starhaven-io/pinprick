@@ -78,7 +78,7 @@ jobs:
 
           UPDATED=0
           if [[ -n "${INPUT_ACTION}" ]]; then
-            if [[ "${INPUT_ACTION}" != */* ]]; then
+            if [[ ! "${INPUT_ACTION}" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ || "${INPUT_ACTION}" == *..* ]]; then
               echo "error: expected OWNER/REPO, got '${INPUT_ACTION}'" >&2
               exit 1
             fi

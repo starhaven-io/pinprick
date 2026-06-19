@@ -33,7 +33,8 @@ jobs:
 
       - name: Install dependencies
         working-directory: site
-        run: npm ci
+        # Fail closed on unreviewed install scripts (npm v12 default; see allowScripts in package.json).
+        run: npm ci --strict-allow-scripts
 
       - name: Build site
         working-directory: site
