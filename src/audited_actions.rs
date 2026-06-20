@@ -16,7 +16,11 @@ const CATALOG_PUBKEY_FILE: &str = include_str!("../catalog-minisign.pub");
 #[derive(Deserialize)]
 struct AuditedEntry {
     sha: String,
+    #[serde(default)]
+    pinprick_version: Option<String>,
 }
+
+const LOCAL_CACHE_PINPRICK_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Which layer in the lookup satisfied an audited-action check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,6 +138,15 @@ impl AuditedActions {
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
 
+        // Drop entries written by other pinprick versions before the dedup
+        // check. The reader (`parse_local_cache_entries`) already ignores them,
+        // so without this a stale same-SHA entry would block the write — the
+        // cache would never re-warm after an upgrade. Pruning here also keeps
+        // the file from accumulating dead entries.
+        entries.retain(|e| {
+            e.get("pinprick_version").and_then(|v| v.as_str()) == Some(LOCAL_CACHE_PINPRICK_VERSION)
+        });
+
         if entries
             .iter()
             .any(|e| e.get("sha").and_then(|s| s.as_str()) == Some(sha))
@@ -141,7 +154,11 @@ impl AuditedActions {
             return;
         }
 
-        entries.push(serde_json::json!({ "sha": sha, "tag": tag }));
+        entries.push(serde_json::json!({
+            "sha": sha,
+            "tag": tag,
+            "pinprick_version": LOCAL_CACHE_PINPRICK_VERSION
+        }));
 
         if std::fs::create_dir_all(&dir).is_ok()
             && let Some(json) = render_entries(&entries)
@@ -160,7 +177,7 @@ impl AuditedActions {
         let Ok(content) = std::fs::read_to_string(path) else {
             return HashSet::new();
         };
-        parse_entries(&content)
+        parse_local_cache_entries(&content)
     }
 
     async fn fetch_remote_list(&self, action_key: &str) -> Option<HashSet<String>> {
@@ -241,6 +258,15 @@ fn load_bundled() -> HashMap<String, HashSet<String>> {
 fn parse_entries(json: &str) -> HashSet<String> {
     let entries: Vec<AuditedEntry> = serde_json::from_str(json).unwrap_or_default();
     entries.into_iter().map(|e| e.sha).collect()
+}
+
+fn parse_local_cache_entries(json: &str) -> HashSet<String> {
+    let entries: Vec<AuditedEntry> = serde_json::from_str(json).unwrap_or_default();
+    entries
+        .into_iter()
+        .filter(|e| e.pinprick_version.as_deref() == Some(LOCAL_CACHE_PINPRICK_VERSION))
+        .map(|e| e.sha)
+        .collect()
 }
 
 /// Serialize cache entries to their on-disk JSON form. Going through serde
@@ -331,6 +357,52 @@ mod tests {
         assert_eq!(parsed[0]["tag"], r#"v1 "stable" \ release"#);
         // The reader still recovers the sha.
         assert!(parse_entries(&rendered).contains("abc123"));
+    }
+
+    #[test]
+    fn local_cache_ignores_unversioned_legacy_entries() {
+        let rendered = r#"[
+  { "sha": "aaa", "tag": "v1" }
+]"#;
+        assert!(parse_entries(rendered).contains("aaa"));
+        assert!(!parse_local_cache_entries(rendered).contains("aaa"));
+    }
+
+    #[test]
+    fn local_cache_accepts_current_version_entries() {
+        let rendered = serde_json::to_string(&vec![serde_json::json!({
+            "sha": "aaa",
+            "tag": "v1",
+            "pinprick_version": LOCAL_CACHE_PINPRICK_VERSION
+        })])
+        .unwrap();
+        assert!(parse_local_cache_entries(&rendered).contains("aaa"));
+    }
+
+    #[test]
+    fn cache_clean_rewarms_after_version_change() {
+        // A legacy entry (written by an older pinprick, no version field) must
+        // not permanently block re-warming. The reader already ignores it, so
+        // re-recording the same SHA has to replace it under the current version
+        // rather than dedup-skipping — otherwise the cache never re-warms.
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut aa = AuditedActions::new(false);
+        aa.cache_dir = Some(dir.path().to_path_buf());
+
+        let path = cache_path(dir.path(), "owner", "repo").unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, r#"[{ "sha": "aaa", "tag": "v1" }]"#).unwrap();
+        // Pre-state: the legacy entry is invisible to the reader.
+        assert!(!aa.load_local_cache("owner", "repo").contains("aaa"));
+
+        aa.cache_clean("owner", "repo", "aaa", "v1");
+
+        // The SHA is now cached under the current version…
+        assert!(aa.load_local_cache("owner", "repo").contains("aaa"));
+        // …and the stale legacy entry was pruned rather than duplicated.
+        let on_disk: Vec<serde_json::Value> =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(on_disk.len(), 1);
     }
 
     #[test]
