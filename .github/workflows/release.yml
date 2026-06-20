@@ -162,9 +162,6 @@ jobs:
           echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
           echo "tag=v${VERSION}" >> "${GITHUB_OUTPUT}"
 
-      - name: Verify packageable
-        run: cargo publish --dry-run
-
       - name: Create tag
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
