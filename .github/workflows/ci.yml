@@ -28,6 +28,7 @@ jobs:
       contents: read
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
+      run_zizmor: ${{ steps.matrix.outputs.run_zizmor }}
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
@@ -45,14 +46,17 @@ jobs:
           # Codecov has a baseline for PR comparisons.
           if [[ "${EVENT_NAME}" == "push" ]]; then
             echo 'matrix=[{"name":"Lint","check":"lint","runner":"ubuntu-latest"},{"name":"Coverage","check":"coverage","runner":"ubuntu-latest","environment":"codecov"}]' >> "${GITHUB_OUTPUT}"
+            echo "run_zizmor=false" >> "${GITHUB_OUTPUT}"
             exit 0
           fi
 
           MATRIX='[{"name":"Conventional Commits","check":"commits","runner":"ubuntu-slim","fetch_depth":"0"}'
+          RUN_ZIZMOR=false
 
           # For title/body edits, only recheck conventional commits
           if [[ "${EVENT_ACTION}" == "edited" ]]; then
             echo "matrix=${MATRIX}]" >> "${GITHUB_OUTPUT}"
+            echo "run_zizmor=false" >> "${GITHUB_OUTPUT}"
             exit 0
           fi
 
@@ -79,10 +83,11 @@ jobs:
 
           # Workflow changes: Actions security audit
           if echo "${CHANGED}" | grep -qE '^\.github/workflows/'; then
-            MATRIX+=',{"name":"zizmor","check":"zizmor","runner":"ubuntu-latest"}'
+            RUN_ZIZMOR=true
           fi
 
           echo "matrix=${MATRIX}]" >> "${GITHUB_OUTPUT}"
+          echo "run_zizmor=${RUN_ZIZMOR}" >> "${GITHUB_OUTPUT}"
 
   check:
     name: ${{ matrix.name }}
@@ -94,7 +99,6 @@ jobs:
     permissions:
       contents: read
       pull-requests: read # required to fetch PR commits for conventional commit validation
-      security-events: write # required for zizmor SARIF upload
     strategy:
       fail-fast: false
       matrix:
@@ -386,21 +390,34 @@ jobs:
           done
           exit "${FAILED}"
 
-      # --- zizmor ---
+  zizmor:
+    name: zizmor
+    needs: generate-matrix
+    if: needs.generate-matrix.outputs.run_zizmor == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write # required for zizmor SARIF upload
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
 
       - name: Run zizmor
-        if: matrix.check == 'zizmor'
         uses: zizmorcore/zizmor-action@5f14fd08f7cf1cb1609c1e344975f152c7ee938d # v0.5.6
         with:
           persona: auditor
 
   conclusion:
     name: conclusion
-    needs: check
+    needs: [check, zizmor]
     runs-on: ubuntu-slim
     if: always()
     steps:
       - name: Result
         env:
           CHECK_RESULT: ${{ needs.check.result }}
-        run: test "${CHECK_RESULT}" = "success"
+          ZIZMOR_RESULT: ${{ needs.zizmor.result }}
+        run: |
+          test "${CHECK_RESULT}" = "success"
+          [[ "${ZIZMOR_RESULT}" == "success" || "${ZIZMOR_RESULT}" == "skipped" ]]

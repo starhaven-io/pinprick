@@ -47,7 +47,7 @@ add-action owner_repo:
     #!/usr/bin/env bash
     set -euo pipefail
     OWNER_REPO="{{ owner_repo }}"
-    if [[ "$OWNER_REPO" != */* ]]; then
+    if [[ ! "$OWNER_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ || "$OWNER_REPO" == *..* ]]; then
         echo "error: expected OWNER/REPO, got '$OWNER_REPO'" >&2
         exit 2
     fi
