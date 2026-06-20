@@ -5,6 +5,12 @@
   "plugins": ["prettier-plugin-astro"],
   "overrides": [
     {
+      "files": ["**/*.yml", "**/*.yaml"],
+      "options": {
+        "singleQuote": false
+      }
+    },
+    {
       "files": "*.astro",
       "options": {
         "parser": "astro"

@@ -1,7 +1,13 @@
-# Build
+# Local machine/editor/agent state
+.claude/
+.codex/
+.DS_Store
+.vscode/
+
+# Build outputs
 .astro/
-.wrangler/
 dist/
+.wrangler/
 
 # Dependencies
 node_modules/
@@ -12,6 +18,3 @@ node_modules/
 
 # Logs
 npm-debug.log*
-
-# macOS
-.DS_Store

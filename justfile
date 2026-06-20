@@ -2,11 +2,11 @@
 
 # Build the project
 build:
-    cargo build
+    cargo build --locked
 
 # Build in release mode
 build-release:
-    cargo build --release
+    cargo build --locked --release
 
 # Clean build artifacts
 clean:
@@ -16,7 +16,7 @@ clean:
 
 # Run tests
 test:
-    cargo test
+    cargo test --locked
 
 # Lint
 
@@ -26,7 +26,7 @@ audit:
 
 # Run clippy
 clippy:
-    cargo clippy -- -D warnings
+    cargo clippy --locked --all-targets -- -D warnings
 
 # Check formatting
 fmt-check:
@@ -83,7 +83,7 @@ add-action owner_repo:
           - uses: ${OWNER}/${REPO}@${LATEST_SHA} # ${LATEST}
     YAML
 
-    cargo run --release --quiet -- --json audit "$TMPDIR"
+    cargo run --locked --release --quiet -- --json audit "$TMPDIR"
 
     FILE="audited-actions/${OWNER}/${REPO}.json"
     mkdir -p "$(dirname "$FILE")"
@@ -115,7 +115,7 @@ site-format-check:
 
 # Install site dependencies
 site-install:
-    cd site && npm install
+    cd site && npm ci --strict-allow-scripts
 
 # Preview the built site
 site-preview:
@@ -143,7 +143,7 @@ check:
         echo "--- $1 --- skipped ($2 not found)"
         skipped+=("$2 (brew install $3)")
     }
-    run cargo clippy -- -D warnings
+    run cargo clippy --locked --all-targets -- -D warnings
     run cargo fmt -- --check
     if command -v typos &>/dev/null; then
         run typos
@@ -160,7 +160,7 @@ check:
     else
         skip audit zizmor zizmor
     fi
-    run cargo test
+    run cargo test --locked
     echo "--- site-format-check ---"
     (cd site && npm run format:check) || failed=1
     echo "--- site-build ---"
