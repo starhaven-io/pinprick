@@ -39,7 +39,6 @@ jobs:
         id: matrix
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          EVENT_ACTION: ${{ github.event.action }}
           EVENT_NAME: ${{ github.event_name }}
         run: |
           # Push to main: run lint to warm the cache, and Coverage so
@@ -53,13 +52,11 @@ jobs:
           MATRIX='[{"name":"Conventional Commits","check":"commits","runner":"ubuntu-slim","fetch_depth":"0"}'
           RUN_ZIZMOR=false
 
-          # For title/body edits, only recheck conventional commits
-          if [[ "${EVENT_ACTION}" == "edited" ]]; then
-            echo "matrix=${MATRIX}]" >> "${GITHUB_OUTPUT}"
-            echo "run_zizmor=false" >> "${GITHUB_OUTPUT}"
-            exit 0
-          fi
-
+          # `edited` (title/body/base) also runs the full path-derived matrix. The
+          # aggregate "conclusion" job is the only required status check, so it must
+          # certify every relevant leg for the current commit. Collapsing to a
+          # commits-only matrix on `edited` lets a green run overwrite a prior failing
+          # one on the same SHA, bypassing tests, coverage, site checks and the rest.
           CHANGED=$(git diff --name-only "${BASE_SHA}...HEAD")
 
           # Rust or build workflow changes: lint + test
@@ -214,7 +211,7 @@ jobs:
 
       - name: Clippy
         if: matrix.check == 'lint'
-        run: cargo clippy -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: Rustfmt
         if: matrix.check == 'lint'
@@ -254,7 +251,7 @@ jobs:
 
       - name: Test
         if: matrix.check == 'test'
-        run: cargo test
+        run: cargo test --locked
 
       # --- Coverage ---
 
@@ -331,7 +328,7 @@ jobs:
         working-directory: site
         run: npm run deploy:dry
         env:
-          WRANGLER_SEND_METRICS: 'false'
+          WRANGLER_SEND_METRICS: "false"
 
       # --- Verify Audited Actions ---
 
@@ -351,7 +348,7 @@ jobs:
 
       - name: Build pinprick
         if: matrix.check == 'verify-audited'
-        run: cargo build --release
+        run: cargo build --locked --release
 
       - name: Verify audited-actions entries
         if: matrix.check == 'verify-audited'

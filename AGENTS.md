@@ -42,7 +42,7 @@ pinprick/
 └── .gitignore
 ```
 
-## Architecture
+## Project-specific notes
 
 ### Commands
 
@@ -103,15 +103,7 @@ Git clone ref pinning: `git clone` without `--branch`/`-b` or with a branch name
 - `1` — findings present (audit) or updates available (update dry-run)
 - `2` — error
 
-## Code style and conventions
-
-- `cargo clippy` with zero warnings
-- `cargo fmt` for formatting
-- No unnecessary abstractions — flat module structure, no nested directories
-- `thiserror` for typed errors in library code, `anyhow` for context-rich error propagation in commands
-- `LazyLock` for compiled regex constants
-
-## CI workflows (.github/workflows/)
+### CI workflows (`.github/workflows/`)
 
 - **audit-actions.yml** — Weekly scan of tracked actions for new releases, automated PRs for clean entries
 - **bump-cargo-tools.yml** — Weekly check for newer versions of the cargo-installed CI lint tools (typos, cargo-deny, cargo-nextest, cargo-llvm-cov); opens a PR bumping the pins in ci.yml
@@ -123,17 +115,37 @@ Git clone ref pinning: `git clone` without `--branch`/`-b` or with a branch name
 - **release.yml** — Manual dispatch: dry-run crate publishing, build cross-platform binaries (linux-amd64, linux-arm64, darwin-arm64), create GitHub release with build provenance attestations, publish the crate to crates.io, bump the Homebrew cask
 - **zizmor.yml** — GitHub Actions security audit on push to main
 
-## Commit conventions
+## Safety / do-not-touch rules
 
-Conventional Commits format: `type(scope): description`
+1. Do not round-trip workflow files through a YAML parser when writing pins or
+   updates; preserve the single-line `uses:` replacement model.
+2. Keep repo-local config suppressions visible on stderr, and preserve
+   `--no-repo-config` for scanning repositories the caller does not control.
+3. Treat remote action source as untrusted input. Audit may inspect fetched
+   JavaScript, Python, Docker, and action metadata, but it must not execute
+   fetched action code.
+4. Keep SARIF rule IDs stable when refining detections so downstream code
+   scanning configuration keeps working.
 
-Common types: `feat`, `fix`, `refactor`, `docs`, `ci`, `chore`
+## Required checks
 
-All commits must:
+- `cargo clippy` with zero warnings
+- `cargo fmt` for formatting
+- No unnecessary abstractions — flat module structure, no nested directories
+- `thiserror` for typed errors in library code, `anyhow` for context-rich error propagation in commands
+- `LazyLock` for compiled regex constants
+
+## Commit and PR conventions
+
+- Conventional Commits format: `type(scope): description`
+
+- Common types: `feat`, `fix`, `refactor`, `docs`, `ci`, `chore`
+
 - Sign off every commit with `git commit -s` for DCO (enforced by the `.githooks/commit-msg` hook — run `just install-hooks` once per clone to enable it).
-- Add a `Co-Authored-By` trailer for the agent/model that authored the change, placed after `Signed-off-by` (e.g. `Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>`). Bump the model version as newer ones ship.
+- When authored with an AI coding agent, add a `Co-Authored-By` trailer after `Signed-off-by`, naming the agent and model. Current examples: `Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>` or `Co-Authored-By: Codex GPT-5 <noreply@openai.com>`. Bump the model version as newer ones ship.
 
-## Git workflow
+### Git workflow
 
-- Never commit directly to main — always create a feature branch and open a PR
-- PR descriptions should contain only a summary of the changes — no test plan sections, no bot attribution, no generated-by footers
+- Never commit directly to `main`; create a feature branch and open a PR.
+- PR descriptions should contain only a concise summary of changes. Do not add
+  test-plan sections, bot attribution, or generated-with footers.

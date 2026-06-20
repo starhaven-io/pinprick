@@ -18,7 +18,9 @@ on:
 
 defaults:
   run:
-    shell: bash -xeuo pipefail {0}
+    # No -x: this workflow uses GitHub tokens in run steps and can mint
+    # short-lived app tokens.
+    shell: bash -euo pipefail {0}
 
 concurrency:
   group: audit-actions
@@ -51,7 +53,7 @@ jobs:
           restore-keys: ${{ runner.os }}-${{ runner.arch }}-cargo-debug-
 
       - name: Build pinprick
-        run: cargo build
+        run: cargo build --locked
 
       - name: Scan for new releases
         env:

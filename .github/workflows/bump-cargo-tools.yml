@@ -7,7 +7,8 @@ on:
 
 defaults:
   run:
-    shell: bash -xeuo pipefail {0}
+    # No -x: this workflow can mint and use short-lived app tokens.
+    shell: bash -euo pipefail {0}
 
 concurrency:
   group: bump-cargo-tools

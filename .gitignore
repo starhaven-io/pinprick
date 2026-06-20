@@ -1,8 +1,8 @@
-# Build
-/target
-
-# Claude Code
+# Local machine/editor/agent state
 .claude/
-
-# macOS
+.codex/
 .DS_Store
+.vscode/
+
+# Build outputs
+/target

@@ -5,7 +5,9 @@ on:
 
 defaults:
   run:
-    shell: bash -xeuo pipefail {0}
+    # No -x: this workflow handles signing/notarization secrets, generated
+    # keychain passwords, and short-lived app tokens.
+    shell: bash -euo pipefail {0}
 
 concurrency:
   group: release
@@ -78,7 +80,7 @@ jobs:
       - name: Build
         env:
           TARGET: ${{ matrix.target }}
-        run: cargo build --release --target "${TARGET}"
+        run: cargo build --locked --release --target "${TARGET}"
 
       - name: Codesign binary
         if: matrix.sign
@@ -223,7 +225,7 @@ jobs:
           persist-credentials: false
 
       - name: Verify packageable
-        run: cargo publish --dry-run
+        run: cargo publish --locked --dry-run
 
       - name: Authenticate to crates.io
         id: auth
@@ -232,7 +234,7 @@ jobs:
       - name: Publish
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-        run: cargo publish
+        run: cargo publish --locked
 
   bump-cask:
     name: Bump Homebrew cask
