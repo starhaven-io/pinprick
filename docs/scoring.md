@@ -85,7 +85,7 @@ These reuse findings from the existing `pinprick audit` pipeline applied to each
 Notes:
 
 - The audit pipeline already suppresses `data format URL` and checksum-verified fetches to allowed matches and applies the trusted-host exemption before `runtime.*` scoring runs, so those never deduct points and there's no double-counting. (Checksum-verified fetches are suppressed as of rubric 0.7.0; they were downgraded one severity level through 0.6.0.)
-- Through v0.5.0 the runtime scan is limited to `run:` blocks in local workflow files (no GitHub token required). Runtime findings in the source of fetched actions themselves — where `pinprick audit` looks when a token is present — are not yet scored; that integration lands in a later rubric version.
+- As of v0.7.0 the runtime score scan is limited to `run:` blocks in local workflow files (no GitHub token required). Runtime findings in the source of fetched actions themselves — where `pinprick audit` looks when a token is present — are not yet scored; that integration lands in a later rubric version.
 - Runtime findings are not deduplicated. Each pattern match emits one finding keyed to its `(workflow, line)` — each is a distinct fix in a distinct place.
 - Config interaction: `runtime.*` scoring honors `ignore.patterns` from `.pinprick.toml` (an explicitly accepted risk is not deducted), but **not** the `severity` display threshold — the posture score reflects every finding regardless of what `pinprick audit` is configured to print.
 
@@ -99,7 +99,7 @@ These fire once per workflow, not per action use.
 | `workflow.pull_request_target` | Workflow uses the `pull_request_target` trigger     | high     |    5   | live   | Validate the checkout ref; avoid running PR code with elevated tokens |
 | `workflow.workflow_run`     | Workflow uses the `workflow_run` trigger              | medium   |    3   | live   | Explicitly validate trigger provenance                |
 
-The `pull_request_target` and `workflow_run` rules fire on trigger *presence* as of v0.5.0. A future release may narrow to "without explicit guardrails" once the parser can recognize common safe patterns (e.g., validating the checkout ref).
+The `pull_request_target` and `workflow_run` rules fire on trigger *presence* as of v0.7.0. A future release may narrow to "without explicit guardrails" once the parser can recognize common safe patterns (e.g., validating the checkout ref).
 
 ### Future categories (not in v1)
 
@@ -119,7 +119,6 @@ These are deliberately out of scope for v1 to keep the initial rubric defensible
 {
   "rubric_version": "0.7.0",
   "pinprick_version": "…",
-  "scanned_at": "2026-04-22T20:00:00Z",
   "target": { "kind": "repo", "path": "./" },
   "score": 72,
   "grade": "C",
@@ -157,17 +156,14 @@ pinprick score  v0.7.0 rubric
   Grade:  C   (72 / 100)
 
   Findings (11 unique, 24 occurrences):
-    high    2  pin.branch           actions/foo@main
-    high    1  source.archived      bar/baz@abc1234
-    medium  6  pin.sliding          7 actions
-    low     2  pin.full_tag         2 actions
+    high    -15   pin.branch                        actions/foo@main
+    high    -10   source.archived                   bar/baz@abc1234
+    medium  -5    pin.sliding                       actions/checkout@v4
+    low     -2    pin.full_tag                      actions/setup-node@v4.2.1
 
-  Top remediations:
-    1. Pin actions/foo@main to a full SHA             (-15)
-    2. Replace bar/baz (archived) with a maintained action (-10)
-    …
+  4 workflows scanned, 17 unique actions.
 
-  Run `pinprick score --json` for the full report.
+  Run with --json for the full report.
 ```
 
 ### HTML report
@@ -175,9 +171,8 @@ pinprick score  v0.7.0 rubric
 A single self-contained HTML file with:
 
 - Score + grade banner
-- Per-category breakdown with expandable finding lists
-- Per-workflow drill-down
-- Prioritized remediation list (sorted by points recovered)
+- Prioritized finding list (sorted by points recovered)
+- Remediation text and occurrence locations for each finding
 
 No JavaScript frameworks; plain HTML + a little CSS. The HTML report is shareable as a static artifact.
 

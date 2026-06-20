@@ -230,6 +230,10 @@ pub struct ConfigImpact {
     /// Unique action refs exempted from `source.unverified` via the
     /// configured `trusted-owners` list (baseline owners not counted).
     pub actions_exempted: usize,
+    /// Runtime fetches exempted via the configured `trusted-hosts` list.
+    pub trusted_host_fetches: usize,
+    /// Runtime fetches exempted via the configured `extra-data-formats` list.
+    pub extra_data_format_fetches: usize,
 }
 
 /// Collect findings across all workflows, dedupe by rule + target, and roll
@@ -306,6 +310,8 @@ pub fn score_repo(repo_root: &Path, config: &Config) -> Result<(ScoreReport, Con
                     config,
                 );
             }
+            impact.trusted_host_fetches += collector.trusted_host_allowed;
+            impact.extra_data_format_fetches += collector.extra_data_format_allowed;
             for finding in &collector.findings {
                 // Honor `ignore.patterns` (an accepted risk shouldn't score) but
                 // not the `severity` display threshold — the score is complete.
@@ -871,6 +877,18 @@ pub async fn run(
                 impact.actions_exempted
             ));
         }
+        if impact.trusted_host_fetches > 0 {
+            parts.push(format!(
+                "trusted-host fetches: {}",
+                impact.trusted_host_fetches
+            ));
+        }
+        if impact.extra_data_format_fetches > 0 {
+            parts.push(format!(
+                "extra-data-format fetches: {}",
+                impact.extra_data_format_fetches
+            ));
+        }
         if !parts.is_empty() {
             eprintln!(
                 "note: the scanned repo's .pinprick.toml affected the score ({}) — rerun with --no-repo-config to ignore it",
@@ -1416,6 +1434,58 @@ jobs:
         assert_eq!(report.totals.points_deducted, 46);
         assert_eq!(report.score, 54);
         assert_eq!(report.grade, "F");
+    }
+
+    #[test]
+    fn runtime_trusted_host_impact_is_reported() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let wfdir = dir.path().join(".github").join("workflows");
+        std::fs::create_dir_all(&wfdir).unwrap();
+        let yaml = r#"
+name: trusted-host
+on: push
+jobs:
+  install:
+    runs-on: ubuntu-latest
+    steps:
+      - run: curl -fsSL https://artifacts.example.com/install.sh -o install.sh
+"#;
+        std::fs::write(wfdir.join("ci.yml"), yaml).unwrap();
+
+        let cfg = Config {
+            trusted_hosts: vec!["artifacts.example.com".to_string()],
+            ..Config::default()
+        };
+        let (report, impact) = score_repo(dir.path(), &cfg).unwrap();
+        assert!(report.findings.is_empty());
+        assert_eq!(report.score, 100);
+        assert_eq!(impact.trusted_host_fetches, 1);
+    }
+
+    #[test]
+    fn runtime_extra_data_format_impact_is_reported() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let wfdir = dir.path().join(".github").join("workflows");
+        std::fs::create_dir_all(&wfdir).unwrap();
+        let yaml = r#"
+name: extra-data
+on: push
+jobs:
+  install:
+    runs-on: ubuntu-latest
+    steps:
+      - run: curl -fsSL https://example.com/schema.proto -o schema.proto
+"#;
+        std::fs::write(wfdir.join("ci.yml"), yaml).unwrap();
+
+        let cfg = Config {
+            extra_data_formats: vec!["proto".to_string()],
+            ..Config::default()
+        };
+        let (report, impact) = score_repo(dir.path(), &cfg).unwrap();
+        assert!(report.findings.is_empty());
+        assert_eq!(report.score, 100);
+        assert_eq!(impact.extra_data_format_fetches, 1);
     }
 
     #[test]

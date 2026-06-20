@@ -159,6 +159,12 @@ impl Config {
         if audit_patterns::url_is_data_format(url) {
             return true;
         }
+        self.is_extra_data_format_exempt(url)
+    }
+
+    /// Check whether a URL is exempt only because of `extra-data-formats`
+    /// from the active config file. Built-in data formats are not counted.
+    pub fn is_extra_data_format_exempt(&self, url: &str) -> bool {
         let Some(ext) = audit_patterns::url_extension(url) else {
             return false;
         };
