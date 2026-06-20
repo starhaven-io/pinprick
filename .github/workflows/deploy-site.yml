@@ -12,7 +12,8 @@ on:
 
 defaults:
   run:
-    shell: bash -xeuo pipefail {0}
+    # No -x: this job handles Cloudflare and catalog-signing secrets.
+    shell: bash -euo pipefail {0}
 
 permissions: {}
 
@@ -76,4 +77,4 @@ jobs:
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
-          WRANGLER_SEND_METRICS: 'false'
+          WRANGLER_SEND_METRICS: "false"
