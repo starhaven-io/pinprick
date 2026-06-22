@@ -44,7 +44,7 @@ jobs:
           # Push to main: run lint to warm the cache, and Coverage so
           # Codecov has a baseline for PR comparisons.
           if [[ "${EVENT_NAME}" == "push" ]]; then
-            echo 'matrix=[{"name":"Lint","check":"lint","runner":"ubuntu-latest"},{"name":"Coverage","check":"coverage","runner":"ubuntu-latest","environment":"codecov"}]' >> "${GITHUB_OUTPUT}"
+            echo 'matrix=[{"name":"Lint","check":"lint","runner":"ubuntu-24.04"},{"name":"Coverage","check":"coverage","runner":"ubuntu-24.04","environment":"codecov"}]' >> "${GITHUB_OUTPUT}"
             echo "run_zizmor=false" >> "${GITHUB_OUTPUT}"
             exit 0
           fi
@@ -61,16 +61,16 @@ jobs:
 
           # Rust or build workflow changes: lint + test
           if echo "${CHANGED}" | grep -qE '\.rs$|^Cargo\.(toml|lock)$|^clippy\.toml$|^rustfmt\.toml$|^\.github/workflows/(ci|release)\.yml$'; then
-            MATRIX+=',{"name":"Lint","check":"lint","runner":"ubuntu-latest"}'
-            MATRIX+=',{"name":"Test (Linux)","check":"test","runner":"ubuntu-latest"}'
-            MATRIX+=',{"name":"Test (Linux ARM)","check":"test","runner":"ubuntu-22.04-arm"}'
+            MATRIX+=',{"name":"Lint","check":"lint","runner":"ubuntu-24.04"}'
+            MATRIX+=',{"name":"Test (Linux)","check":"test","runner":"ubuntu-24.04"}'
+            MATRIX+=',{"name":"Test (Linux ARM)","check":"test","runner":"ubuntu-24.04-arm"}'
             MATRIX+=',{"name":"Test (macOS)","check":"test","runner":"macos-26"}'
-            MATRIX+=',{"name":"Coverage","check":"coverage","runner":"ubuntu-latest","environment":"codecov"}'
+            MATRIX+=',{"name":"Coverage","check":"coverage","runner":"ubuntu-24.04","environment":"codecov"}'
           fi
 
           # Audited-actions changes: verify all entries
           if echo "${CHANGED}" | grep -qE '^audited-actions/'; then
-            MATRIX+=',{"name":"Verify Audited Actions","check":"verify-audited","runner":"ubuntu-latest"}'
+            MATRIX+=',{"name":"Verify Audited Actions","check":"verify-audited","runner":"ubuntu-24.04"}'
           fi
 
           # Site or audited-actions changes: format check + build
@@ -373,7 +373,7 @@ jobs:
           on: push
           jobs:
             test:
-              runs-on: ubuntu-latest
+              runs-on: ubuntu-24.04
               steps:
                 - uses: ${OWNER}/${REPO}@${SHA} # ${TAG}
           YAML
@@ -391,7 +391,7 @@ jobs:
     name: zizmor
     needs: generate-matrix
     if: needs.generate-matrix.outputs.run_zizmor == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       security-events: write # required for zizmor SARIF upload

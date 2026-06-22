@@ -31,7 +31,7 @@ Download a prebuilt binary from [GitHub Releases](https://github.com/starhaven-i
 - Linux arm64, musl (static) — `aarch64-unknown-linux-musl`
 - macOS Apple Silicon — `aarch64-apple-darwin`
 
-The `gnu` builds link against the system glibc and suit most mainstream distributions (Debian, Ubuntu, Fedora, …). The `musl` builds are statically linked and run on musl-based distributions such as Alpine, as well as minimal or distroless containers.
+The `gnu` builds link against the system glibc. They are built on Ubuntu 24.04, so they require **glibc 2.39 or newer** (Ubuntu 24.04+, Debian 13+, Fedora 40+). On older releases — Ubuntu 22.04, Debian 12, RHEL 9 and the like — use the statically linked `musl` builds instead. The `musl` builds carry no glibc requirement and also run on musl-based distributions such as Alpine, as well as minimal or distroless containers.
 
 :::note[musl binaries still need CA certificates]
 The musl binaries are statically linked, but pinprick makes HTTPS calls to the GitHub API and reads the host's trusted CA certificates at runtime. On Alpine, install them with `apk add ca-certificates`.
