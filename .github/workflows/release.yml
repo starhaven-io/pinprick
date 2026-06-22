@@ -30,13 +30,13 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
           - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-22.04-arm
+            runner: ubuntu-24.04-arm
           - target: x86_64-unknown-linux-musl
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
           - target: aarch64-unknown-linux-musl
-            runner: ubuntu-22.04-arm
+            runner: ubuntu-24.04-arm
           - target: aarch64-apple-darwin
             runner: macos-26
             sign: true
@@ -244,7 +244,7 @@ jobs:
   publish-crate:
     name: Publish to crates.io
     needs: release
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     environment:
       name: release
       deployment: false
