@@ -11,6 +11,9 @@ on:
     branches:
       - main
 
+env:
+  CARGO_INCREMENTAL: 0
+
 concurrency:
   group: "pinprick-audit-${{ github.ref }}"
   cancel-in-progress: true
@@ -34,7 +37,6 @@ jobs:
           persist-credentials: false
 
       - name: Restore cargo cache (debug)
-        id: cargo-cache
         uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: |
@@ -43,21 +45,9 @@ jobs:
             ~/.cargo/git/db/
             target/
           key: ${{ runner.os }}-${{ runner.arch }}-cargo-debug-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-${{ runner.arch }}-cargo-debug-
 
       - name: Build pinprick
         run: cargo build --locked
-
-      - name: Save cargo cache (debug)
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
-        with:
-          path: |
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-${{ runner.arch }}-cargo-debug-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Run pinprick audit
         env:
