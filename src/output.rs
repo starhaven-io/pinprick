@@ -1,5 +1,6 @@
 use colored::Colorize;
 use serde::Serialize;
+use std::io::{self, Write};
 
 use crate::audit_patterns::Severity;
 
@@ -47,48 +48,61 @@ pub struct PinReport {
 
 impl PinReport {
     pub fn print_human(&self) {
+        self.write_human(&mut io::stdout())
+            .expect("writing pin report");
+    }
+
+    fn write_human(&self, w: &mut impl Write) -> io::Result<()> {
         let mut current_file = String::new();
 
         for p in &self.pinned {
             if p.file != current_file {
                 if !current_file.is_empty() {
-                    println!();
+                    writeln!(w)?;
                 }
-                println!("{}", p.file.bold());
+                writeln!(w, "{}", sanitize_for_terminal(&p.file).bold())?;
                 current_file.clone_from(&p.file);
             }
-            println!(
+            let action = sanitize_for_terminal(&p.action);
+            let old_ref = sanitize_for_terminal(&p.old_ref);
+            let tag = sanitize_for_terminal(&p.tag);
+            writeln!(
+                w,
                 "  {} {} {} {}",
-                p.action.cyan(),
-                format!("@{}", p.old_ref).dimmed(),
+                action.cyan(),
+                format!("@{old_ref}").dimmed(),
                 "->".dimmed(),
-                format!("@{}… # {}", &p.sha[..12], p.tag).green()
-            );
+                format!("@{}… # {tag}", &p.sha[..12]).green()
+            )?;
         }
 
         for s in &self.skipped {
             if s.file != current_file {
                 if !current_file.is_empty() {
-                    println!();
+                    writeln!(w)?;
                 }
-                println!("{}", s.file.bold());
+                writeln!(w, "{}", sanitize_for_terminal(&s.file).bold())?;
                 current_file.clone_from(&s.file);
             }
-            println!(
+            let action = sanitize_for_terminal(&s.action);
+            let reason = sanitize_for_terminal(&s.reason);
+            writeln!(
+                w,
                 "  {} {}",
-                format!("! {}", s.action).yellow(),
-                format!("-- {}", s.reason).dimmed()
-            );
+                format!("! {action}").yellow(),
+                format!("-- {reason}").dimmed()
+            )?;
         }
 
         if !self.pinned.is_empty() || !self.skipped.is_empty() {
-            println!();
+            writeln!(w)?;
         }
 
         let total_files: std::collections::HashSet<&str> =
             self.pinned.iter().map(|p| p.file.as_str()).collect();
         let verb = if self.applied { "Pinned" } else { "Would pin" };
-        println!(
+        writeln!(
+            w,
             "{verb} {} action{} across {} file{}{}",
             self.pinned.len(),
             if self.pinned.len() == 1 { "" } else { "s" },
@@ -99,10 +113,11 @@ impl PinReport {
             } else {
                 format!(" ({} skipped)", self.skipped.len())
             }
-        );
+        )?;
         if !self.applied && !self.pinned.is_empty() {
-            println!("Run with {} to apply.", "--write".bold());
+            writeln!(w, "Run with {} to apply.", "--write".bold())?;
         }
+        Ok(())
     }
 
     pub fn print_json(&self) {
@@ -134,47 +149,59 @@ pub struct UpdateReport {
 
 impl UpdateReport {
     pub fn print_human(&self) {
+        self.write_human(&mut io::stdout())
+            .expect("writing update report");
+    }
+
+    fn write_human(&self, w: &mut impl Write) -> io::Result<()> {
         if self.updates.is_empty() {
-            println!("All pinned actions are up to date.");
-            return;
+            writeln!(w, "All pinned actions are up to date.")?;
+            return Ok(());
         }
 
         let mut current_file = String::new();
         for u in &self.updates {
             if u.file != current_file {
                 if !current_file.is_empty() {
-                    println!();
+                    writeln!(w)?;
                 }
-                println!("{}", u.file.bold());
+                writeln!(w, "{}", sanitize_for_terminal(&u.file).bold())?;
                 current_file.clone_from(&u.file);
             }
-            println!(
+            let action = sanitize_for_terminal(&u.action);
+            let current_tag = sanitize_for_terminal(&u.current_tag);
+            let latest_tag = sanitize_for_terminal(&u.latest_tag);
+            writeln!(
+                w,
                 "  {} {} {} {}",
-                u.action.cyan(),
-                u.current_tag.dimmed(),
+                action.cyan(),
+                current_tag.dimmed(),
                 "->".dimmed(),
-                u.latest_tag.green()
-            );
+                latest_tag.green()
+            )?;
             if let Some(url) = &u.release_url {
-                println!("    {}", url.dimmed());
+                writeln!(w, "    {}", sanitize_for_terminal(url).dimmed())?;
             }
         }
 
-        println!();
+        writeln!(w)?;
         if self.applied {
-            println!(
+            writeln!(
+                w,
                 "{} update{} applied.",
                 self.updates.len(),
                 if self.updates.len() == 1 { "" } else { "s" }
-            );
+            )?;
         } else {
-            println!(
+            writeln!(
+                w,
                 "{} update{} available. Run with {} to apply.",
                 self.updates.len(),
                 if self.updates.len() == 1 { "" } else { "s" },
                 "--write".bold()
-            );
+            )?;
         }
+        Ok(())
     }
 
     pub fn print_json(&self) {
@@ -870,6 +897,68 @@ mod audit_summary_tests {
             sanitize_for_terminal("x\ry\nz\u{7}\u{7f}"),
             "x\u{fffd}y\u{fffd}z\u{fffd}\u{fffd}"
         );
+    }
+
+    #[test]
+    fn pin_human_output_sanitizes_untrusted_fields() {
+        let report = PinReport {
+            pinned: vec![PinResult {
+                file: ".github/workflows/ci.yml".into(),
+                action: "evil\u{1b}[2J/action".into(),
+                old_ref: "main\u{7}".into(),
+                sha: "0123456789abcdef0123456789abcdef01234567".into(),
+                tag: "v1.2.3\rrewrite".into(),
+                line: 1,
+            }],
+            skipped: vec![PinSkip {
+                file: ".github/workflows/ci.yml".into(),
+                action: "skip\u{7f}action".into(),
+                reason: "branch\u{1b}[31m ref".into(),
+                line: 2,
+            }],
+            applied: false,
+        };
+        let mut buf = Vec::new();
+        report.write_human(&mut buf).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+
+        assert!(out.contains("evil\u{fffd}[2J/action"));
+        assert!(out.contains("@main\u{fffd}"));
+        assert!(out.contains("# v1.2.3\u{fffd}rewrite"));
+        assert!(out.contains("skip\u{fffd}action"));
+        assert!(out.contains("branch\u{fffd}[31m ref"));
+        assert!(!out.contains('\u{7}'));
+        assert!(!out.contains('\r'));
+        assert!(!out.contains('\u{7f}'));
+    }
+
+    #[test]
+    fn update_human_output_sanitizes_untrusted_fields() {
+        let report = UpdateReport {
+            updates: vec![UpdateResult {
+                file: ".github/workflows/ci.yml".into(),
+                action: "evil\u{1b}[2J/action".into(),
+                current_tag: "v1\u{7}".into(),
+                current_sha: "0123456789abcdef0123456789abcdef01234567".into(),
+                latest_tag: "v2\rrewrite".into(),
+                latest_sha: "abcdef0123456789abcdef0123456789abcdef01".into(),
+                line: 1,
+                release_url: Some("https://example.com/release\u{7f}".into()),
+            }],
+            up_to_date: 0,
+            applied: false,
+        };
+        let mut buf = Vec::new();
+        report.write_human(&mut buf).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+
+        assert!(out.contains("evil\u{fffd}[2J/action"));
+        assert!(out.contains("v1\u{fffd}"));
+        assert!(out.contains("v2\u{fffd}rewrite"));
+        assert!(out.contains("https://example.com/release\u{fffd}"));
+        assert!(!out.contains('\u{7}'));
+        assert!(!out.contains('\r'));
+        assert!(!out.contains('\u{7f}'));
     }
 
     #[test]

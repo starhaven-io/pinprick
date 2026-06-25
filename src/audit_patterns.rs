@@ -211,6 +211,12 @@ re!(
 re!(JS_CHILD_PROC_CURL, r"child_process.*\bcurl\b");
 re!(JS_FETCH_URL, r#"fetch\s*\(\s*["'`]https?://"#);
 re!(JS_AXIOS_URL, r#"axios\.\w+\s*\(\s*["'`]https?://"#);
+re!(JS_GOT_URL, r#"\bgot(?:\.\w+)?\s*\(\s*["'`]https?://"#);
+re!(JS_HTTP_URL, r#"https?\.get\s*\(\s*["'`]https?://"#);
+re!(
+    JS_REQUIRE_HTTP_GET,
+    r#"require\(\s*["'](?:node:)?https?["']\s*\)\.get\s*\(\s*["'`]https?://"#
+);
 
 pub static JS_PATTERNS: LazyLock<Vec<Pattern>> = LazyLock::new(|| {
     vec![
@@ -266,6 +272,24 @@ pub static JS_URL_PATTERNS: LazyLock<Vec<Pattern>> = LazyLock::new(|| {
             severity: Severity::Medium,
             category: Category::JavaScriptFetch,
             description: "axios request to external URL without version pinning",
+        },
+        Pattern {
+            regex: &JS_GOT_URL,
+            severity: Severity::Medium,
+            category: Category::JavaScriptFetch,
+            description: "got() request to external URL without version pinning",
+        },
+        Pattern {
+            regex: &JS_HTTP_URL,
+            severity: Severity::Medium,
+            category: Category::JavaScriptFetch,
+            description: "http.get() to external URL without version pinning",
+        },
+        Pattern {
+            regex: &JS_REQUIRE_HTTP_GET,
+            severity: Severity::Medium,
+            category: Category::JavaScriptFetch,
+            description: "http.get() to external URL without version pinning",
         },
     ]
 });
@@ -428,29 +452,31 @@ pub fn fetch_piped_to_jq(line: &str) -> bool {
 // the trailing class admits a following extension dot, suffix (`-rc1`), or end
 // of string (a URL whose path ends at the version, e.g. `/download/v1.2.3`).
 static VERSION_SEGMENT: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#"[-_/=]v?\d+(\.\d+)+(?:[-_./\s"]|$)"#).unwrap());
+    LazyLock::new(|| Regex::new(r#"[-_/]v?\d+(\.\d+)+(?:[-_./\s"]|$)"#).unwrap());
 
-/// Check if a URL contains a version segment in its **path or query** — not
-/// its host. Scanning the authority too would let a versioned-looking host (a
-/// bare IP like `10.0.0.1`, or a date-stamped hostname) whitelist an otherwise
-/// unpinned fetch, which is a detection bypass.
+/// Check if a URL contains a version segment in its **path** — not its host or
+/// query string. Scanning the authority or query too would let a
+/// versioned-looking host or inert parameter whitelist an otherwise unpinned
+/// fetch, which is a detection bypass.
 pub fn url_has_version(s: &str) -> bool {
-    VERSION_SEGMENT.is_match(url_path_and_query(s))
+    VERSION_SEGMENT.is_match(url_path(s))
 }
 
-/// Return the path+query+fragment of an `http(s)://` URL (everything from the
-/// first `/` after the authority). Returns `""` for a URL with no path, and
+/// Return the path of an `http(s)://` URL (everything from the first `/` after
+/// the authority until `?` or `#`). Returns `""` for a URL with no path, and
 /// the input unchanged for a string that is not an `http(s)://` URL.
-fn url_path_and_query(url: &str) -> &str {
+fn url_path(url: &str) -> &str {
     let Some(rest) = url
         .strip_prefix("https://")
         .or_else(|| url.strip_prefix("http://"))
     else {
         return url;
     };
-    let after_userinfo = rest.split_once('@').map(|(_, r)| r).unwrap_or(rest);
-    match after_userinfo.find('/') {
-        Some(i) => &after_userinfo[i..],
+    // The path starts at the first `/`, which also ends the authority. Any
+    // `user@host` userinfo and any `@` in a later path segment or query are
+    // therefore excluded without special-casing `@`.
+    match rest.find('/') {
+        Some(i) => rest[i..].split(['?', '#']).next().unwrap_or_default(),
         None => "",
     }
 }
@@ -721,6 +747,31 @@ mod tests {
     }
 
     #[test]
+    fn query_only_version_is_not_versioned() {
+        assert!(!url_has_version(
+            "https://example.com/download/install.sh?version=1.2.3"
+        ));
+        assert!(!url_has_version(
+            "https://example.com/download/install.sh?v=1.2.3#release"
+        ));
+        assert!(url_has_version(
+            "https://example.com/releases/v1.2.3/install.sh?cache=false"
+        ));
+    }
+
+    #[test]
+    fn at_sign_past_authority_does_not_break_path_version() {
+        // A `@` in a later path segment or query must not truncate the path:
+        // the version is still found and the URL counts as pinned.
+        assert!(url_has_version(
+            "https://example.com/releases/v1.2.3/tool?token=a@b"
+        ));
+        assert!(url_has_version(
+            "https://user@example.com/releases/v1.2.3/tool"
+        ));
+    }
+
+    #[test]
     fn arch_suffix_not_version() {
         // `x86_64` must not read as a version — no dotted component.
         assert!(!url_has_version("https://example.com/setup-x86_64.sh"));
@@ -730,7 +781,7 @@ mod tests {
     #[test]
     fn versioned_looking_host_not_counted() {
         // A bare-IP host (or a version-shaped authority) must NOT register as a
-        // pinned version — only the path/query is scanned, so these still fire.
+        // pinned version — only the path is scanned, so these still fire.
         assert!(!url_has_version("https://10.0.0.1/install.sh"));
         assert!(!url_has_version("https://1.2.3.4/get.sh"));
         // …but a real version in the path still counts.
