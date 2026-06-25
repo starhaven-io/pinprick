@@ -1,10 +1,15 @@
 use anyhow::{Context, Result};
 use regex::Regex;
-use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use rustix::fs::{self as rfs, AtFlags, Dir, Mode, OFlags};
+use rustix::io::Errno;
+use std::fs::{self, File};
+use std::io::{Read, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 use std::sync::LazyLock;
 use std::time::{SystemTime, UNIX_EPOCH};
+use thiserror::Error;
 
 #[derive(Debug, Clone)]
 pub struct ActionRef {
@@ -58,6 +63,62 @@ static BLOCK_SCALAR_RE: LazyLock<Regex> = LazyLock::new(|| {
 pub struct LocalActionRef {
     pub path: String,
     pub line_number: usize,
+}
+
+#[derive(Debug, Error)]
+#[error("{message}")]
+pub struct UnsafeWorkflowPath {
+    message: String,
+}
+
+impl UnsafeWorkflowPath {
+    fn symlinked_directory(path: &Path) -> Self {
+        Self {
+            message: format!("Refusing to scan symlinked directory {}", path.display()),
+        }
+    }
+
+    fn symlinked_workflow_file(path: &Path) -> Self {
+        Self {
+            message: format!(
+                "Refusing to scan symlinked workflow file {}",
+                path.display()
+            ),
+        }
+    }
+}
+
+pub fn is_unsafe_workflow_path(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<UnsafeWorkflowPath>().is_some()
+}
+
+#[derive(Debug)]
+struct WorkflowDirectory {
+    path: PathBuf,
+    fd: Arc<File>,
+}
+
+#[derive(Debug, Clone)]
+pub struct WorkflowFile {
+    path: PathBuf,
+    name: std::ffi::OsString,
+    dir: Arc<File>,
+}
+
+impl WorkflowDirectory {
+    fn file(&self, name: std::ffi::OsString) -> WorkflowFile {
+        WorkflowFile {
+            path: self.path.join(&name),
+            name,
+            dir: Arc::clone(&self.fd),
+        }
+    }
+}
+
+impl WorkflowFile {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
 }
 
 /// Parse a single line into an ActionRef, if it's a `uses:` line with an external action.
@@ -249,61 +310,145 @@ pub fn scan_local_actions(content: &str) -> Vec<LocalActionRef> {
 }
 
 /// Scan a workflow file and return all external action references.
-pub fn scan_workflow(path: &Path) -> Result<Vec<ActionRef>> {
-    let content =
-        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+pub fn scan_workflow(file: &WorkflowFile) -> Result<Vec<ActionRef>> {
+    let content = read_workflow(file)?;
     Ok(scan_content(&content))
 }
 
-/// Find all workflow files in a repository.
-pub fn find_workflows(repo_root: &Path) -> Result<Vec<PathBuf>> {
-    let github_dir = repo_root.join(".github");
-    let workflows_dir = repo_root.join(".github").join("workflows");
+pub fn read_workflow(file: &WorkflowFile) -> Result<String> {
+    let mut handle = open_workflow_file(file)?;
+    let mut content = String::new();
+    handle
+        .read_to_string(&mut content)
+        .with_context(|| format!("reading {}", file.path.display()))?;
+    Ok(content)
+}
 
-    if !is_real_directory(&github_dir)? || !is_real_directory(&workflows_dir)? {
+/// Find all workflow files in a repository.
+pub fn find_workflows(repo_root: &Path) -> Result<Vec<WorkflowFile>> {
+    let workflows = open_workflows_dir(repo_root)?;
+
+    let mut files = Vec::new();
+    let entries = Dir::read_from(&*workflows.fd)
+        .with_context(|| format!("reading {}", workflows.path.display()))?;
+    for entry in entries {
+        let entry = entry.with_context(|| format!("reading {}", workflows.path.display()))?;
+        let name = entry.file_name().to_bytes();
+        if name == b"." || name == b".." {
+            continue;
+        }
+        let name = std::ffi::OsStr::from_bytes(name).to_os_string();
+        let file = workflows.file(name);
+        if !is_workflow_file(file.path()) {
+            continue;
+        }
+
+        let file_type = workflow_entry_type(&workflows, &file)?;
+        if file_type.is_symlink() {
+            return Err(UnsafeWorkflowPath::symlinked_workflow_file(file.path()).into());
+        }
+        if file_type.is_file() {
+            files.push(file);
+        }
+    }
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(files)
+}
+
+fn open_workflows_dir(repo_root: &Path) -> Result<WorkflowDirectory> {
+    let root = open_repo_root(repo_root)?;
+    let github_path = repo_root.join(".github");
+    let Some(github) = open_child_dir(&root, ".github", &github_path)? else {
         anyhow::bail!(
             "No .github/workflows/ directory found in {}",
             repo_root.display()
         );
-    }
+    };
+    let workflows_path = github_path.join("workflows");
+    let Some(workflows) = open_child_dir(&github, "workflows", &workflows_path)? else {
+        anyhow::bail!(
+            "No .github/workflows/ directory found in {}",
+            repo_root.display()
+        );
+    };
 
-    let mut files = Vec::new();
-    for entry in std::fs::read_dir(&workflows_dir)
-        .with_context(|| format!("reading {}", workflows_dir.display()))?
-    {
-        let entry = entry?;
-        let path = entry.path();
-        if !is_workflow_file(&path) {
-            continue;
-        }
-
-        let file_type = entry
-            .file_type()
-            .with_context(|| format!("checking {}", path.display()))?;
-        if file_type.is_symlink() {
-            anyhow::bail!(
-                "Refusing to scan symlinked workflow file {}",
-                path.display()
-            );
-        }
-        if file_type.is_file() {
-            files.push(path);
-        }
-    }
-    files.sort();
-    Ok(files)
+    Ok(WorkflowDirectory {
+        path: workflows_path,
+        fd: Arc::new(workflows),
+    })
 }
 
-fn is_real_directory(path: &Path) -> Result<bool> {
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(e) => return Err(e).with_context(|| format!("checking {}", path.display())),
-    };
-    if metadata.file_type().is_symlink() {
-        anyhow::bail!("Refusing to scan symlinked directory {}", path.display());
+fn open_repo_root(repo_root: &Path) -> Result<File> {
+    openat_file(
+        rfs::CWD,
+        repo_root,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+    )
+    .with_context(|| format!("checking {}", repo_root.display()))
+}
+
+fn open_child_dir(parent: &File, name: &str, path: &Path) -> Result<Option<File>> {
+    match openat_file(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+    ) {
+        Ok(file) => Ok(Some(file)),
+        Err(e) if e == Errno::LOOP || path_is_symlink(path) => {
+            Err(UnsafeWorkflowPath::symlinked_directory(path).into())
+        }
+        Err(e) if e == Errno::NOENT || e == Errno::NOTDIR => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("checking {}", path.display())),
     }
-    Ok(metadata.is_dir())
+}
+
+fn path_is_symlink(path: &Path) -> bool {
+    fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_symlink())
+        .unwrap_or_default()
+}
+
+fn open_workflow_file(file: &WorkflowFile) -> Result<File> {
+    match openat_file(
+        &*file.dir,
+        file.name.as_os_str(),
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+    ) {
+        Ok(handle) => Ok(handle),
+        Err(e) if e == Errno::LOOP => {
+            Err(UnsafeWorkflowPath::symlinked_workflow_file(file.path()).into())
+        }
+        Err(e) => Err(e).with_context(|| format!("reading {}", file.path.display())),
+    }
+}
+
+fn workflow_entry_type(
+    workflows: &WorkflowDirectory,
+    file: &WorkflowFile,
+) -> Result<rfs::FileType> {
+    let stat = rfs::statat(
+        &*workflows.fd,
+        file.name.as_os_str(),
+        AtFlags::SYMLINK_NOFOLLOW,
+    )
+    .with_context(|| format!("checking {}", file.path.display()))?;
+    Ok(rfs::FileType::from_raw_mode(stat.st_mode))
+}
+
+fn openat_file<Fd: rustix::fd::AsFd, P: rustix::path::Arg>(
+    dirfd: Fd,
+    path: P,
+    flags: OFlags,
+) -> std::result::Result<File, Errno> {
+    rfs::openat(dirfd, path, flags, Mode::empty()).map(File::from)
+}
+
+fn create_openat_file<Fd: rustix::fd::AsFd, P: rustix::path::Arg>(
+    dirfd: Fd,
+    path: P,
+    flags: OFlags,
+) -> std::result::Result<File, Errno> {
+    rfs::openat(dirfd, path, flags, Mode::from_raw_mode(0o666)).map(File::from)
 }
 
 fn is_workflow_file(path: &Path) -> bool {
@@ -326,11 +471,10 @@ pub fn display_path(path: &Path, root: &Path) -> String {
 /// silently skipped so a caller bug can't corrupt a workflow by letting the
 /// later entry clobber the earlier one.
 pub fn rewrite_actions(
-    path: &Path,
+    file: &WorkflowFile,
     replacements: &[(usize, String)], // (line_number, new_line)
 ) -> Result<usize> {
-    let content =
-        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let content = read_workflow(file)?;
 
     // Preserve CRLF: `str::lines()` strips `\r`, so we'd otherwise rewrite the
     // whole file to LF.
@@ -349,7 +493,7 @@ pub fn rewrite_actions(
             debug_assert!(
                 false,
                 "duplicate rewrite target for line {line_num} in {}",
-                path.display()
+                file.path.display()
             );
             continue;
         }
@@ -367,25 +511,30 @@ pub fn rewrite_actions(
 
     // Write to a create-new sibling temp file and rename over the original so a
     // crash or full disk mid-write can't leave a truncated workflow behind.
-    let file_name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("workflow");
-    let (tmp, mut tmp_file) = create_rewrite_temp(path, file_name)?;
+    let file_name = file.name.as_os_str();
+    let (tmp, mut tmp_file) = create_rewrite_temp(file, file_name)?;
     if let Err(e) = tmp_file.write_all(output.as_bytes()) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e).with_context(|| format!("writing {}", tmp.display()));
+        let _ = remove_workflow_tmp(file, &tmp);
+        return Err(e).with_context(|| format!("writing {}", tmp_path(file, &tmp).display()));
     }
     drop(tmp_file);
 
-    if let Err(e) = std::fs::rename(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e).with_context(|| format!("replacing {}", path.display()));
+    if let Err(e) = rfs::renameat(
+        &*file.dir,
+        tmp.as_os_str(),
+        &*file.dir,
+        file.name.as_os_str(),
+    ) {
+        let _ = remove_workflow_tmp(file, &tmp);
+        return Err(e).with_context(|| format!("replacing {}", file.path.display()));
     }
     Ok(count)
 }
 
-fn create_rewrite_temp(path: &Path, file_name: &str) -> Result<(PathBuf, File)> {
+fn create_rewrite_temp(
+    file: &WorkflowFile,
+    file_name: &std::ffi::OsStr,
+) -> Result<(std::ffi::OsString, File)> {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -393,23 +542,59 @@ fn create_rewrite_temp(path: &Path, file_name: &str) -> Result<(PathBuf, File)> 
     let pid = std::process::id();
 
     for attempt in 0..100 {
-        let tmp = path.with_file_name(format!(".{file_name}.pinprick-tmp-{pid}-{nonce}-{attempt}"));
-        match OpenOptions::new().write(true).create_new(true).open(&tmp) {
+        let tmp = std::ffi::OsString::from(format!(
+            ".{}.pinprick-tmp-{pid}-{nonce}-{attempt}",
+            file_name.to_string_lossy()
+        ));
+        match create_openat_file(
+            &*file.dir,
+            tmp.as_os_str(),
+            OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        ) {
             Ok(file) => return Ok((tmp, file)),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(e).with_context(|| format!("creating {}", tmp.display())),
+            Err(e) if e == Errno::EXIST => continue,
+            Err(e) => {
+                return Err(e)
+                    .with_context(|| format!("creating {}", tmp_path(file, &tmp).display()));
+            }
         }
     }
 
     anyhow::bail!(
         "could not create a unique temporary workflow file next to {}",
-        path.display()
+        file.path.display()
     )
+}
+
+fn remove_workflow_tmp(
+    file: &WorkflowFile,
+    tmp: &std::ffi::OsStr,
+) -> std::result::Result<(), Errno> {
+    rfs::unlinkat(&*file.dir, tmp, AtFlags::empty())
+}
+
+fn tmp_path(file: &WorkflowFile, tmp: &std::ffi::OsStr) -> PathBuf {
+    file.path.with_file_name(tmp)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn workflow_path(root: &Path, name: &str) -> PathBuf {
+        root.join(".github").join("workflows").join(name)
+    }
+
+    fn write_temp_workflow(dir: &tempfile::TempDir, name: &str, content: &str) -> WorkflowFile {
+        let path = workflow_path(dir.path(), name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, content).unwrap();
+        find_workflows(dir.path())
+            .unwrap()
+            .into_iter()
+            .find(|file| file.path() == path)
+            .unwrap()
+    }
 
     // ── parse_uses_line ─────────────────────────────────────────────────
 
@@ -791,7 +976,7 @@ jobs:
         let files = find_workflows(dir.path()).unwrap();
         let names: Vec<_> = files
             .iter()
-            .map(|p| p.file_name().unwrap().to_str().unwrap())
+            .map(|p| p.path().file_name().unwrap().to_str().unwrap())
             .collect();
 
         assert_eq!(names, vec!["a.yaml", "b.yml"]);
@@ -837,16 +1022,44 @@ jobs:
         assert!(err.to_string().contains("symlinked directory"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn open_workflows_dir_rejects_symlinked_workflows_directory() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let github = dir.path().join(".github");
+        let outside = dir.path().join("outside-workflows");
+        std::fs::create_dir_all(&github).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, github.join("workflows")).unwrap();
+
+        let err = open_workflows_dir(dir.path()).unwrap_err();
+        assert!(err.to_string().contains("symlinked directory"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_workflow_rejects_file_swapped_to_symlink_after_discovery() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = write_temp_workflow(&dir, "ci.yml", "name: safe\n");
+        let outside = dir.path().join("outside.yml");
+        std::fs::write(&outside, "name: outside\n").unwrap();
+        std::fs::remove_file(file.path()).unwrap();
+        std::os::unix::fs::symlink(&outside, file.path()).unwrap();
+
+        let err = read_workflow(&file).unwrap_err();
+        assert!(is_unsafe_workflow_path(&err));
+        assert!(err.to_string().contains("symlinked workflow file"));
+    }
+
     // ── rewrite_actions ────────────────────────────────────────────────
 
     #[test]
     fn rewrite_preserves_trailing_newline() {
         let dir = tempfile::TempDir::new().unwrap();
-        let file = dir.path().join("test.yml");
-        std::fs::write(&file, "line1\nline2\n").unwrap();
+        let file = write_temp_workflow(&dir, "test.yml", "line1\nline2\n");
         let count = rewrite_actions(&file, &[(1, "replaced".to_string())]).unwrap();
         assert_eq!(count, 1);
-        let result = std::fs::read_to_string(&file).unwrap();
+        let result = std::fs::read_to_string(file.path()).unwrap();
         assert!(result.ends_with('\n'));
         assert_eq!(result, "replaced\nline2\n");
     }
@@ -854,30 +1067,27 @@ jobs:
     #[test]
     fn rewrite_preserves_crlf() {
         let dir = tempfile::TempDir::new().unwrap();
-        let file = dir.path().join("test.yml");
-        std::fs::write(&file, "line1\r\nline2\r\n").unwrap();
+        let file = write_temp_workflow(&dir, "test.yml", "line1\r\nline2\r\n");
         let count = rewrite_actions(&file, &[(1, "replaced".to_string())]).unwrap();
         assert_eq!(count, 1);
-        let result = std::fs::read_to_string(&file).unwrap();
+        let result = std::fs::read_to_string(file.path()).unwrap();
         assert_eq!(result, "replaced\r\nline2\r\n");
     }
 
     #[test]
     fn rewrite_no_trailing_newline() {
         let dir = tempfile::TempDir::new().unwrap();
-        let file = dir.path().join("test.yml");
-        std::fs::write(&file, "line1\nline2").unwrap();
+        let file = write_temp_workflow(&dir, "test.yml", "line1\nline2");
         let count = rewrite_actions(&file, &[(1, "replaced".to_string())]).unwrap();
         assert_eq!(count, 1);
-        let result = std::fs::read_to_string(&file).unwrap();
+        let result = std::fs::read_to_string(file.path()).unwrap();
         assert!(!result.ends_with('\n'));
     }
 
     #[test]
     fn rewrite_out_of_bounds_skipped() {
         let dir = tempfile::TempDir::new().unwrap();
-        let file = dir.path().join("test.yml");
-        std::fs::write(&file, "line1\n").unwrap();
+        let file = write_temp_workflow(&dir, "test.yml", "line1\n");
         let count = rewrite_actions(&file, &[(99, "nope".to_string())]).unwrap();
         assert_eq!(count, 0);
     }
@@ -885,8 +1095,7 @@ jobs:
     #[test]
     fn rewrite_empty_replacements() {
         let dir = tempfile::TempDir::new().unwrap();
-        let file = dir.path().join("test.yml");
-        std::fs::write(&file, "line1\n").unwrap();
+        let file = write_temp_workflow(&dir, "test.yml", "line1\n");
         let count = rewrite_actions(&file, &[]).unwrap();
         assert_eq!(count, 0);
     }
@@ -895,10 +1104,9 @@ jobs:
     #[test]
     fn rewrite_does_not_follow_preexisting_temp_symlink() {
         let dir = tempfile::TempDir::new().unwrap();
-        let file = dir.path().join("ci.yml");
+        let file = write_temp_workflow(&dir, "ci.yml", "      - uses: actions/checkout@v4\n");
         let victim = dir.path().join("victim.txt");
-        let old_tmp = dir.path().join(".ci.yml.pinprick-tmp");
-        std::fs::write(&file, "      - uses: actions/checkout@v4\n").unwrap();
+        let old_tmp = file.path().with_file_name(".ci.yml.pinprick-tmp");
         std::fs::write(&victim, "untouched").unwrap();
         std::os::unix::fs::symlink(&victim, &old_tmp).unwrap();
 
@@ -909,10 +1117,26 @@ jobs:
 
         assert_eq!(count, 1);
         assert_eq!(
-            std::fs::read_to_string(&file).unwrap(),
+            std::fs::read_to_string(file.path()).unwrap(),
             format!("{replacement}\n")
         );
         assert_eq!(std::fs::read_to_string(&victim).unwrap(), "untouched");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rewrite_rejects_file_swapped_to_symlink_before_read() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = write_temp_workflow(&dir, "ci.yml", "line1\n");
+        let outside = dir.path().join("outside.yml");
+        std::fs::write(&outside, "outside\n").unwrap();
+        std::fs::remove_file(file.path()).unwrap();
+        std::os::unix::fs::symlink(&outside, file.path()).unwrap();
+
+        let err = rewrite_actions(&file, &[(1, "replaced".to_string())]).unwrap_err();
+        assert!(is_unsafe_workflow_path(&err));
+        assert!(err.to_string().contains("symlinked workflow file"));
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "outside\n");
     }
 
     #[test]
@@ -920,8 +1144,7 @@ jobs:
     fn rewrite_duplicate_line_skipped_in_release() {
         // Release builds drop the duplicate instead of clobbering the earlier entry.
         let dir = tempfile::TempDir::new().unwrap();
-        let file = dir.path().join("test.yml");
-        std::fs::write(&file, "line1\nline2\n").unwrap();
+        let file = write_temp_workflow(&dir, "test.yml", "line1\nline2\n");
         let count = rewrite_actions(
             &file,
             &[
@@ -931,7 +1154,7 @@ jobs:
         )
         .unwrap();
         assert_eq!(count, 1);
-        let result = std::fs::read_to_string(&file).unwrap();
+        let result = std::fs::read_to_string(file.path()).unwrap();
         assert_eq!(result, "first\nline2\n");
     }
 
@@ -940,8 +1163,7 @@ jobs:
     #[should_panic(expected = "duplicate rewrite target")]
     fn rewrite_duplicate_line_panics_in_debug() {
         let dir = tempfile::TempDir::new().unwrap();
-        let file = dir.path().join("test.yml");
-        std::fs::write(&file, "line1\nline2\n").unwrap();
+        let file = write_temp_workflow(&dir, "test.yml", "line1\nline2\n");
         let _ = rewrite_actions(
             &file,
             &[(1, "first".to_string()), (1, "second".to_string())],

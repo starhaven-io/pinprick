@@ -1178,6 +1178,7 @@ dependencies = [
  "predicates",
  "regex",
  "reqwest",
+ "rustix",
  "semver",
  "serde",
  "serde_json",

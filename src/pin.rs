@@ -28,7 +28,7 @@ pub async fn run(repo_root: &Path, json: bool, apply: bool) -> Result<ExitCode> 
     let mut unpinnable = 0usize;
 
     for file in &files {
-        let display_name = workflow::display_path(file, repo_root);
+        let display_name = workflow::display_path(file.path(), repo_root);
         if !json {
             eprintln!("Scanning {display_name}...");
         }
@@ -42,7 +42,7 @@ pub async fn run(repo_root: &Path, json: bool, apply: bool) -> Result<ExitCode> 
                 RefType::Branch => {
                     unpinnable += 1;
                     report.skipped.push(PinSkip {
-                        file: workflow::display_path(file, repo_root),
+                        file: workflow::display_path(file.path(), repo_root),
                         action: format!("{}@{}", action.full_name(), action.ref_string),
                         reason: "branch ref — pin to a SHA manually".to_string(),
                         line: action.line_number,
@@ -98,7 +98,7 @@ pub async fn run(repo_root: &Path, json: bool, apply: bool) -> Result<ExitCode> 
                         Ok((sha, tag)) => {
                             if action.ref_type == RefType::SlidingTag {
                                 report.skipped.push(PinSkip {
-                                    file: workflow::display_path(file, repo_root),
+                                    file: workflow::display_path(file.path(), repo_root),
                                     action: format!("{}@{}", action.full_name(), action.ref_string),
                                     reason: format!("sliding tag, resolved to {tag}"),
                                     line: action.line_number,
@@ -109,7 +109,7 @@ pub async fn run(repo_root: &Path, json: bool, apply: bool) -> Result<ExitCode> 
                             {
                                 replacements.push((action.line_number, new_line));
                                 report.pinned.push(PinResult {
-                                    file: workflow::display_path(file, repo_root),
+                                    file: workflow::display_path(file.path(), repo_root),
                                     action: action.full_name(),
                                     old_ref: action.ref_string.clone(),
                                     sha,
@@ -121,7 +121,7 @@ pub async fn run(repo_root: &Path, json: bool, apply: bool) -> Result<ExitCode> 
                         Err(e) => {
                             unpinnable += 1;
                             report.skipped.push(PinSkip {
-                                file: workflow::display_path(file, repo_root),
+                                file: workflow::display_path(file.path(), repo_root),
                                 action: format!("{}@{}", action.full_name(), action.ref_string),
                                 reason: format!("{e}"),
                                 line: action.line_number,

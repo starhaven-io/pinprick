@@ -253,9 +253,8 @@ pub fn score_repo(repo_root: &Path, config: &Config) -> Result<(ScoreReport, Con
     let mut unique_actions: std::collections::BTreeSet<String> = Default::default();
 
     for file in &files {
-        let display = workflow::display_path(file, repo_root);
-        let content = std::fs::read_to_string(file)
-            .map_err(|e| anyhow::anyhow!("reading {}: {e}", file.display()))?;
+        let display = workflow::display_path(file.path(), repo_root);
+        let content = workflow::read_workflow(file)?;
 
         // Action-level findings (pin.*, source.*)
         for a in workflow::scan_content(&content) {
@@ -298,7 +297,7 @@ pub fn score_repo(repo_root: &Path, config: &Config) -> Result<(ScoreReport, Con
 
         // Runtime findings (runtime.*) — reuse the audit pipeline's shell
         // scanner on each `run:` block.
-        if let Ok(run_blocks) = audit::extract_run_blocks(file, &content) {
+        if let Ok(run_blocks) = audit::extract_run_blocks(file.path(), &content) {
             let mut collector = AuditCollector::new(false);
             for (line_offset, run_content) in &run_blocks {
                 audit::scan_shell_content(
@@ -452,9 +451,8 @@ async fn enrich_with_source_archived(
     let mut action_repo: BTreeMap<String, (String, String)> = BTreeMap::new();
 
     for file in &files {
-        let display = workflow::display_path(file, repo_root);
-        let content = std::fs::read_to_string(file)
-            .map_err(|e| anyhow::anyhow!("reading {}: {e}", file.display()))?;
+        let display = workflow::display_path(file.path(), repo_root);
+        let content = workflow::read_workflow(file)?;
         for a in workflow::scan_content(&content) {
             let action_ref = format!("{}@{}", a.full_name(), a.ref_string);
             action_repo
@@ -547,9 +545,8 @@ async fn enrich_with_source_advisory(
     let mut action_pins: BTreeMap<String, (String, String, String, RefType)> = BTreeMap::new();
 
     for file in &files {
-        let display = workflow::display_path(file, repo_root);
-        let content = std::fs::read_to_string(file)
-            .map_err(|e| anyhow::anyhow!("reading {}: {e}", file.display()))?;
+        let display = workflow::display_path(file.path(), repo_root);
+        let content = workflow::read_workflow(file)?;
         for a in workflow::scan_content(&content) {
             let action_ref = format!("{}@{}", a.full_name(), a.ref_string);
             action_pins.entry(action_ref.clone()).or_insert((
