@@ -435,9 +435,11 @@ fn join_continuations(content: &str) -> Vec<(usize, String)> {
         // A comment never continues onto the next line — a trailing backslash
         // is just comment text, so the next line is a new command. Joining it
         // into the comment would hide it from the scan.
-        let is_continuation =
-            trimmed_end.ends_with('\\') && !(pending.is_none() && is_shell_comment_line(raw));
-        let body = if is_continuation {
+        let backslash_continuation = trimmed_end.ends_with('\\');
+        let operator_continuation = ends_with_pipeline_operator(trimmed_end);
+        let is_continuation = (backslash_continuation || operator_continuation)
+            && !(pending.is_none() && is_shell_comment_line(raw));
+        let body = if backslash_continuation {
             &trimmed_end[..trimmed_end.len() - 1]
         } else {
             raw
@@ -459,6 +461,10 @@ fn join_continuations(content: &str) -> Vec<(usize, String)> {
         out.push(p);
     }
     out
+}
+
+fn ends_with_pipeline_operator(line: &str) -> bool {
+    line.ends_with('|') || line.ends_with("&&") || line.ends_with("||")
 }
 
 pub fn scan_shell_content(
@@ -1056,7 +1062,7 @@ fn select_source_files(
         };
         let kind = if relative == "action.yml" || relative == "action.yaml" {
             SourceFileKind::ActionYml
-        } else if path.ends_with(".js") || path.ends_with(".ts") {
+        } else if is_javascript_source(path) {
             SourceFileKind::JavaScript
         } else if path.ends_with(".py") {
             SourceFileKind::Python
@@ -1115,7 +1121,7 @@ fn collect_local_source_files(action_dir: &Path) -> Result<Vec<(PathBuf, SourceF
 fn source_file_kind(relative: &str) -> Option<SourceFileKind> {
     if relative == "action.yml" || relative == "action.yaml" {
         Some(SourceFileKind::ActionYml)
-    } else if relative.ends_with(".js") || relative.ends_with(".ts") {
+    } else if is_javascript_source(relative) {
         Some(SourceFileKind::JavaScript)
     } else if relative.ends_with(".py") {
         Some(SourceFileKind::Python)
@@ -1124,6 +1130,13 @@ fn source_file_kind(relative: &str) -> Option<SourceFileKind> {
     } else {
         None
     }
+}
+
+fn is_javascript_source(path: &str) -> bool {
+    path.ends_with(".js")
+        || path.ends_with(".ts")
+        || path.ends_with(".mjs")
+        || path.ends_with(".cjs")
 }
 
 fn local_action_dir(repo_root: &Path, action: &LocalActionRef) -> Result<PathBuf> {
@@ -1431,6 +1444,21 @@ more stuff
     }
 
     #[test]
+    fn join_continuations_merges_trailing_pipeline_operators() {
+        let joined = join_continuations(
+            "curl https://x.example/s.sh |\n  sh\necho ok &&\n  true\necho no ||\n  false\n",
+        );
+        assert_eq!(
+            joined,
+            vec![
+                (0, "curl https://x.example/s.sh | sh".into()),
+                (2, "echo ok && true".into()),
+                (4, "echo no || false".into()),
+            ]
+        );
+    }
+
+    #[test]
     fn join_continuations_leaves_unbroken_lines_alone() {
         let joined = join_continuations("echo one\necho two\n");
         assert_eq!(joined, vec![(0, "echo one".into()), (1, "echo two".into())]);
@@ -1458,6 +1486,23 @@ more stuff
         assert_eq!(c.findings.len(), 1);
         assert_eq!(c.findings[0].severity, "high");
         assert_eq!(c.findings[0].line, Some(1));
+    }
+
+    #[test]
+    fn shell_scan_catches_pipe_to_shell_after_pipeline_newline() {
+        let mut c = AuditCollector::new(true);
+        scan_shell_content(
+            "curl -fsSL https://example.com/releases/download/v1.2.3/install.sh |\n  bash\n",
+            "test.sh",
+            1,
+            "",
+            &mut c,
+            &DEFAULT_CONFIG,
+        );
+        assert_eq!(c.findings.len(), 1);
+        assert_eq!(c.findings[0].severity, "high");
+        assert!(c.findings[0].description.contains("piped to shell"));
+        assert!(c.allowed.is_empty());
     }
 
     #[test]
@@ -1608,6 +1653,52 @@ more stuff
             &DEFAULT_CONFIG,
         );
         assert_eq!(c.findings.len(), 1);
+        assert!(c.allowed.is_empty());
+    }
+
+    #[test]
+    fn js_scan_unversioned_got_and_http_get_are_findings() {
+        let mut c = AuditCollector::new(true);
+        scan_js_content(
+            r#"
+const a = await got("https://example.com/api/data");
+http.get("http://example.com/install.sh", cb);
+https.get("https://example.com/install.sh", cb);
+"#,
+            "test.js",
+            "",
+            &mut c,
+            &DEFAULT_CONFIG,
+        );
+        assert_eq!(c.findings.len(), 3);
+        assert!(c.allowed.is_empty());
+        assert!(
+            c.findings
+                .iter()
+                .any(|f| f.description.contains("got() request"))
+        );
+        assert!(
+            c.findings
+                .iter()
+                .any(|f| f.description.contains("http.get()"))
+        );
+    }
+
+    #[test]
+    fn js_scan_got_method_and_require_http_get_are_findings() {
+        let mut c = AuditCollector::new(true);
+        scan_js_content(
+            r#"
+const a = await got.get("https://example.com/api/data");
+const b = require("http").get("http://example.com/install.sh", cb);
+const d = require("node:https").get("https://example.com/install.sh", cb);
+"#,
+            "test.js",
+            "",
+            &mut c,
+            &DEFAULT_CONFIG,
+        );
+        assert_eq!(c.findings.len(), 3);
         assert!(c.allowed.is_empty());
     }
 
@@ -2281,6 +2372,8 @@ runs:
         let tree = vec![
             tree_entry("action.yml", "blob"),
             tree_entry("dist/index.js", "blob"), // bundled action code — kept
+            tree_entry("dist/index.mjs", "blob"),
+            tree_entry("src/main.cjs", "blob"),
             tree_entry("src/main.ts", "blob"),
             tree_entry("setup.py", "blob"),
             tree_entry("Dockerfile", "blob"),
@@ -2294,6 +2387,8 @@ runs:
             vec![
                 ("action.yml".to_string(), SourceFileKind::ActionYml),
                 ("dist/index.js".to_string(), SourceFileKind::JavaScript),
+                ("dist/index.mjs".to_string(), SourceFileKind::JavaScript),
+                ("src/main.cjs".to_string(), SourceFileKind::JavaScript),
                 ("src/main.ts".to_string(), SourceFileKind::JavaScript),
                 ("setup.py".to_string(), SourceFileKind::Python),
                 ("Dockerfile".to_string(), SourceFileKind::Dockerfile),
@@ -2352,9 +2447,20 @@ runs:
         let action_dir = dir.path().join(".github/actions/local");
         std::fs::create_dir_all(action_dir.join("node_modules/dep")).unwrap();
         std::fs::create_dir_all(action_dir.join("dist")).unwrap();
+        std::fs::create_dir_all(action_dir.join("src")).unwrap();
         std::fs::write(action_dir.join("action.yml"), "name: local\n").unwrap();
         std::fs::write(
+            action_dir.join("dist/helper.mjs"),
+            "fetch('https://example.com/x')",
+        )
+        .unwrap();
+        std::fs::write(
             action_dir.join("dist/index.js"),
+            "fetch('https://example.com/x')",
+        )
+        .unwrap();
+        std::fs::write(
+            action_dir.join("src/main.cjs"),
             "fetch('https://example.com/x')",
         )
         .unwrap();
@@ -2374,7 +2480,15 @@ runs:
                     .replace('\\', "/")
             })
             .collect();
-        assert_eq!(paths, vec!["action.yml", "dist/index.js"]);
+        assert_eq!(
+            paths,
+            vec![
+                "action.yml",
+                "dist/helper.mjs",
+                "dist/index.js",
+                "src/main.cjs"
+            ]
+        );
     }
 
     #[test]
