@@ -30,7 +30,7 @@ pub async fn run(
     let mut tag_sha_cache: HashMap<String, String> = HashMap::new();
 
     for file in &files {
-        let display_name = workflow::display_path(file, repo_root);
+        let display_name = workflow::display_path(file.path(), repo_root);
         if !json {
             eprintln!("Scanning {display_name}...");
         }
@@ -164,7 +164,7 @@ pub async fn run(
             }
 
             report.updates.push(UpdateResult {
-                file: workflow::display_path(file, repo_root),
+                file: workflow::display_path(file.path(), repo_root),
                 action: action.full_name(),
                 current_tag: current_tag.clone(),
                 current_sha: action.ref_string.clone(),

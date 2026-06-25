@@ -30,6 +30,7 @@ colored = "3"
 toml = "1"
 semver = "1"
 minisign-verify = "0.2.5"
+rustix = { version = "1", features = ["fs"] }
 
 [build-dependencies]
 serde = { version = "1", features = ["derive"] }

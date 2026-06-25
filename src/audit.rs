@@ -102,13 +102,14 @@ pub async fn run(
     let mut ignored = 0usize;
 
     for file in &files {
-        let display_name = workflow::display_path(file, repo_root);
+        let display_name = workflow::display_path(file.path(), repo_root);
         if !quiet {
             eprintln!("Scanning {display_name}");
         }
 
-        let content = match std::fs::read_to_string(file) {
+        let content = match workflow::read_workflow(file) {
             Ok(content) => content,
+            Err(e) if workflow::is_unsafe_workflow_path(&e) => return Err(e),
             Err(e) => {
                 // One unreadable/non-UTF-8 workflow shouldn't abort the scan.
                 eprintln!("  {} {display_name}: {e}", "skipped".yellow());
@@ -116,7 +117,7 @@ pub async fn run(
             }
         };
 
-        match extract_run_blocks(file, &content) {
+        match extract_run_blocks(file.path(), &content) {
             Ok(run_blocks) => {
                 for (line_offset, run_content) in &run_blocks {
                     scan_shell_content(
