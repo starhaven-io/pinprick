@@ -22,11 +22,11 @@ Verification is fail-closed. A missing or invalid signature — or a binary buil
 
 Each SHA was scanned for **unversioned runtime fetch patterns**. Specifically:
 
-- Shell: `curl`/`wget` to `/latest/` or unversioned URLs, `gh release download` without a tag, `go install @latest`, unpinned `pip`/`npm`
-- PowerShell: `Invoke-WebRequest`/`iwr`/`Invoke-RestMethod`/`irm` to `/latest/` or unversioned URLs
+- Shell: pipe-to-shell, `curl`/`wget` to `/latest/` or unversioned URLs, `gh release download` without a tag, unpinned `git clone`, `go install @latest`, and unpinned package installs
+- PowerShell: pipe-to-shell equivalents, `Invoke-WebRequest`/`iwr`/`Invoke-RestMethod`/`irm` to `/latest/` or unversioned URLs, and unpinned `Install-Module` / `Install-Script`
 - JavaScript: `fetch()`/`axios`/`got`/`http.get` to `/latest/` or unversioned URLs, `exec()`/`child_process` shelling out to `curl`
 - Python: `urllib.request.urlopen`/`requests.get` to `/latest/` or unversioned URLs, `subprocess` shelling out to `curl`/`wget`
-- Docker: `FROM :latest` or untagged, `curl`/`wget` in `RUN` instructions
+- Docker: `FROM :latest` or untagged, `curl`/`wget` in `RUN` instructions, and remote `ADD` sources
 
 ## What "audited" does NOT mean
 
@@ -55,5 +55,5 @@ To add a new entry to the audited-actions list:
 Each file is a JSON array:
 
 ```json
-[{ "sha": "de0fac2e4500dabe0009e67214ff5f5447ce83dd", "tag": "v6.0.2" }]
+[{ "sha": "9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0", "tag": "v7.0.0" }]
 ```

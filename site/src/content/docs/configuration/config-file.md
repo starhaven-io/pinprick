@@ -8,7 +8,7 @@ pinprick reads configuration from TOML files in two locations:
 1. **Global** — `~/.config/pinprick/config.toml`
 2. **Per-repo** — `.pinprick.toml` in the repository root
 
-Per-repo config overrides global config. Both are optional — pinprick uses sensible defaults.
+Per-repo config overrides global config as a whole file; fields are not merged. Both are optional — pinprick uses sensible defaults.
 
 ## Options
 
@@ -28,6 +28,9 @@ extra-data-formats = ["proto", "graphql"]
 # URL host exactly matches an entry is downgraded from a finding to an allowed
 # match. Case-insensitive.
 trusted-hosts = ["artifacts.example.com"]
+
+# Additional GitHub owners trusted for the zero-point source.unverified score note.
+trusted-owners = ["my-org"]
 
 # Suppress specific findings
 [ignore]
@@ -81,6 +84,12 @@ trusted-hosts = [
 - Package manager installs (`pip install foo`, `npm install foo`) — those are package registries, not HTTP hosts
 
 To suppress a specific pattern that `trusted-hosts` doesn't cover, use [`ignore.patterns`](#ignorepatterns) instead.
+
+### `trusted-owners`
+
+A list of GitHub owners to treat as trusted for the `source.unverified` scoring note. The baseline trusted set is `actions` and `github`; this setting extends that list for your own org or reviewed vendors.
+
+Matching is exact owner, case-insensitive. This option only affects the zero-point `source.unverified` note in `pinprick score`. It does not skip auditing, suppress runtime findings, or trust downloads from the owner.
 
 ### `ignore.actions`
 

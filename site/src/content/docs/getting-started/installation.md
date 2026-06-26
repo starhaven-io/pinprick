@@ -37,6 +37,12 @@ The `gnu` builds link against the system glibc. They are built on Ubuntu 24.04, 
 The musl binaries are statically linked, but pinprick makes HTTPS calls to the GitHub API and reads the host's trusted CA certificates at runtime. On Alpine, install them with `apk add ca-certificates`.
 :::
 
+## GitHub Action
+
+For CI audit runs without hand-rolling the install step, use [`starhaven-io/pinprick-action`](https://github.com/starhaven-io/pinprick-action). The action installs a pinned pinprick release, verifies the downloaded archive checksum, runs `pinprick audit`, and can upload SARIF to GitHub code scanning.
+
+See [GitHub Action](/getting-started/github-action/) for a SHA-pinned workflow example and input reference.
+
 ## Shell completions
 
 Generate completions for your shell:

@@ -1,6 +1,7 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" fill="none">
-  <circle cx="16" cy="8" r="5" fill="#e94560"/>
-  <line x1="16" y1="13" x2="16" y2="30" stroke="#e94560" stroke-width="2.5" stroke-linecap="round"/>
-  <line x1="16" y1="30" x2="14" y2="26" stroke="#e94560" stroke-width="2" stroke-linecap="round"/>
-  <line x1="16" y1="30" x2="18" y2="26" stroke="#e94560" stroke-width="2" stroke-linecap="round"/>
+<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 48 48" fill="none" role="img" aria-label="pinprick">
+  <rect width="48" height="48" rx="9" fill="#1c1a18" />
+  <path d="M11 15 L22 24 L11 33" stroke="#ef4444" stroke-width="6.4" stroke-linecap="round" stroke-linejoin="round" />
+  <circle cx="33" cy="15" r="5" fill="#f7f7f5" />
+  <path d="M29.6 16.6 L36.4 16.6 L34.7 29 L31.3 29 Z" fill="#f7f7f5" />
+  <path d="M31.3 29 L34.7 29 L33 39.5 Z" fill="#ef4444" />
 </svg>
