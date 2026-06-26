@@ -31,15 +31,17 @@ See [Audited Actions](/configuration/audited-actions) for details on how the lis
 
 ## Without a token
 
-When no GitHub token is available, audit scans only workflow `run:` blocks. Action source code is not fetched. This still catches the most common patterns (shell commands fetching unversioned resources) but misses JavaScript, Python, and Docker patterns inside actions.
+When no GitHub token is available, audit scans workflow `run:` blocks and local actions referenced with `uses: ./...`. Remote action source code is not fetched. This still catches the most common patterns in repository-owned workflow code, but misses JavaScript, Python, and Docker patterns inside remote actions.
 
 ## Output formats
 
 - Default: colored human-readable output with severity buckets
 - `--json`: machine-readable JSON for CI integration
 - `--sarif`: SARIF 2.1.0 for upload to GitHub code scanning
-- `--verbose`: also report _allowed_ matches (fetches that fired a rule but were dropped because the URL is versioned)
+- `--verbose`: also report _allowed_ matches (fetches that fired a rule but were dropped because the URL is versioned, data-shaped, piped to `jq`, checksum-verified, or matched by `trusted-hosts`)
 - `--no-repo-config`: ignore the scanned repository's `.pinprick.toml` and use the global config (or defaults)
+
+For GitHub Actions CI, [`starhaven-io/pinprick-action`](/getting-started/github-action/) wraps this command and optional SARIF upload.
 
 ## Auditing repositories you don't control
 
@@ -50,11 +52,11 @@ The scanned repository's own `.pinprick.toml` applies during an audit — `ignor
 ```
 $ pinprick audit
 Scanning .github/workflows/ci.yml
-  actions/checkout@de0fac2e audited (bundled)
-  actions/upload-artifact@bbbca2dd audited (bundled)
+  actions/checkout@9c091bb audited (bundled)
+  actions/upload-artifact@043fb46 audited (bundled)
 Scanning .github/workflows/release.yml
-  actions/attest@59d89421 audited (bundled)
-  rust-lang/crates-io-auth-action@bbd81622 audited (local cache)
+  actions/attest@59d8942 audited (bundled)
+  rust-lang/crates-io-auth-action@c6f97d4 audited (local cache)
   Fetching Homebrew/actions/setup-homebrew@main (unpinned)
 
 No runtime fetch risks found.

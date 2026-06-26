@@ -27,6 +27,9 @@ export default defineConfig({
       title: 'pinprick',
       description: 'GitHub Actions supply chain security.',
       favicon: '/favicon.svg',
+      logo: {
+        src: './src/assets/pinprick-logo.svg',
+      },
       customCss: ['./src/styles/custom.css'],
       lastUpdated: true,
       components: {
@@ -49,6 +52,7 @@ export default defineConfig({
           items: [
             { label: 'Introduction', slug: 'getting-started/introduction' },
             { label: 'Installation', slug: 'getting-started/installation' },
+            { label: 'GitHub Action', slug: 'getting-started/github-action' },
           ],
         },
         {

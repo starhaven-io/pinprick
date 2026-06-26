@@ -39,10 +39,10 @@ Matching is case-sensitive. Matching is against `owner/repo` only — subpaths a
 ```
 $ pinprick update
 .github/workflows/ci.yml
-  actions/checkout v4.1.0 -> v6.0.2
-    https://github.com/actions/checkout/releases/tag/v6.0.2
-  actions/setup-node v4.0.0 -> v6.3.0
-    https://github.com/actions/setup-node/releases/tag/v6.3.0
+  actions/checkout v4.1.0 -> v7.0.0
+    https://github.com/actions/checkout/releases/tag/v7.0.0
+  actions/setup-node v4.0.0 -> v6.4.0
+    https://github.com/actions/setup-node/releases/tag/v6.4.0
 
 2 updates available. Run with --write to apply.
 ```

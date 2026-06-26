@@ -39,6 +39,40 @@ To try unreleased changes from `main`:
 cargo install --git https://github.com/starhaven-io/pinprick
 ```
 
+### GitHub Action
+
+For CI audit runs, use the shipped [`starhaven-io/pinprick-action`](https://github.com/starhaven-io/pinprick-action). It installs a pinned pinprick release, verifies the archive checksum, runs `pinprick audit`, and can upload SARIF:
+
+```yaml
+name: GitHub Actions supply chain audit
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  pinprick:
+    runs-on: ubuntu-24.04
+    permissions:
+      security-events: write
+      contents: read
+      actions: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Run pinprick
+        uses: starhaven-io/pinprick-action@d52684fdf26c13aec4a37eb09029af8fd41b6f01 # v0.1.0
+```
+
+The action wraps `pinprick audit` only. Use the CLI directly for `pin`, `update`, and `score`. For console-mode pull request feedback, set `advanced-security: false`; see the action README for the full matrix.
+
 ## Usage
 
 All commands default to the current directory. Pass a path to target a different repository root. Use `--json` for machine-readable output.
@@ -65,7 +99,7 @@ pinprick audit
 # Target a specific repo
 pinprick audit /path/to/repo
 
-# Show every matched pattern, including ones that passed the version check
+# Show every matched pattern, including allowed matches
 pinprick audit --verbose
 
 # Emit SARIF 2.1.0 for GitHub code scanning
@@ -92,17 +126,17 @@ Resolve action tag references to full SHAs (dry-run by default):
 ```
 $ pinprick pin
 .github/workflows/ci.yml
-  actions/checkout @v4 -> @de0fac2e…ce83dd # v6.0.2
-  actions/upload-artifact @v4 -> @bbbca2dd…f024f # v7.0.0
+  actions/checkout @v7 -> @9c091bb21b7c… # v7.0.0
+  actions/upload-artifact @v7 -> @043fb46d1a93… # v7.0.1
 
-  ! actions/checkout@v4 -- sliding tag, resolved to v6.0.2
+  ! actions/checkout@v7 -- sliding tag, resolved to v7.0.0
   ! Homebrew/actions/setup-homebrew@main -- branch ref — pin to a SHA manually
 
 Would pin 2 actions across 1 file (2 skipped)
 Run with --write to apply.
 ```
 
-Sliding tags like `@v4` are resolved to their exact version. Branch refs like `@main` are flagged.
+Sliding tags like `@v7` are resolved to their exact version. Branch refs like `@main` are flagged.
 
 ### Update
 
@@ -111,7 +145,7 @@ Check pinned actions for newer releases (dry-run by default):
 ```
 $ pinprick update
 .github/workflows/ci.yml
-  actions/checkout  v4.1.0 -> v6.0.2
+  actions/checkout  v4.1.0 -> v7.0.0
 
 1 update available. Run with --write to apply.
 ```
@@ -196,26 +230,26 @@ Cache cleaned.
 
 ## What the audit detects
 
-| Category | Examples | Severity |
-|----------|----------|----------|
-| Pipe-to-shell | `curl`/`wget` piped to `sh`/`bash`/`python` (any URL) | High |
-| Pipe-to-shell | `bash <(curl ...)`, `bash -c "$(curl ...)"`, `eval "$(curl ...)"` | High |
-| Pipe-to-shell | PowerShell `iex (iwr ...)` / `Invoke-Expression (... DownloadString ...)` | High |
-| Shell | `curl`/`wget` to `/latest/` URLs | High |
-| Shell | `curl`/`wget` to unversioned URLs | Medium |
-| Shell | `gh release download` without a tag | Medium |
-| Shell | `git clone` without a pinned `--branch` ref (unless a `git checkout <sha>` follows within 3 lines) | Medium |
-| Shell | `go install @latest`, unpinned `pip`/`npm`/`cargo install`/`gem install` | Low |
-| PowerShell | `Invoke-WebRequest`/`iwr`/`irm` to `/latest/` URLs | High |
-| PowerShell | `Invoke-WebRequest`/`iwr`/`irm` to unversioned URLs | Medium |
-| JavaScript | `fetch()`/`axios`/`got` to `/latest/` URLs | High |
-| JavaScript | `exec("curl ...")`, `child_process` curl | High |
-| Python | `requests.get`/`urllib` to `/latest/` URLs | High |
-| Python | `subprocess` shelling out to `curl`/`wget` | High |
-| Docker | `FROM :latest` or untagged | High |
-| Docker | `RUN curl`/`wget` piped to a shell | High |
-| Docker | `curl`/`wget` in `RUN` instructions | Medium |
-| Docker | `ADD` with an `http(s)://` URL source | Medium |
+| Category      | Examples                                                                                           | Severity |
+| ------------- | -------------------------------------------------------------------------------------------------- | -------- |
+| Pipe-to-shell | `curl`/`wget` piped to `sh`/`bash`/`python` (any URL)                                              | High     |
+| Pipe-to-shell | `bash <(curl ...)`, `bash -c "$(curl ...)"`, `eval "$(curl ...)"`                                  | High     |
+| Pipe-to-shell | PowerShell `iex (iwr ...)` / `Invoke-Expression (... DownloadString ...)`                          | High     |
+| Shell         | `curl`/`wget` to `/latest/` URLs                                                                   | High     |
+| Shell         | `curl`/`wget` to unversioned URLs                                                                  | Medium   |
+| Shell         | `gh release download` without a tag                                                                | Medium   |
+| Shell         | `git clone` without a pinned `--branch` ref (unless a `git checkout <sha>` follows within 3 lines) | Medium   |
+| Shell         | `go install @latest`, unpinned `pip`/`npm`/`cargo install`/`gem install`                           | Low      |
+| PowerShell    | `Invoke-WebRequest`/`iwr`/`irm` to `/latest/` URLs                                                 | High     |
+| PowerShell    | `Invoke-WebRequest`/`iwr`/`irm` to unversioned URLs                                                | Medium   |
+| JavaScript    | `fetch()`/`axios`/`got` to `/latest/` URLs                                                         | High     |
+| JavaScript    | `exec("curl ...")`, `child_process` curl                                                           | High     |
+| Python        | `requests.get`/`urllib` to `/latest/` URLs                                                         | High     |
+| Python        | `subprocess` shelling out to `curl`/`wget`                                                         | High     |
+| Docker        | `FROM :latest` or untagged                                                                         | High     |
+| Docker        | `RUN curl`/`wget` piped to a shell                                                                 | High     |
+| Docker        | `curl`/`wget` in `RUN` instructions                                                                | Medium   |
+| Docker        | `ADD` with an `http(s)://` URL source                                                              | Medium   |
 
 Pipe-to-shell is flagged even when the URL is versioned — a piped payload is never written to disk, so it cannot be checksum-verified and the versioned path pins the URL but not the content.
 
@@ -225,11 +259,11 @@ Findings followed by checksum verification (`sha256sum`, `gpg --verify`, etc.) w
 
 ## Exit codes
 
-| Code | Meaning |
-|------|---------|
-| 0 | Clean — no findings, no pending updates |
-| 1 | Findings present (audit), score deductions present, or updates available (update dry-run) |
-| 2 | Error |
+| Code | Meaning                                                                                   |
+| ---- | ----------------------------------------------------------------------------------------- |
+| 0    | Clean — no findings, no pending updates                                                   |
+| 1    | Findings present (audit), score deductions present, or updates available (update dry-run) |
+| 2    | Error                                                                                     |
 
 ## Building
 
