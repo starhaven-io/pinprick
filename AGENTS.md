@@ -46,7 +46,7 @@ pinprick/
 
 ### Commands
 
-- `pinprick pin [PATH] [--write]` — Scan `.github/workflows/*.yml`, resolve action tag refs to full SHAs via GitHub API. Dry-run by default (exits 1 when there are unpinned actions). `--write` rewrites files with `@sha # tag` format. Skips already-pinned (SHA) refs. Warns on branch refs (`@main`) and sliding tags (`@v4`), resolving sliding tags to exact versions.
+- `pinprick pin [PATH] [--write]` — Scan workflow files, resolve action tag refs to full SHAs via GitHub API. Dry-run by default (exits 1 when there are unpinned actions). `--write` rewrites files with `@sha # tag` format. Skips already-pinned (SHA) refs. Warns on branch refs (`@main`) and sliding tags (`@v4`), resolving sliding tags to exact versions.
 - `pinprick update [PATH] [--write] [--only PATTERN]` — Check SHA-pinned actions for newer releases. Dry-run by default, `--write` to apply changes. `--only` restricts the check to actions whose `owner/repo` contains the given substring.
 - `pinprick audit [PATH] [--verbose] [--sarif]` — Scan for runtime fetch patterns that bypass pinning. Without a GitHub token, scans local `run:` blocks and local actions referenced with `uses: ./...`. With a token, also fetches and scans remote action source code (JS/TS, Python, Dockerfiles, action.yml). `--verbose` shows allowed matches. `--sarif` outputs SARIF 2.1.0 for GitHub code scanning.
 - `pinprick score [PATH] [--html]` — Compute a supply-chain posture score (0–100, letter grade A–F) for a repository's workflows. Implements the public rubric in `docs/scoring.md` (rubric v0.7.0). The offline rules (`pin.*`, `workflow.*`, `source.unverified`, `runtime.*`) need no token; with a token it additionally emits the token-gated `source.archived` and `source.advisory` rules. `runtime.*` rules reuse the `audit` shell pipeline against each workflow's `run:` blocks, distinguishing pipe-to-shell (-20) from severity-graded fetches (-15/-8/-3). `source.unverified` is an informational zero-point note — publisher outside the trusted baseline (`actions`, `github`) and the `trusted-owners` list in `.pinprick.toml`; it never affects the score or the gate. Exits 1 when any finding deducts points — zero-point informational notes never gate (matches `audit` for CI gating); outputs JSON with `--json` or a self-contained HTML report with `--html` (mutually exclusive with `--json`).
@@ -62,6 +62,12 @@ pinprick/
 ### YAML handling
 
 **Critical design decision:** workflow files are never round-tripped through a YAML parser for writing. `uses:` lines have a rigid single-line format — regex capture groups replace the ref while preserving leading whitespace, indentation, and surrounding comments. `serde_norway` is only used for read-only extraction of `run:` block contents during audit.
+
+### Workflow discovery
+
+`workflow::find_workflows` scans every forge root in `DEFAULT_FORGE_ROOTS` (`.github`, `.forgejo`, `.gitea`) for a `workflows/` subdirectory. Forgejo and Gitea use GitHub-compatible workflow syntax. Discovery is **purely additive**: each root that exists is scanned and the files are unioned, so extra roots only widen coverage. The list is a compile-time constant and is deliberately *not* configurable via `.pinprick.toml`: a scanned repo (which may be hostile, hence `--no-repo-config`) must never be able to redirect the scan to a decoy directory while real workflows hide in `.github/workflows`. Every root goes through the same symlink-refusing `open_child_dir` path, so a symlinked forge root is refused, never followed. GitLab is out of scope: `.gitlab-ci.yml` is a single file with a different schema and no `uses:` references.
+
+**Support tiers.** GitHub Actions is the first-class, fully supported target. Forgejo/Gitea support is incidental to GHA compatibility and best-effort: don't intentionally break it, but don't constrain a GitHub Actions improvement to preserve forge behavior either. When the two conflict, GHA wins. (Example: tag/release resolution is hardcoded to the github.com API, so `pin`/`update` only resolve github.com-hosted actions; that's an accepted limitation, not a bug to fix at GHA's expense.)
 
 ### GitHub auth
 

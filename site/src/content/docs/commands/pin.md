@@ -3,7 +3,9 @@ title: pin
 description: Resolve action tag references to full SHAs.
 ---
 
-Scan `.github/workflows/*.yml` files and resolve action tag references to full SHA-pinned references.
+Scan workflow files and resolve action tag references to full SHA-pinned references.
+
+Workflows are discovered under `.github/workflows/`, `.forgejo/workflows/`, and `.gitea/workflows/`; whichever exist are all scanned. Forgejo and Gitea use GitHub-compatible workflow syntax, so the same pinning applies. The set of forge roots is fixed and cannot be changed by a repository's `.pinprick.toml`, so a scanned repo can never redirect the scan away from `.github`. Tag resolution goes through the github.com API, so refs to actions hosted on a Forgejo or Gitea instance cannot be resolved; only github.com-hosted actions (the common case) are pinned.
 
 ```bash
 pinprick pin                # dry-run (show what would be pinned)

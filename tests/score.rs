@@ -143,7 +143,7 @@ fn no_workflows_directory_errors() {
         .arg(dir.path())
         .assert()
         .code(2)
-        .stderr(predicate::str::contains("No .github/workflows/"));
+        .stderr(predicate::str::contains("No workflow directory found"));
 }
 
 #[test]

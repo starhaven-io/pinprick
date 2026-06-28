@@ -351,9 +351,7 @@ fn missing_workflows_dir_exits_two() {
         .arg(dir.path())
         .assert()
         .code(2)
-        .stderr(predicate::str::contains(
-            "No .github/workflows/ directory found",
-        ));
+        .stderr(predicate::str::contains("No workflow directory found"));
 }
 
 #[test]
@@ -372,7 +370,7 @@ fn missing_workflows_dir_json() {
         json["error"]
             .as_str()
             .unwrap()
-            .contains("No .github/workflows/ directory found")
+            .contains("No workflow directory found")
     );
 }
 

@@ -77,6 +77,8 @@ The action wraps `pinprick audit` only. Use the CLI directly for `pin`, `update`
 
 All commands default to the current directory. Pass a path to target a different repository root. Use `--json` for machine-readable output.
 
+> **Forge support.** GitHub Actions is pinprick's first-class, fully supported target. Forgejo and Gitea run GitHub-compatible Actions, so workflows under `.forgejo/workflows/` and `.gitea/workflows/` are discovered and scanned alongside `.github/workflows/` (whichever exist are all scanned). That support is incidental to GHA compatibility and best-effort: we won't intentionally break it, but we also won't hold back a GitHub Actions improvement to preserve forge behavior. When the two conflict, GHA wins. Concretely today, `pin` and `update` resolve through the github.com API, so they handle github.com-hosted actions (the common case) but not actions hosted on a Forgejo or Gitea instance; `audit` and `score` need no network for their local rules.
+
 ```bash
 # Pin action tags to full SHAs
 pinprick pin
