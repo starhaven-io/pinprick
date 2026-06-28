@@ -84,7 +84,6 @@ re!(
 );
 
 re!(SH_GIT_CLONE, r"git\s+clone\s");
-re!(GIT_CHECKOUT_SHA, r"git\s+checkout\s+[0-9a-f]{40}\b");
 re!(
     SH_CARGO_INSTALL_UNVERSIONED,
     r"cargo\s+install\s+(?:-\S+\s+)*[a-zA-Z][a-zA-Z0-9_-]*(\s|$)"
@@ -425,22 +424,6 @@ pub fn has_checksum_verify(line: &str) -> bool {
     CHECKSUM_VERIFY.is_match(line)
 }
 
-// ── Fetch-to-jq detection ───────────────────────────────────────────────────
-
-// A pipe into `jq`. The trailing `\b` keeps `jqfoo` (and a path-qualified
-// `| /usr/bin/jq`, deliberately) from matching — erring toward flagging.
-re!(SH_PIPE_JQ, r"\|\s*jq\b");
-
-/// Whether a line pipes a fetch into `jq`. `jq` parses JSON and errors on
-/// anything else, so the fetched bytes are data, not executable code — the same
-/// rationale as the data-format-extension exemption, but for an API endpoint
-/// that carries no file extension (e.g. `https://crates.io/api/v1/crates/<x>`).
-/// Pipe-to-shell matches and pre-empts the URL rules, so a
-/// `curl … | jq … | bash` line never reaches this check.
-pub fn fetch_piped_to_jq(line: &str) -> bool {
-    SH_PIPE_JQ.is_match(line)
-}
-
 // ── URL version detection ───────────────────────────────────────────────────
 
 // Requires at least one dotted component (e.g. `v1.2`, `1.2.3`) so that a
@@ -596,11 +579,6 @@ pub fn git_clone_has_pinned_ref(line: &str) -> bool {
         return false;
     };
     ref_looks_versioned(&caps[1])
-}
-
-/// Check if a line contains a `git checkout <full-SHA>`.
-pub fn has_git_checkout_sha(line: &str) -> bool {
-    GIT_CHECKOUT_SHA.is_match(line)
 }
 
 /// The stage name a `FROM … AS <name>` line declares, lowercased. Tolerates a
@@ -1486,36 +1464,6 @@ mod tests {
         assert!(SH_PIPE_SHELL.is_match("curl https://x.example/c | jq -r .url | bash"));
     }
 
-    // ── fetch_piped_to_jq ──────────────────────────────────────────────
-
-    #[test]
-    fn fetch_piped_to_jq_matches() {
-        assert!(fetch_piped_to_jq(
-            r#"curl -fsSL "https://crates.io/api/v1/crates/typos-cli" | jq -r '.crate.max_stable_version'"#
-        ));
-        assert!(fetch_piped_to_jq(
-            "curl https://api.example.com/data | jq ."
-        ));
-        // No space after the pipe.
-        assert!(fetch_piped_to_jq(
-            "wget -qO- https://api.example.com/data |jq"
-        ));
-    }
-
-    #[test]
-    fn fetch_piped_to_jq_rejects_non_jq() {
-        assert!(!fetch_piped_to_jq(
-            "curl https://example.com/install.sh -o install.sh"
-        ));
-        assert!(!fetch_piped_to_jq(
-            "curl https://api.example.com/d | grep foo"
-        ));
-        // `jq` must be a whole word, not a prefix of another command.
-        assert!(!fetch_piped_to_jq(
-            "curl https://api.example.com/d | jqlang"
-        ));
-    }
-
     #[test]
     fn cmd_sub_bash_c_curl_matched() {
         assert!(
@@ -1726,23 +1674,6 @@ mod tests {
         assert!(!git_clone_has_pinned_ref(
             "git clone https://github.com/org/repo"
         ));
-    }
-
-    #[test]
-    fn git_checkout_sha_detected() {
-        assert!(has_git_checkout_sha(
-            "git checkout abcdef1234567890abcdef1234567890abcdef12"
-        ));
-    }
-
-    #[test]
-    fn git_checkout_branch_not_sha() {
-        assert!(!has_git_checkout_sha("git checkout main"));
-    }
-
-    #[test]
-    fn git_checkout_short_sha_not_matched() {
-        assert!(!has_git_checkout_sha("git checkout abc1234"));
     }
 
     // ── cargo/gem install patterns ─────────────────────────────────────

