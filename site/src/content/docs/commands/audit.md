@@ -5,6 +5,8 @@ description: Scan actions for runtime fetch patterns that bypass pinning.
 
 Scan workflow `run:` blocks and action source code for runtime fetch patterns that bypass SHA pinning.
 
+Workflows are discovered under `.github/workflows/`, `.forgejo/workflows/`, and `.gitea/workflows/` (whichever exist are all scanned). Forgejo and Gitea use GitHub-compatible workflow syntax.
+
 ```bash
 pinprick audit
 pinprick audit /path/to/repo

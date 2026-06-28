@@ -5,6 +5,8 @@ description: Check pinned actions for newer releases.
 
 Check SHA-pinned actions for newer releases and optionally update them.
 
+Workflows are discovered under `.github/workflows/`, `.forgejo/workflows/`, and `.gitea/workflows/` (whichever exist are all scanned). Forgejo and Gitea use GitHub-compatible workflow syntax. Release checks go through the github.com API, so actions hosted on a Forgejo or Gitea instance cannot be checked; only github.com-hosted actions (the common case).
+
 ```bash
 pinprick update                       # dry-run (show available updates)
 pinprick update --write               # write updates to files

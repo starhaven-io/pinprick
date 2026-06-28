@@ -5,6 +5,8 @@ description: Compute a posture grade for a repository's Actions supply chain.
 
 Compute a single posture score (0–100, letter grade A–F) for a repository's GitHub Actions configuration. Implements the public [scoring rubric](https://github.com/starhaven-io/pinprick/blob/main/docs/scoring.md) — every point deducted maps to a named rule, so the grade can be re-derived by hand from the finding list.
 
+Workflows are discovered under `.github/workflows/`, `.forgejo/workflows/`, and `.gitea/workflows/` (whichever exist are all scanned). Forgejo and Gitea use GitHub-compatible workflow syntax.
+
 ```bash
 pinprick score
 pinprick score /path/to/repo

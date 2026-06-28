@@ -324,58 +324,96 @@ pub fn read_workflow(file: &WorkflowFile) -> Result<String> {
     Ok(content)
 }
 
-/// Find all workflow files in a repository.
+/// Forge roots scanned for a `workflows/` subdirectory. GitHub (`.github`),
+/// Forgejo (`.forgejo`), and Gitea (`.gitea`) all use byte-compatible workflow
+/// syntax, so the same `uses:`/`run:` scanning applies to each.
+///
+/// This list is a compile-time constant on purpose: the scanned repository's
+/// `.pinprick.toml` cannot influence it. Discovery is purely additive: every
+/// root that exists is scanned and the results are unioned, so a hostile repo
+/// can never redirect the scan to a decoy directory while real workflows hide
+/// in another. Extra roots can only widen coverage, never narrow it.
+///
+/// GitHub Actions is the first-class target; Forgejo/Gitea support is
+/// incidental to GHA compatibility and best-effort.
+pub const DEFAULT_FORGE_ROOTS: &[&str] = &[".github", ".forgejo", ".gitea"];
+
+/// Find all workflow files in a repository, scanning every default forge root.
 pub fn find_workflows(repo_root: &Path) -> Result<Vec<WorkflowFile>> {
-    let workflows = open_workflows_dir(repo_root)?;
+    find_workflows_in(repo_root, DEFAULT_FORGE_ROOTS)
+}
+
+/// Find all workflow files under the given forge roots (e.g. `.github`,
+/// `.forgejo`). Each `<root>/workflows/` directory that exists is scanned and
+/// the files are merged and sorted. It is an error for *none* of the roots to
+/// contain a `workflows/` directory.
+fn find_workflows_in(repo_root: &Path, forge_roots: &[&str]) -> Result<Vec<WorkflowFile>> {
+    let dirs = open_workflows_dirs(repo_root, forge_roots)?;
 
     let mut files = Vec::new();
-    let entries = Dir::read_from(&*workflows.fd)
-        .with_context(|| format!("reading {}", workflows.path.display()))?;
-    for entry in entries {
-        let entry = entry.with_context(|| format!("reading {}", workflows.path.display()))?;
-        let name = entry.file_name().to_bytes();
-        if name == b"." || name == b".." {
-            continue;
-        }
-        let name = std::ffi::OsStr::from_bytes(name).to_os_string();
-        let file = workflows.file(name);
-        if !is_workflow_file(file.path()) {
-            continue;
-        }
+    for workflows in &dirs {
+        let entries = Dir::read_from(&*workflows.fd)
+            .with_context(|| format!("reading {}", workflows.path.display()))?;
+        for entry in entries {
+            let entry = entry.with_context(|| format!("reading {}", workflows.path.display()))?;
+            let name = entry.file_name().to_bytes();
+            if name == b"." || name == b".." {
+                continue;
+            }
+            let name = std::ffi::OsStr::from_bytes(name).to_os_string();
+            let file = workflows.file(name);
+            if !is_workflow_file(file.path()) {
+                continue;
+            }
 
-        let file_type = workflow_entry_type(&workflows, &file)?;
-        if file_type.is_symlink() {
-            return Err(UnsafeWorkflowPath::symlinked_workflow_file(file.path()).into());
-        }
-        if file_type.is_file() {
-            files.push(file);
+            let file_type = workflow_entry_type(workflows, &file)?;
+            if file_type.is_symlink() {
+                return Err(UnsafeWorkflowPath::symlinked_workflow_file(file.path()).into());
+            }
+            if file_type.is_file() {
+                files.push(file);
+            }
         }
     }
     files.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(files)
 }
 
-fn open_workflows_dir(repo_root: &Path) -> Result<WorkflowDirectory> {
+/// Open the `workflows/` directory under each existing forge root. Roots that
+/// are absent are silently skipped; a root present but symlinked is refused
+/// loudly (it is never followed). Bails if no root yields a `workflows/`
+/// directory.
+fn open_workflows_dirs(repo_root: &Path, forge_roots: &[&str]) -> Result<Vec<WorkflowDirectory>> {
     let root = open_repo_root(repo_root)?;
-    let github_path = repo_root.join(".github");
-    let Some(github) = open_child_dir(&root, ".github", &github_path)? else {
-        anyhow::bail!(
-            "No .github/workflows/ directory found in {}",
-            repo_root.display()
-        );
-    };
-    let workflows_path = github_path.join("workflows");
-    let Some(workflows) = open_child_dir(&github, "workflows", &workflows_path)? else {
-        anyhow::bail!(
-            "No .github/workflows/ directory found in {}",
-            repo_root.display()
-        );
-    };
+    let mut dirs = Vec::new();
+    for forge in forge_roots {
+        let forge_path = repo_root.join(forge);
+        let Some(forge_dir) = open_child_dir(&root, forge, &forge_path)? else {
+            continue;
+        };
+        let workflows_path = forge_path.join("workflows");
+        let Some(workflows) = open_child_dir(&forge_dir, "workflows", &workflows_path)? else {
+            continue;
+        };
+        dirs.push(WorkflowDirectory {
+            path: workflows_path,
+            fd: Arc::new(workflows),
+        });
+    }
 
-    Ok(WorkflowDirectory {
-        path: workflows_path,
-        fd: Arc::new(workflows),
-    })
+    if dirs.is_empty() {
+        let looked_for = forge_roots
+            .iter()
+            .map(|r| format!("{r}/workflows/"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        anyhow::bail!(
+            "No workflow directory found in {} (looked for {looked_for})",
+            repo_root.display()
+        );
+    }
+
+    Ok(dirs)
 }
 
 fn open_repo_root(repo_root: &Path) -> Result<File> {
@@ -1024,7 +1062,7 @@ jobs:
 
     #[cfg(unix)]
     #[test]
-    fn open_workflows_dir_rejects_symlinked_workflows_directory() {
+    fn open_workflows_dirs_rejects_symlinked_workflows_directory() {
         let dir = tempfile::TempDir::new().unwrap();
         let github = dir.path().join(".github");
         let outside = dir.path().join("outside-workflows");
@@ -1032,7 +1070,70 @@ jobs:
         std::fs::create_dir_all(&outside).unwrap();
         std::os::unix::fs::symlink(&outside, github.join("workflows")).unwrap();
 
-        let err = open_workflows_dir(dir.path()).unwrap_err();
+        let err = open_workflows_dirs(dir.path(), DEFAULT_FORGE_ROOTS).unwrap_err();
+        assert!(err.to_string().contains("symlinked directory"));
+    }
+
+    #[test]
+    fn find_workflows_scans_forgejo_root() {
+        // A Forgejo/Gitea repo with no `.github` at all is still scanned.
+        let dir = tempfile::TempDir::new().unwrap();
+        let workflows = dir.path().join(".forgejo").join("workflows");
+        std::fs::create_dir_all(&workflows).unwrap();
+        std::fs::write(workflows.join("ci.yml"), "").unwrap();
+
+        let files = find_workflows(dir.path()).unwrap();
+        let names: Vec<_> = files
+            .iter()
+            .map(|p| display_path(p.path(), dir.path()))
+            .collect();
+        assert_eq!(names, vec![".forgejo/workflows/ci.yml"]);
+    }
+
+    #[test]
+    fn find_workflows_unions_multiple_forge_roots() {
+        // A repo mirrored across forges keeps workflows in several roots; every
+        // existing root is scanned and the results merged (additive discovery).
+        let dir = tempfile::TempDir::new().unwrap();
+        for (root, name) in [(".github", "gh.yml"), (".gitea", "gitea.yml")] {
+            let workflows = dir.path().join(root).join("workflows");
+            std::fs::create_dir_all(&workflows).unwrap();
+            std::fs::write(workflows.join(name), "").unwrap();
+        }
+
+        let files = find_workflows(dir.path()).unwrap();
+        let names: Vec<_> = files
+            .iter()
+            .map(|p| display_path(p.path(), dir.path()))
+            .collect();
+        assert_eq!(
+            names,
+            vec![".gitea/workflows/gitea.yml", ".github/workflows/gh.yml"]
+        );
+    }
+
+    #[test]
+    fn find_workflows_error_lists_all_forge_roots() {
+        // With no workflow directory anywhere, the error names every root tried
+        // so the user knows a Forgejo/Gitea layout is also supported.
+        let dir = tempfile::TempDir::new().unwrap();
+        let err = find_workflows(dir.path()).unwrap_err().to_string();
+        assert!(err.contains(".github/workflows/"));
+        assert!(err.contains(".forgejo/workflows/"));
+        assert!(err.contains(".gitea/workflows/"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn find_workflows_rejects_symlinked_forgejo_directory() {
+        // The v0.18.0 symlink hardening applies to every forge root, not just
+        // `.github`: a symlinked `.forgejo` is refused, never followed.
+        let dir = tempfile::TempDir::new().unwrap();
+        let outside = dir.path().join("outside-forgejo");
+        std::fs::create_dir_all(outside.join("workflows")).unwrap();
+        std::os::unix::fs::symlink(&outside, dir.path().join(".forgejo")).unwrap();
+
+        let err = find_workflows(dir.path()).unwrap_err();
         assert!(err.to_string().contains("symlinked directory"));
     }
 
