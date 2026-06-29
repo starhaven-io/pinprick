@@ -15,6 +15,8 @@ const CATALOG_PUBKEY_FILE: &str = include_str!("../catalog-minisign.pub");
 
 #[derive(Deserialize)]
 struct AuditedEntry {
+    #[serde(default)]
+    action: Option<String>,
     sha: String,
     #[serde(default)]
     pinprick_version: Option<String>,
@@ -91,8 +93,14 @@ impl AuditedActions {
 
     /// Check if an action at a specific SHA has been pre-audited. Returns
     /// which lookup layer satisfied the check, or `None` if no layer matched.
-    pub async fn check(&mut self, owner: &str, repo: &str, sha: &str) -> Option<AuditSource> {
-        let key = format!("{owner}/{repo}");
+    pub async fn check(
+        &mut self,
+        owner: &str,
+        repo: &str,
+        subpath: Option<&str>,
+        sha: &str,
+    ) -> Option<AuditSource> {
+        let key = action_key(owner, repo, subpath)?;
 
         if self
             .bundled
@@ -103,7 +111,7 @@ impl AuditedActions {
         }
 
         if !self.local.contains_key(&key) {
-            let shas = self.load_local_cache(owner, repo);
+            let shas = self.load_local_cache(owner, repo, &key);
             self.local.insert(key.clone(), shas);
         }
         if self.local.get(&key).is_some_and(|shas| shas.contains(sha)) {
@@ -124,7 +132,14 @@ impl AuditedActions {
     }
 
     /// Record a clean scan result in the local cache.
-    pub fn cache_clean(&self, owner: &str, repo: &str, sha: &str, tag: &str) {
+    pub fn cache_clean(
+        &self,
+        owner: &str,
+        repo: &str,
+        subpath: Option<&str>,
+        sha: &str,
+        tag: &str,
+    ) {
         let Some(cache_dir) = &self.cache_dir else {
             return;
         };
@@ -132,6 +147,9 @@ impl AuditedActions {
             return;
         };
         let dir = cache_dir.join(owner);
+        let Some(key) = action_key(owner, repo, subpath) else {
+            return;
+        };
 
         let mut entries: Vec<serde_json::Value> = std::fs::read_to_string(&path)
             .ok()
@@ -145,16 +163,18 @@ impl AuditedActions {
         // the file from accumulating dead entries.
         entries.retain(|e| {
             e.get("pinprick_version").and_then(|v| v.as_str()) == Some(LOCAL_CACHE_PINPRICK_VERSION)
+                && e.get("action").and_then(|v| v.as_str()).is_some()
         });
 
-        if entries
-            .iter()
-            .any(|e| e.get("sha").and_then(|s| s.as_str()) == Some(sha))
-        {
+        if entries.iter().any(|e| {
+            e.get("action").and_then(|v| v.as_str()) == Some(key.as_str())
+                && e.get("sha").and_then(|s| s.as_str()) == Some(sha)
+        }) {
             return;
         }
 
         entries.push(serde_json::json!({
+            "action": key,
             "sha": sha,
             "tag": tag,
             "pinprick_version": LOCAL_CACHE_PINPRICK_VERSION
@@ -167,7 +187,7 @@ impl AuditedActions {
         }
     }
 
-    fn load_local_cache(&self, owner: &str, repo: &str) -> HashSet<String> {
+    fn load_local_cache(&self, owner: &str, repo: &str, key: &str) -> HashSet<String> {
         let Some(cache_dir) = &self.cache_dir else {
             return HashSet::new();
         };
@@ -177,7 +197,7 @@ impl AuditedActions {
         let Ok(content) = std::fs::read_to_string(path) else {
             return HashSet::new();
         };
-        parse_local_cache_entries(&content)
+        parse_local_cache_entries(&content, key)
     }
 
     async fn fetch_remote_list(&self, action_key: &str) -> Option<HashSet<String>> {
@@ -260,11 +280,12 @@ fn parse_entries(json: &str) -> HashSet<String> {
     entries.into_iter().map(|e| e.sha).collect()
 }
 
-fn parse_local_cache_entries(json: &str) -> HashSet<String> {
+fn parse_local_cache_entries(json: &str, key: &str) -> HashSet<String> {
     let entries: Vec<AuditedEntry> = serde_json::from_str(json).unwrap_or_default();
     entries
         .into_iter()
         .filter(|e| e.pinprick_version.as_deref() == Some(LOCAL_CACHE_PINPRICK_VERSION))
+        .filter(|e| e.action.as_deref() == Some(key))
         .map(|e| e.sha)
         .collect()
 }
@@ -293,6 +314,21 @@ fn cache_path(cache_dir: &Path, owner: &str, repo: &str) -> Option<PathBuf> {
         .then(|| cache_dir.join(owner).join(format!("{repo}.json")))
 }
 
+fn action_key(owner: &str, repo: &str, subpath: Option<&str>) -> Option<String> {
+    if !is_safe_segment(owner) || !is_safe_segment(repo) {
+        return None;
+    }
+    match subpath {
+        Some(subpath) if is_safe_subpath(subpath) => Some(format!("{owner}/{repo}/{subpath}")),
+        Some(_) => None,
+        None => Some(format!("{owner}/{repo}")),
+    }
+}
+
+fn is_safe_subpath(path: &str) -> bool {
+    !path.is_empty() && path.split('/').all(is_safe_segment)
+}
+
 fn is_safe_segment(s: &str) -> bool {
     !s.is_empty() && s != "." && s != ".." && !s.contains(['/', '\\'])
 }
@@ -313,6 +349,20 @@ mod tests {
         for s in ["", ".", "..", "a/b", "a\\b", "/etc", "..\\.."] {
             assert!(!is_safe_segment(s), "{s} should be rejected");
         }
+    }
+
+    #[test]
+    fn action_key_rejects_unsafe_subpath_components() {
+        assert_eq!(
+            action_key("owner", "repo", Some("a/b.c")),
+            Some("owner/repo/a/b.c".to_string())
+        );
+
+        for subpath in ["", ".", "..", "a//b", "a/../b", r"a\\b"] {
+            assert_eq!(action_key("owner", "repo", Some(subpath)), None);
+        }
+        assert_eq!(action_key("owner/name", "repo", Some("a")), None);
+        assert_eq!(action_key("owner", "repo/name", Some("a")), None);
     }
 
     #[test]
@@ -365,18 +415,60 @@ mod tests {
   { "sha": "aaa", "tag": "v1" }
 ]"#;
         assert!(parse_entries(rendered).contains("aaa"));
-        assert!(!parse_local_cache_entries(rendered).contains("aaa"));
+        assert!(!parse_local_cache_entries(rendered, "owner/repo").contains("aaa"));
     }
 
     #[test]
-    fn local_cache_accepts_current_version_entries() {
+    fn local_cache_ignores_owner_repo_only_entries() {
         let rendered = serde_json::to_string(&vec![serde_json::json!({
             "sha": "aaa",
             "tag": "v1",
             "pinprick_version": LOCAL_CACHE_PINPRICK_VERSION
         })])
         .unwrap();
-        assert!(parse_local_cache_entries(&rendered).contains("aaa"));
+        assert!(!parse_local_cache_entries(&rendered, "owner/repo").contains("aaa"));
+    }
+
+    #[test]
+    fn local_cache_accepts_current_version_entries() {
+        let rendered = serde_json::to_string(&vec![serde_json::json!({
+            "action": "owner/repo",
+            "sha": "aaa",
+            "tag": "v1",
+            "pinprick_version": LOCAL_CACHE_PINPRICK_VERSION
+        })])
+        .unwrap();
+        assert!(parse_local_cache_entries(&rendered, "owner/repo").contains("aaa"));
+        assert!(!parse_local_cache_entries(&rendered, "owner/repo/subdir").contains("aaa"));
+    }
+
+    #[test]
+    fn local_cache_separates_subpath_verdicts() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut aa = AuditedActions::new(false);
+        aa.cache_dir = Some(dir.path().to_path_buf());
+
+        aa.cache_clean("owner", "repo", Some("a"), "aaa", "v1");
+
+        assert!(
+            aa.load_local_cache("owner", "repo", "owner/repo/a")
+                .contains("aaa")
+        );
+        assert!(
+            !aa.load_local_cache("owner", "repo", "owner/repo/b")
+                .contains("aaa")
+        );
+
+        aa.cache_clean("owner", "repo", Some("b"), "aaa", "v1");
+        assert!(
+            aa.load_local_cache("owner", "repo", "owner/repo/b")
+                .contains("aaa")
+        );
+
+        let path = cache_path(dir.path(), "owner", "repo").unwrap();
+        let on_disk: Vec<serde_json::Value> =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(on_disk.len(), 2);
     }
 
     #[test]
@@ -393,12 +485,18 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, r#"[{ "sha": "aaa", "tag": "v1" }]"#).unwrap();
         // Pre-state: the legacy entry is invisible to the reader.
-        assert!(!aa.load_local_cache("owner", "repo").contains("aaa"));
+        assert!(
+            !aa.load_local_cache("owner", "repo", "owner/repo")
+                .contains("aaa")
+        );
 
-        aa.cache_clean("owner", "repo", "aaa", "v1");
+        aa.cache_clean("owner", "repo", None, "aaa", "v1");
 
         // The SHA is now cached under the current version…
-        assert!(aa.load_local_cache("owner", "repo").contains("aaa"));
+        assert!(
+            aa.load_local_cache("owner", "repo", "owner/repo")
+                .contains("aaa")
+        );
         // …and the stale legacy entry was pruned rather than duplicated.
         let on_disk: Vec<serde_json::Value> =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
@@ -593,11 +691,34 @@ mod tests {
             aa.cache_dir = None; // don't consult the real ~/.cache during the test
             // Not bundled, no local cache hit → resolved by the remote layer.
             assert_eq!(
-                aa.check("some", "action", "feedface").await,
+                aa.check("some", "action", None, "feedface").await,
                 Some(AuditSource::Remote)
             );
             // A SHA the remote list doesn't contain stays unaudited.
-            assert_eq!(aa.check("some", "action", "0000").await, None);
+            assert_eq!(aa.check("some", "action", None, "0000").await, None);
+        }
+
+        #[tokio::test]
+        async fn check_uses_subpath_remote_identity() {
+            let (key, sign) = test_identity();
+            let body = serde_json::to_string(&json!([{ "sha": "feedface", "tag": "v3" }])).unwrap();
+
+            let server = MockServer::start().await;
+            mount_signed(&server, "some/action/a", &body, &sign(body.as_bytes())).await;
+
+            let mut aa = AuditedActions::new(true);
+            aa.catalog_key = Some(key);
+            aa.remote_url = server.uri();
+            aa.cache_dir = None;
+
+            assert_eq!(
+                aa.check("some", "action", Some("b"), "feedface").await,
+                None
+            );
+            assert_eq!(
+                aa.check("some", "action", Some("a"), "feedface").await,
+                Some(AuditSource::Remote)
+            );
         }
     }
 }
