@@ -1857,14 +1857,20 @@ fn local_action_dir(repo_root: &Path, action: &LocalActionRef) -> Result<PathBuf
     let Some(rel) = action.path.strip_prefix("./") else {
         anyhow::bail!("local action path must start with ./");
     };
+    let rel_path = Path::new(rel);
     if rel.is_empty()
-        || !Path::new(rel)
+        || !rel_path
             .components()
             .all(|c| matches!(c, Component::Normal(_)))
     {
         anyhow::bail!("local action path escapes the repository");
     }
-    Ok(repo_root.join(rel))
+
+    let action_dir = repo_root.join(rel);
+    if workflow::open_child_dir_path(repo_root, rel_path)?.is_none() {
+        anyhow::bail!("{} is not a directory", action_dir.display());
+    }
+    Ok(action_dir)
 }
 
 fn scan_local_action_source(
@@ -1874,10 +1880,6 @@ fn scan_local_action_source(
     config: &Config,
 ) -> Result<ActionScanStatus> {
     let action_dir = local_action_dir(repo_root, action)?;
-    if !action_dir.is_dir() {
-        anyhow::bail!("{} is not a directory", action_dir.display());
-    }
-
     let mut targets = collect_local_source_files(&action_dir)?;
     force_include_local_action_entrypoints(&action_dir, &mut targets);
     if targets.is_empty() {
@@ -3355,6 +3357,30 @@ runs:
         assert!(
             scan_local_action_source(dir.path(), &action, &mut collector, &DEFAULT_CONFIG).is_err()
         );
+    }
+
+    #[test]
+    fn scan_local_action_source_rejects_symlinked_action_root() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        std::fs::write(outside.path().join("action.yml"), "name: outside\n").unwrap();
+        let actions_dir = dir.path().join(".github/actions");
+        std::fs::create_dir_all(&actions_dir).unwrap();
+        std::os::unix::fs::symlink(outside.path(), actions_dir.join("local")).unwrap();
+
+        let action = LocalActionRef {
+            path: "./.github/actions/local".to_string(),
+            line_number: 1,
+        };
+        let mut collector = AuditCollector::new(false);
+        let err = scan_local_action_source(dir.path(), &action, &mut collector, &DEFAULT_CONFIG)
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("Refusing to scan symlinked directory")
+        );
+        assert!(collector.findings.is_empty());
     }
 
     #[test]

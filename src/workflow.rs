@@ -416,6 +416,27 @@ fn open_workflows_dirs(repo_root: &Path, forge_roots: &[&str]) -> Result<Vec<Wor
     Ok(dirs)
 }
 
+pub fn open_child_dir_path(repo_root: &Path, rel: &Path) -> Result<Option<File>> {
+    let mut current = open_repo_root(repo_root)?;
+    let mut display_path = repo_root.to_path_buf();
+
+    for component in rel.components() {
+        let Component::Normal(name) = component else {
+            anyhow::bail!("child path escapes the repository");
+        };
+        let Some(name) = name.to_str() else {
+            anyhow::bail!("child path contains non-UTF-8 components");
+        };
+        display_path.push(name);
+        let Some(next) = open_child_dir(&current, name, &display_path)? else {
+            return Ok(None);
+        };
+        current = next;
+    }
+
+    Ok(Some(current))
+}
+
 fn open_repo_root(repo_root: &Path) -> Result<File> {
     openat_file(
         rfs::CWD,
