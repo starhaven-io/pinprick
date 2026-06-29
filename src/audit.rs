@@ -168,7 +168,7 @@ pub async fn run(
         if let Some(client) = &client {
             let actions = workflow::scan_content(&content);
             for action in &actions {
-                let key = format!("{}@{}", action.owner_repo(), action.ref_string);
+                let key = remote_action_scan_key(action);
                 if !scanned_actions.insert(key) {
                     continue;
                 }
@@ -187,7 +187,12 @@ pub async fn run(
                 }
 
                 if let Some(source) = audited
-                    .check(&action.owner, &action.repo, &action.ref_string)
+                    .check(
+                        &action.owner,
+                        &action.repo,
+                        action.subpath.as_deref(),
+                        &action.ref_string,
+                    )
                     .await
                 {
                     match source {
@@ -268,6 +273,7 @@ pub async fn run(
                             audited.cache_clean(
                                 &action.owner,
                                 &action.repo,
+                                action.subpath.as_deref(),
                                 &action.ref_string,
                                 tag,
                             );
@@ -355,6 +361,10 @@ pub async fn run(
     } else {
         Ok(ExitCode::SUCCESS)
     }
+}
+
+fn remote_action_scan_key(action: &ActionRef) -> String {
+    format!("{}@{}", action.full_name(), action.ref_string)
 }
 
 pub fn extract_run_blocks(path: &Path, content: &str) -> Result<Vec<(usize, String)>> {
@@ -2889,6 +2899,32 @@ runs:
     #[test]
     fn short_sha_short() {
         assert_eq!(short_sha("abc"), "abc");
+    }
+
+    #[test]
+    fn remote_action_scan_key_includes_subpath() {
+        let mut first = ActionRef {
+            owner: "owner".to_string(),
+            repo: "repo".to_string(),
+            subpath: Some("a".to_string()),
+            ref_string: "abcdef1234567890abcdef1234567890abcdef12".to_string(),
+            ref_type: workflow::RefType::Sha,
+            tag_comment: None,
+            line_number: 1,
+            raw_line: String::new(),
+        };
+        let mut second = first.clone();
+        second.subpath = Some("b".to_string());
+
+        assert_ne!(
+            remote_action_scan_key(&first),
+            remote_action_scan_key(&second)
+        );
+        first.subpath = None;
+        assert_ne!(
+            remote_action_scan_key(&first),
+            remote_action_scan_key(&second)
+        );
     }
 
     // ── vendored-path filtering ────────────────────────────────────────
