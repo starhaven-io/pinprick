@@ -1,5 +1,9 @@
 use crate::audit_patterns;
+use rustix::fs::{self as rfs, Mode, OFlags};
+use rustix::io::Errno;
 use serde::Deserialize;
+use std::fs::File;
+use std::io::Read;
 use std::path::Path;
 
 #[derive(Debug, Default, Deserialize)]
@@ -236,31 +240,87 @@ fn load_global() -> ConfigLoad {
         .join(".config")
         .join("pinprick")
         .join("config.toml");
-    load_file(&path)
+    load_file(&path, ParseWarning::Detailed)
 }
 
 fn load_local(repo_root: &Path) -> ConfigLoad {
-    load_file(&repo_root.join(".pinprick.toml"))
+    load_repo_file(repo_root, ".pinprick.toml")
 }
 
 /// Load and parse a config file. Missing/unreadable is `Absent` (the normal
 /// case). Present-but-unparsable is `Malformed` and warns — a silently-dropped
 /// config would leave the user thinking their rules are active when they aren't.
-fn load_file(path: &Path) -> ConfigLoad {
+fn load_file(path: &Path, warning: ParseWarning) -> ConfigLoad {
     let content = match std::fs::read_to_string(path) {
         Ok(content) => content,
         Err(_) => return ConfigLoad::Absent,
     };
-    match toml::from_str(&content) {
+    parse_file(path, &content, warning)
+}
+
+fn load_repo_file(repo_root: &Path, name: &str) -> ConfigLoad {
+    let root = match openat_file(
+        rfs::CWD,
+        repo_root,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+    ) {
+        Ok(root) => root,
+        Err(_) => return ConfigLoad::Absent,
+    };
+
+    let path = repo_root.join(name);
+    let mut file = match openat_file(
+        &root,
+        name,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+    ) {
+        Ok(file) => file,
+        Err(_) => return ConfigLoad::Absent,
+    };
+
+    let mut content = String::new();
+    if file.read_to_string(&mut content).is_err() {
+        return ConfigLoad::Absent;
+    }
+
+    parse_file(&path, &content, ParseWarning::Generic)
+}
+
+fn parse_file(path: &Path, content: &str, warning: ParseWarning) -> ConfigLoad {
+    match toml::from_str(content) {
         Ok(config) => ConfigLoad::Loaded(config),
         Err(e) => {
-            eprintln!(
-                "warning: failed to parse {}, using defaults:\n{e}",
-                path.display()
-            );
+            match warning {
+                ParseWarning::Detailed => {
+                    eprintln!(
+                        "warning: failed to parse {}, using defaults:\n{e}",
+                        path.display()
+                    );
+                }
+                ParseWarning::Generic => {
+                    eprintln!(
+                        "warning: failed to parse {}, using defaults",
+                        path.display()
+                    );
+                }
+            }
             ConfigLoad::Malformed
         }
     }
+}
+
+#[derive(Clone, Copy)]
+enum ParseWarning {
+    Detailed,
+    Generic,
+}
+
+fn openat_file<Fd: rustix::fd::AsFd, P: rustix::path::Arg>(
+    dirfd: Fd,
+    path: P,
+    flags: OFlags,
+) -> std::result::Result<File, Errno> {
+    rfs::openat(dirfd, path, flags, Mode::empty()).map(File::from)
 }
 
 #[cfg(test)]
@@ -283,6 +343,18 @@ mod tests {
         let without = Config::load(dir.path(), false);
         assert!(!without.is_repo_local());
         assert!(!without.is_host_trusted("https://x.example/tool"));
+    }
+
+    #[test]
+    fn load_repo_config_ignores_symlinked_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(outside.path(), "trusted-hosts = [\"x.example\"]\n").unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join(".pinprick.toml")).unwrap();
+
+        let cfg = Config::load(dir.path(), true);
+        assert!(!cfg.is_repo_local());
+        assert!(!cfg.is_host_trusted("https://x.example/tool"));
     }
 
     #[test]
@@ -491,7 +563,7 @@ trusted-hosts = ["artifacts.example.com", "releases.example.org"]
         let dir = tempfile::TempDir::new().unwrap();
         // No file written — absent config is silent, defaults apply.
         assert!(matches!(
-            load_file(&dir.path().join("config.toml")),
+            load_file(&dir.path().join("config.toml"), ParseWarning::Detailed),
             ConfigLoad::Absent
         ));
     }
@@ -503,7 +575,10 @@ trusted-hosts = ["artifacts.example.com", "releases.example.org"]
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("config.toml");
         std::fs::write(&path, "severity = \"nope\"\n").unwrap();
-        assert!(matches!(load_file(&path), ConfigLoad::Malformed));
+        assert!(matches!(
+            load_file(&path, ParseWarning::Detailed),
+            ConfigLoad::Malformed
+        ));
     }
 
     #[test]
@@ -511,7 +586,7 @@ trusted-hosts = ["artifacts.example.com", "releases.example.org"]
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("config.toml");
         std::fs::write(&path, "severity = \"high\"\nfetch-remote = true\n").unwrap();
-        let ConfigLoad::Loaded(cfg) = load_file(&path) else {
+        let ConfigLoad::Loaded(cfg) = load_file(&path, ParseWarning::Detailed) else {
             panic!("valid config should parse");
         };
         assert_eq!(cfg.severity, SeverityFilter::High);
