@@ -74,6 +74,25 @@ jobs:
       - run: curl -fsSL https://example.com/install.sh | bash
 ";
 
+/// Pipe-to-shell nested inside a `parallel:` step group (GitHub's parallel-
+/// steps feature). Expect one high-severity finding from the nested run block,
+/// proving run-block extraction descends into parallel groups.
+pub const WORKFLOW_PARALLEL_PIPE_TO_SHELL: &str = "\
+name: parallel
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - parallel:
+          - name: Build frontend
+            run: npm run build:frontend
+          - name: Fetch installer
+            run: curl -fsSL https://example.com/install.sh | bash
+      - run: npm test
+";
+
 /// Curl with /latest/ in URL. Expect one high-severity finding.
 pub const WORKFLOW_CURL_LATEST: &str = "\
 name: curl-latest

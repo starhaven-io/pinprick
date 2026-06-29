@@ -90,6 +90,28 @@ fn pipe_to_shell_json_fields() {
 }
 
 #[test]
+fn parallel_run_block_is_scanned() {
+    // A `curl | bash` nested inside a `parallel:` step group must be caught
+    // end-to-end (run-block extraction recurses into parallel groups) and must
+    // anchor to the real source line, not the `parallel:` container.
+    let dir = common::repo_with_workflow("ci.yml", common::WORKFLOW_PARALLEL_PIPE_TO_SHELL);
+    let output = common::pinprick_cmd()
+        .arg("--json")
+        .arg("audit")
+        .arg(dir.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let findings = json["findings"].as_array().unwrap();
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0]["severity"], "high");
+    assert_eq!(findings[0]["category"], "shell_fetch");
+    assert_eq!(findings[0]["line"], 12);
+}
+
+#[test]
 fn curl_latest_finding() {
     let dir = common::repo_with_workflow("ci.yml", common::WORKFLOW_CURL_LATEST);
     let output = common::pinprick_cmd()

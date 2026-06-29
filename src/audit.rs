@@ -374,26 +374,62 @@ pub fn extract_run_blocks(path: &Path, content: &str) -> Result<Vec<(usize, Stri
     let mut blocks = Vec::new();
     let mut cursor: usize = 0; // 0-based line index, monotonically advancing
 
-    // Walk jobs.*.steps[].run. serde_norway's Mapping preserves insertion
-    // order, so iterating here visits `run:` blocks in document order and we
-    // can anchor each one at the next matching line, never earlier ones.
+    // Walk jobs.*.steps[].run, including nested parallel groups.
+    // serde_norway's Mapping preserves insertion order, so iterating here
+    // visits `run:` blocks in document order and we can anchor each one at
+    // the next matching line, never earlier ones.
     if let Some(jobs) = yaml.get("jobs").and_then(|j| j.as_mapping()) {
         for (_job_name, job) in jobs {
-            if let Some(steps) = job.get("steps").and_then(|s| s.as_sequence()) {
-                for step in steps {
-                    if let Some(run) = step.get("run").and_then(|r| r.as_str()) {
-                        let (line, next_cursor) = find_run_line(content, run, cursor);
-                        cursor = next_cursor;
-                        // Line 0 (not found) is kept — the block is still
-                        // scanned, just unanchored.
-                        blocks.push((line, run.to_string()));
-                    }
+            if let Some(steps) = job.get("steps") {
+                for run in collect_step_run_blocks(steps) {
+                    let (line, next_cursor) = find_run_line(content, run, cursor);
+                    cursor = next_cursor;
+                    // Line 0 (not found) is kept — the block is still
+                    // scanned, just unanchored.
+                    blocks.push((line, run.to_string()));
                 }
             }
         }
     }
 
     Ok(blocks)
+}
+
+/// Collect the `run:` block bodies under a `steps:` sequence in document
+/// order, descending into `parallel:` groups.
+///
+/// GitHub documents `parallel:` as a sequence of steps, so a nested group is
+/// walked exactly like the top-level `steps:` list — which also covers
+/// `parallel:` nested inside `parallel:`. A `background: true` step keeps its
+/// own `run:` key and is collected like any other step. Steps without a `run:`
+/// (`uses:`, `wait:`, `cancel:`) contribute nothing.
+fn collect_step_run_blocks(steps: &Value) -> Vec<&str> {
+    fn collect<'a>(steps: &'a Value, runs: &mut Vec<&'a str>) {
+        let Some(sequence) = steps.as_sequence() else {
+            return;
+        };
+
+        for step in sequence {
+            let Some(mapping) = step.as_mapping() else {
+                continue;
+            };
+            for (key, value) in mapping {
+                match key.as_str() {
+                    Some("run") => {
+                        if let Some(run) = value.as_str() {
+                            runs.push(run);
+                        }
+                    }
+                    Some("parallel") => collect(value, runs),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    let mut runs = Vec::new();
+    collect(steps, &mut runs);
+    runs
 }
 
 /// Locate the 1-based line of `run_content` in the raw file, starting the
@@ -1992,17 +2028,12 @@ fn scan_action_yml_runs(
     collector: &mut AuditCollector,
     config: &Config,
 ) {
-    // runs.steps[].run (composite actions). base_line 0: positions are
-    // block-relative — the block is never located inside the fetched file.
-    if let Some(steps) = yaml
-        .get("runs")
-        .and_then(|r| r.get("steps"))
-        .and_then(|s| s.as_sequence())
-    {
-        for step in steps {
-            if let Some(run) = step.get("run").and_then(|r| r.as_str()) {
-                scan_shell_content(run, source_file, 0, action_name, collector, config);
-            }
+    // runs.steps[].run (composite actions), including nested parallel groups.
+    // base_line 0: positions are block-relative — the block is never located
+    // inside the fetched file.
+    if let Some(steps) = yaml.get("runs").and_then(|r| r.get("steps")) {
+        for run in collect_step_run_blocks(steps) {
+            scan_shell_content(run, source_file, 0, action_name, collector, config);
         }
     }
 
@@ -2117,6 +2148,160 @@ more stuff
         let file = "echo hello world\nother\n";
         let (line, cursor) = find_run_line(file, "echo hello", 0);
         assert_eq!((line, cursor), (1, 1));
+    }
+
+    #[test]
+    fn extract_run_blocks_recurses_into_parallel_steps() {
+        let yaml = r#"
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo outside
+      - parallel:
+          - run: echo nested one
+          - name: Nested two
+            run: |
+              echo nested two
+"#;
+        let blocks = extract_run_blocks(Path::new("workflow.yml"), yaml).unwrap();
+        let runs = blocks.iter().map(|(_, run)| run.trim()).collect::<Vec<_>>();
+
+        assert_eq!(
+            runs,
+            vec!["echo outside", "echo nested one", "echo nested two"]
+        );
+    }
+
+    #[test]
+    fn extract_run_blocks_anchors_nested_parallel_blocks_in_document_order() {
+        let yaml = "\
+jobs:
+  test:
+    steps:
+      - run: |
+          echo shared
+          echo first
+      - parallel:
+          - run: |
+              echo shared
+              echo nested
+      - run: |
+          echo shared
+          echo third
+";
+        let blocks = extract_run_blocks(Path::new("workflow.yml"), yaml).unwrap();
+        let lines = blocks.iter().map(|(line, _run)| *line).collect::<Vec<_>>();
+
+        assert_eq!(lines, vec![5, 9, 12]);
+    }
+
+    #[test]
+    fn scan_shell_content_flags_parallel_pipe_to_shell() {
+        let yaml = r#"
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - parallel:
+          - run: curl https://example.com/install.sh | sh
+"#;
+        let blocks = extract_run_blocks(Path::new("workflow.yml"), yaml).unwrap();
+        let mut c = AuditCollector::new(false);
+
+        for (line, run) in blocks {
+            scan_shell_content(&run, "workflow.yml", line, "", &mut c, &DEFAULT_CONFIG);
+        }
+
+        assert_eq!(c.findings.len(), 1);
+        assert_eq!(c.findings[0].severity, "high");
+    }
+
+    #[test]
+    fn parallel_control_steps_do_not_create_spurious_findings() {
+        let yaml = r#"
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - wait: server
+      - parallel:
+          - wait: server
+          - cancel: server
+          - uses: actions/checkout@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+          - run: echo safe
+      - cancel: server
+"#;
+        let blocks = extract_run_blocks(Path::new("workflow.yml"), yaml).unwrap();
+        let mut c = AuditCollector::new(false);
+
+        for (line, run) in &blocks {
+            scan_shell_content(run, "workflow.yml", *line, "", &mut c, &DEFAULT_CONFIG);
+        }
+
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].1.trim(), "echo safe");
+        assert!(c.findings.is_empty());
+    }
+
+    #[test]
+    fn scan_content_finds_uses_inside_parallel_group() {
+        let yaml = r#"
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - parallel:
+          - uses: actions/checkout@v4
+"#;
+        let refs = workflow::scan_content(yaml);
+
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].full_name(), "actions/checkout");
+    }
+
+    #[test]
+    fn extract_run_blocks_recurses_into_nested_parallel() {
+        // `parallel:` nested inside `parallel:` — each level is a sequence of
+        // steps, walked the same way as the top-level list.
+        let yaml = r#"
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - parallel:
+          - run: echo outer
+          - parallel:
+              - run: echo inner
+"#;
+        let blocks = extract_run_blocks(Path::new("workflow.yml"), yaml).unwrap();
+        let runs = blocks.iter().map(|(_, run)| run.trim()).collect::<Vec<_>>();
+
+        assert_eq!(runs, vec!["echo outer", "echo inner"]);
+    }
+
+    #[test]
+    fn extract_run_blocks_flags_backgrounded_service_run() {
+        // A `background: true` step keeps its `run:`, so a risky service start
+        // must still be scanned.
+        let yaml = r#"
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Start service
+        run: curl https://example.com/install.sh | sh
+        background: true
+"#;
+        let blocks = extract_run_blocks(Path::new("workflow.yml"), yaml).unwrap();
+        let mut c = AuditCollector::new(false);
+
+        for (line, run) in blocks {
+            scan_shell_content(&run, "workflow.yml", line, "", &mut c, &DEFAULT_CONFIG);
+        }
+
+        assert_eq!(c.findings.len(), 1);
+        assert_eq!(c.findings[0].severity, "high");
     }
 
     #[test]
@@ -3009,6 +3194,24 @@ runs:
         let mut c = AuditCollector::new(false);
         scan_action_yml_runs(&yaml, "action.yml", "test-action", &mut c, &DEFAULT_CONFIG);
         assert_eq!(c.findings.len(), 1);
+    }
+
+    #[test]
+    fn scan_action_yml_composite_parallel_steps() {
+        let yaml: serde_norway::Value = serde_norway::from_str(
+            r#"
+runs:
+  using: composite
+  steps:
+    - parallel:
+        - run: curl https://example.com/install.sh | sh
+"#,
+        )
+        .unwrap();
+        let mut c = AuditCollector::new(false);
+        scan_action_yml_runs(&yaml, "action.yml", "test-action", &mut c, &DEFAULT_CONFIG);
+        assert_eq!(c.findings.len(), 1);
+        assert_eq!(c.findings[0].severity, "high");
     }
 
     #[test]

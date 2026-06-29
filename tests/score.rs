@@ -187,6 +187,32 @@ jobs:
 }
 
 #[test]
+fn runtime_rule_fires_on_parallel_run_block() {
+    // The score runtime.* rules reuse extract_run_blocks, so a pipe-to-shell
+    // nested in a `parallel:` group must dent the score like a top-level block.
+    let dir = common::repo_with_workflow("ci.yml", common::WORKFLOW_PARALLEL_PIPE_TO_SHELL);
+    let output = common::pinprick_cmd()
+        .arg("--json")
+        .arg("score")
+        .arg(dir.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let ids: Vec<String> = json["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["id"].as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        ids.contains(&"runtime.pipe_to_shell".to_string()),
+        "ids: {ids:?}"
+    );
+}
+
+#[test]
 fn ignore_patterns_suppresses_runtime_score_finding() {
     let workflow = "\
 name: risky
