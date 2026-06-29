@@ -19,7 +19,7 @@
     "@astrojs/cloudflare": "^13.7.0",
     "@astrojs/starlight": "^0.40.0",
     "astro": "^6.4.8",
-    "sharp": "^0.35.1"
+    "sharp": "^0.35.2"
   },
   "devDependencies": {
     "prettier": "^3.8.4",
