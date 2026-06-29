@@ -473,8 +473,10 @@ impl GitHubClient {
         path: &str,
         git_ref: &str,
     ) -> Result<String> {
+        let encoded_path = percent_encode_path(path);
+        let encoded_ref = percent_encode_component(git_ref);
         let url = format!(
-            "{}/repos/{owner}/{repo}/contents/{path}?ref={git_ref}",
+            "{}/repos/{owner}/{repo}/contents/{encoded_path}?ref={encoded_ref}",
             self.base
         );
         let resp = self.get_with_accept(&url, ACCEPT_RAW).await?;
@@ -492,6 +494,29 @@ impl GitHubClient {
         let bytes = read_capped(resp).await?;
         Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
+}
+
+fn percent_encode_path(path: &str) -> String {
+    path.split('/')
+        .map(percent_encode_component)
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn percent_encode_component(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if is_unreserved(byte) {
+            encoded.push(byte as char);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
+}
+
+fn is_unreserved(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~')
 }
 
 fn ensure_success(resp: &reqwest::Response, operation: String) -> Result<()> {
@@ -572,10 +597,22 @@ mod tests {
         let _ = build_client();
     }
 
+    #[test]
+    fn percent_encode_path_preserves_separators() {
+        assert_eq!(
+            percent_encode_path("dir/a file#x.js"),
+            "dir/a%20file%23x.js"
+        );
+        assert_eq!(
+            percent_encode_component("refs/heads/feature?x&y"),
+            "refs%2Fheads%2Ffeature%3Fx%26y"
+        );
+    }
+
     mod network {
         use super::*;
         use serde_json::json;
-        use wiremock::matchers::{header, method, path};
+        use wiremock::matchers::{header, method, path, query_param};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         async fn client_for(server: &MockServer) -> GitHubClient {
@@ -793,6 +830,24 @@ mod tests {
             assert_eq!(tree[0].path, "action.yml");
             let body = c.fetch_file("o", "r", "action.yml", "sha").await.unwrap();
             assert!(body.contains("using: node20"));
+        }
+
+        #[tokio::test]
+        async fn fetch_file_percent_encodes_path_and_ref() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/repos/o/r/contents/dir/a%20file%23x.js"))
+                .and(query_param("ref", "refs/heads/feature?x&y"))
+                .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+                .mount(&server)
+                .await;
+
+            let body = client_for(&server)
+                .await
+                .fetch_file("o", "r", "dir/a file#x.js", "refs/heads/feature?x&y")
+                .await
+                .unwrap();
+            assert_eq!(body, "ok");
         }
 
         #[tokio::test]

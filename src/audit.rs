@@ -1628,6 +1628,168 @@ fn select_source_files(
     targets
 }
 
+fn force_include_remote_action_entrypoints(
+    base: &str,
+    targets: &mut Vec<(String, SourceFileKind)>,
+    contents: &[Option<Result<String>>],
+) {
+    let metadata: Vec<String> = targets
+        .iter()
+        .zip(contents)
+        .filter_map(|((_, kind), content)| {
+            if *kind != SourceFileKind::ActionYml {
+                return None;
+            }
+            let Some(Ok(content)) = content.as_ref() else {
+                return None;
+            };
+            Some(content.clone())
+        })
+        .collect();
+
+    for content in metadata {
+        let Ok(yaml) = serde_norway::from_str::<Value>(&content) else {
+            continue;
+        };
+        for entrypoint in action_yml_entrypoint_paths(&yaml, base) {
+            push_unique_source_target(targets, entrypoint, SourceFileKind::JavaScript);
+        }
+    }
+}
+
+fn force_include_local_action_entrypoints(
+    action_dir: &Path,
+    targets: &mut Vec<(PathBuf, SourceFileKind)>,
+) {
+    let metadata_paths: Vec<PathBuf> = targets
+        .iter()
+        .filter_map(|(path, kind)| (*kind == SourceFileKind::ActionYml).then_some(path.clone()))
+        .collect();
+
+    for path in metadata_paths {
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(yaml) = serde_norway::from_str::<Value>(&content) else {
+            continue;
+        };
+        for entrypoint in action_yml_entrypoint_paths(&yaml, "") {
+            let path = action_dir.join(&entrypoint);
+            if local_entrypoint_is_regular_file(&path) {
+                push_unique_local_source_target(targets, path, SourceFileKind::JavaScript);
+            }
+        }
+    }
+}
+
+fn action_yml_entrypoint_paths(yaml: &Value, base: &str) -> Vec<String> {
+    let Some(runs) = yaml.get("runs").and_then(|r| r.as_mapping()) else {
+        return Vec::new();
+    };
+
+    ["main", "pre", "post"]
+        .into_iter()
+        .filter_map(|key| runs.get(key).and_then(|v| v.as_str()))
+        .filter_map(|path| normalize_action_entrypoint_path(base, path))
+        .collect()
+}
+
+fn normalize_action_entrypoint_path(base: &str, path: &str) -> Option<String> {
+    let path = path.trim();
+    if path.is_empty() || path.contains('\\') {
+        return None;
+    }
+    let rel = Path::new(path);
+    if rel.is_absolute() {
+        return None;
+    }
+
+    let mut parts = Vec::new();
+    for component in rel.components() {
+        match component {
+            Component::Normal(part) => parts.push(part.to_str()?.to_string()),
+            Component::CurDir => {}
+            _ => return None,
+        }
+    }
+    if parts.is_empty() {
+        return None;
+    }
+
+    let rel = parts.join("/");
+    if base.is_empty() {
+        Some(rel)
+    } else {
+        Some(format!("{base}/{rel}"))
+    }
+}
+
+fn push_unique_source_target(
+    targets: &mut Vec<(String, SourceFileKind)>,
+    path: String,
+    kind: SourceFileKind,
+) {
+    if !targets.iter().any(|(existing, _)| existing == &path) {
+        targets.push((path, kind));
+    }
+}
+
+fn push_unique_local_source_target(
+    targets: &mut Vec<(PathBuf, SourceFileKind)>,
+    path: PathBuf,
+    kind: SourceFileKind,
+) {
+    if !targets.iter().any(|(existing, _)| existing == &path) {
+        targets.push((path, kind));
+    }
+}
+
+fn local_entrypoint_is_regular_file(path: &Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_file())
+        .unwrap_or_default()
+}
+
+async fn fetch_remote_source_files(
+    client: &GitHubClient,
+    action: &ActionRef,
+    targets: &[(String, SourceFileKind)],
+) -> (Vec<Option<Result<String>>>, bool) {
+    let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_FILE_FETCHES));
+    let mut fetches = tokio::task::JoinSet::new();
+    for (index, (path, _)) in targets.iter().enumerate() {
+        let client = client.clone();
+        let owner = action.owner.clone();
+        let repo = action.repo.clone();
+        let git_ref = action.ref_string.clone();
+        let path = path.clone();
+        let semaphore = Arc::clone(&semaphore);
+        fetches.spawn(async move {
+            let _permit = semaphore.acquire_owned().await.ok();
+            let content = client.fetch_file(&owner, &repo, &path, &git_ref).await;
+            (index, content)
+        });
+    }
+
+    let mut contents: Vec<Option<Result<String>>> = (0..targets.len()).map(|_| None).collect();
+    let mut complete = true;
+    while let Some(joined) = fetches.join_next().await {
+        match joined {
+            Ok((index, content)) => {
+                if content.is_err() {
+                    complete = false;
+                }
+                contents[index] = Some(content);
+            }
+            Err(_) => {
+                complete = false;
+            }
+        }
+    }
+
+    (contents, complete)
+}
+
 fn collect_local_source_files(action_dir: &Path) -> Result<Vec<(PathBuf, SourceFileKind)>> {
     fn visit(dir: &Path, base: &Path, targets: &mut Vec<(PathBuf, SourceFileKind)>) -> Result<()> {
         let mut entries = Vec::new();
@@ -1716,7 +1878,8 @@ fn scan_local_action_source(
         anyhow::bail!("{} is not a directory", action_dir.display());
     }
 
-    let targets = collect_local_source_files(&action_dir)?;
+    let mut targets = collect_local_source_files(&action_dir)?;
+    force_include_local_action_entrypoints(&action_dir, &mut targets);
     if targets.is_empty() {
         return Ok(ActionScanStatus::Complete);
     }
@@ -1772,7 +1935,7 @@ async fn scan_action_source(
         .await?;
 
     let base = action.subpath.as_deref().unwrap_or("");
-    let targets = select_source_files(&tree, base);
+    let mut targets = select_source_files(&tree, base);
     if targets.is_empty() {
         return Ok(ActionScanStatus::Complete);
     }
@@ -1780,36 +1943,14 @@ async fn scan_action_source(
     // Fetch concurrently, then scan in tree order so findings are
     // deterministic regardless of which fetch lands first. A failed fetch
     // makes the scan incomplete, so the caller will not cache a clean verdict.
-    let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_FILE_FETCHES));
-    let mut fetches = tokio::task::JoinSet::new();
-    for (index, (path, _)) in targets.iter().enumerate() {
-        let client = client.clone();
-        let owner = action.owner.clone();
-        let repo = action.repo.clone();
-        let git_ref = action.ref_string.clone();
-        let path = path.clone();
-        let semaphore = Arc::clone(&semaphore);
-        fetches.spawn(async move {
-            let _permit = semaphore.acquire_owned().await.ok();
-            let content = client.fetch_file(&owner, &repo, &path, &git_ref).await;
-            (index, content)
-        });
-    }
-
-    let mut contents: Vec<Option<Result<String>>> = (0..targets.len()).map(|_| None).collect();
-    let mut complete = true;
-    while let Some(joined) = fetches.join_next().await {
-        match joined {
-            Ok((index, content)) => {
-                if content.is_err() {
-                    complete = false;
-                }
-                contents[index] = Some(content);
-            }
-            Err(_) => {
-                complete = false;
-            }
-        }
+    let (mut contents, mut complete) = fetch_remote_source_files(client, action, &targets).await;
+    let initial_len = targets.len();
+    force_include_remote_action_entrypoints(base, &mut targets, &contents);
+    if targets.len() > initial_len {
+        let (new_contents, new_complete) =
+            fetch_remote_source_files(client, action, &targets[initial_len..]).await;
+        contents.extend(new_contents);
+        complete &= new_complete;
     }
 
     for ((path, kind), content) in targets.iter().zip(contents) {
@@ -1864,12 +2005,16 @@ fn scan_action_yml_runs(
     }
 
     // runs.args (some actions use shell: bash with inline scripts)
-    if let Some(args) = yaml
-        .get("runs")
-        .and_then(|r| r.get("args"))
-        .and_then(|a| a.as_str())
-    {
-        scan_shell_content(args, source_file, 0, action_name, collector, config);
+    if let Some(args) = yaml.get("runs").and_then(|r| r.get("args")) {
+        if let Some(args) = args.as_str() {
+            scan_shell_content(args, source_file, 0, action_name, collector, config);
+        } else if let Some(args) = args.as_sequence() {
+            for arg in args {
+                if let Some(arg) = arg.as_str() {
+                    scan_shell_content(arg, source_file, 0, action_name, collector, config);
+                }
+            }
+        }
     }
 }
 
@@ -2881,6 +3026,23 @@ runs:
     }
 
     #[test]
+    fn scan_action_yml_sequence_args() {
+        let yaml: serde_norway::Value = serde_norway::from_str(
+            r#"
+runs:
+  using: node20
+  args:
+    - --flag
+    - curl -L https://example.com/install.sh -o install.sh
+"#,
+        )
+        .unwrap();
+        let mut c = AuditCollector::new(false);
+        scan_action_yml_runs(&yaml, "action.yml", "test-action", &mut c, &DEFAULT_CONFIG);
+        assert_eq!(c.findings.len(), 1);
+    }
+
+    #[test]
     fn scan_action_yml_no_runs_key() {
         let yaml: serde_norway::Value = serde_norway::from_str("name: test\n").unwrap();
         let mut c = AuditCollector::new(false);
@@ -2964,6 +3126,30 @@ runs:
             path: path.into(),
             entry_type: entry_type.into(),
         }
+    }
+
+    #[test]
+    fn action_yml_entrypoint_paths_stay_in_action_subpath() {
+        let yaml: serde_norway::Value = serde_norway::from_str(
+            r#"
+runs:
+  using: node20
+  pre: ./preload
+  main: dist/runner
+  post: ../outside
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            action_yml_entrypoint_paths(&yaml, "actions/sub"),
+            vec![
+                "actions/sub/dist/runner".to_string(),
+                "actions/sub/preload".to_string()
+            ]
+        );
+        assert!(normalize_action_entrypoint_path("", "/tmp/runner").is_none());
+        assert!(normalize_action_entrypoint_path("", r"dist\\runner").is_none());
     }
 
     #[test]
@@ -3123,6 +3309,42 @@ runs:
     }
 
     #[test]
+    fn scan_local_action_source_includes_metadata_entrypoint() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let action_dir = dir.path().join(".github/actions/local");
+        std::fs::create_dir_all(action_dir.join("dist")).unwrap();
+        std::fs::write(
+            action_dir.join("action.yml"),
+            r#"
+runs:
+  using: node20
+  main: dist/runner
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            action_dir.join("dist/runner"),
+            r#"fetch("https://example.com/install")"#,
+        )
+        .unwrap();
+
+        let action = LocalActionRef {
+            path: "./.github/actions/local".to_string(),
+            line_number: 12,
+        };
+        let mut collector = AuditCollector::new(false);
+        let status =
+            scan_local_action_source(dir.path(), &action, &mut collector, &DEFAULT_CONFIG).unwrap();
+
+        assert_eq!(status, ActionScanStatus::Complete);
+        assert_eq!(collector.findings.len(), 1);
+        assert_eq!(
+            collector.findings[0].source_file,
+            "./.github/actions/local (dist/runner)"
+        );
+    }
+
+    #[test]
     fn scan_local_action_source_rejects_parent_escape() {
         let dir = tempfile::TempDir::new().unwrap();
         let action = LocalActionRef {
@@ -3224,6 +3446,65 @@ runs:
             collector.findings.is_empty(),
             "failed fetch should not invent findings, only block clean caching"
         );
+    }
+
+    #[tokio::test]
+    async fn scan_action_source_includes_metadata_entrypoint() {
+        use serde_json::json;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/repos/o/r/git/trees/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "tree": [
+                    { "path": "action.yml", "type": "blob" },
+                    { "path": "dist/runner", "type": "blob" }
+                ]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/contents/action.yml"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("runs:\n  using: node20\n  main: dist/runner\n"),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/contents/dist/runner"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"fetch("https://example.com/install")"#),
+            )
+            .mount(&server)
+            .await;
+
+        let client = GitHubClient::with_base("t".into(), server.uri());
+        let action = ActionRef {
+            owner: "o".into(),
+            repo: "r".into(),
+            subpath: None,
+            ref_string: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            ref_type: workflow::RefType::Sha,
+            tag_comment: Some("v1.0.0".into()),
+            line_number: 1,
+            raw_line: String::new(),
+        };
+        let mut collector = AuditCollector::new(false);
+
+        let status = scan_action_source(&client, &action, &mut collector, &DEFAULT_CONFIG)
+            .await
+            .unwrap();
+
+        assert_eq!(status, ActionScanStatus::Complete);
+        assert_eq!(collector.findings.len(), 1);
+        assert_eq!(collector.findings[0].source_file, "o/r (dist/runner)");
     }
 
     #[test]
