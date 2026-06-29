@@ -1,4 +1,5 @@
 [
+  { "sha": "a1948c3f048ba23858d222213b7c278aabede763", "tag": "v4.1.1" },
   { "sha": "59d89421af93a897026c735860bf21b6eb4f7b26", "tag": "v4.1.0" },
   { "sha": "c32b4b8b198b65d0bd9d63490e847ff7b53989d4", "tag": "v4.0.0" },
   { "sha": "e59cbc1ad1ac2d59339667419eb8cdde6eb61e3d", "tag": "v3.2.0" },
