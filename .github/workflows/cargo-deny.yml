@@ -1,0 +1,108 @@
+name: Cargo Deny
+
+# Scheduled advisory drift detector. CI already runs `cargo deny check` on every
+# Rust-touching PR and on push to main, but a newly published RustSec advisory
+# (or a yank, or an unmaintained flag) can turn an *unchanged* Cargo.lock red
+# without any code change. This catches that on a cadence instead of waiting for
+# the next push to main, and records a tracking issue so a red scheduled run is
+# actually visible.
+
+on:
+  schedule:
+    - cron: "47 7 * * 1" # every Monday at 07:47 UTC
+  workflow_dispatch:
+
+env:
+  CARGO_INCREMENTAL: 0
+
+defaults:
+  run:
+    shell: bash -xeuo pipefail {0}
+
+concurrency:
+  group: cargo-deny
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  deny:
+    name: Check
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      issues: write # open/close the tracking issue when the scan flips
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install cargo-deny
+        # Pinned to the version CI enforces (.github/workflows/ci.yml);
+        # bump-cargo-tools.yml keeps the two in lockstep. No cache: GitHub evicts
+        # caches after 7 days, so a weekly job would miss almost every run.
+        run: cargo install cargo-deny --locked --version 0.19.9
+
+      - name: Run cargo deny check
+        id: deny
+        # Mirror the exact gate CI runs (advisories + bans + licenses + sources).
+        # Capture the status instead of failing here so the issue steps can run.
+        run: |
+          set +e
+          cargo deny check 2>&1 | tee deny-output.txt
+          DENY_EXIT=${PIPESTATUS[0]}
+          set -e
+          echo "exit=${DENY_EXIT}" >> "${GITHUB_OUTPUT}"
+
+      - name: Open or update tracking issue
+        if: steps.deny.outputs.exit != '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          TITLE="cargo deny check is failing on main"
+          {
+            echo "The scheduled \`cargo deny check\` run reported one or more advisory, ban, license, or source violations against the current \`Cargo.lock\`. Because the lockfile is unchanged between pushes, this is typically a newly published RustSec advisory rather than a code change."
+            echo
+            echo "Run: ${RUN_URL}"
+            echo
+            echo "<details><summary>cargo deny output</summary>"
+            echo
+            echo '```'
+            tail -c 60000 deny-output.txt
+            echo '```'
+            echo
+            echo "</details>"
+          } > issue-body.md
+          EXISTING=$(gh issue list --state open --limit 50 \
+            --search "in:title cargo deny check is failing" \
+            --json number,title \
+            --jq ".[] | select(.title == \"${TITLE}\") | .number" | head -1)
+          if [[ -n "${EXISTING}" ]]; then
+            gh issue comment "${EXISTING}" --body-file issue-body.md
+          else
+            gh issue create --title "${TITLE}" --body-file issue-body.md
+          fi
+
+      - name: Resolve tracking issue
+        if: steps.deny.outputs.exit == '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          TITLE="cargo deny check is failing on main"
+          for N in $(gh issue list --state open --limit 50 \
+            --search "in:title cargo deny check is failing" \
+            --json number,title \
+            --jq ".[] | select(.title == \"${TITLE}\") | .number"); do
+            gh issue comment "${N}" --body "\`cargo deny check\` is passing again as of ${RUN_URL}. Closing."
+            gh issue close "${N}"
+          done
+
+      - name: Fail the run if cargo deny reported violations
+        if: steps.deny.outputs.exit != '0'
+        run: |
+          echo "::error::cargo deny check reported violations; see the tracking issue."
+          exit 1
