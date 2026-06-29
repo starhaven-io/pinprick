@@ -615,6 +615,28 @@ fn no_repo_config_ignores_local_file() {
 }
 
 #[test]
+fn repo_config_parse_error_redacts_source_excerpt() {
+    let dir = common::repo_with_config(
+        "ci.yml",
+        common::WORKFLOW_CLEAN,
+        "trusted-hosts = [\"secret.internal.example\"\n",
+    );
+
+    let output = common::pinprick_cmd()
+        .arg("audit")
+        .arg(dir.path())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("warning: failed to parse"));
+    assert!(stderr.contains("using defaults"));
+    assert!(!stderr.contains("secret.internal.example"));
+    assert!(!stderr.contains("TOML parse error"));
+}
+
+#[test]
 fn repo_config_trusted_host_notice_without_verbose() {
     // The trusted-host count must not depend on --verbose.
     let dir = common::repo_with_config(
