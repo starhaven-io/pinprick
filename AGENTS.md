@@ -63,6 +63,8 @@ pinprick/
 
 **Critical design decision:** workflow files are never round-tripped through a YAML parser for writing. `uses:` lines have a rigid single-line format — regex capture groups replace the ref while preserving leading whitespace, indentation, and surrounding comments. `serde_norway` is only used for read-only extraction of `run:` block contents during audit.
 
+That read-only `run:` extraction (`extract_run_blocks` for workflows and `scan_action_yml_runs` for composite actions) recurses into `parallel:` step groups. GitHub's parallel-steps feature models a `parallel:` step as a sequence of nested steps, so `run:` blocks inside a parallel group (including `parallel:` nested in `parallel:`) are scanned by both `audit` and `score`. A `background:`/`wait:`/`cancel:` step carries no nested `run:` and needs no special handling; line anchoring still walks blocks in document order.
+
 ### Workflow discovery
 
 `workflow::find_workflows` scans every forge root in `DEFAULT_FORGE_ROOTS` (`.github`, `.forgejo`, `.gitea`) for a `workflows/` subdirectory. Forgejo and Gitea use GitHub-compatible workflow syntax. Discovery is **purely additive**: each root that exists is scanned and the files are unioned, so extra roots only widen coverage. The list is a compile-time constant and is deliberately *not* configurable via `.pinprick.toml`: a scanned repo (which may be hostile, hence `--no-repo-config`) must never be able to redirect the scan to a decoy directory while real workflows hide in `.github/workflows`. Every root goes through the same symlink-refusing `open_child_dir` path, so a symlinked forge root is refused, never followed. GitLab is out of scope: `.gitlab-ci.yml` is a single file with a different schema and no `uses:` references.
