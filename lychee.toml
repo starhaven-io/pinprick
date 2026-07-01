@@ -7,5 +7,6 @@ max_concurrency = 20
 timeout = 20
 max_retries = 3
 
-# claude.ai returns 403 to automated link checkers
-exclude = ["https://claude.ai/.*"]
+# gnu.org can time out or block automated link checkers from hosted runners.
+# The AGPL license URL is canonical; skip verifying it.
+exclude = ["^https://www\\.gnu\\.org/"]
