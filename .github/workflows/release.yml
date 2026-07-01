@@ -61,7 +61,9 @@ jobs:
       - name: Create and unlock temporary macOS keychain
         if: matrix.sign
         run: |
+          # Keep xtrace disabled here: this password is generated at runtime and is not a registered secret.
           TEMPORARY_KEYCHAIN_PASSWORD="$(openssl rand -base64 20)"
+          echo "::add-mask::${TEMPORARY_KEYCHAIN_PASSWORD}"
           TEMPORARY_KEYCHAIN_PATH="${RUNNER_TEMP}/${TEMPORARY_KEYCHAIN_FILE}"
           security create-keychain -p "${TEMPORARY_KEYCHAIN_PASSWORD}" "${TEMPORARY_KEYCHAIN_PATH}"
           security set-keychain-settings -lut 21600 "${TEMPORARY_KEYCHAIN_PATH}"
@@ -157,7 +159,7 @@ jobs:
           mkdir -p staging
           cp "target/${TARGET}/release/pinprick" staging/
           cp LICENSE staging/
-          tar czf "${ARTIFACT}.tar.gz" -C staging .
+          /usr/bin/tar --no-mac-metadata --no-xattrs -czf "${ARTIFACT}.tar.gz" -C staging .
           echo "ARTIFACT=${ARTIFACT}" >> "${GITHUB_ENV}"
 
       - name: Generate build provenance

@@ -12,7 +12,6 @@ on:
 
 defaults:
   run:
-    # No -x: this job handles Cloudflare and catalog-signing secrets.
     shell: bash -euo pipefail {0}
 
 permissions: {}

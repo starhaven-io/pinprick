@@ -7,7 +7,6 @@ on:
 
 defaults:
   run:
-    # No -x: this workflow can mint and use short-lived app tokens.
     shell: bash -euo pipefail {0}
 
 concurrency:
@@ -91,16 +90,6 @@ jobs:
       contents: read
       actions: read # required by download-artifact
     steps:
-      - name: Mint bot token
-        id: app-token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
-        with:
-          client-id: ${{ vars.APP_CLIENT_ID }}
-          private-key: ${{ secrets.APP_PRIVATE_KEY }}
-          permission-contents: write
-          permission-pull-requests: write
-          permission-workflows: write
-
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
@@ -110,6 +99,16 @@ jobs:
         with:
           name: ci-yml
           path: .github/workflows/
+
+      - name: Mint bot token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.APP_CLIENT_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+          permission-workflows: write
 
       - name: Create signed commit and open PR
         env:
