@@ -408,14 +408,25 @@ impl GitHubClient {
         resp.json().await.context("parsing tags")
     }
 
-    /// Find a tag name pointing at the given commit SHA, if any.
+    /// Find a tag name pointing at the given commit SHA, if any. A release
+    /// commit typically carries several tags (`v4`, `v4.2`, `v4.2.1`, maybe
+    /// `nightly`); prefer the most specific version-like name — mirroring
+    /// `find_exact_tag` — so callers compare against `v4.2.1` rather than a
+    /// sliding `v4` or a moving `nightly`.
     pub async fn sha_to_tag(&self, owner: &str, repo: &str, sha: &str) -> Result<Option<String>> {
-        Ok(self
+        let names: Vec<String> = self
             .fetch_tags(owner, repo)
             .await?
             .into_iter()
-            .find(|t| t.commit.sha == sha)
-            .map(|t| t.name))
+            .filter(|t| t.commit.sha == sha)
+            .map(|t| t.name)
+            .collect();
+        Ok(names
+            .iter()
+            .filter(|t| is_version_like_tag(t))
+            .max_by_key(|t| t.len())
+            .cloned()
+            .or_else(|| names.into_iter().next()))
     }
 
     /// List tag names for a repo. The `update` command falls back to this when
@@ -556,6 +567,14 @@ fn percent_encode_component(value: &str) -> String {
 
 fn is_unreserved(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~')
+}
+
+/// Whether a tag looks like a version (optional `v` followed by a digit).
+/// Mirrors `update::is_version_like`.
+fn is_version_like_tag(tag: &str) -> bool {
+    tag.strip_prefix('v')
+        .unwrap_or(tag)
+        .starts_with(|c: char| c.is_ascii_digit())
 }
 
 fn ensure_success(resp: &reqwest::Response, operation: String) -> Result<()> {
@@ -837,6 +856,33 @@ mod tests {
                 Some("v2")
             );
             assert_eq!(c.sha_to_tag("o", "r", "zzz").await.unwrap(), None);
+        }
+
+        #[tokio::test]
+        async fn sha_to_tag_prefers_most_specific_version_tag() {
+            let server = MockServer::start().await;
+            // nightly, v4, and v4.2.1 all point at the release commit — the
+            // caller must see v4.2.1, not whichever the API listed first.
+            Mock::given(method("GET"))
+                .and(path("/repos/o/r/tags"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                    { "name": "nightly", "commit": { "sha": "aaa" } },
+                    { "name": "v4", "commit": { "sha": "aaa" } },
+                    { "name": "v4.2.1", "commit": { "sha": "aaa" } },
+                    { "name": "stable", "commit": { "sha": "bbb" } }
+                ])))
+                .mount(&server)
+                .await;
+            let c = client_for(&server).await;
+            assert_eq!(
+                c.sha_to_tag("o", "r", "aaa").await.unwrap().as_deref(),
+                Some("v4.2.1")
+            );
+            // No version-like tag at the SHA: fall back to the first match.
+            assert_eq!(
+                c.sha_to_tag("o", "r", "bbb").await.unwrap().as_deref(),
+                Some("stable")
+            );
         }
 
         #[tokio::test]

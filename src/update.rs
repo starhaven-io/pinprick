@@ -225,7 +225,7 @@ fn pick_latest_release(releases: &[Release]) -> Option<&Release> {
 fn pick_latest_tag(tags: &[String]) -> Option<&String> {
     let pick = |stable_only: bool| {
         tags.iter()
-            .filter(|t| is_version_like(t) && (!stable_only || !parse_version(t).1))
+            .filter(|t| is_version_like(t) && (!stable_only || parse_version(t).1.is_none()))
             .reduce(|best, t| if is_newer(best, t) { t } else { best })
     };
     pick(true).or_else(|| pick(false))
@@ -274,28 +274,43 @@ fn is_newer(current: &str, candidate: &str) -> bool {
     if cand.len() != cur.len() {
         return cand.len() > cur.len();
     }
-    // Exactly equal numerically: a stable release is newer than a pre-release.
+    // Exactly equal numerically: a stable release is newer than a pre-release,
+    // and two pre-releases order by semver identifier rules.
     match (cur_pre, cand_pre) {
-        (true, false) => true,
-        (false, true) => false,
+        (Some(_), None) => true,
+        (Some(cur), Some(cand)) => prerelease_newer(&cur, &cand),
         _ => false,
     }
 }
 
-/// Parse a version string into (numeric components, has pre-release suffix).
-/// Semver `-suffix` and `+build` tails are stripped before the numeric split.
-fn parse_version(s: &str) -> (Vec<u64>, bool) {
+/// Whether `candidate` is a newer pre-release than `current`, per semver
+/// pre-release ordering (`rc.1` < `rc.2`, `beta` < `rc1`). Suffixes that
+/// aren't valid semver pre-release identifiers stay conservative: neither
+/// is newer.
+fn prerelease_newer(current: &str, candidate: &str) -> bool {
+    match (
+        semver::Prerelease::new(current),
+        semver::Prerelease::new(candidate),
+    ) {
+        (Ok(cur), Ok(cand)) => cand > cur,
+        _ => false,
+    }
+}
+
+/// Parse a version string into (numeric components, pre-release suffix).
+/// The semver `+build` tail is stripped before the numeric split.
+fn parse_version(s: &str) -> (Vec<u64>, Option<String>) {
     let s = s.trim_start_matches('v');
-    let (head, has_suffix) = match s.split_once('-') {
-        Some((before, _)) => (before, true),
-        None => (s, false),
+    let (head, pre) = match s.split_once('-') {
+        Some((before, suffix)) => (before, Some(suffix.to_string())),
+        None => (s, None),
     };
     let head = head.split_once('+').map(|(b, _)| b).unwrap_or(head);
     let parts = head
         .split('.')
         .filter_map(|p| p.parse::<u64>().ok())
         .collect();
-    (parts, has_suffix)
+    (parts, pre)
 }
 
 #[cfg(test)]
@@ -362,10 +377,21 @@ mod tests {
     }
 
     #[test]
-    fn two_prereleases_same_numeric_are_equal() {
-        // Conservative: we don't try to order rc1 vs rc2, so neither is newer.
-        assert!(!is_newer("v1.2.3-rc1", "v1.2.3-rc2"));
+    fn two_prereleases_same_numeric_order_by_semver_rules() {
+        assert!(is_newer("v1.2.3-rc1", "v1.2.3-rc2"));
         assert!(!is_newer("v1.2.3-rc2", "v1.2.3-rc1"));
+        assert!(is_newer("v1.2.3-rc.1", "v1.2.3-rc.2"));
+        assert!(is_newer("v1.2.3-beta", "v1.2.3-rc1"));
+        assert!(!is_newer("v1.2.3-rc1", "v1.2.3-beta"));
+        // Identical pre-releases: neither is newer.
+        assert!(!is_newer("v1.2.3-rc1", "v1.2.3-rc1"));
+    }
+
+    #[test]
+    fn invalid_prerelease_suffixes_stay_conservative() {
+        // Not valid semver pre-release identifiers — don't guess an order.
+        assert!(!is_newer("v1.2.3-r_c1", "v1.2.3-r_c2"));
+        assert!(!is_newer("v1.2.3-r_c2", "v1.2.3-r_c1"));
     }
 
     #[test]
