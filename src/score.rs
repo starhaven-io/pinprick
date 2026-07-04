@@ -20,7 +20,7 @@ use crate::github::{AdvisoryVulnerability, GitHubClient, GitHubError, SecurityAd
 use crate::output::AuditFinding;
 use crate::workflow::{self, ActionRef, RefType};
 
-pub const RUBRIC_VERSION: &str = "0.7.0";
+pub const RUBRIC_VERSION: &str = "0.8.0";
 
 // ── Rule catalog ────────────────────────────────────────────────────────────
 
@@ -526,10 +526,8 @@ fn archived_findings(
 /// version falls inside the vulnerable range of a published repo advisory.
 ///
 /// Tag-pinned and SHA-pinned actions are both eligible. SHAs are resolved
-/// to a tag via the GitHub tags endpoint; if no matching tag exists in the
-/// first page (100), the action is silently skipped — the alternative
-/// would be either over-flagging or making this rule O(repo) per scan,
-/// and neither is justifiable for an MVP.
+/// to a tag via the GitHub tags endpoint with bounded pagination; if no
+/// matching tag exists in that bounded window, the action is silently skipped.
 ///
 /// Sliding-tag refs (`@v4`) and branch refs are not version-precise, so
 /// no advisory matching is attempted — those refs already trigger

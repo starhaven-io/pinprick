@@ -131,6 +131,29 @@ Not flagged:
 - Any URL whose host matches [`trusted-hosts`](#trusted-hosts-exemption) in `.pinprick.toml`.
 - Any URL whose path ends in a data-format extension (`.json`, `.yaml`, `.toml`, `.csv`, etc.). See [Data-format exemption](#data-format-exemption).
 
+### curl or wget from a non-literal URL to an executable target
+
+**Severity:** Low
+
+Triggers when `curl` or `wget` writes a `$`-sourced URL to a target that does not look like a data file. pinprick cannot inspect the URL path, so this is intentionally lower severity than a known unversioned URL.
+
+```bash
+curl -fsSL "$RELEASE_URL" -o tool
+wget "$TOOL_URL" -O bin/tool
+curl "$DOWNLOAD_URL" > install.sh
+```
+
+Not flagged:
+
+```bash
+curl -fsSL "$SCHEMA_URL" -o schema.json
+curl -fsSL "$RELEASE_URL" -o /dev/null
+curl -fsSL "$RELEASE_URL" | cat > tool
+curl -fsSL https://example.com/tool -o tool
+```
+
+Literal URLs stay on the normal versioned/unversioned URL path. Later pipeline stages are not treated as proof that the fetch itself wrote an executable file.
+
 ### gh release download without a pinned tag
 
 **Severity:** Medium
@@ -164,6 +187,26 @@ Not flagged:
 ```bash
 go install github.com/golangci/golangci-lint/cmd/golangci-lint@v1.55.0
 ```
+
+### deno run / install from an unversioned URL
+
+**Severity:** High
+
+Triggers on `deno run` or `deno install` when the command executes code from an unversioned URL.
+
+```bash
+deno run --allow-net https://deno.land/x/install/mod.ts
+deno install https://example.com/scripts/tool.ts
+```
+
+Not flagged:
+
+```bash
+deno run https://deno.land/x/tool@v1.2.3/mod.ts
+deno install https://example.com/releases/download/v1.2.3/tool.ts
+```
+
+Deno URL imports commonly pin by embedding the version after the package name (`tool@v1.2.3`), so the versioned-URL heuristic accepts `@` as a version boundary.
 
 ### git clone without a pinned ref
 
@@ -222,6 +265,24 @@ pip install requests>=2.0
 pip install -r requirements.txt
 ```
 
+### pipx install without a version pin
+
+**Severity:** Low
+
+Triggers on `pipx install <package>` where the package has no Python version specifier.
+
+```bash
+pipx install poetry
+pipx install black --include-deps
+```
+
+Not flagged:
+
+```bash
+pipx install poetry==1.8.3
+pipx install black>=24.0
+```
+
 ### npm install without a version pin
 
 **Severity:** Low
@@ -262,6 +323,42 @@ npx typescript@5.6.0
 npx @angular/cli@17.0.0 new my-app
 npx -p typescript@5.6.0 tsc
 npx --package=typescript@5.6.0 tsc
+```
+
+### uv tool install without a version pin
+
+**Severity:** Low
+
+Triggers on `uv tool install <package>` where the tool spec has no version pin.
+
+```bash
+uv tool install ruff
+uv tool install black --with click
+```
+
+Not flagged:
+
+```bash
+uv tool install ruff==0.8.0
+uv tool install ruff@0.8.0
+```
+
+### uvx without a version pin
+
+**Severity:** Medium
+
+Triggers on `uvx <package>` where no token on the line has a version specifier. Like `npx`, `uvx` fetches and runs a tool in one step, so an unpinned invocation can change between CI runs.
+
+```bash
+uvx ruff check .
+uvx --from black black --check .
+```
+
+Not flagged:
+
+```bash
+uvx ruff@0.8.0 check .
+uvx --from black@24.10.0 black --check .
 ```
 
 ### pip install git+URL without a ref
@@ -369,6 +466,36 @@ Not flagged:
 Invoke-WebRequest "https://example.com/releases/download/v1.2.3/tool"
 ```
 
+### Start-BitsTransfer to a `/latest/` or unversioned URL
+
+**Severity:** High for `/latest/`, Medium for other unversioned URLs
+
+```powershell
+Start-BitsTransfer -Source "https://example.com/releases/latest/tool.ps1" -Destination tool.ps1
+Start-BitsTransfer -Source "https://example.com/tool.ps1" -Destination tool.ps1
+```
+
+Not flagged:
+
+```powershell
+Start-BitsTransfer -Source "https://example.com/releases/download/v1.2.3/tool.ps1" -Destination tool.ps1
+```
+
+### WebClient.DownloadFile to a `/latest/` or unversioned URL
+
+**Severity:** High for `/latest/`, Medium for other unversioned URLs
+
+```powershell
+(New-Object Net.WebClient).DownloadFile("https://example.com/releases/latest/tool.exe", "tool.exe")
+(New-Object Net.WebClient).DownloadFile("https://example.com/tool.exe", "tool.exe")
+```
+
+Not flagged:
+
+```powershell
+(New-Object Net.WebClient).DownloadFile("https://example.com/releases/download/v1.2.3/tool.exe", "tool.exe")
+```
+
 ### Install-Module / Install-Script without -RequiredVersion
 
 **Severity:** Medium
@@ -465,6 +592,35 @@ Not flagged:
 - Trusted host via [`trusted-hosts`](#trusted-hosts-exemption)
 - Data-format URL: `requests.get("https://example.com/data.json")` — see [Data-format exemption](#data-format-exemption).
 
+## Docker CLI patterns
+
+Flagged in shell `run:` blocks and composite `action.yml` steps.
+
+### docker pull / run image:latest or untagged
+
+**Severity:** High
+
+Triggers on literal image names in `docker pull` and `docker run` commands when the image has no tag or uses `:latest`.
+
+```bash
+docker pull alpine:latest
+docker run --rm alpine echo hi
+docker image pull ghcr.io/org/app
+docker container run ghcr.io/org/app:latest
+```
+
+Not flagged:
+
+```bash
+docker run alpine:3.20 echo hi
+docker pull ghcr.io/org/app@sha256:abc123
+docker run "$IMAGE" echo hi
+docker build .
+docker compose up
+```
+
+Variable or GitHub-expression image names are not classified: the value might expand to a digest-pinned image, and pinprick cannot inspect that value statically.
+
 ## Dockerfile patterns
 
 Flagged in `Dockerfile` and `*.dockerfile` files inside an action's source tree.
@@ -541,12 +697,13 @@ Not flagged:
 
 ## Versioned URL heuristic
 
-A URL is considered _versioned_ if it contains a path segment matching `v?\d+(\.\d+)+` between `/` or `=` boundaries:
+A URL is considered _versioned_ if it contains a path segment matching `v?\d+(\.\d+)+` between `/`, `=`, or `@` boundaries:
 
 | URL                                                        | Versioned?                         |
 | ---------------------------------------------------------- | ---------------------------------- |
 | `https://example.com/releases/download/v1.2.3/tool.tar.gz` | yes                                |
 | `https://example.com/releases/download/0.55.8/tool`        | yes                                |
+| `https://deno.land/x/tool@v1.2.3/mod.ts`                   | yes                                |
 | `https://example.com/releases/latest/download/tool.tar.gz` | no                                 |
 | `https://api.example.com/data`                             | no                                 |
 | `https://example.com/v4/resource`                          | no (single numeric component only) |

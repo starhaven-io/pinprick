@@ -10,14 +10,15 @@ use crate::audit_patterns::{
     PS_INSTALL_MODULE_UNVERSIONED, PY_PATTERNS, PY_URL_PATTERNS, Pattern,
     SH_CARGO_INSTALL_UNVERSIONED, SH_GEM_INSTALL_UNVERSIONED, SH_GH_RELEASE_LATEST, SH_GIT_CLONE,
     SH_NPM_UNVERSIONED, SH_NPX_UNVERSIONED, SH_PIP_GIT_URL_UNVERSIONED, SH_PIP_UNVERSIONED,
-    SHELL_PATTERNS, SHELL_PIPE_PATTERNS, SHELL_URL_PATTERNS, cargo_install_has_version,
-    extract_urls, gem_install_has_version, gh_release_has_tag, git_clone_has_pinned_ref,
-    npm_install_has_version, npx_has_version, pip_git_url_has_ref, pip_install_has_version,
-    ps_install_has_required_version, url_has_version,
+    SH_PIPX_UNVERSIONED, SH_UV_TOOL_INSTALL_UNVERSIONED, SH_UVX_UNVERSIONED, SHELL_PATTERNS,
+    SHELL_PIPE_PATTERNS, SHELL_URL_PATTERNS, cargo_install_has_version, extract_urls,
+    gem_install_has_version, gh_release_has_tag, git_clone_has_pinned_ref, npm_install_has_version,
+    npx_has_version, pip_git_url_has_ref, pip_install_has_version, pipx_install_has_version,
+    ps_install_has_required_version, url_has_version, uv_tool_install_has_version, uvx_has_version,
 };
 use crate::audit_shell::{
-    checksum_verifies_target, fetch_output_targets, git_clone_has_bound_sha_checkout,
-    is_shell_comment_line, join_continuations, url_piped_to_jq,
+    checksum_verifies_target, docker_unpinned_images, fetch_output_targets,
+    git_clone_has_bound_sha_checkout, is_shell_comment_line, join_continuations, url_piped_to_jq,
 };
 use crate::audit_source::{
     ActionScanStatus, remote_action_scan_key, scan_action_source, scan_local_action_source,
@@ -74,6 +75,24 @@ static PKG_RULES: &[PkgRule] = &[
         regex: &SH_NPX_UNVERSIONED,
         is_pinned: npx_has_version,
         description: "npx without version pin — fetches and executes latest on every run",
+        severity: audit_patterns::Severity::Medium,
+    },
+    PkgRule {
+        regex: &SH_PIPX_UNVERSIONED,
+        is_pinned: pipx_install_has_version,
+        description: "pipx install without version pin",
+        severity: audit_patterns::Severity::Low,
+    },
+    PkgRule {
+        regex: &SH_UV_TOOL_INSTALL_UNVERSIONED,
+        is_pinned: uv_tool_install_has_version,
+        description: "uv tool install without version pin",
+        severity: audit_patterns::Severity::Low,
+    },
+    PkgRule {
+        regex: &SH_UVX_UNVERSIONED,
+        is_pinned: uvx_has_version,
+        description: "uvx without version pin — fetches and executes latest on every run",
         severity: audit_patterns::Severity::Medium,
     },
     PkgRule {
@@ -604,6 +623,30 @@ pub fn scan_shell_content(
             ));
         }
 
+        for image in docker_unpinned_images(line) {
+            collector.push_finding(AuditFinding::new(
+                &audit_patterns::Severity::High,
+                &audit_patterns::Category::DockerUnpinned,
+                action_name,
+                source_file,
+                line_num,
+                line,
+                format!("docker pull/run uses unpinned image `{image}`"),
+            ));
+        }
+
+        if fetches_non_literal_executable(line, config) {
+            collector.push_finding(AuditFinding::new(
+                &audit_patterns::Severity::Low,
+                &audit_patterns::Category::ShellFetch,
+                action_name,
+                source_file,
+                line_num,
+                line,
+                "curl/wget downloads executable from non-literal source — cannot verify URL version",
+            ));
+        }
+
         if SH_GIT_CLONE.is_match(line) && !git_clone_has_pinned_ref(line) {
             if git_clone_has_bound_sha_checkout(&logical, li) {
                 collector.push_allowed(AuditMatch::new(
@@ -799,7 +842,7 @@ pub(crate) fn scan_dockerfile_content(
         }
     }
 
-    for (start, line) in &logical {
+    for (li, (start, line)) in logical.iter().enumerate() {
         let line = line.as_str();
         let line_num = start + 1;
 
@@ -837,17 +880,38 @@ pub(crate) fn scan_dockerfile_content(
         );
 
         if SH_GIT_CLONE.is_match(line) && !git_clone_has_pinned_ref(line) {
-            collector.push_finding(AuditFinding::new(
-                &audit_patterns::Severity::Medium,
-                &audit_patterns::Category::DockerUnpinned,
-                action_name,
-                source_file,
-                line_num,
-                line,
-                "git clone in Dockerfile without pinned ref",
-            ));
+            if git_clone_has_bound_sha_checkout(&logical, li) {
+                collector.push_allowed(AuditMatch::new(
+                    &audit_patterns::Severity::Medium,
+                    &audit_patterns::Category::DockerUnpinned,
+                    action_name,
+                    source_file,
+                    line_num,
+                    line,
+                    "followed by SHA checkout",
+                ));
+            } else {
+                collector.push_finding(AuditFinding::new(
+                    &audit_patterns::Severity::Medium,
+                    &audit_patterns::Category::DockerUnpinned,
+                    action_name,
+                    source_file,
+                    line_num,
+                    line,
+                    "git clone in Dockerfile without pinned ref",
+                ));
+            }
         }
     }
+}
+
+fn fetches_non_literal_executable(line: &str, config: &Config) -> bool {
+    if extract_urls(line).next().is_some() || !line.contains('$') {
+        return false;
+    }
+    fetch_output_targets(line).into_iter().any(|target| {
+        !target.contains('$') && target != "/dev/null" && !config.is_data_format_exempt(&target)
+    })
 }
 
 fn push_pkg_finding(
@@ -1257,6 +1321,251 @@ jobs:
         );
         assert_eq!(c.findings.len(), 1);
         assert_eq!(c.findings[0].line, Some(1));
+    }
+
+    #[test]
+    fn shell_scan_docker_pull_latest_is_finding() {
+        let mut c = AuditCollector::new(false);
+        scan_shell_content(
+            "docker pull alpine:latest",
+            "test.sh",
+            1,
+            "",
+            &mut c,
+            &DEFAULT_CONFIG,
+        );
+        assert_eq!(c.findings.len(), 1);
+        assert_eq!(c.findings[0].severity, "high");
+        assert_eq!(c.findings[0].category, "docker_unpinned");
+        assert!(c.findings[0].description.contains("alpine:latest"));
+    }
+
+    #[test]
+    fn shell_scan_docker_run_untagged_skips_options() {
+        let mut c = AuditCollector::new(false);
+        scan_shell_content(
+            "sudo docker run --rm -v /tmp:/tmp -e FOO=bar alpine echo hi",
+            "test.sh",
+            1,
+            "",
+            &mut c,
+            &DEFAULT_CONFIG,
+        );
+        assert_eq!(c.findings.len(), 1);
+        assert_eq!(c.findings[0].category, "docker_unpinned");
+        assert!(c.findings[0].description.contains("alpine"));
+    }
+
+    #[test]
+    fn shell_scan_docker_run_versioned_or_digest_clean() {
+        let mut c = AuditCollector::new(false);
+        scan_shell_content(
+            "docker run alpine:3.20\ndocker pull ghcr.io/org/app@sha256:aaaaaaaa",
+            "test.sh",
+            1,
+            "",
+            &mut c,
+            &DEFAULT_CONFIG,
+        );
+        assert!(c.findings.is_empty());
+    }
+
+    #[test]
+    fn shell_scan_docker_run_variable_images_clean() {
+        let mut c = AuditCollector::new(false);
+        scan_shell_content(
+            r#"docker run $MY_IMAGE echo hi
+docker run "${{ matrix.image }}" echo hi"#,
+            "test.sh",
+            1,
+            "",
+            &mut c,
+            &DEFAULT_CONFIG,
+        );
+        assert!(c.findings.is_empty());
+    }
+
+    #[test]
+    fn shell_scan_docker_build_and_compose_clean() {
+        let mut c = AuditCollector::new(false);
+        scan_shell_content(
+            "docker build .\ndocker compose up",
+            "test.sh",
+            1,
+            "",
+            &mut c,
+            &DEFAULT_CONFIG,
+        );
+        assert!(c.findings.is_empty());
+    }
+
+    #[test]
+    fn shell_scan_deno_url_is_finding_when_unversioned() {
+        let mut c = AuditCollector::new(false);
+        scan_shell_content(
+            "deno run --allow-net https://deno.land/x/install/mod.ts",
+            "test.sh",
+            1,
+            "",
+            &mut c,
+            &DEFAULT_CONFIG,
+        );
+        assert_eq!(c.findings.len(), 1);
+        assert_eq!(c.findings[0].severity, "high");
+        assert!(c.findings[0].description.contains("deno"));
+    }
+
+    #[test]
+    fn shell_scan_deno_versioned_url_is_allowed() {
+        let mut c = AuditCollector::new(true);
+        scan_shell_content(
+            "deno run https://deno.land/x/tool@v1.2.3/mod.ts",
+            "test.sh",
+            1,
+            "",
+            &mut c,
+            &DEFAULT_CONFIG,
+        );
+        assert!(c.findings.is_empty());
+        assert_eq!(c.allowed.len(), 1);
+        assert_eq!(c.allowed[0].reason, "versioned URL");
+    }
+
+    #[test]
+    fn shell_scan_powershell_bits_and_downloadfile_are_findings() {
+        let mut c = AuditCollector::new(false);
+        scan_shell_content(
+            "Start-BitsTransfer -Source https://example.com/tool.ps1 -Destination tool.ps1\n(New-Object Net.WebClient).DownloadFile('https://example.com/tool.exe', 'tool.exe')",
+            "test.ps1",
+            1,
+            "",
+            &mut c,
+            &DEFAULT_CONFIG,
+        );
+        assert_eq!(c.findings.len(), 2);
+        assert!(
+            c.findings
+                .iter()
+                .any(|f| f.description.contains("Start-BitsTransfer"))
+        );
+        assert!(
+            c.findings
+                .iter()
+                .any(|f| f.description.contains("WebClient.DownloadFile"))
+        );
+    }
+
+    #[test]
+    fn shell_scan_non_literal_fetch_to_executable_is_low_finding() {
+        let mut c = AuditCollector::new(false);
+        scan_shell_content(
+            r#"curl -fsSL "$RELEASE_URL" -o tool"#,
+            "test.sh",
+            1,
+            "",
+            &mut c,
+            &DEFAULT_CONFIG,
+        );
+        assert_eq!(c.findings.len(), 1);
+        assert_eq!(c.findings[0].severity, "low");
+        assert!(c.findings[0].description.contains("non-literal source"));
+    }
+
+    #[test]
+    fn shell_scan_non_literal_fetch_to_data_file_is_clean() {
+        let mut c = AuditCollector::new(false);
+        scan_shell_content(
+            r#"curl -fsSL "$SCHEMA_URL" -o schema.json"#,
+            "test.sh",
+            1,
+            "",
+            &mut c,
+            &DEFAULT_CONFIG,
+        );
+        assert!(c.findings.is_empty());
+    }
+
+    #[test]
+    fn shell_scan_non_literal_fetch_to_dev_null_or_later_pipe_redirect_is_clean() {
+        let mut c = AuditCollector::new(false);
+        scan_shell_content(
+            r#"curl -fsSL "$RELEASE_URL" -o /dev/null
+curl -fsSL "$RELEASE_URL" | cat > tool"#,
+            "test.sh",
+            1,
+            "",
+            &mut c,
+            &DEFAULT_CONFIG,
+        );
+        assert!(c.findings.is_empty());
+    }
+
+    #[test]
+    fn shell_scan_pipx_and_uv_tool_unversioned_are_findings() {
+        let mut c = AuditCollector::new(false);
+        scan_shell_content(
+            "pipx install poetry\nuv tool install ruff",
+            "test.sh",
+            1,
+            "",
+            &mut c,
+            &DEFAULT_CONFIG,
+        );
+        assert_eq!(c.findings.len(), 2);
+        assert!(
+            c.findings
+                .iter()
+                .any(|f| f.description.contains("pipx install"))
+        );
+        assert!(
+            c.findings
+                .iter()
+                .any(|f| f.description.contains("uv tool install"))
+        );
+    }
+
+    #[test]
+    fn shell_scan_pipx_and_uv_tool_version_pinned_clean() {
+        let mut c = AuditCollector::new(false);
+        scan_shell_content(
+            "pipx install poetry==1.8.3\nuv tool install ruff==0.8.0",
+            "test.sh",
+            1,
+            "",
+            &mut c,
+            &DEFAULT_CONFIG,
+        );
+        assert!(c.findings.is_empty());
+    }
+
+    #[test]
+    fn shell_scan_uvx_unversioned_is_finding() {
+        let mut c = AuditCollector::new(false);
+        scan_shell_content(
+            "uvx ruff check .",
+            "test.sh",
+            1,
+            "",
+            &mut c,
+            &DEFAULT_CONFIG,
+        );
+        assert_eq!(c.findings.len(), 1);
+        assert_eq!(c.findings[0].severity, "medium");
+        assert!(c.findings[0].description.contains("uvx"));
+    }
+
+    #[test]
+    fn shell_scan_uvx_version_pinned_clean() {
+        let mut c = AuditCollector::new(false);
+        scan_shell_content(
+            "uvx ruff@0.8.0 check .",
+            "test.sh",
+            1,
+            "",
+            &mut c,
+            &DEFAULT_CONFIG,
+        );
+        assert!(c.findings.is_empty());
     }
 
     #[test]
@@ -2048,6 +2357,21 @@ const d = require("node:https").get("https://example.com/install.sh", cb);
         );
         assert_eq!(c.findings.len(), 1);
         assert!(c.findings[0].description.contains("FROM without tag"));
+    }
+
+    #[test]
+    fn dockerfile_git_clone_followed_by_sha_checkout_is_allowed() {
+        let mut c = AuditCollector::new(true);
+        scan_dockerfile_content(
+            "FROM alpine:3.20\nRUN git clone https://github.com/org/repo /src && git -C /src checkout abcdef1234567890abcdef1234567890abcdef12\n",
+            "Dockerfile",
+            "",
+            &mut c,
+            &DEFAULT_CONFIG,
+        );
+        assert!(c.findings.is_empty());
+        assert_eq!(c.allowed.len(), 1);
+        assert_eq!(c.allowed[0].reason, "followed by SHA checkout");
     }
 
     #[test]
