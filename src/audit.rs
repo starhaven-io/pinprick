@@ -3,6 +3,7 @@ use serde_norway::Value;
 use std::collections::HashSet;
 use std::path::Path;
 use std::process::ExitCode;
+use std::sync::LazyLock;
 
 use crate::audit_patterns::{
     self, DOCKER_PATTERNS, DOCKER_URL_PATTERNS, JS_PATTERNS, JS_URL_PATTERNS,
@@ -10,9 +11,9 @@ use crate::audit_patterns::{
     SH_CARGO_INSTALL_UNVERSIONED, SH_GEM_INSTALL_UNVERSIONED, SH_GH_RELEASE_LATEST, SH_GIT_CLONE,
     SH_NPM_UNVERSIONED, SH_NPX_UNVERSIONED, SH_PIP_GIT_URL_UNVERSIONED, SH_PIP_UNVERSIONED,
     SHELL_PATTERNS, SHELL_PIPE_PATTERNS, SHELL_URL_PATTERNS, cargo_install_has_version,
-    category_str, extract_urls, gem_install_has_version, gh_release_has_tag,
-    git_clone_has_pinned_ref, npm_install_has_version, npx_has_version, pip_git_url_has_ref,
-    pip_install_has_version, ps_install_has_required_version, url_has_version,
+    extract_urls, gem_install_has_version, gh_release_has_tag, git_clone_has_pinned_ref,
+    npm_install_has_version, npx_has_version, pip_git_url_has_ref, pip_install_has_version,
+    ps_install_has_required_version, url_has_version,
 };
 use crate::audit_shell::{
     checksum_verifies_target, fetch_output_targets, git_clone_has_bound_sha_checkout,
@@ -26,15 +27,68 @@ use crate::audited_actions::{AuditSource, AuditedActions};
 use crate::auth;
 use crate::config::Config;
 use crate::github::GitHubClient;
-use crate::output::{self, AuditFinding, AuditMatch, AuditReport};
+use crate::output::{AuditFinding, AuditMatch, AuditReport};
 use crate::workflow;
 use colored::Colorize;
+use regex::Regex;
 
 /// Reason string for matches allowed via the `trusted-hosts` config list.
 /// Shared between the allow site and the repo-config notice that counts them.
 pub(crate) const REASON_TRUSTED_HOST: &str = "trusted host";
 /// Reason string for matches allowed via `extra-data-formats` config entries.
 pub(crate) const REASON_EXTRA_DATA_FORMAT: &str = "extra data format URL";
+
+struct PkgRule {
+    regex: &'static LazyLock<Regex>,
+    is_pinned: fn(&str) -> bool,
+    description: &'static str,
+    severity: audit_patterns::Severity,
+}
+
+static PKG_RULES: &[PkgRule] = &[
+    PkgRule {
+        regex: &SH_PIP_UNVERSIONED,
+        is_pinned: pip_install_has_version,
+        description: "pip install without version pin",
+        severity: audit_patterns::Severity::Low,
+    },
+    PkgRule {
+        regex: &SH_NPM_UNVERSIONED,
+        is_pinned: npm_install_has_version,
+        description: "npm install without version pin",
+        severity: audit_patterns::Severity::Low,
+    },
+    PkgRule {
+        regex: &SH_CARGO_INSTALL_UNVERSIONED,
+        is_pinned: cargo_install_has_version,
+        description: "cargo install without --version pin",
+        severity: audit_patterns::Severity::Low,
+    },
+    PkgRule {
+        regex: &SH_GEM_INSTALL_UNVERSIONED,
+        is_pinned: gem_install_has_version,
+        description: "gem install without version pin",
+        severity: audit_patterns::Severity::Low,
+    },
+    PkgRule {
+        regex: &SH_NPX_UNVERSIONED,
+        is_pinned: npx_has_version,
+        description: "npx without version pin — fetches and executes latest on every run",
+        severity: audit_patterns::Severity::Medium,
+    },
+    PkgRule {
+        regex: &PS_INSTALL_MODULE_UNVERSIONED,
+        is_pinned: ps_install_has_required_version,
+        description: "PowerShell Install-Module/Install-Script without -RequiredVersion",
+        severity: audit_patterns::Severity::Medium,
+    },
+    PkgRule {
+        regex: &SH_PIP_GIT_URL_UNVERSIONED,
+        is_pinned: pip_git_url_has_ref,
+        description: "pip install git+URL without @<ref> — tracks default branch HEAD",
+        severity: audit_patterns::Severity::Medium,
+    },
+];
 
 /// Accumulates findings and (when verbose) allowed matches during a scan.
 ///
@@ -539,122 +593,45 @@ pub fn scan_shell_content(
         }
 
         if SH_GH_RELEASE_LATEST.is_match(line) && !gh_release_has_tag(line) {
-            collector.push_finding(AuditFinding {
-                severity: output::severity_str(&audit_patterns::Severity::Medium).to_string(),
-                category: category_str(&audit_patterns::Category::ShellFetch).to_string(),
-                action: action_name.to_string(),
-                source_file: source_file.to_string(),
-                line: Some(line_num),
-                pattern_matched: line.trim().to_string(),
-                description: "gh release download without pinned version".to_string(),
-                workflow_file: None,
-                workflow_line: None,
-            });
+            collector.push_finding(AuditFinding::new(
+                &audit_patterns::Severity::Medium,
+                &audit_patterns::Category::ShellFetch,
+                action_name,
+                source_file,
+                line_num,
+                line,
+                "gh release download without pinned version",
+            ));
         }
 
         if SH_GIT_CLONE.is_match(line) && !git_clone_has_pinned_ref(line) {
             if git_clone_has_bound_sha_checkout(&logical, li) {
-                collector.push_allowed(AuditMatch {
-                    severity: output::severity_str(&audit_patterns::Severity::Medium).to_string(),
-                    category: category_str(&audit_patterns::Category::ShellFetch).to_string(),
-                    action: action_name.to_string(),
-                    source_file: source_file.to_string(),
-                    line: Some(line_num),
-                    pattern_matched: line.trim().to_string(),
-                    reason: "followed by SHA checkout".to_string(),
-                });
+                collector.push_allowed(AuditMatch::new(
+                    &audit_patterns::Severity::Medium,
+                    &audit_patterns::Category::ShellFetch,
+                    action_name,
+                    source_file,
+                    line_num,
+                    line,
+                    "followed by SHA checkout",
+                ));
             } else {
-                collector.push_finding(AuditFinding {
-                    severity: output::severity_str(&audit_patterns::Severity::Medium).to_string(),
-                    category: category_str(&audit_patterns::Category::ShellFetch).to_string(),
-                    action: action_name.to_string(),
-                    source_file: source_file.to_string(),
-                    line: Some(line_num),
-                    pattern_matched: line.trim().to_string(),
-                    description: "git clone without pinned ref — clones HEAD of default branch"
-                        .to_string(),
-                    workflow_file: None,
-                    workflow_line: None,
-                });
+                collector.push_finding(AuditFinding::new(
+                    &audit_patterns::Severity::Medium,
+                    &audit_patterns::Category::ShellFetch,
+                    action_name,
+                    source_file,
+                    line_num,
+                    line,
+                    "git clone without pinned ref — clones HEAD of default branch",
+                ));
             }
         }
 
-        if SH_PIP_UNVERSIONED.is_match(line) && !pip_install_has_version(line) {
-            push_pkg_finding(
-                "pip install without version pin",
-                audit_patterns::Severity::Low,
-                line,
-                source_file,
-                line_num,
-                action_name,
-                collector,
-            );
-        }
-        if SH_NPM_UNVERSIONED.is_match(line) && !npm_install_has_version(line) {
-            push_pkg_finding(
-                "npm install without version pin",
-                audit_patterns::Severity::Low,
-                line,
-                source_file,
-                line_num,
-                action_name,
-                collector,
-            );
-        }
-        if SH_CARGO_INSTALL_UNVERSIONED.is_match(line) && !cargo_install_has_version(line) {
-            push_pkg_finding(
-                "cargo install without --version pin",
-                audit_patterns::Severity::Low,
-                line,
-                source_file,
-                line_num,
-                action_name,
-                collector,
-            );
-        }
-        if SH_GEM_INSTALL_UNVERSIONED.is_match(line) && !gem_install_has_version(line) {
-            push_pkg_finding(
-                "gem install without version pin",
-                audit_patterns::Severity::Low,
-                line,
-                source_file,
-                line_num,
-                action_name,
-                collector,
-            );
-        }
-        if SH_NPX_UNVERSIONED.is_match(line) && !npx_has_version(line) {
-            push_pkg_finding(
-                "npx without version pin — fetches and executes latest on every run",
-                audit_patterns::Severity::Medium,
-                line,
-                source_file,
-                line_num,
-                action_name,
-                collector,
-            );
-        }
-        if PS_INSTALL_MODULE_UNVERSIONED.is_match(line) && !ps_install_has_required_version(line) {
-            push_pkg_finding(
-                "PowerShell Install-Module/Install-Script without -RequiredVersion",
-                audit_patterns::Severity::Medium,
-                line,
-                source_file,
-                line_num,
-                action_name,
-                collector,
-            );
-        }
-        if SH_PIP_GIT_URL_UNVERSIONED.is_match(line) && !pip_git_url_has_ref(line) {
-            push_pkg_finding(
-                "pip install git+URL without @<ref> — tracks default branch HEAD",
-                audit_patterns::Severity::Medium,
-                line,
-                source_file,
-                line_num,
-                action_name,
-                collector,
-            );
+        for rule in PKG_RULES {
+            if rule.regex.is_match(line) && !(rule.is_pinned)(line) {
+                push_pkg_finding(rule, line, source_file, line_num, action_name, collector);
+            }
         }
     }
 
@@ -685,15 +662,10 @@ pub fn scan_shell_content(
         });
         if verified {
             let finding = collector.findings.remove(idx);
-            collector.push_allowed(AuditMatch {
-                severity: finding.severity,
-                category: finding.category,
-                action: finding.action,
-                source_file: finding.source_file,
-                line: finding.line,
-                pattern_matched: finding.pattern_matched,
-                reason: "followed by checksum verification".to_string(),
-            });
+            collector.push_allowed(AuditMatch::from_finding(
+                finding,
+                "followed by checksum verification",
+            ));
         } else {
             idx += 1;
         }
@@ -865,41 +837,36 @@ pub(crate) fn scan_dockerfile_content(
         );
 
         if SH_GIT_CLONE.is_match(line) && !git_clone_has_pinned_ref(line) {
-            collector.push_finding(AuditFinding {
-                severity: output::severity_str(&audit_patterns::Severity::Medium).to_string(),
-                category: category_str(&audit_patterns::Category::DockerUnpinned).to_string(),
-                action: action_name.to_string(),
-                source_file: source_file.to_string(),
-                line: Some(line_num),
-                pattern_matched: line.trim().to_string(),
-                description: "git clone in Dockerfile without pinned ref".to_string(),
-                workflow_file: None,
-                workflow_line: None,
-            });
+            collector.push_finding(AuditFinding::new(
+                &audit_patterns::Severity::Medium,
+                &audit_patterns::Category::DockerUnpinned,
+                action_name,
+                source_file,
+                line_num,
+                line,
+                "git clone in Dockerfile without pinned ref",
+            ));
         }
     }
 }
 
 fn push_pkg_finding(
-    description: &str,
-    severity: audit_patterns::Severity,
+    rule: &PkgRule,
     line: &str,
     source_file: &str,
     line_num: usize,
     action_name: &str,
     collector: &mut AuditCollector,
 ) {
-    collector.push_finding(AuditFinding {
-        severity: output::severity_str(&severity).to_string(),
-        category: category_str(&audit_patterns::Category::ShellFetch).to_string(),
-        action: action_name.to_string(),
-        source_file: source_file.to_string(),
-        line: Some(line_num),
-        pattern_matched: line.trim().to_string(),
-        description: description.to_string(),
-        workflow_file: None,
-        workflow_line: None,
-    });
+    collector.push_finding(AuditFinding::new(
+        &rule.severity,
+        &audit_patterns::Category::ShellFetch,
+        action_name,
+        source_file,
+        line_num,
+        line,
+        rule.description,
+    ));
 }
 
 fn check_url_patterns(
@@ -943,37 +910,31 @@ fn check_url_patterns(
 
     if dangerous {
         if let Some(reason) = allowed_reason {
-            collector.push_allowed(AuditMatch {
-                severity: output::severity_str(&pattern.severity).to_string(),
-                category: category_str(&pattern.category).to_string(),
-                action: action_name.to_string(),
-                source_file: source_file.to_string(),
-                line: Some(line_num),
-                pattern_matched: line.trim().to_string(),
-                reason: reason.to_string(),
-            });
+            collector.push_allowed(AuditMatch::from_pattern(
+                pattern,
+                action_name,
+                source_file,
+                line_num,
+                line,
+                reason,
+            ));
         }
-        collector.push_finding(AuditFinding {
-            severity: output::severity_str(&pattern.severity).to_string(),
-            category: category_str(&pattern.category).to_string(),
-            action: action_name.to_string(),
-            source_file: source_file.to_string(),
-            line: Some(line_num),
-            pattern_matched: line.trim().to_string(),
-            description: pattern.description.to_string(),
-            workflow_file: None,
-            workflow_line: None,
-        });
+        collector.push_finding(AuditFinding::from_pattern(
+            pattern,
+            action_name,
+            source_file,
+            line_num,
+            line,
+        ));
     } else if let Some(reason) = allowed_reason {
-        collector.push_allowed(AuditMatch {
-            severity: output::severity_str(&pattern.severity).to_string(),
-            category: category_str(&pattern.category).to_string(),
-            action: action_name.to_string(),
-            source_file: source_file.to_string(),
-            line: Some(line_num),
-            pattern_matched: line.trim().to_string(),
-            reason: reason.to_string(),
-        });
+        collector.push_allowed(AuditMatch::from_pattern(
+            pattern,
+            action_name,
+            source_file,
+            line_num,
+            line,
+            reason,
+        ));
     }
     // No URL on the line: nothing to record.
 }
@@ -988,17 +949,13 @@ fn check_patterns(
 ) {
     for pattern in patterns {
         if pattern.regex.is_match(line) {
-            collector.push_finding(AuditFinding {
-                severity: output::severity_str(&pattern.severity).to_string(),
-                category: category_str(&pattern.category).to_string(),
-                action: action_name.to_string(),
-                source_file: source_file.to_string(),
-                line: Some(line_num),
-                pattern_matched: line.trim().to_string(),
-                description: pattern.description.to_string(),
-                workflow_file: None,
-                workflow_line: None,
-            });
+            collector.push_finding(AuditFinding::from_pattern(
+                pattern,
+                action_name,
+                source_file,
+                line_num,
+                line,
+            ));
         }
     }
 }
@@ -1013,30 +970,30 @@ mod tests {
     #[test]
     fn collector_drops_allowed_when_not_verbose() {
         let mut c = AuditCollector::new(false);
-        c.push_allowed(AuditMatch {
-            severity: "medium".into(),
-            category: "shell_fetch".into(),
-            action: String::new(),
-            source_file: "test".into(),
-            line: Some(1),
-            pattern_matched: "curl https://example.com/v1.2.3/foo".into(),
-            reason: "versioned URL".into(),
-        });
+        c.push_allowed(AuditMatch::new(
+            &audit_patterns::Severity::Medium,
+            &audit_patterns::Category::ShellFetch,
+            "",
+            "test",
+            1,
+            "curl https://example.com/v1.2.3/foo",
+            "versioned URL",
+        ));
         assert!(c.allowed.is_empty());
     }
 
     #[test]
     fn collector_keeps_allowed_when_verbose() {
         let mut c = AuditCollector::new(true);
-        c.push_allowed(AuditMatch {
-            severity: "medium".into(),
-            category: "shell_fetch".into(),
-            action: String::new(),
-            source_file: "test".into(),
-            line: Some(1),
-            pattern_matched: "curl https://example.com/v1.2.3/foo".into(),
-            reason: "versioned URL".into(),
-        });
+        c.push_allowed(AuditMatch::new(
+            &audit_patterns::Severity::Medium,
+            &audit_patterns::Category::ShellFetch,
+            "",
+            "test",
+            1,
+            "curl https://example.com/v1.2.3/foo",
+            "versioned URL",
+        ));
         assert_eq!(c.allowed.len(), 1);
     }
 
