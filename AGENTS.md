@@ -20,6 +20,8 @@ pinprick/
 │   ├── main.rs              # Entry point, clap CLI definition, command dispatch
 │   ├── audit.rs             # Audit command: scan workflows + action source for runtime fetches
 │   ├── audit_patterns.rs    # Compiled regex patterns for shell/JS/Docker fetch detection
+│   ├── audit_shell.rs       # Shell tokenizer + fetch-target extraction for the audit scanners
+│   ├── audit_source.rs      # Action source selection and fetch (remote trees API, local ./ actions)
 │   ├── audited_actions.rs   # Layered lookup: bundled → local cache → remote → GitHub API
 │   ├── auth.rs              # GitHub token resolution (GITHUB_TOKEN env → gh auth token fallback)
 │   ├── config.rs            # TOML config file loading (.pinprick.toml, ~/.config/pinprick/)
