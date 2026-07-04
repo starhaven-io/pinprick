@@ -40,7 +40,7 @@ jobs:
           persist-credentials: false
 
       - name: Run pinprick
-        uses: starhaven-io/pinprick-action@834248de335b3a7c862e1c75b2c7a4dd7940c7d0 # v0.3.0
+        uses: starhaven-io/pinprick-action@5adca23b3098208cd4d19cd291abb3ae1c4cb432 # v0.4.0
 ```
 
 ## Usage without GitHub Advanced Security
@@ -72,7 +72,7 @@ jobs:
           persist-credentials: false
 
       - name: Run pinprick
-        uses: starhaven-io/pinprick-action@834248de335b3a7c862e1c75b2c7a4dd7940c7d0 # v0.3.0
+        uses: starhaven-io/pinprick-action@5adca23b3098208cd4d19cd291abb3ae1c4cb432 # v0.4.0
         with:
           advanced-security: false
 ```
@@ -83,7 +83,7 @@ Each example pins `pinprick-action` to a full commit SHA with the release tag in
 
 ```yaml
 - name: Run pinprick
-  uses: starhaven-io/pinprick-action@834248de335b3a7c862e1c75b2c7a4dd7940c7d0 # v0.3.0
+  uses: starhaven-io/pinprick-action@5adca23b3098208cd4d19cd291abb3ae1c4cb432 # v0.4.0
   with:
     fail-on-findings: true
 ```
@@ -92,7 +92,7 @@ Each example pins `pinprick-action` to a full commit SHA with the release tag in
 
 | Input               | Default  | Meaning                                                                                                                                                                              |
 | ------------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `version`           | `0.19.0` | pinprick version to install. The `v0.3.0` action release pins this default for deterministic runs. Use `latest` for the newest pinprick release, or an exact version like `v0.19.0`. |
+| `version`           | `0.20.0` | pinprick version to install. The `v0.4.0` action release pins this default for deterministic runs. Use `latest` for the newest pinprick release, or an exact version like `v0.20.0`. |
 | `path`              | `.`      | Repository path to scan.                                                                                                                                                             |
 | `advanced-security` | `true`   | Upload SARIF results to GitHub code scanning. When `false`, the action prints normal console output.                                                                                 |
 | `fail-on-findings`  | `false`  | Fail the workflow when `pinprick audit` reports findings. Without this, findings are emitted as a warning and the workflow continues.                                                |
