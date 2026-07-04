@@ -21,7 +21,7 @@ pinprick/
 │   ├── audit.rs             # Audit command: scan workflows + action source for runtime fetches
 │   ├── audit_patterns.rs    # Compiled regex patterns for shell/JS/Docker fetch detection
 │   ├── audited_actions.rs   # Layered lookup: bundled → local cache → remote → GitHub API
-│   ├── auth.rs              # GitHub token resolution (GITHUB_TOKEN env → gh auth token fallback)
+│   ├── auth.rs              # GitHub token resolution (GITHUB_TOKEN/GH_TOKEN env → gh auth token fallback)
 │   ├── config.rs            # TOML config file loading (.pinprick.toml, ~/.config/pinprick/)
 │   ├── github.rs            # GitHub API client (tag→SHA, releases, file trees)
 │   ├── output.rs            # Human-readable (colored) and --json output formatting
@@ -74,8 +74,9 @@ That read-only `run:` extraction (`extract_run_blocks` for workflows and `scan_a
 ### GitHub auth
 
 1. `GITHUB_TOKEN` environment variable (checked first)
-2. `gh auth token` CLI fallback
-3. Graceful degradation: `pin` and `update` require a token; `audit` works without one (reduced coverage)
+2. `GH_TOKEN` environment variable (the variable the `gh` CLI itself honors)
+3. `gh auth token` CLI fallback
+4. Graceful degradation: `pin` and `update` require a token; `audit` works without one (reduced coverage)
 
 Rate-limit handling: `github::get` retries once on network/5xx errors and sleeps through `x-ratelimit-reset` when the reset is within 60 s; longer waits bail with `RateLimit`.
 

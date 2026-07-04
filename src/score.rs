@@ -2182,7 +2182,10 @@ jobs:
     #[test]
     fn render_html_escapes_user_content() {
         // Exercise the escaping path for action refs / workflow paths that
-        // could (in theory) contain HTML metacharacters.
+        // could (in theory) contain HTML metacharacters. The finding uses
+        // `pin.full_tag` (2 points) so the fixture models a state the rubric
+        // can actually produce — `source.unverified` is 0-point informational
+        // and must never carry a deduction.
         let report = ScoreReport {
             rubric_version: RUBRIC_VERSION,
             pinprick_version: env!("CARGO_PKG_VERSION"),
@@ -2190,25 +2193,25 @@ jobs:
                 kind: "repo",
                 path: ".".to_string(),
             },
-            score: 99,
+            score: 98,
             grade: "A",
             totals: Totals {
-                points_deducted: 1,
+                points_deducted: 2,
                 findings: 1,
                 workflows_scanned: 1,
                 unique_actions: 1,
             },
             findings: vec![Finding {
-                id: "source.unverified",
-                category: Category::Source,
+                id: "pin.full_tag",
+                category: Category::Pin,
                 severity: Severity::Low,
-                points: 1,
+                points: 2,
                 action_ref: Some("<evil>/bar@v1".to_string()),
                 occurrences: vec![Occurrence {
                     workflow: "a&b.yml".to_string(),
                     line: 1,
                 }],
-                remediation: "fix it",
+                remediation: "Pin to a full 40-char SHA; keep the tag as a comment",
                 details: None,
             }],
         };

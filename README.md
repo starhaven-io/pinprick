@@ -166,7 +166,7 @@ HIGH  .github/workflows/ci.yml:42
 1 finding (1 high, 0 medium, 0 low)
 ```
 
-Without a GitHub token, audit scans local workflow `run:` blocks and local actions referenced with `uses: ./...`. With a token (via `GITHUB_TOKEN` or `gh auth`), it also fetches and scans external action source code — JavaScript, Python, Dockerfiles, and composite action steps.
+Without a GitHub token, audit scans local workflow `run:` blocks and local actions referenced with `uses: ./...`. With a token (via `GITHUB_TOKEN`, `GH_TOKEN`, or `gh auth`), it also fetches and scans external action source code — JavaScript, Python, Dockerfiles, and composite action steps.
 
 Pass `--sarif` to emit SARIF 2.1.0 for upload to [GitHub code scanning](https://docs.github.com/en/code-security/code-scanning). Pass `--verbose` to see every match, including ones that passed the version check or were downgraded to an allowed match by the trusted-host, data-format, jq-pipe, or checksum rules.
 
