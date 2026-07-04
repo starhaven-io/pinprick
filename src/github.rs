@@ -268,9 +268,26 @@ impl GitHubClient {
         unreachable!("loop always returns or continues until last_attempt")
     }
 
+    /// Base URL for a repo's API routes, with owner and repo percent-encoded
+    /// so a crafted `uses:` ref can't reshape the request path.
+    fn repo_url(&self, owner: &str, repo: &str) -> Result<String> {
+        Ok(format!(
+            "{}/repos/{}/{}",
+            self.base,
+            encode_path_segment(owner)?,
+            encode_path_segment(repo)?
+        ))
+    }
+
     /// Resolve a tag to its commit SHA, following annotated tag objects.
     pub async fn resolve_tag(&self, owner: &str, repo: &str, tag: &str) -> Result<String> {
-        let url = format!("{}/repos/{owner}/{repo}/git/ref/tags/{tag}", self.base);
+        // Tags may legitimately contain `/` (e.g. `release/v1.2`), so encode
+        // per segment rather than as a single component.
+        let url = format!(
+            "{}/git/ref/tags/{}",
+            self.repo_url(owner, repo)?,
+            percent_encode_path(tag)?
+        );
         let resp = self.get(&url).await?;
 
         if resp.status().as_u16() == 404 {
@@ -286,8 +303,9 @@ impl GitHubClient {
 
         if git_ref.object.object_type == "tag" {
             let tag_url = format!(
-                "{}/repos/{owner}/{repo}/git/tags/{}",
-                self.base, git_ref.object.sha
+                "{}/git/tags/{}",
+                self.repo_url(owner, repo)?,
+                encode_path_segment(&git_ref.object.sha)?
             );
             let tag_resp = self.get(&tag_url).await?;
             ensure_success(
@@ -310,10 +328,13 @@ impl GitHubClient {
         sha: &str,
         original_tag: &str,
     ) -> String {
-        let url = format!(
-            "{}/repos/{owner}/{repo}/git/matching-refs/tags/{original_tag}",
-            self.base
-        );
+        let Ok(base) = self.repo_url(owner, repo) else {
+            return original_tag.to_string();
+        };
+        let Ok(encoded_tag) = percent_encode_path(original_tag) else {
+            return original_tag.to_string();
+        };
+        let url = format!("{base}/git/matching-refs/tags/{encoded_tag}");
         let Ok(resp) = self.get(&url).await else {
             return original_tag.to_string();
         };
@@ -339,7 +360,12 @@ impl GitHubClient {
     }
 
     async fn resolve_annotated_tag(&self, owner: &str, repo: &str, tag_sha: &str) -> String {
-        let url = format!("{}/repos/{owner}/{repo}/git/tags/{tag_sha}", self.base);
+        let (Ok(base), Ok(encoded_sha)) =
+            (self.repo_url(owner, repo), encode_path_segment(tag_sha))
+        else {
+            return String::new();
+        };
+        let url = format!("{base}/git/tags/{encoded_sha}");
         let Ok(resp) = self.get(&url).await else {
             return String::new();
         };
@@ -351,7 +377,7 @@ impl GitHubClient {
 
     /// List releases for a repo (first page, most recent first).
     pub async fn list_releases(&self, owner: &str, repo: &str) -> Result<Vec<Release>> {
-        let url = format!("{}/repos/{owner}/{repo}/releases?per_page=30", self.base);
+        let url = format!("{}/releases?per_page=30", self.repo_url(owner, repo)?);
         let resp = self.get(&url).await?;
 
         if resp.status().as_u16() == 404 {
@@ -370,7 +396,7 @@ impl GitHubClient {
     /// actions are virtually always on a recent tag, so paginating further
     /// isn't worth the latency.
     async fn fetch_tags(&self, owner: &str, repo: &str) -> Result<Vec<TagListEntry>> {
-        let url = format!("{}/repos/{owner}/{repo}/tags?per_page=100", self.base);
+        let url = format!("{}/tags?per_page=100", self.repo_url(owner, repo)?);
         let resp = self.get(&url).await?;
         if resp.status().as_u16() == 404 {
             bail!(GitHubError::RepoNotFound {
@@ -412,8 +438,8 @@ impl GitHubClient {
         repo: &str,
     ) -> Result<Vec<SecurityAdvisory>> {
         let url = format!(
-            "{}/repos/{owner}/{repo}/security-advisories?state=published&per_page=100",
-            self.base
+            "{}/security-advisories?state=published&per_page=100",
+            self.repo_url(owner, repo)?
         );
         let resp = self.get(&url).await?;
         if resp.status().as_u16() == 404 {
@@ -431,7 +457,7 @@ impl GitHubClient {
 
     /// Return `true` if the repo is archived on GitHub.
     pub async fn is_archived(&self, owner: &str, repo: &str) -> Result<bool> {
-        let url = format!("{}/repos/{owner}/{repo}", self.base);
+        let url = self.repo_url(owner, repo)?;
         let resp = self.get(&url).await?;
 
         if resp.status().as_u16() == 404 {
@@ -449,8 +475,9 @@ impl GitHubClient {
     /// Fetch the file tree for a repo at a given SHA.
     pub async fn fetch_tree(&self, owner: &str, repo: &str, sha: &str) -> Result<Vec<TreeEntry>> {
         let url = format!(
-            "{}/repos/{owner}/{repo}/git/trees/{sha}?recursive=1",
-            self.base
+            "{}/git/trees/{}?recursive=1",
+            self.repo_url(owner, repo)?,
+            encode_path_segment(sha)?
         );
         let resp = self.get(&url).await?;
         if resp.status().as_u16() == 404 {
@@ -473,11 +500,11 @@ impl GitHubClient {
         path: &str,
         git_ref: &str,
     ) -> Result<String> {
-        let encoded_path = percent_encode_path(path);
+        let encoded_path = percent_encode_path(path)?;
         let encoded_ref = percent_encode_component(git_ref);
         let url = format!(
-            "{}/repos/{owner}/{repo}/contents/{encoded_path}?ref={encoded_ref}",
-            self.base
+            "{}/contents/{encoded_path}?ref={encoded_ref}",
+            self.repo_url(owner, repo)?
         );
         let resp = self.get_with_accept(&url, ACCEPT_RAW).await?;
 
@@ -496,11 +523,23 @@ impl GitHubClient {
     }
 }
 
-fn percent_encode_path(path: &str) -> String {
-    path.split('/')
-        .map(percent_encode_component)
-        .collect::<Vec<_>>()
-        .join("/")
+fn percent_encode_path(path: &str) -> Result<String> {
+    Ok(path
+        .split('/')
+        .map(encode_path_segment)
+        .collect::<Result<Vec<_>>>()?
+        .join("/"))
+}
+
+/// Percent-encode a single URL path segment, rejecting dot-segments. The
+/// WHATWG URL parser collapses `.`/`..` segments even when percent-encoded,
+/// so a crafted value could climb out of its path position; git and GitHub
+/// both forbid such names, so refusing them loses nothing.
+fn encode_path_segment(value: &str) -> Result<String> {
+    if value == "." || value == ".." {
+        bail!("invalid path segment {value:?}");
+    }
+    Ok(percent_encode_component(value))
 }
 
 fn percent_encode_component(value: &str) -> String {
@@ -600,13 +639,22 @@ mod tests {
     #[test]
     fn percent_encode_path_preserves_separators() {
         assert_eq!(
-            percent_encode_path("dir/a file#x.js"),
+            percent_encode_path("dir/a file#x.js").unwrap(),
             "dir/a%20file%23x.js"
         );
         assert_eq!(
             percent_encode_component("refs/heads/feature?x&y"),
             "refs%2Fheads%2Ffeature%3Fx%26y"
         );
+    }
+
+    #[test]
+    fn encode_path_segment_rejects_dot_segments() {
+        assert!(encode_path_segment(".").is_err());
+        assert!(encode_path_segment("..").is_err());
+        assert!(percent_encode_path("../../etc").is_err());
+        // Dotted-but-not-dot-segment values pass through.
+        assert_eq!(encode_path_segment("v1.2.3").unwrap(), "v1.2.3");
     }
 
     mod network {
@@ -636,6 +684,38 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(sha, "deadbeef");
+        }
+
+        #[tokio::test]
+        async fn resolve_tag_percent_encodes_owner_repo_and_tag() {
+            let server = MockServer::start().await;
+            // Metacharacters in owner/repo/tag must not reshape the request
+            // path; slashes inside tag names stay literal separators.
+            Mock::given(method("GET"))
+                .and(path("/repos/o%23x/r%3Fx/git/ref/tags/release/v1%20x"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "object": { "sha": "deadbeef", "type": "commit" }
+                })))
+                .mount(&server)
+                .await;
+
+            let sha = client_for(&server)
+                .await
+                .resolve_tag("o#x", "r?x", "release/v1 x")
+                .await
+                .unwrap();
+            assert_eq!(sha, "deadbeef");
+        }
+
+        #[tokio::test]
+        async fn resolve_tag_rejects_dot_segment_components() {
+            // No mock mounted: a dot-segment owner or tag must error before
+            // any request is sent, not climb the API path.
+            let server = MockServer::start().await;
+            let client = client_for(&server).await;
+            assert!(client.resolve_tag("..", "r", "v1").await.is_err());
+            assert!(client.resolve_tag("o", "r", "../../x").await.is_err());
+            assert_eq!(server.received_requests().await.unwrap().len(), 0);
         }
 
         #[tokio::test]
