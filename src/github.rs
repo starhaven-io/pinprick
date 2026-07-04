@@ -34,6 +34,9 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
+const LIST_PAGE_SIZE: usize = 100;
+const MAX_LIST_PAGES: usize = 10;
+
 /// Cap on a buffered response body — a hostile endpoint could otherwise stream
 /// gigabytes of "action source" into memory.
 pub(crate) const MAX_RESPONSE_BYTES: usize = 50 * 1024 * 1024;
@@ -375,37 +378,54 @@ impl GitHubClient {
             .unwrap_or_default()
     }
 
-    /// List releases for a repo (first page, most recent first).
+    /// List releases for a repo (bounded pagination, most recent first).
     pub async fn list_releases(&self, owner: &str, repo: &str) -> Result<Vec<Release>> {
-        let url = format!("{}/releases?per_page=30", self.repo_url(owner, repo)?);
-        let resp = self.get(&url).await?;
+        let base = self.repo_url(owner, repo)?;
+        let mut releases = Vec::new();
+        for page in 1..=MAX_LIST_PAGES {
+            let url = format!("{base}/releases?per_page={LIST_PAGE_SIZE}&page={page}");
+            let resp = self.get(&url).await?;
 
-        if resp.status().as_u16() == 404 {
-            bail!(GitHubError::RepoNotFound {
-                owner: owner.into(),
-                repo: repo.into(),
-            });
+            if resp.status().as_u16() == 404 {
+                bail!(GitHubError::RepoNotFound {
+                    owner: owner.into(),
+                    repo: repo.into(),
+                });
+            }
+            ensure_success(&resp, format!("listing releases for {owner}/{repo}"))?;
+
+            let mut page_releases: Vec<Release> = resp.json().await.context("parsing releases")?;
+            let done = page_releases.len() < LIST_PAGE_SIZE;
+            releases.append(&mut page_releases);
+            if done {
+                break;
+            }
         }
-        ensure_success(&resp, format!("listing releases for {owner}/{repo}"))?;
-
-        let releases: Vec<Release> = resp.json().await.context("parsing releases")?;
         Ok(releases)
     }
 
-    /// Fetch the tag list for a repo (first page, up to 100 tags). Pinned
-    /// actions are virtually always on a recent tag, so paginating further
-    /// isn't worth the latency.
+    /// Fetch the tag list for a repo (bounded pagination).
     async fn fetch_tags(&self, owner: &str, repo: &str) -> Result<Vec<TagListEntry>> {
-        let url = format!("{}/tags?per_page=100", self.repo_url(owner, repo)?);
-        let resp = self.get(&url).await?;
-        if resp.status().as_u16() == 404 {
-            bail!(GitHubError::RepoNotFound {
-                owner: owner.into(),
-                repo: repo.into(),
-            });
+        let base = self.repo_url(owner, repo)?;
+        let mut tags = Vec::new();
+        for page in 1..=MAX_LIST_PAGES {
+            let url = format!("{base}/tags?per_page={LIST_PAGE_SIZE}&page={page}");
+            let resp = self.get(&url).await?;
+            if resp.status().as_u16() == 404 {
+                bail!(GitHubError::RepoNotFound {
+                    owner: owner.into(),
+                    repo: repo.into(),
+                });
+            }
+            ensure_success(&resp, format!("listing tags for {owner}/{repo}"))?;
+            let mut page_tags: Vec<TagListEntry> = resp.json().await.context("parsing tags")?;
+            let done = page_tags.len() < LIST_PAGE_SIZE;
+            tags.append(&mut page_tags);
+            if done {
+                break;
+            }
         }
-        ensure_success(&resp, format!("listing tags for {owner}/{repo}"))?;
-        resp.json().await.context("parsing tags")
+        Ok(tags)
     }
 
     /// Find a tag name pointing at the given commit SHA, if any. A release
@@ -840,6 +860,45 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn list_releases_paginates_bounded_pages() {
+            let server = MockServer::start().await;
+            let first_page: Vec<_> = (0..100)
+                .map(|i| {
+                    json!({
+                        "tag_name": format!("v1.0.{i}"),
+                        "draft": false,
+                        "prerelease": false,
+                        "html_url": null
+                    })
+                })
+                .collect();
+            Mock::given(method("GET"))
+                .and(path("/repos/o/r/releases"))
+                .and(query_param("per_page", "100"))
+                .and(query_param("page", "1"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(first_page))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/repos/o/r/releases"))
+                .and(query_param("per_page", "100"))
+                .and(query_param("page", "2"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                    { "tag_name": "v2.0.0", "draft": false, "prerelease": false, "html_url": null }
+                ])))
+                .mount(&server)
+                .await;
+
+            let releases = client_for(&server)
+                .await
+                .list_releases("o", "r")
+                .await
+                .unwrap();
+            assert_eq!(releases.len(), 101);
+            assert_eq!(releases.last().unwrap().tag_name, "v2.0.0");
+        }
+
+        #[tokio::test]
         async fn sha_to_tag_finds_match_or_none() {
             let server = MockServer::start().await;
             Mock::given(method("GET"))
@@ -882,6 +941,40 @@ mod tests {
             assert_eq!(
                 c.sha_to_tag("o", "r", "bbb").await.unwrap().as_deref(),
                 Some("stable")
+            );
+        }
+
+        #[tokio::test]
+        async fn sha_to_tag_searches_later_tag_pages() {
+            let server = MockServer::start().await;
+            let first_page: Vec<_> = (0..100)
+                .map(|i| json!({ "name": format!("v0.0.{i}"), "commit": { "sha": "old" } }))
+                .collect();
+            Mock::given(method("GET"))
+                .and(path("/repos/o/r/tags"))
+                .and(query_param("per_page", "100"))
+                .and(query_param("page", "1"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(first_page))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/repos/o/r/tags"))
+                .and(query_param("per_page", "100"))
+                .and(query_param("page", "2"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                    { "name": "v9.9.9", "commit": { "sha": "target" } }
+                ])))
+                .mount(&server)
+                .await;
+
+            assert_eq!(
+                client_for(&server)
+                    .await
+                    .sha_to_tag("o", "r", "target")
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some("v9.9.9")
             );
         }
 

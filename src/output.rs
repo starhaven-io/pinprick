@@ -694,8 +694,8 @@ const SARIF_RULES: &[RuleDef] = &[
     RuleDef {
         id: "pinprick/docker_unpinned",
         name: "DockerUnpinned",
-        short: "Docker image or RUN instruction without pinning",
-        full: "Dockerfile FROM lines using `:latest` or no tag, or RUN instructions that download content without pinning. Prefer digest-pinned images and versioned downloads.",
+        short: "Docker image or runtime fetch without pinning",
+        full: "Docker images using `:latest` or no tag, or Docker build/runtime instructions that download content without pinning. Prefer digest-pinned images and versioned downloads.",
     },
 ];
 

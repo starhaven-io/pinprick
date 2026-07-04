@@ -1,6 +1,6 @@
 # pinprick scoring rubric
 
-**Status:** draft (rubric version `0.7.0`)
+**Status:** draft (rubric version `0.8.0`)
 
 This document defines how pinprick computes a single score for a GitHub repository's Actions supply chain posture. It is the public specification that the `pinprick score` CLI subcommand implements against, and that any downstream tool wrapping the engine (dashboards, CI plugins, reporting pipelines) should implement against so scores stay portable and comparable.
 
@@ -69,7 +69,7 @@ Why zero points: the rule has no evidence input — it cannot distinguish an est
 
 `source.archived` requires a GitHub token (`GITHUB_TOKEN` env var or `gh auth login`); without one, the offline rules still run. The check fires once per unique `action_ref` whose `owner/repo` is archived on GitHub. A repo lookup failure (network error, 404) is treated as "not archived" so a single bad reference doesn't abort the scan.
 
-`source.advisory` also requires a token. For each tag-pinned action, the tag is matched against the `vulnerable_version_range` of every published GHSA advisory for the repo. SHA-pinned actions are resolved to a tag via the GitHub tags endpoint (first page only — pinned actions are virtually always on a recent release); when no tag pointing at the SHA is found, the action is silently skipped rather than guessed at. Sliding-tag (`@v4`) and branch refs are not version-precise, so they trigger `pin.sliding` / `pin.branch` but no advisory matching. Each (action, advisory) match emits its own finding with the GHSA id, severity, the matched range, any patched-version hint, and the advisory URL carried in the finding's `details` field.
+`source.advisory` also requires a token. For each tag-pinned action, the tag is matched against the `vulnerable_version_range` of every published GHSA advisory for the repo. SHA-pinned actions are resolved to a tag via the GitHub tags endpoint (bounded pagination, up to 1,000 tags); when no tag pointing at the SHA is found, the action is silently skipped rather than guessed at. Sliding-tag (`@v4`) and branch refs are not version-precise, so they trigger `pin.sliding` / `pin.branch` but no advisory matching. Each (action, advisory) match emits its own finding with the GHSA id, severity, the matched range, any patched-version hint, and the advisory URL carried in the finding's `details` field.
 
 ### Runtime-fetch rules (category: `runtime`)
 
@@ -85,7 +85,7 @@ These reuse findings from the existing `pinprick audit` pipeline applied to each
 Notes:
 
 - The audit pipeline already suppresses `data format URL` and checksum-verified fetches to allowed matches and applies the trusted-host exemption before `runtime.*` scoring runs, so those never deduct points and there's no double-counting. (Checksum-verified fetches are suppressed as of rubric 0.7.0; they were downgraded one severity level through 0.6.0.)
-- As of v0.7.0 the runtime score scan is limited to `run:` blocks in local workflow files (no GitHub token required). Runtime findings in the source of fetched actions themselves — where `pinprick audit` looks when a token is present — are not yet scored; that integration lands in a later rubric version.
+- As of v0.8.0, the runtime score scan includes the expanded audit coverage for Docker CLI image pulls/runs, Deno URL execution, `pipx`/`uv` tool installs, additional PowerShell download idioms, and non-literal curl/wget executable downloads. The scan is still limited to `run:` blocks in local workflow files (no GitHub token required). Runtime findings in the source of fetched actions themselves — where `pinprick audit` looks when a token is present — are not yet scored; that integration lands in a later rubric version.
 - Runtime findings are not deduplicated. Each pattern match emits one finding keyed to its `(workflow, line)` — each is a distinct fix in a distinct place.
 - Config interaction: `runtime.*` scoring honors `ignore.patterns` from `.pinprick.toml` (an explicitly accepted risk is not deducted), but **not** the `severity` display threshold — the posture score reflects every finding regardless of what `pinprick audit` is configured to print.
 
@@ -117,7 +117,7 @@ These are deliberately out of scope for v1 to keep the initial rubric defensible
 
 ```jsonc
 {
-  "rubric_version": "0.7.0",
+  "rubric_version": "0.8.0",
   "pinprick_version": "…",
   "target": { "kind": "repo", "path": "./" },
   "score": 72,
@@ -151,7 +151,7 @@ These are deliberately out of scope for v1 to keep the initial rubric defensible
 A compact summary:
 
 ```
-pinprick score  v0.7.0 rubric
+pinprick score  v0.8.0 rubric
 
   Grade:  C   (72 / 100)
 

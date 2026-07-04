@@ -66,7 +66,7 @@ Because the scanned repository's own `.pinprick.toml` applies, a third-party rep
 
 ```
 $ pinprick score
-pinprick score  v0.7.0 rubric
+pinprick score  v0.8.0 rubric
 
   Grade:  A   (95 / 100)
 
@@ -80,4 +80,4 @@ pinprick score  v0.7.0 rubric
 
 ## Versioning
 
-The rubric is independently versioned from the pinprick binary (currently `v0.7.0`). Every scan records the rubric version so historical scores remain interpretable as the rubric evolves. Re-scoring against a newer rubric is always explicit — pinprick never silently re-grades a past scan.
+The rubric is independently versioned from the pinprick binary (currently `v0.8.0`). Every scan records the rubric version so historical scores remain interpretable as the rubric evolves. Re-scoring against a newer rubric is always explicit — pinprick never silently re-grades a past scan.

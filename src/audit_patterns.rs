@@ -67,6 +67,26 @@ re!(
     SH_IWR_UNVERSIONED,
     r#"(?i)\b(Invoke-WebRequest|iwr|Invoke-RestMethod|irm)\b.*https?://[^\s"']+"#
 );
+re!(
+    SH_BITS_LATEST,
+    r#"(?i)\bStart-BitsTransfer\b.*[/=]latest(?:[/\s"]|$)"#
+);
+re!(
+    SH_BITS_UNVERSIONED,
+    r#"(?i)\bStart-BitsTransfer\b.*https?://[^\s"']+"#
+);
+re!(
+    SH_WEBCLIENT_DOWNLOADFILE_LATEST,
+    r#"(?i)\bDownloadFile\s*\(.*[/=]latest(?:[/\s"]|$)"#
+);
+re!(
+    SH_WEBCLIENT_DOWNLOADFILE_UNVERSIONED,
+    r#"(?i)\bDownloadFile\s*\(.*https?://[^\s"']+"#
+);
+re!(
+    SH_DENO_URL,
+    r#"(?i)\bdeno\s+(?:run|install)\b.*https?://[^\s"']+"#
+);
 
 // The shell may sit any number of pipe stages after the fetch — `curl … | tr
 // -d '\r' | bash` is as executable as a direct pipe.
@@ -103,6 +123,18 @@ re!(
 re!(
     SH_NPX_UNVERSIONED,
     r"\bnpx\s+(-\S+\s+)*(@[a-zA-Z][a-zA-Z0-9_-]*/)?[a-zA-Z][a-zA-Z0-9_-]*"
+);
+re!(
+    SH_PIPX_UNVERSIONED,
+    r"pipx\s+install\s+(?:-\S+\s+)*[a-zA-Z][a-zA-Z0-9_-]*(\s|$)"
+);
+re!(
+    SH_UV_TOOL_INSTALL_UNVERSIONED,
+    r"uv\s+tool\s+install\s+(?:-\S+\s+)*[a-zA-Z][a-zA-Z0-9_-]*(\s|$)"
+);
+re!(
+    SH_UVX_UNVERSIONED,
+    r"\buvx\s+(-\S+\s+)*[a-zA-Z][a-zA-Z0-9_-]*"
 );
 re!(SH_BREW_HEAD, r"(?i)\bbrew\s+install\b[^\n]*--head\b");
 re!(
@@ -145,6 +177,20 @@ pub static SHELL_PATTERNS: LazyLock<Vec<Pattern>> = LazyLock::new(|| {
             finding_kind: None,
         },
         Pattern {
+            regex: &SH_BITS_LATEST,
+            severity: Severity::High,
+            category: Category::ShellFetch,
+            description: "PowerShell Start-BitsTransfer from a 'latest' URL — can change without notice",
+            finding_kind: None,
+        },
+        Pattern {
+            regex: &SH_WEBCLIENT_DOWNLOADFILE_LATEST,
+            severity: Severity::High,
+            category: Category::ShellFetch,
+            description: "PowerShell WebClient.DownloadFile from a 'latest' URL — can change without notice",
+            finding_kind: None,
+        },
+        Pattern {
             regex: &SH_BREW_HEAD,
             severity: Severity::Medium,
             category: Category::ShellFetch,
@@ -176,6 +222,27 @@ pub static SHELL_URL_PATTERNS: LazyLock<Vec<Pattern>> = LazyLock::new(|| {
             severity: Severity::Medium,
             category: Category::ShellFetch,
             description: "PowerShell fetching URL without version pinning",
+            finding_kind: None,
+        },
+        Pattern {
+            regex: &SH_BITS_UNVERSIONED,
+            severity: Severity::Medium,
+            category: Category::ShellFetch,
+            description: "PowerShell Start-BitsTransfer URL without version pinning",
+            finding_kind: None,
+        },
+        Pattern {
+            regex: &SH_WEBCLIENT_DOWNLOADFILE_UNVERSIONED,
+            severity: Severity::Medium,
+            category: Category::ShellFetch,
+            description: "PowerShell WebClient.DownloadFile URL without version pinning",
+            finding_kind: None,
+        },
+        Pattern {
+            regex: &SH_DENO_URL,
+            severity: Severity::High,
+            category: Category::ShellFetch,
+            description: "deno run/install from URL without version pinning",
             finding_kind: None,
         },
     ]
@@ -474,10 +541,11 @@ pub fn has_checksum_verify(line: &str) -> bool {
 // release. Callers who want to exempt such hosts should use the
 // `trusted-hosts` config instead of relaxing this regex.
 // Leading `-`/`_` admit versions embedded in filenames (`tool-1.2.3.tar.gz`);
+// `@` covers Deno-style URL pins (`/x/tool@v1.2.3/mod.ts`);
 // the trailing class admits a following extension dot, suffix (`-rc1`), or end
 // of string (a URL whose path ends at the version, e.g. `/download/v1.2.3`).
 static VERSION_SEGMENT: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#"[-_/]v?\d+(\.\d+)+(?:[-_./\s"]|$)"#).unwrap());
+    LazyLock::new(|| Regex::new(r#"[-_/@]v?\d+(\.\d+)+(?:[-_./\s"]|$)"#).unwrap());
 
 /// Check if a URL contains a version segment in its **path** — not its host or
 /// query string. Scanning the authority or query too would let a
@@ -681,6 +749,28 @@ pub fn npx_has_version(line: &str) -> bool {
     NPX_VERSION.is_match(line)
 }
 
+/// Check if a `pipx install` line has a Python package version specifier.
+pub fn pipx_install_has_version(line: &str) -> bool {
+    static PIPX_VERSION: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"pipx\s+install\s+(?:-\S+\s+)*\S*[=>~]=").unwrap());
+    PIPX_VERSION.is_match(line)
+}
+
+/// Check if a `uv tool install` line has a package version specifier.
+pub fn uv_tool_install_has_version(line: &str) -> bool {
+    static UV_TOOL_VERSION: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"uv\s+tool\s+install\s+(?:-\S+\s+)*\S*(?:[=>~]=|@\d)").unwrap()
+    });
+    UV_TOOL_VERSION.is_match(line)
+}
+
+/// Check if a `uvx` line has a version pin on the tool spec.
+pub fn uvx_has_version(line: &str) -> bool {
+    static UVX_VERSION: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"\buvx\s+.*\S+(?:[=>~]=|@\d)").unwrap());
+    UVX_VERSION.is_match(line)
+}
+
 /// Check if a PowerShell `Install-Module`/`Install-Script` line has `-RequiredVersion`.
 pub fn ps_install_has_required_version(line: &str) -> bool {
     static PS_VERSION: LazyLock<Regex> =
@@ -734,6 +824,11 @@ mod tests {
         assert!(url_has_version(
             "https://example.com/releases/download/v2.8.1/tool.tar.xz"
         ));
+    }
+
+    #[test]
+    fn versioned_with_at_prefix() {
+        assert!(url_has_version("https://deno.land/x/tool@v1.2.3/mod.ts"));
     }
 
     #[test]

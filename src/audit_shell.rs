@@ -271,6 +271,139 @@ pub(crate) fn fetch_output_targets(line: &str) -> Vec<String> {
     targets
 }
 
+pub(crate) fn docker_unpinned_images(line: &str) -> Vec<String> {
+    let mut images = Vec::new();
+    for command in parse_shell_line(line) {
+        for stage in command.stages {
+            let Some(image) = docker_pull_or_run_image(&stage.words) else {
+                continue;
+            };
+            if docker_image_is_unpinned(&image) && !images.contains(&image) {
+                images.push(image);
+            }
+        }
+    }
+    images
+}
+
+fn docker_pull_or_run_image(words: &[String]) -> Option<String> {
+    let docker = docker_command_index(words)?;
+    let mut i = docker + 1;
+    let subcommand = words.get(i)?.as_str();
+    let subcommand = match subcommand {
+        "image" | "container" => {
+            i += 1;
+            words.get(i)?.as_str()
+        }
+        other => other,
+    };
+    i += 1;
+    match subcommand {
+        "pull" => docker_image_after_options(&words[i..], &["--platform"]),
+        "run" => docker_image_after_options(
+            &words[i..],
+            &[
+                "--add-host",
+                "--cidfile",
+                "--cpus",
+                "--entrypoint",
+                "--env",
+                "--env-file",
+                "--hostname",
+                "--label",
+                "--memory",
+                "--mount",
+                "--name",
+                "--network",
+                "--platform",
+                "--publish",
+                "--pull",
+                "--user",
+                "--volume",
+                "--workdir",
+            ],
+        ),
+        _ => None,
+    }
+}
+
+fn docker_command_index(words: &[String]) -> Option<usize> {
+    let mut idx = command_word_index(words)?;
+    loop {
+        match words.get(idx)?.as_str() {
+            "sudo" | "command" => idx += 1,
+            "env" => {
+                idx += 1;
+                while words.get(idx).is_some_and(|word| word.contains('=')) {
+                    idx += 1;
+                }
+            }
+            "docker" => return Some(idx),
+            _ => return None,
+        }
+    }
+}
+
+fn docker_image_after_options(args: &[String], value_flags: &[&str]) -> Option<String> {
+    let mut i = 0;
+    while i < args.len() {
+        let word = args[i].as_str();
+        if word == "--" {
+            return args.get(i + 1).cloned();
+        }
+        if !word.starts_with('-') {
+            return Some(word.to_string());
+        }
+        if docker_option_consumes_value(word, value_flags) {
+            i += if docker_option_has_attached_value(word) {
+                1
+            } else {
+                2
+            };
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
+fn docker_option_consumes_value(word: &str, value_flags: &[&str]) -> bool {
+    if let Some((flag, _)) = word.split_once('=') {
+        return value_flags.contains(&flag);
+    }
+    if value_flags.contains(&word) {
+        return true;
+    }
+    let Some(short) = word.strip_prefix('-') else {
+        return false;
+    };
+    if short.starts_with('-') {
+        return false;
+    }
+    matches!(
+        short.chars().next(),
+        Some('e' | 'h' | 'l' | 'm' | 'p' | 'u' | 'v' | 'w')
+    )
+}
+
+fn docker_option_has_attached_value(word: &str) -> bool {
+    if word.starts_with("--") {
+        return word.contains('=');
+    }
+    word.len() > 2
+}
+
+fn docker_image_is_unpinned(image: &str) -> bool {
+    if image.contains('$') || image.contains('@') {
+        return false;
+    }
+    let last_segment = image.rsplit('/').next().unwrap_or(image);
+    match last_segment.rsplit_once(':') {
+        Some((_, tag)) => tag.eq_ignore_ascii_case("latest"),
+        None => true,
+    }
+}
+
 fn fetch_output_target(stage: &ShellStage) -> Option<String> {
     let fetch_index = stage
         .words

@@ -176,7 +176,7 @@ Compute a posture grade against the public, versioned rubric in [`docs/scoring.m
 
 ```
 $ pinprick score
-pinprick score  v0.7.0 rubric
+pinprick score  v0.8.0 rubric
 
   Grade:  A   (95 / 100)
 
