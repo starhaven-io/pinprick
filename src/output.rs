@@ -2,7 +2,7 @@ use colored::Colorize;
 use serde::Serialize;
 use std::io::{self, Write};
 
-use crate::audit_patterns::Severity;
+use crate::audit_patterns::{Category, Pattern, Severity, category_str};
 
 /// Replace control chars (C0/C1/DEL, except tab) with U+FFFD so escape sequences
 /// in fetched action source can't spoof or hide findings in the terminal.
@@ -229,6 +229,48 @@ pub struct AuditFinding {
     pub workflow_line: Option<usize>,
 }
 
+impl AuditFinding {
+    pub fn new(
+        severity: &Severity,
+        category: &Category,
+        action_name: &str,
+        source_file: &str,
+        line: usize,
+        pattern_matched: &str,
+        description: impl Into<String>,
+    ) -> Self {
+        Self {
+            severity: severity_str(severity).to_string(),
+            category: category_str(category).to_string(),
+            action: action_name.to_string(),
+            source_file: source_file.to_string(),
+            line: Some(line),
+            pattern_matched: pattern_matched.trim().to_string(),
+            description: description.into(),
+            workflow_file: None,
+            workflow_line: None,
+        }
+    }
+
+    pub fn from_pattern(
+        pattern: &Pattern,
+        action_name: &str,
+        source_file: &str,
+        line: usize,
+        pattern_matched: &str,
+    ) -> Self {
+        Self::new(
+            &pattern.severity,
+            &pattern.category,
+            action_name,
+            source_file,
+            line,
+            pattern_matched,
+            pattern.description,
+        )
+    }
+}
+
 #[derive(Serialize)]
 pub struct AuditMatch {
     pub severity: String,
@@ -238,6 +280,59 @@ pub struct AuditMatch {
     pub line: Option<usize>,
     pub pattern_matched: String,
     pub reason: String,
+}
+
+impl AuditMatch {
+    pub fn new(
+        severity: &Severity,
+        category: &Category,
+        action_name: &str,
+        source_file: &str,
+        line: usize,
+        pattern_matched: &str,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            severity: severity_str(severity).to_string(),
+            category: category_str(category).to_string(),
+            action: action_name.to_string(),
+            source_file: source_file.to_string(),
+            line: Some(line),
+            pattern_matched: pattern_matched.trim().to_string(),
+            reason: reason.into(),
+        }
+    }
+
+    pub fn from_pattern(
+        pattern: &Pattern,
+        action_name: &str,
+        source_file: &str,
+        line: usize,
+        pattern_matched: &str,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self::new(
+            &pattern.severity,
+            &pattern.category,
+            action_name,
+            source_file,
+            line,
+            pattern_matched,
+            reason,
+        )
+    }
+
+    pub fn from_finding(finding: AuditFinding, reason: impl Into<String>) -> Self {
+        Self {
+            severity: finding.severity,
+            category: finding.category,
+            action: finding.action,
+            source_file: finding.source_file,
+            line: finding.line,
+            pattern_matched: finding.pattern_matched,
+            reason: reason.into(),
+        }
+    }
 }
 
 #[derive(Serialize)]
