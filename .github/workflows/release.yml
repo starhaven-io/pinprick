@@ -16,12 +16,65 @@ concurrency:
 permissions: {}
 
 jobs:
-  build:
-    name: Build (${{ matrix.target }})
+  preflight:
+    name: Preflight
     # Releases come from main only — a dispatch from any other branch would
     # tag and publish whatever that branch contains. Guarding the entry job
     # skips the whole chain via `needs`.
     if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Extract version
+        id: version
+        run: |
+          VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          if [[ -z "${VERSION}" ]]; then
+            echo "::error::Could not extract version from Cargo.toml"
+            exit 1
+          fi
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "tag=v${VERSION}" >> "${GITHUB_OUTPUT}"
+
+      # Fail before the five build jobs spend their minutes: a forgotten
+      # version bump previously surfaced only at tag creation, after every
+      # binary was already built.
+      - name: Fail if tag already exists
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          if gh api "repos/${REPOSITORY}/git/ref/tags/${TAG}" --silent 2>/dev/null; then
+            echo "::error::Tag ${TAG} already exists — bump the version in Cargo.toml before dispatching a release"
+            exit 1
+          fi
+
+      - name: Fail if version already on crates.io
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          # Piped to jq: a JSON API probe, not fetched code — pinprick's own
+          # audit exempts this form.
+          if curl -fsS -A "pinprick-release-preflight" \
+            "https://crates.io/api/v1/crates/pinprick/${VERSION}" | jq -e .version > /dev/null; then
+            echo "::error::pinprick ${VERSION} is already on crates.io — bump the version in Cargo.toml before dispatching a release"
+            exit 1
+          fi
+
+      # A workflow_dispatch can fire while main is red; don't publish an
+      # untested commit to crates.io and the release page.
+      - name: Test
+        run: cargo test --locked
+
+  build:
+    name: Build (${{ matrix.target }})
+    needs: preflight
     environment:
       name: release
       deployment: false

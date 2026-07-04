@@ -61,13 +61,14 @@ jobs:
           # one on the same SHA, bypassing tests, coverage, site checks and the rest.
           CHANGED=$(git diff --name-only "${BASE_SHA}...HEAD")
 
-          # Rust or build workflow changes: lint + test
+          # Rust or build workflow changes: lint + test + MSRV
           if echo "${CHANGED}" | grep -qE '\.rs$|^Cargo\.(toml|lock)$|^clippy\.toml$|^rustfmt\.toml$|^\.github/workflows/(ci|release)\.yml$'; then
             MATRIX+=',{"name":"Lint","check":"lint","runner":"ubuntu-24.04"}'
             MATRIX+=',{"name":"Test (Linux)","check":"test","runner":"ubuntu-24.04"}'
             MATRIX+=',{"name":"Test (Linux ARM)","check":"test","runner":"ubuntu-24.04-arm"}'
             MATRIX+=',{"name":"Test (macOS)","check":"test","runner":"macos-26"}'
             MATRIX+=',{"name":"Coverage","check":"coverage","runner":"ubuntu-24.04","environment":"codecov"}'
+            MATRIX+=',{"name":"MSRV","check":"msrv","runner":"ubuntu-24.04"}'
           fi
 
           # Audited-actions changes: verify all entries
@@ -254,6 +255,21 @@ jobs:
       - name: Test
         if: matrix.check == 'test'
         run: cargo test --locked
+
+      # --- MSRV ---
+
+      - name: Install MSRV toolchain
+        if: matrix.check == 'msrv'
+        run: |
+          # The declared rust-version is only a promise if something builds
+          # with it — the other legs all use the runner's latest stable.
+          MSRV=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].rust_version')
+          rustup toolchain install "${MSRV}" --profile minimal
+          echo "MSRV=${MSRV}" >> "${GITHUB_ENV}"
+
+      - name: Check with MSRV toolchain
+        if: matrix.check == 'msrv'
+        run: cargo "+${MSRV}" check --locked --all-targets
 
       # --- Coverage ---
 
