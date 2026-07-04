@@ -1,12 +1,15 @@
 use anyhow::{Result, bail};
 
 pub async fn resolve_token() -> Option<String> {
-    // A set-but-empty GITHUB_TOKEN (common in CI) counts as absent — fall
-    // through to gh.
-    if let Ok(token) = std::env::var("GITHUB_TOKEN")
-        && !token.is_empty()
-    {
-        return Some(token);
+    // A set-but-empty token variable (common in CI) counts as absent — fall
+    // through to the next source. GH_TOKEN is the variable the gh CLI itself
+    // honors, so check it before shelling out to gh.
+    for var in ["GITHUB_TOKEN", "GH_TOKEN"] {
+        if let Ok(token) = std::env::var(var)
+            && !token.is_empty()
+        {
+            return Some(token);
+        }
     }
 
     let output = tokio::process::Command::new("gh")
