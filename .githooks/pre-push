@@ -1,3 +1,18 @@
 #!/bin/sh
 # Runs the same checks as CI before pushing.
+#
+# Deletion-only pushes carry no code (git reports an all-zero local
+# sha for each deleted ref on stdin), so skip the checks for them.
+
+deleting_only=1
+while read -r local_ref local_sha remote_ref remote_sha; do
+    case "$local_sha" in
+        *[!0]*) deleting_only=0 ;;
+    esac
+done
+
+if [ "$deleting_only" -eq 1 ]; then
+    exit 0
+fi
+
 just check
