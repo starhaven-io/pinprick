@@ -154,7 +154,7 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - run: |
-          curl -L \"https://github.com/owner/repo/releases/latest/download/tool\" -o tool
+          curl -L \"https://github.com/owner/repo/releases/download/tool\" -o tool
           sha256sum --check tool.sha256
 ";
 

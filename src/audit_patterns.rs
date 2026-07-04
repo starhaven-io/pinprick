@@ -21,6 +21,7 @@ pub enum Category {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FindingKind {
     PipeToShell,
+    ChecksumSuppressibleShellFetch,
 }
 
 pub struct Pattern {
@@ -208,35 +209,35 @@ pub static SHELL_URL_PATTERNS: LazyLock<Vec<Pattern>> = LazyLock::new(|| {
             severity: Severity::Medium,
             category: Category::ShellFetch,
             description: "curl fetching URL without version pinning",
-            finding_kind: None,
+            finding_kind: Some(FindingKind::ChecksumSuppressibleShellFetch),
         },
         Pattern {
             regex: &SH_WGET_UNVERSIONED,
             severity: Severity::Medium,
             category: Category::ShellFetch,
             description: "wget fetching URL without version pinning",
-            finding_kind: None,
+            finding_kind: Some(FindingKind::ChecksumSuppressibleShellFetch),
         },
         Pattern {
             regex: &SH_IWR_UNVERSIONED,
             severity: Severity::Medium,
             category: Category::ShellFetch,
             description: "PowerShell fetching URL without version pinning",
-            finding_kind: None,
+            finding_kind: Some(FindingKind::ChecksumSuppressibleShellFetch),
         },
         Pattern {
             regex: &SH_BITS_UNVERSIONED,
             severity: Severity::Medium,
             category: Category::ShellFetch,
             description: "PowerShell Start-BitsTransfer URL without version pinning",
-            finding_kind: None,
+            finding_kind: Some(FindingKind::ChecksumSuppressibleShellFetch),
         },
         Pattern {
             regex: &SH_WEBCLIENT_DOWNLOADFILE_UNVERSIONED,
             severity: Severity::Medium,
             category: Category::ShellFetch,
             description: "PowerShell WebClient.DownloadFile URL without version pinning",
-            finding_kind: None,
+            finding_kind: Some(FindingKind::ChecksumSuppressibleShellFetch),
         },
         Pattern {
             regex: &SH_DENO_URL,

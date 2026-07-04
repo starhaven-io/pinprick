@@ -678,31 +678,13 @@ pub fn scan_shell_content(
         }
     }
 
-    // Suppress findings immediately followed by checksum verification: a
-    // sha256sum / gpg --verify check deterministically detects a tampered
-    // download, so the fetch is mitigated, not merely less severe. Recorded as
-    // an allowed match (visible under --verbose), mirroring the SHA-checkout
-    // suppression above. Pipe-shell findings sit below `findings_before` and are
-    // exempt — the piped payload is never written to disk for a checksum to
-    // verify. Offset 0 covers a one-liner `curl -o f … && sha256sum -c …`.
+    // Suppress saved shell URL fetch findings immediately followed by checksum
+    // verification. Pipe-shell and `/latest/` findings are different risk
+    // classes and never opt into this downgrade. Offset 0 covers a one-liner
+    // `curl -o f … && sha256sum -c …`.
     let mut idx = findings_before;
     while idx < collector.findings.len() {
-        let verified = collector.findings[idx].line.is_some_and(|finding_line| {
-            let rel = finding_line.saturating_sub(base_line);
-            logical
-                .iter()
-                .position(|(start, _)| *start == rel)
-                .is_some_and(|li| {
-                    let targets = fetch_output_targets(&collector.findings[idx].pattern_matched);
-                    !targets.is_empty()
-                        && targets.iter().all(|target| {
-                            (0..=3).any(|offset| {
-                                li + offset < logical.len()
-                                    && checksum_verifies_target(&logical[li + offset].1, target)
-                            })
-                        })
-                })
-        });
+        let verified = checksum_suppresses_finding(&collector.findings[idx], &logical, base_line);
         if verified {
             let finding = collector.findings.remove(idx);
             collector.push_allowed(AuditMatch::from_finding(
@@ -713,6 +695,39 @@ pub fn scan_shell_content(
             idx += 1;
         }
     }
+}
+
+fn checksum_suppresses_finding(
+    finding: &AuditFinding,
+    logical: &[(usize, String)],
+    base_line: usize,
+) -> bool {
+    if finding.finding_kind != Some(audit_patterns::FindingKind::ChecksumSuppressibleShellFetch) {
+        return false;
+    }
+    let Some(finding_line) = finding.line else {
+        return false;
+    };
+    let targets = fetch_output_targets(&finding.pattern_matched);
+    if targets.is_empty() {
+        return false;
+    }
+    let rel = finding_line.saturating_sub(base_line);
+    logical
+        .iter()
+        .position(|(start, _)| *start == rel)
+        .is_some_and(|li| checksum_within_window(logical, li, &targets))
+}
+
+fn checksum_within_window(logical: &[(usize, String)], li: usize, targets: &[String]) -> bool {
+    (0..=3).any(|offset| {
+        li + offset < logical.len()
+            && !is_shell_comment_line(&logical[li + offset].1)
+            && (audit_patterns::has_checksum_verify(&logical[li + offset].1)
+                || targets
+                    .iter()
+                    .all(|target| checksum_verifies_target(&logical[li + offset].1, target)))
+    })
 }
 
 /// Lines longer than this are treated as minified and split on `;` before scanning.
@@ -2412,7 +2427,7 @@ const d = require("node:https").get("https://example.com/install.sh", cb);
     fn checksum_at_boundary_of_three_lines_suppresses() {
         let mut c = AuditCollector::new(true);
         scan_shell_content(
-            "curl -L https://example.com/releases/latest/download/tool -o tool\necho step1\necho step2\nsha256sum --check tool.sha256",
+            "curl -L https://example.com/downloads/tool -o tool\necho step1\necho step2\nsha256sum --check tool.sha256",
             "test.sh",
             1,
             "",
@@ -2430,7 +2445,7 @@ const d = require("node:https").get("https://example.com/install.sh", cb);
     fn checksum_beyond_three_lines_not_suppressed() {
         let mut c = AuditCollector::new(false);
         scan_shell_content(
-            "curl -L https://example.com/releases/latest/download/tool -o tool\necho 1\necho 2\necho 3\nsha256sum --check tool.sha256",
+            "curl -L https://example.com/downloads/tool -o tool\necho 1\necho 2\necho 3\nsha256sum --check tool.sha256",
             "test.sh",
             1,
             "",
@@ -2438,9 +2453,26 @@ const d = require("node:https").get("https://example.com/install.sh", cb);
             &DEFAULT_CONFIG,
         );
         // Checksum is on the fourth line — beyond the window — so the fetch is
-        // still flagged at full severity.
+        // still flagged.
+        assert_eq!(c.findings.len(), 1);
+        assert_eq!(c.findings[0].severity, "medium");
+    }
+
+    #[test]
+    fn shell_scan_latest_url_not_suppressed_by_checksum() {
+        let mut c = AuditCollector::new(true);
+        scan_shell_content(
+            "curl -L https://example.com/releases/latest/download/tool -o tool\nsha256sum --check tool.sha256",
+            "test.sh",
+            1,
+            "",
+            &mut c,
+            &DEFAULT_CONFIG,
+        );
         assert_eq!(c.findings.len(), 1);
         assert_eq!(c.findings[0].severity, "high");
+        assert!(c.findings[0].description.contains("'latest' URL"));
+        assert!(c.allowed.is_empty());
     }
 
     // ── git clone ─────────────────────────────────────────────────────
@@ -2650,7 +2682,75 @@ const d = require("node:https").get("https://example.com/install.sh", cb);
     }
 
     #[test]
-    fn shell_scan_unrelated_checksum_does_not_suppress_fetch() {
+    fn shell_scan_piped_checksum_manifest_suppresses_fetch() {
+        let mut c = AuditCollector::new(true);
+        scan_shell_content(
+            "curl -o tool https://example.com/tool\necho \"abcdef  tool\" | shasum -a 256 -c -",
+            "test.sh",
+            1,
+            "",
+            &mut c,
+            &DEFAULT_CONFIG,
+        );
+        assert!(c.findings.is_empty());
+        assert_eq!(c.allowed.len(), 1);
+        assert_eq!(c.allowed[0].reason, "followed by checksum verification");
+    }
+
+    #[test]
+    fn shell_scan_direct_checksum_manifest_suppresses_fetch() {
+        let mut c = AuditCollector::new(true);
+        scan_shell_content(
+            "curl -o tool https://example.com/tool\nshasum -a 256 -c checksums.txt",
+            "test.sh",
+            1,
+            "",
+            &mut c,
+            &DEFAULT_CONFIG,
+        );
+        assert!(c.findings.is_empty());
+        assert_eq!(c.allowed.len(), 1);
+        assert_eq!(c.allowed[0].reason, "followed by checksum verification");
+    }
+
+    #[test]
+    fn shell_scan_continuation_curl_checksum_suppressed() {
+        let mut c = AuditCollector::new(true);
+        scan_shell_content(
+            "curl -L \\\n  https://example.com/tool -o tool\nsha256sum -c checksums.txt",
+            "test.sh",
+            1,
+            "",
+            &mut c,
+            &DEFAULT_CONFIG,
+        );
+        assert!(c.findings.is_empty());
+        assert_eq!(c.allowed.len(), 1);
+        assert_eq!(c.allowed[0].reason, "followed by checksum verification");
+    }
+
+    #[test]
+    fn shell_scan_checksum_command_variants_suppress_fetch() {
+        for checksum in [
+            "sha256sum -c checksums.txt",
+            "openssl dgst -sha256 tool",
+            "gpg --verify tool.sig tool",
+            "Get-FileHash -Algorithm SHA256 tool",
+        ] {
+            let mut c = AuditCollector::new(true);
+            let content = format!("curl -o tool https://example.com/tool\n{checksum}");
+            scan_shell_content(&content, "test.sh", 1, "", &mut c, &DEFAULT_CONFIG);
+            assert!(c.findings.is_empty(), "{checksum}");
+            assert_eq!(c.allowed.len(), 1, "{checksum}");
+            assert_eq!(
+                c.allowed[0].reason, "followed by checksum verification",
+                "{checksum}"
+            );
+        }
+    }
+
+    #[test]
+    fn shell_scan_nearby_checksum_suppresses_fetch() {
         let mut c = AuditCollector::new(true);
         scan_shell_content(
             "curl -o tool.sh https://example.com/install.sh\nsha256sum unrelated.txt",
@@ -2660,9 +2760,9 @@ const d = require("node:https").get("https://example.com/install.sh", cb);
             &mut c,
             &DEFAULT_CONFIG,
         );
-        assert_eq!(c.findings.len(), 1);
-        assert!(c.findings[0].description.contains("curl fetching URL"));
-        assert!(c.allowed.is_empty());
+        assert!(c.findings.is_empty());
+        assert_eq!(c.allowed.len(), 1);
+        assert_eq!(c.allowed[0].reason, "followed by checksum verification");
     }
 
     #[test]
@@ -2682,10 +2782,7 @@ const d = require("node:https").get("https://example.com/install.sh", cb);
     }
 
     #[test]
-    fn shell_scan_generic_checksum_manifest_does_not_suppress_fetch() {
-        // `sha256sum -c SHA256SUMS` names a manifest, not the downloaded file,
-        // so it cannot prove this artifact is pinned: the fetch still flags.
-        // Intentional tightening: a generic manifest is not target binding.
+    fn shell_scan_generic_checksum_manifest_suppresses_fetch() {
         let mut c = AuditCollector::new(true);
         scan_shell_content(
             "curl -o tool.tgz https://example.com/tool.tgz\nsha256sum -c SHA256SUMS",
@@ -2695,9 +2792,9 @@ const d = require("node:https").get("https://example.com/install.sh", cb);
             &mut c,
             &DEFAULT_CONFIG,
         );
-        assert_eq!(c.findings.len(), 1);
-        assert!(c.findings[0].description.contains("curl fetching URL"));
-        assert!(c.allowed.is_empty());
+        assert!(c.findings.is_empty());
+        assert_eq!(c.allowed.len(), 1);
+        assert_eq!(c.allowed[0].reason, "followed by checksum verification");
     }
 
     #[test]
