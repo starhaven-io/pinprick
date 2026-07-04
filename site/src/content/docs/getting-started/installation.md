@@ -60,6 +60,7 @@ pinprick uses the GitHub API to resolve tags, check releases, and fetch action s
 It looks for a token in this order:
 
 1. `GITHUB_TOKEN` environment variable
-2. `gh auth token` CLI fallback
+2. `GH_TOKEN` environment variable
+3. `gh auth token` CLI fallback
 
 The `pin` and `update` commands require a token. The `audit` command works without one but with reduced coverage — only local `run:` blocks are scanned.
