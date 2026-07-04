@@ -212,7 +212,14 @@ jobs:
           mkdir -p staging
           cp "target/${TARGET}/release/pinprick" staging/
           cp LICENSE staging/
-          /usr/bin/tar --no-mac-metadata --no-xattrs -czf "${ARTIFACT}.tar.gz" -C staging .
+          # Keep AppleDouble/xattr metadata out of the tarball. --no-mac-metadata
+          # is a bsdtar-only flag (macOS); GNU tar on the Linux runners rejects it
+          # and only needs --no-xattrs, so gate it on the runner OS.
+          TAR_FLAGS=(--no-xattrs)
+          if [ "${RUNNER_OS}" = "macOS" ]; then
+            TAR_FLAGS+=(--no-mac-metadata)
+          fi
+          /usr/bin/tar "${TAR_FLAGS[@]}" -czf "${ARTIFACT}.tar.gz" -C staging .
           echo "ARTIFACT=${ARTIFACT}" >> "${GITHUB_ENV}"
 
       - name: Generate build provenance
