@@ -13,6 +13,7 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use crate::audit::{self, AuditCollector};
+use crate::audit_patterns::FindingKind;
 use crate::auth;
 use crate::config::Config;
 use crate::github::{AdvisoryVulnerability, GitHubClient, GitHubError, SecurityAdvisory};
@@ -771,19 +772,10 @@ fn runtime_rule_for(finding: &AuditFinding) -> RuleId {
     }
 }
 
-/// Pipe-to-shell findings are identified by phrases unique to the four
-/// patterns in `SHELL_PIPE_PATTERNS` (piped to shell, process substitution,
-/// command substitution, Invoke-Expression). If those descriptions are ever
-/// changed, this mapping breaks — the `runtime_pipe_to_shell_descriptions_are_stable`
-/// test exists to catch that.
+/// Pipe-to-shell findings are structurally marked by the audit pattern table;
+/// descriptions are user-facing text and must not affect the score rule.
 fn is_pipe_to_shell_finding(finding: &AuditFinding) -> bool {
-    const MARKERS: &[&str] = &[
-        "piped to shell",
-        "process substitution",
-        "command substitution",
-        "Invoke-Expression on fetched content",
-    ];
-    MARKERS.iter().any(|m| finding.description.contains(m))
+    matches!(finding.finding_kind, Some(FindingKind::PipeToShell))
 }
 
 fn pin_rule_for(a: &ActionRef) -> Option<RuleId> {
@@ -1486,12 +1478,8 @@ jobs:
     }
 
     #[test]
-    fn runtime_pipe_to_shell_descriptions_are_stable() {
-        // If any of these descriptions change in audit_patterns.rs, the
-        // `is_pipe_to_shell_finding` mapping silently degrades — pipe-to-shell
-        // findings would get mapped to runtime.fetch.high (-15) instead of
-        // runtime.pipe_to_shell (-20). This test catches that.
-        use crate::audit_patterns::SHELL_PIPE_PATTERNS;
+    fn runtime_pipe_to_shell_uses_structured_finding_kind() {
+        use crate::audit_patterns::{FindingKind, SHELL_PIPE_PATTERNS};
         for pattern in SHELL_PIPE_PATTERNS.iter() {
             let fake = AuditFinding {
                 severity: "high".to_string(),
@@ -1500,16 +1488,38 @@ jobs:
                 source_file: String::new(),
                 line: Some(1),
                 pattern_matched: String::new(),
-                description: pattern.description.to_string(),
+                description: "copy-edit-safe pipe finding text".to_string(),
                 workflow_file: None,
                 workflow_line: None,
+                finding_kind: pattern.finding_kind,
             };
-            assert!(
-                is_pipe_to_shell_finding(&fake),
-                "pipe-to-shell description no longer matched by is_pipe_to_shell_finding: {:?}",
+            assert_eq!(
+                pattern.finding_kind.as_ref(),
+                Some(&FindingKind::PipeToShell),
+                "pipe-to-shell pattern missing structured finding kind: {:?}",
                 pattern.description
             );
+            assert!(
+                is_pipe_to_shell_finding(&fake),
+                "pipe-to-shell pattern did not set a structured finding kind: {:?}",
+                pattern.description
+            );
+            assert_eq!(runtime_rule_for(&fake), RuleId::RuntimePipeToShell);
         }
+
+        let phrase_only = AuditFinding {
+            severity: "high".to_string(),
+            category: "ShellFetch".to_string(),
+            action: String::new(),
+            source_file: String::new(),
+            line: Some(1),
+            pattern_matched: String::new(),
+            description: "fetch piped to shell but not structurally marked".to_string(),
+            workflow_file: None,
+            workflow_line: None,
+            finding_kind: None,
+        };
+        assert_eq!(runtime_rule_for(&phrase_only), RuleId::RuntimeFetchHigh);
     }
 
     #[test]

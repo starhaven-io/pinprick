@@ -16,11 +16,19 @@ pub enum Category {
     ShellFetch,
 }
 
+/// Internal semantic labels for findings whose behavior cannot be derived from
+/// severity/category alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FindingKind {
+    PipeToShell,
+}
+
 pub struct Pattern {
     pub regex: &'static LazyLock<Regex>,
     pub severity: Severity,
     pub category: Category,
     pub description: &'static str,
+    pub(crate) finding_kind: Option<FindingKind>,
 }
 
 // ── Shell patterns (for run: blocks and action.yml) ─────────────────────────
@@ -113,30 +121,35 @@ pub static SHELL_PATTERNS: LazyLock<Vec<Pattern>> = LazyLock::new(|| {
             severity: Severity::High,
             category: Category::ShellFetch,
             description: "curl fetching from a 'latest' URL — can change without notice",
+            finding_kind: None,
         },
         Pattern {
             regex: &SH_WGET_LATEST,
             severity: Severity::High,
             category: Category::ShellFetch,
             description: "wget fetching from a 'latest' URL — can change without notice",
+            finding_kind: None,
         },
         Pattern {
             regex: &SH_GO_INSTALL_LATEST,
             severity: Severity::Medium,
             category: Category::ShellFetch,
             description: "go install @latest/@main — not version-pinned",
+            finding_kind: None,
         },
         Pattern {
             regex: &SH_IWR_LATEST,
             severity: Severity::High,
             category: Category::ShellFetch,
             description: "PowerShell fetching from a 'latest' URL — can change without notice",
+            finding_kind: None,
         },
         Pattern {
             regex: &SH_BREW_HEAD,
             severity: Severity::Medium,
             category: Category::ShellFetch,
             description: "brew install --HEAD — builds from upstream main, bypasses pinning",
+            finding_kind: None,
         },
     ]
 });
@@ -149,18 +162,21 @@ pub static SHELL_URL_PATTERNS: LazyLock<Vec<Pattern>> = LazyLock::new(|| {
             severity: Severity::Medium,
             category: Category::ShellFetch,
             description: "curl fetching URL without version pinning",
+            finding_kind: None,
         },
         Pattern {
             regex: &SH_WGET_UNVERSIONED,
             severity: Severity::Medium,
             category: Category::ShellFetch,
             description: "wget fetching URL without version pinning",
+            finding_kind: None,
         },
         Pattern {
             regex: &SH_IWR_UNVERSIONED,
             severity: Severity::Medium,
             category: Category::ShellFetch,
             description: "PowerShell fetching URL without version pinning",
+            finding_kind: None,
         },
     ]
 });
@@ -175,24 +191,28 @@ pub static SHELL_PIPE_PATTERNS: LazyLock<Vec<Pattern>> = LazyLock::new(|| {
             severity: Severity::High,
             category: Category::ShellFetch,
             description: "fetch piped to shell — payload not written to disk, cannot be checksummed",
+            finding_kind: Some(FindingKind::PipeToShell),
         },
         Pattern {
             regex: &SH_PROC_SUB_FETCH,
             severity: Severity::High,
             category: Category::ShellFetch,
             description: "shell reading fetched content via process substitution — bypasses pinning",
+            finding_kind: Some(FindingKind::PipeToShell),
         },
         Pattern {
             regex: &SH_CMD_SUB_FETCH,
             severity: Severity::High,
             category: Category::ShellFetch,
             description: "shell executing fetched content via command substitution — bypasses pinning",
+            finding_kind: Some(FindingKind::PipeToShell),
         },
         Pattern {
             regex: &SH_IEX_FETCH,
             severity: Severity::High,
             category: Category::ShellFetch,
             description: "PowerShell Invoke-Expression on fetched content — bypasses pinning",
+            finding_kind: Some(FindingKind::PipeToShell),
         },
     ]
 });
@@ -224,36 +244,42 @@ pub static JS_PATTERNS: LazyLock<Vec<Pattern>> = LazyLock::new(|| {
             severity: Severity::High,
             category: Category::JavaScriptFetch,
             description: "fetch() with 'latest' URL — runtime supply chain risk",
+            finding_kind: None,
         },
         Pattern {
             regex: &JS_AXIOS_LATEST,
             severity: Severity::High,
             category: Category::JavaScriptFetch,
             description: "axios request to 'latest' URL",
+            finding_kind: None,
         },
         Pattern {
             regex: &JS_GOT_LATEST,
             severity: Severity::High,
             category: Category::JavaScriptFetch,
             description: "got() request to 'latest' URL",
+            finding_kind: None,
         },
         Pattern {
             regex: &JS_HTTP_LATEST,
             severity: Severity::High,
             category: Category::JavaScriptFetch,
             description: "http.get() to 'latest' URL",
+            finding_kind: None,
         },
         Pattern {
             regex: &JS_EXEC_SPAWN_CURL,
             severity: Severity::High,
             category: Category::JavaScriptFetch,
             description: "exec()/spawn() shelling out to curl/wget — runtime fetch bypasses pinning",
+            finding_kind: None,
         },
         Pattern {
             regex: &JS_CHILD_PROC_CURL,
             severity: Severity::High,
             category: Category::JavaScriptFetch,
             description: "child_process curl — runtime fetch bypasses pinning",
+            finding_kind: None,
         },
     ]
 });
@@ -265,30 +291,35 @@ pub static JS_URL_PATTERNS: LazyLock<Vec<Pattern>> = LazyLock::new(|| {
             severity: Severity::Medium,
             category: Category::JavaScriptFetch,
             description: "fetch() to external URL without version pinning",
+            finding_kind: None,
         },
         Pattern {
             regex: &JS_AXIOS_URL,
             severity: Severity::Medium,
             category: Category::JavaScriptFetch,
             description: "axios request to external URL without version pinning",
+            finding_kind: None,
         },
         Pattern {
             regex: &JS_GOT_URL,
             severity: Severity::Medium,
             category: Category::JavaScriptFetch,
             description: "got() request to external URL without version pinning",
+            finding_kind: None,
         },
         Pattern {
             regex: &JS_HTTP_URL,
             severity: Severity::Medium,
             category: Category::JavaScriptFetch,
             description: "http.get() to external URL without version pinning",
+            finding_kind: None,
         },
         Pattern {
             regex: &JS_REQUIRE_HTTP_GET,
             severity: Severity::Medium,
             category: Category::JavaScriptFetch,
             description: "http.get() to external URL without version pinning",
+            finding_kind: None,
         },
     ]
 });
@@ -315,24 +346,28 @@ pub static DOCKER_PATTERNS: LazyLock<Vec<Pattern>> = LazyLock::new(|| {
             severity: Severity::High,
             category: Category::DockerUnpinned,
             description: "FROM :latest — image not pinned to specific version",
+            finding_kind: None,
         },
         Pattern {
             regex: &DOCKER_FROM_UNTAGGED,
             severity: Severity::High,
             category: Category::DockerUnpinned,
             description: "FROM without tag — implicitly pulls :latest",
+            finding_kind: None,
         },
         Pattern {
             regex: &DOCKER_RUN_CURL,
             severity: Severity::Medium,
             category: Category::DockerUnpinned,
             description: "curl in Dockerfile RUN — check URL is versioned",
+            finding_kind: None,
         },
         Pattern {
             regex: &DOCKER_RUN_WGET,
             severity: Severity::Medium,
             category: Category::DockerUnpinned,
             description: "wget in Dockerfile RUN — check URL is versioned",
+            finding_kind: None,
         },
     ]
 });
@@ -343,6 +378,7 @@ pub static DOCKER_URL_PATTERNS: LazyLock<Vec<Pattern>> = LazyLock::new(|| {
         severity: Severity::Medium,
         category: Category::DockerUnpinned,
         description: "Dockerfile ADD with URL source — build-time fetch bypasses pinning",
+        finding_kind: None,
     }]
 });
 
@@ -374,24 +410,28 @@ pub static PY_PATTERNS: LazyLock<Vec<Pattern>> = LazyLock::new(|| {
             severity: Severity::High,
             category: Category::PythonFetch,
             description: "urllib fetching from a 'latest' URL",
+            finding_kind: None,
         },
         Pattern {
             regex: &PY_REQUESTS_LATEST,
             severity: Severity::High,
             category: Category::PythonFetch,
             description: "requests library fetching from a 'latest' URL",
+            finding_kind: None,
         },
         Pattern {
             regex: &PY_SUBPROCESS_CURL,
             severity: Severity::High,
             category: Category::PythonFetch,
             description: "subprocess shelling out to curl — runtime fetch bypasses pinning",
+            finding_kind: None,
         },
         Pattern {
             regex: &PY_SUBPROCESS_WGET,
             severity: Severity::High,
             category: Category::PythonFetch,
             description: "subprocess shelling out to wget — runtime fetch bypasses pinning",
+            finding_kind: None,
         },
     ]
 });
@@ -403,12 +443,14 @@ pub static PY_URL_PATTERNS: LazyLock<Vec<Pattern>> = LazyLock::new(|| {
             severity: Severity::Medium,
             category: Category::PythonFetch,
             description: "urllib fetching external URL without version pinning",
+            finding_kind: None,
         },
         Pattern {
             regex: &PY_REQUESTS_URL,
             severity: Severity::Medium,
             category: Category::PythonFetch,
             description: "requests library fetching external URL without version pinning",
+            finding_kind: None,
         },
     ]
 });
