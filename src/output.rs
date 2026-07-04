@@ -2,7 +2,7 @@ use colored::Colorize;
 use serde::Serialize;
 use std::io::{self, Write};
 
-use crate::audit_patterns::{Category, Pattern, Severity, category_str};
+use crate::audit_patterns::{Category, FindingKind, Pattern, Severity, category_str};
 
 /// Replace control chars (C0/C1/DEL, except tab) with U+FFFD so escape sequences
 /// in fetched action source can't spoof or hide findings in the terminal.
@@ -227,6 +227,8 @@ pub struct AuditFinding {
     /// 1-based line number of the `uses:` line in `workflow_file`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workflow_line: Option<usize>,
+    #[serde(skip)]
+    pub(crate) finding_kind: Option<FindingKind>,
 }
 
 impl AuditFinding {
@@ -249,6 +251,7 @@ impl AuditFinding {
             description: description.into(),
             workflow_file: None,
             workflow_line: None,
+            finding_kind: None,
         }
     }
 
@@ -259,7 +262,7 @@ impl AuditFinding {
         line: usize,
         pattern_matched: &str,
     ) -> Self {
-        Self::new(
+        let mut finding = Self::new(
             &pattern.severity,
             &pattern.category,
             action_name,
@@ -267,7 +270,9 @@ impl AuditFinding {
             line,
             pattern_matched,
             pattern.description,
-        )
+        );
+        finding.finding_kind = pattern.finding_kind;
+        finding
     }
 }
 
@@ -803,6 +808,7 @@ mod sarif_tests {
             description: "unversioned curl".into(),
             workflow_file: None,
             workflow_line: None,
+            finding_kind: None,
         }
     }
 
@@ -826,6 +832,14 @@ mod sarif_tests {
         let doc = report(findings).build_sarif();
         let json = serde_json::to_string(&doc).unwrap();
         serde_json::from_str(&json).unwrap()
+    }
+
+    #[test]
+    fn audit_finding_json_skips_internal_finding_kind() {
+        let mut finding = finding("high", "shell_fetch");
+        finding.finding_kind = Some(FindingKind::PipeToShell);
+        let json = serde_json::to_value(&finding).unwrap();
+        assert!(json.get("finding_kind").is_none());
     }
 
     #[test]
