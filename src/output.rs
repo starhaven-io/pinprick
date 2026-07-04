@@ -555,7 +555,10 @@ pub fn severity_str(s: &Severity) -> &'static str {
 
 // ── SARIF 2.1.0 ─────────────────────────────────────────────────────────────
 
-const SARIF_SCHEMA: &str = "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json";
+// Immutable published URL — the spec repo's `master` branch has moved schema
+// paths before, which would leave emitted documents pointing at a dead link.
+const SARIF_SCHEMA: &str =
+    "https://docs.oasis-open.org/sarif/sarif/v2.1.0/errata01/os/schemas/sarif-schema-2.1.0.json";
 const SARIF_VERSION: &str = "2.1.0";
 const TOOL_NAME: &str = "pinprick";
 const TOOL_URI: &str = "https://pinprick.rs";
@@ -777,6 +780,32 @@ mod sarif_tests {
         assert_eq!(results[0]["level"], "error");
         assert_eq!(results[1]["level"], "warning");
         assert_eq!(results[2]["level"], "note");
+    }
+
+    #[test]
+    fn every_category_has_sarif_rule_metadata() {
+        use crate::audit_patterns::{Category, category_str};
+        // The match is exhaustive on purpose: adding a Category variant fails
+        // compilation here until the list below (and SARIF_RULES) grows with it.
+        let all = [
+            Category::DockerUnpinned,
+            Category::JavaScriptFetch,
+            Category::PythonFetch,
+            Category::ShellFetch,
+        ];
+        for category in &all {
+            match category {
+                Category::DockerUnpinned
+                | Category::JavaScriptFetch
+                | Category::PythonFetch
+                | Category::ShellFetch => {}
+            }
+            let id = format!("pinprick/{}", category_str(category));
+            assert!(
+                SARIF_RULES.iter().any(|r| r.id == id),
+                "no SARIF rule metadata for category {id} — findings would carry a ruleId with no rule"
+            );
+        }
     }
 
     #[test]

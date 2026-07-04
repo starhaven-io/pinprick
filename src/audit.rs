@@ -1491,56 +1491,38 @@ fn check_url_patterns(
     collector: &mut AuditCollector,
     config: &Config,
 ) {
-    for pattern in patterns {
-        if !pattern.regex.is_match(line) {
-            continue;
-        }
-        // Check EVERY URL, not just the first: a versioned/trusted decoy before
-        // the real fetch must not suppress the finding. Allowed only if all URLs
-        // are exempt; any unexempt one is a finding.
-        let mut allowed_reason: Option<&str> = None;
-        let mut dangerous = false;
-        for url in extract_urls(line) {
-            if url_has_version(url) {
-                allowed_reason.get_or_insert("versioned URL");
-            } else if config.is_host_trusted(url) {
-                allowed_reason.get_or_insert(REASON_TRUSTED_HOST);
-            } else if config.is_extra_data_format_exempt(url) {
-                allowed_reason.get_or_insert(REASON_EXTRA_DATA_FORMAT);
-            } else if config.is_data_format_exempt(url) {
-                allowed_reason.get_or_insert("data format URL");
-            } else if url_piped_to_jq(line, url) {
-                allowed_reason.get_or_insert("piped to jq");
-            } else {
-                dangerous = true;
-                break;
-            }
-        }
+    // The URL classification below is line-level, so every matching pattern
+    // would reach the identical verdict on the identical URL set: record once
+    // for the first match instead of once per pattern (`curl … && wget …`
+    // previously emitted two findings for the same line).
+    let Some(pattern) = patterns.iter().find(|p| p.regex.is_match(line)) else {
+        return;
+    };
 
-        if dangerous {
-            if let Some(reason) = allowed_reason {
-                collector.push_allowed(AuditMatch {
-                    severity: output::severity_str(&pattern.severity).to_string(),
-                    category: category_str(&pattern.category).to_string(),
-                    action: action_name.to_string(),
-                    source_file: source_file.to_string(),
-                    line: Some(line_num),
-                    pattern_matched: line.trim().to_string(),
-                    reason: reason.to_string(),
-                });
-            }
-            collector.push_finding(AuditFinding {
-                severity: output::severity_str(&pattern.severity).to_string(),
-                category: category_str(&pattern.category).to_string(),
-                action: action_name.to_string(),
-                source_file: source_file.to_string(),
-                line: Some(line_num),
-                pattern_matched: line.trim().to_string(),
-                description: pattern.description.to_string(),
-                workflow_file: None,
-                workflow_line: None,
-            });
-        } else if let Some(reason) = allowed_reason {
+    // Check EVERY URL, not just the first: a versioned/trusted decoy before
+    // the real fetch must not suppress the finding. Allowed only if all URLs
+    // are exempt; any unexempt one is a finding.
+    let mut allowed_reason: Option<&str> = None;
+    let mut dangerous = false;
+    for url in extract_urls(line) {
+        if url_has_version(url) {
+            allowed_reason.get_or_insert("versioned URL");
+        } else if config.is_host_trusted(url) {
+            allowed_reason.get_or_insert(REASON_TRUSTED_HOST);
+        } else if config.is_extra_data_format_exempt(url) {
+            allowed_reason.get_or_insert(REASON_EXTRA_DATA_FORMAT);
+        } else if config.is_data_format_exempt(url) {
+            allowed_reason.get_or_insert("data format URL");
+        } else if url_piped_to_jq(line, url) {
+            allowed_reason.get_or_insert("piped to jq");
+        } else {
+            dangerous = true;
+            break;
+        }
+    }
+
+    if dangerous {
+        if let Some(reason) = allowed_reason {
             collector.push_allowed(AuditMatch {
                 severity: output::severity_str(&pattern.severity).to_string(),
                 category: category_str(&pattern.category).to_string(),
@@ -1551,8 +1533,29 @@ fn check_url_patterns(
                 reason: reason.to_string(),
             });
         }
-        // No URL on the line: nothing to record.
+        collector.push_finding(AuditFinding {
+            severity: output::severity_str(&pattern.severity).to_string(),
+            category: category_str(&pattern.category).to_string(),
+            action: action_name.to_string(),
+            source_file: source_file.to_string(),
+            line: Some(line_num),
+            pattern_matched: line.trim().to_string(),
+            description: pattern.description.to_string(),
+            workflow_file: None,
+            workflow_line: None,
+        });
+    } else if let Some(reason) = allowed_reason {
+        collector.push_allowed(AuditMatch {
+            severity: output::severity_str(&pattern.severity).to_string(),
+            category: category_str(&pattern.category).to_string(),
+            action: action_name.to_string(),
+            source_file: source_file.to_string(),
+            line: Some(line_num),
+            pattern_matched: line.trim().to_string(),
+            reason: reason.to_string(),
+        });
     }
+    // No URL on the line: nothing to record.
 }
 
 fn check_patterns(
@@ -2387,6 +2390,23 @@ jobs:
         assert_eq!(c.findings[0].severity, "high");
         assert!(c.findings[0].description.contains("piped to shell"));
         assert!(c.allowed.is_empty());
+    }
+
+    #[test]
+    fn shell_scan_records_one_finding_when_multiple_url_patterns_match() {
+        // curl and wget on one line reach the same line-level URL verdict;
+        // two findings for the same line would be duplicate noise.
+        let mut c = AuditCollector::new(false);
+        scan_shell_content(
+            "curl -O https://example.com/a.tar.gz && wget https://example.com/b.tar.gz\n",
+            "test.sh",
+            1,
+            "",
+            &mut c,
+            &DEFAULT_CONFIG,
+        );
+        assert_eq!(c.findings.len(), 1);
+        assert_eq!(c.findings[0].line, Some(1));
     }
 
     #[test]

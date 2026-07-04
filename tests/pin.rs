@@ -51,6 +51,19 @@ fn all_pinned_dry_run_exits_zero() {
 }
 
 #[test]
+fn gh_token_env_var_is_honored() {
+    // GH_TOKEN (the variable the gh CLI itself uses) must work as a fallback
+    // when GITHUB_TOKEN is unset. All-pinned workflow, so no network follows.
+    let dir = common::repo_with_workflow("ci.yml", common::WORKFLOW_CLEAN);
+    common::pinprick_cmd()
+        .env("GH_TOKEN", "dummy")
+        .arg("pin")
+        .arg(dir.path())
+        .assert()
+        .code(0);
+}
+
+#[test]
 fn no_token_json_error() {
     let dir = common::repo_with_workflow("ci.yml", common::WORKFLOW_CLEAN);
     let output = common::pinprick_cmd()

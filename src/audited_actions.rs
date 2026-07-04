@@ -205,7 +205,20 @@ impl AuditedActions {
         let key = self.catalog_key.as_ref()?;
 
         let url = format!("{}/{action_key}.json", self.remote_url);
-        let bytes = self.fetch_url(&url).await?;
+        let bytes = match self.fetch_url(&url).await {
+            Ok(Some(bytes)) => bytes,
+            // 404: the action has no remote catalog — a normal, silent miss.
+            Ok(None) => return None,
+            // Network or server failure is not absence: the action may well be
+            // audited, we just couldn't find out. Say so instead of silently
+            // degrading coverage for the rest of the run.
+            Err(()) => {
+                eprintln!(
+                    "warning: could not fetch remote catalog for {action_key} — treating it as unaudited for this run"
+                );
+                return None;
+            }
+        };
 
         // The signature is served next to the catalog file (minisign's `.minisig`
         // convention). A catalog without a valid signature is not honored — a
@@ -213,10 +226,16 @@ impl AuditedActions {
         // catalog with a missing or bad signature is worth a warning: it means
         // either serving infra is misconfigured or someone tampered with it.
         let sig_bytes = match self.fetch_url(&format!("{url}.minisig")).await {
-            Some(b) => b,
-            None => {
+            Ok(Some(b)) => b,
+            Ok(None) => {
                 eprintln!(
                     "warning: remote catalog for {action_key} has no signature — ignoring it"
+                );
+                return None;
+            }
+            Err(()) => {
+                eprintln!(
+                    "warning: could not fetch the signature for {action_key}'s remote catalog — ignoring it"
                 );
                 return None;
             }
@@ -232,21 +251,30 @@ impl AuditedActions {
         Some(parse_entries(&String::from_utf8_lossy(&bytes)))
     }
 
-    /// GET a URL and return the (size-capped) body, or `None` on any failure.
-    async fn fetch_url(&self, url: &str) -> Option<Vec<u8>> {
+    /// GET a URL and return the (size-capped) body. `Ok(None)` means the
+    /// server said the resource doesn't exist (404) — confirmed absence.
+    /// `Err(())` is any other failure (network, non-404 status, oversized
+    /// body), where absence was NOT confirmed.
+    async fn fetch_url(&self, url: &str) -> Result<Option<Vec<u8>>, ()> {
         let resp = self
             .client
             .get(url)
             .header("User-Agent", "pinprick")
             .send()
             .await
-            .ok()?;
+            .map_err(|_| ())?;
 
+        if resp.status().as_u16() == 404 {
+            return Ok(None);
+        }
         if !resp.status().is_success() {
-            return None;
+            return Err(());
         }
 
-        crate::github::read_capped(resp).await.ok()
+        crate::github::read_capped(resp)
+            .await
+            .map(Some)
+            .map_err(|_| ())
     }
 }
 
@@ -600,6 +628,49 @@ mod tests {
             aa.catalog_key = Some(key);
             aa.remote_url = server.uri();
             assert!(aa.fetch_remote_list("actions/missing").await.is_none());
+        }
+
+        #[tokio::test]
+        async fn fetch_url_distinguishes_absence_from_failure() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/missing.json"))
+                .respond_with(ResponseTemplate::new(404))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/broken.json"))
+                .respond_with(ResponseTemplate::new(500))
+                .mount(&server)
+                .await;
+
+            let aa = AuditedActions::new(false);
+            // 404 is confirmed absence; a server error is not.
+            assert_eq!(
+                aa.fetch_url(&format!("{}/missing.json", server.uri()))
+                    .await,
+                Ok(None)
+            );
+            assert_eq!(
+                aa.fetch_url(&format!("{}/broken.json", server.uri())).await,
+                Err(())
+            );
+        }
+
+        #[tokio::test]
+        async fn fetch_remote_list_server_error_is_none() {
+            let (key, _) = test_identity();
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/actions/flaky.json"))
+                .respond_with(ResponseTemplate::new(500))
+                .mount(&server)
+                .await;
+
+            let mut aa = AuditedActions::new(true);
+            aa.catalog_key = Some(key);
+            aa.remote_url = server.uri();
+            assert!(aa.fetch_remote_list("actions/flaky").await.is_none());
         }
 
         #[tokio::test]
