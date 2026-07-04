@@ -1,5 +1,7 @@
 mod audit;
 mod audit_patterns;
+mod audit_shell;
+mod audit_source;
 mod audited_actions;
 mod auth;
 mod config;
