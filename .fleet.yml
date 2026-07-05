@@ -1,0 +1,36 @@
+schema: 1
+license: "agpl"
+params:
+  astro-docs: true
+  dependabot:
+    - package-ecosystem: "github-actions"
+      group: "github-actions"
+      directory: "/"
+    - package-ecosystem: "npm"
+      group: "npm-dependencies"
+      directory: "/site"
+    - package-ecosystem: "cargo"
+      group: "cargo-dependencies"
+      directory: "/"
+      allow:
+        - dependency-type: "all"
+  link-check:
+    targets: "--config lychee.toml --root-dir ${{ github.workspace }}/site/dist/client './site/dist/client/**/*.html' README.md"
+    build-site: true
+    site-directory: "site"
+    authenticated-github: false
+    schedule: "0 14 * * 1"
+    concurrency-group: "link-check"
+  codeql:
+    languages: ["actions"]
+    paths: [".github/workflows/**"]
+    runner: "ubuntu-slim"
+    timeout-minutes: 30
+  readme:
+    badges:
+      workflow: "ci.yml"
+      extra: []
+    license: {}
+exceptions:
+  pinprick-audit: "build-from-source: audits the local checkout (GRAND_PARITY_PASS.md P0.2)"
+  pinprick-audit-recipe: "build-from-source: audits the local checkout (GRAND_PARITY_PASS.md P0.2)"
