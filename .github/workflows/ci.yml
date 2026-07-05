@@ -52,7 +52,15 @@ jobs:
             exit 0
           fi
 
-          MATRIX='[{"name":"Conventional Commits","check":"commits","runner":"ubuntu-slim","fetch_depth":"0"}'
+          MATRIX='[]'
+          add_check() {
+            local entry="$1"
+            if [[ "${MATRIX}" == "[]" ]]; then
+              MATRIX="[${entry}]"
+            else
+              MATRIX="${MATRIX%]},${entry}]"
+            fi
+          }
           RUN_ZIZMOR=false
 
           # `edited` (title/body/base) also runs the full path-derived matrix. The
@@ -64,22 +72,22 @@ jobs:
 
           # Rust or build workflow changes: lint + test + MSRV
           if echo "${CHANGED}" | grep -qE '\.rs$|^Cargo\.(toml|lock)$|^clippy\.toml$|^rustfmt\.toml$|^\.github/workflows/(ci|release)\.yml$'; then
-            MATRIX+=',{"name":"Lint","check":"lint","runner":"ubuntu-24.04"}'
-            MATRIX+=',{"name":"Test (Linux)","check":"test","runner":"ubuntu-24.04"}'
-            MATRIX+=',{"name":"Test (Linux ARM)","check":"test","runner":"ubuntu-24.04-arm"}'
-            MATRIX+=',{"name":"Test (macOS)","check":"test","runner":"macos-26"}'
-            MATRIX+=',{"name":"Coverage","check":"coverage","runner":"ubuntu-24.04","environment":"codecov"}'
-            MATRIX+=',{"name":"MSRV","check":"msrv","runner":"ubuntu-24.04"}'
+            add_check '{"name":"Lint","check":"lint","runner":"ubuntu-24.04"}'
+            add_check '{"name":"Test (Linux)","check":"test","runner":"ubuntu-24.04"}'
+            add_check '{"name":"Test (Linux ARM)","check":"test","runner":"ubuntu-24.04-arm"}'
+            add_check '{"name":"Test (macOS)","check":"test","runner":"macos-26"}'
+            add_check '{"name":"Coverage","check":"coverage","runner":"ubuntu-24.04","environment":"codecov"}'
+            add_check '{"name":"MSRV","check":"msrv","runner":"ubuntu-24.04"}'
           fi
 
           # Audited-actions changes: verify all entries
           if echo "${CHANGED}" | grep -qE '^audited-actions/'; then
-            MATRIX+=',{"name":"Verify Audited Actions","check":"verify-audited","runner":"ubuntu-24.04"}'
+            add_check '{"name":"Verify Audited Actions","check":"verify-audited","runner":"ubuntu-24.04"}'
           fi
 
           # Site or audited-actions changes: format check + build
           if echo "${CHANGED}" | grep -qE '^site/|^audited-actions/'; then
-            MATRIX+=',{"name":"Site","check":"site","runner":"ubuntu-slim"}'
+            add_check '{"name":"Site","check":"site","runner":"ubuntu-slim"}'
           fi
 
           # Workflow changes: Actions security audit
@@ -87,12 +95,21 @@ jobs:
             RUN_ZIZMOR=true
           fi
 
-          echo "matrix=${MATRIX}]" >> "${GITHUB_OUTPUT}"
+          echo "matrix=${MATRIX}" >> "${GITHUB_OUTPUT}"
           echo "run_zizmor=${RUN_ZIZMOR}" >> "${GITHUB_OUTPUT}"
+
+  commits:
+    name: Conventional Commits
+    if: github.event_name == 'pull_request'
+    permissions:
+      contents: read
+      pull-requests: read # required to read PR titles
+    uses: starhaven-io/.github/.github/workflows/reusable-conventional-commits.yml@497c741e3457eddfe696cb604b1d1c283ef82b90 # v2026.07.05.5
 
   check:
     name: ${{ matrix.name }}
     needs: generate-matrix
+    if: ${{ needs.generate-matrix.outputs.matrix != '[]' }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     environment:
@@ -100,7 +117,6 @@ jobs:
       deployment: false
     permissions:
       contents: read
-      pull-requests: read # required to fetch PR commits for conventional commit validation
     strategy:
       fail-fast: false
       matrix:
@@ -149,54 +165,6 @@ jobs:
             ~/.cargo/.crates2.json
           key: ${{ runner.os }}-${{ runner.arch }}-cargo-lint-tools-${{ hashFiles('.github/workflows/ci.yml') }}
           restore-keys: ${{ runner.os }}-${{ runner.arch }}-cargo-lint-tools-
-
-
-      - name: Check PR title
-        if: matrix.check == 'commits'
-        env:
-          PR_TITLE: ${{ github.event.pull_request.title }}
-        run: |
-          PATTERN='^(feat|fix|docs|style|refactor|perf|test|build|ci|chore)(\(.+\))?: .+'
-          if [[ ! "${PR_TITLE}" =~ ${PATTERN} ]]; then
-            echo "::error::PR title '${PR_TITLE}' does not follow Conventional Commits."
-            echo ""
-            echo "Expected format: <type>(<scope>): <description>"
-            echo ""
-            echo "Types: feat, fix, docs, style, refactor, perf, test, build, ci, chore"
-            echo ""
-            echo "Examples:"
-            echo "  feat(audit): add Docker FROM pattern detection"
-            echo "  fix(pin): handle annotated tags correctly"
-            echo "  ci: add clippy workflow"
-            exit 1
-          fi
-
-      - name: Check commit messages
-        if: matrix.check == 'commits'
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: |
-          PATTERN='^(feat|fix|docs|style|refactor|perf|test|build|ci|chore)(\(.+\))?: .+'
-          FAILED=0
-          while IFS= read -r LINE; do
-            SHA="${LINE%% *}"
-            MSG="${LINE#* }"
-            if [[ "${MSG}" == Merge\ * ]]; then
-              continue
-            fi
-            if [[ ! "${MSG}" =~ ${PATTERN} ]]; then
-              echo "::error::Commit ${SHA} does not follow Conventional Commits: '${MSG}'"
-              FAILED=1
-            fi
-          done < <(git log --format="%h %s" "${BASE_SHA}..${HEAD_SHA}")
-
-          if [[ "${FAILED}" -eq 1 ]]; then
-            echo ""
-            echo "All commit messages must follow: <type>(<scope>): <description>"
-            echo "Types: feat, fix, docs, style, refactor, perf, test, build, ci, chore"
-            exit 1
-          fi
 
 
       - name: Add Clippy and Rustfmt
@@ -420,15 +388,17 @@ jobs:
 
   conclusion:
     name: conclusion
-    needs: [check, zizmor]
+    needs: [commits, check, zizmor]
     runs-on: ubuntu-slim
     timeout-minutes: 15
     if: always()
     steps:
       - name: Result
         env:
+          COMMITS_RESULT: ${{ needs.commits.result }}
           CHECK_RESULT: ${{ needs.check.result }}
           ZIZMOR_RESULT: ${{ needs.zizmor.result }}
         run: |
-          test "${CHECK_RESULT}" = "success"
+          test "${COMMITS_RESULT}" = "success" || test "${COMMITS_RESULT}" = "skipped"
+          test "${CHECK_RESULT}" = "success" || test "${CHECK_RESULT}" = "skipped"
           [[ "${ZIZMOR_RESULT}" == "success" || "${ZIZMOR_RESULT}" == "skipped" ]]
