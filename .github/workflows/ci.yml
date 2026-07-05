@@ -26,6 +26,7 @@ jobs:
   generate-matrix:
     name: Generate matrix
     runs-on: ubuntu-slim
+    timeout-minutes: 15
     permissions:
       contents: read
     outputs:
@@ -93,6 +94,7 @@ jobs:
     name: ${{ matrix.name }}
     needs: generate-matrix
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
     environment:
       name: ${{ matrix.environment }}
       deployment: false
@@ -109,7 +111,6 @@ jobs:
           fetch-depth: ${{ matrix.fetch_depth || 1 }}
           persist-credentials: false
 
-      # --- Cargo caches ---
 
       - name: Restore cargo build cache
         id: cargo-build-cache
@@ -149,7 +150,6 @@ jobs:
           key: ${{ runner.os }}-${{ runner.arch }}-cargo-lint-tools-${{ hashFiles('.github/workflows/ci.yml') }}
           restore-keys: ${{ runner.os }}-${{ runner.arch }}-cargo-lint-tools-
 
-      # --- Conventional Commits ---
 
       - name: Check PR title
         if: matrix.check == 'commits'
@@ -198,7 +198,6 @@ jobs:
             exit 1
           fi
 
-      # --- Lint ---
 
       - name: Add Clippy and Rustfmt
         if: matrix.check == 'lint'
@@ -206,7 +205,7 @@ jobs:
 
       - name: Install typos-cli
         if: matrix.check == 'lint'
-        run: cargo install typos-cli --locked --version 1.47.2
+        run: cargo install typos-cli --locked --version 1.48.0
 
       - name: Install cargo-deny
         if: matrix.check == 'lint'
@@ -250,13 +249,11 @@ jobs:
             ~/.cargo/.crates2.json
           key: ${{ runner.os }}-${{ runner.arch }}-cargo-lint-tools-${{ hashFiles('.github/workflows/ci.yml') }}
 
-      # --- Test ---
 
       - name: Test
         if: matrix.check == 'test'
         run: cargo test --locked
 
-      # --- MSRV ---
 
       - name: Install MSRV toolchain
         if: matrix.check == 'msrv'
@@ -271,7 +268,6 @@ jobs:
         if: matrix.check == 'msrv'
         run: cargo "+${MSRV}" check --locked --all-targets
 
-      # --- Coverage ---
 
       - name: Add llvm-tools
         if: matrix.check == 'coverage'
@@ -317,7 +313,6 @@ jobs:
             ~/.cargo/.crates2.json
           key: ${{ runner.os }}-${{ runner.arch }}-cargo-cov-tools-${{ hashFiles('.github/workflows/ci.yml') }}
 
-      # --- Site ---
 
       - name: Setup Node
         if: matrix.check == 'site'
@@ -348,7 +343,6 @@ jobs:
         env:
           WRANGLER_SEND_METRICS: "false"
 
-      # --- Verify Audited Actions ---
 
       - name: Check sort order
         if: matrix.check == 'verify-audited'
@@ -410,6 +404,7 @@ jobs:
     needs: generate-matrix
     if: needs.generate-matrix.outputs.run_zizmor == 'true'
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     permissions:
       contents: read
       security-events: write # required for zizmor SARIF upload
@@ -427,6 +422,7 @@ jobs:
     name: conclusion
     needs: [check, zizmor]
     runs-on: ubuntu-slim
+    timeout-minutes: 15
     if: always()
     steps:
       - name: Result

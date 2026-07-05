@@ -29,6 +29,7 @@ jobs:
   deny:
     name: Check
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
     permissions:
       contents: read
       issues: write # open/close the tracking issue when the scan flips

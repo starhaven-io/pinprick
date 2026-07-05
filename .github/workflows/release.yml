@@ -23,6 +23,7 @@ jobs:
     # skips the whole chain via `needs`.
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     permissions:
       contents: read
     steps:
@@ -94,6 +95,7 @@ jobs:
             runner: macos-26
             sign: true
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
     permissions:
       contents: read
       attestations: write # required to generate build provenance attestations
@@ -237,6 +239,7 @@ jobs:
     name: Release
     needs: build
     runs-on: ubuntu-slim
+    timeout-minutes: 60
     permissions:
       contents: write # required to create tags and GitHub releases
     outputs:
@@ -307,6 +310,7 @@ jobs:
     name: Publish to crates.io
     needs: release
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
     environment:
       name: release
       deployment: false
@@ -334,6 +338,7 @@ jobs:
     name: Bump Homebrew cask
     needs: release
     runs-on: macos-26
+    timeout-minutes: 60
     environment:
       name: release
       deployment: false
