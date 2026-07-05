@@ -15,4 +15,9 @@ if [ "$deleting_only" -eq 1 ]; then
     exit 0
 fi
 
+if ! command -v just >/dev/null 2>&1; then
+    echo "pre-push hook: 'just' is required. Install it with 'brew install just'." >&2
+    exit 127
+fi
+
 just check
