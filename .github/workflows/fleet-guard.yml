@@ -16,5 +16,5 @@ jobs:
       contents: read
     uses: starhaven-io/.github/.github/workflows/reusable-fleet-guard.yml@20371f85e8e55e28feb2bec0c957514153e0f1d8 # v2026.07.05.9
     with:
-      hub-ref: "5684a11c4f6cbcea9c0fc24fdd5bb6bd602e32c3"
+      hub-ref: "20371f85e8e55e28feb2bec0c957514153e0f1d8"
       repo-name: ${{ github.event.repository.name }}
