@@ -32,5 +32,5 @@ params:
       extra: []
     license: {}
 exceptions:
-  pinprick-audit: "build-from-source: audits the local checkout (GRAND_PARITY_PASS.md P0.2)"
-  pinprick-audit-recipe: "build-from-source: audits the local checkout (GRAND_PARITY_PASS.md P0.2)"
+  pinprick-audit: "build-from-source: audits the local checkout"
+  pinprick-audit-recipe: "build-from-source: audits the local checkout"
