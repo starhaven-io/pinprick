@@ -3,17 +3,17 @@ license: "agpl"
 params:
   astro-docs: true
   dependabot:
+    - package-ecosystem: "cargo"
+      group: "cargo-dependencies"
+      directory: "/"
+      allow:
+        - dependency-type: "all"
     - package-ecosystem: "github-actions"
       group: "github-actions"
       directory: "/"
     - package-ecosystem: "npm"
       group: "npm-dependencies"
       directory: "/site"
-    - package-ecosystem: "cargo"
-      group: "cargo-dependencies"
-      directory: "/"
-      allow:
-        - dependency-type: "all"
   link-check:
     targets: "--config lychee.toml --root-dir ${{ github.workspace }}/site/dist/client './site/dist/client/**/*.html' README.md"
     build-site: true
