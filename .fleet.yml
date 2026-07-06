@@ -15,7 +15,7 @@ params:
       group: "npm-dependencies"
       directory: "/site"
   link-check:
-    targets: "--config lychee.toml --root-dir ${{ github.workspace }}/site/dist/client './site/dist/client/**/*.html' README.md"
+    targets: "--config lychee.toml --root-dir site/dist/client './site/dist/client/**/*.html' README.md"
     build-site: true
     site-directory: "site"
     authenticated-github: false

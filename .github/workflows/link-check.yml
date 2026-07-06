@@ -18,7 +18,7 @@ jobs:
       contents: read
     uses: starhaven-io/.github/.github/workflows/reusable-link-check.yml@989b76e2b1ceaf3531da903e288e79929bd2f30e # v2026.07.05.10
     with:
-      args: "--config lychee.toml --root-dir ${{ github.workspace }}/site/dist/client './site/dist/client/**/*.html' README.md"
+      args: "--config lychee.toml --root-dir site/dist/client './site/dist/client/**/*.html' README.md"
       build-site: true
       site-directory: "site"
       authenticated-github: false
