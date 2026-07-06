@@ -9,7 +9,7 @@ updates:
     cooldown:
       default-days: 7
     groups:
-      cargo-dependencies:
+      "cargo-dependencies":
         patterns:
           - "*"
   - package-ecosystem: "github-actions"
@@ -24,7 +24,7 @@ updates:
       # Fleet pins are owned by the sync; Dependabot never writes them.
       - dependency-name: "starhaven-io/.github/*"
     groups:
-      github-actions:
+      "github-actions":
         patterns:
           - "*"
   - package-ecosystem: "npm"
@@ -34,6 +34,6 @@ updates:
     cooldown:
       default-days: 7
     groups:
-      npm-dependencies:
+      "npm-dependencies":
         patterns:
           - "*"

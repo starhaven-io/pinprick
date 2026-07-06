@@ -8,7 +8,7 @@ on:
 permissions: {}
 
 concurrency:
-  group: link-check
+  group: "link-check"
   cancel-in-progress: true
 
 jobs:
