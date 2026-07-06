@@ -19,7 +19,7 @@ updates:
     cooldown:
       default-days: 7
       exclude:
-        - "starhaven-io/.github/.github/workflows/reusable-*.yml"
+        - "starhaven-io/*"
     groups:
       github-actions:
         patterns:
