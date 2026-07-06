@@ -1,5 +1,17 @@
 version: 2
 updates:
+  - package-ecosystem: "cargo"
+    directory: "/"
+    allow:
+      - dependency-type: "all"
+    schedule:
+      interval: "daily"
+    cooldown:
+      default-days: 7
+    groups:
+      cargo-dependencies:
+        patterns:
+          - "*"
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
@@ -20,17 +32,5 @@ updates:
       default-days: 7
     groups:
       npm-dependencies:
-        patterns:
-          - "*"
-  - package-ecosystem: "cargo"
-    directory: "/"
-    allow:
-      - dependency-type: "all"
-    schedule:
-      interval: "daily"
-    cooldown:
-      default-days: 7
-    groups:
-      cargo-dependencies:
         patterns:
           - "*"
