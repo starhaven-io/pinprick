@@ -1,6 +1,6 @@
 # pinprick scoring rubric
 
-**Status:** draft (rubric version `0.8.0`)
+**Status:** draft (rubric version `0.9.0`)
 
 This document defines how pinprick computes a single score for a GitHub repository's Actions supply chain posture. It is the public specification that the `pinprick score` CLI subcommand implements against, and that any downstream tool wrapping the engine (dashboards, CI plugins, reporting pipelines) should implement against so scores stay portable and comparable.
 
@@ -54,18 +54,13 @@ A SHA-pinned reference incurs no pinning deduction.
 
 ### Action-source rules (category: `source`)
 
-These rules fire against properties of the referenced action itself. Most require a GitHub token; `source.unverified` is offline (allowlist-based).
+These rules fire against properties of the referenced action itself. Live source rules require a GitHub token.
 
 | ID                    | Condition                                                    | Severity | Points | Status   | Remediation                                      |
 |-----------------------|--------------------------------------------------------------|----------|--------|----------|--------------------------------------------------|
 | `source.archived`     | Referenced repo is archived                                  | high     |   10   | live     | Migrate to an actively maintained replacement    |
 | `source.stale`        | Referenced SHA was committed >365 days ago and no newer tag  | medium   |    5   | planned  | Update to a newer maintained version             |
 | `source.advisory`     | Referenced version has a published GHSA advisory             | high     |   15   | live     | Update past the vulnerable version range; see the referenced GHSA |
-| `source.unverified`   | Publisher is not in the baseline (`actions`, `github`) or the configured `trusted-owners` list | low | 0 | live | Informational note — review the publisher once; add trusted publishers to `trusted-owners` in `.pinprick.toml` to clear it |
-
-`source.unverified` is configurable and **informational**: it deducts zero points and never fails the exit-code gate (as of rubric 0.6.0; it deducted 1 point per publisher through 0.5.0). The built-in baseline of trusted publishers is `actions` and `github`. Extend with `trusted-owners = ["my-org", "vendor"]` in `.pinprick.toml`. Case-insensitive, exact owner match.
-
-Why zero points: the rule has no evidence input — it cannot distinguish an established vendor from a week-old account, only "publisher not yet in your allowlist." Deducting points for that scores config curation rather than security posture, and per-action deductions train bulk acknowledgment — which numbs the reviewer to the one publisher that actually deserves scrutiny. The evidence-backed publisher risks carry the points instead (`source.archived`, `source.advisory`, and the planned `source.stale`). The note stays in the findings list because the per-publisher inventory is genuinely useful: it is the prompt to review each publisher once and record the decision.
 
 `source.archived` requires a GitHub token (`GITHUB_TOKEN` env var or `gh auth login`); without one, the offline rules still run. The check fires once per unique `action_ref` whose `owner/repo` is archived on GitHub. A repo lookup failure (network error, 404) is treated as "not archived" so a single bad reference doesn't abort the scan.
 
@@ -117,7 +112,7 @@ These are deliberately out of scope for v1 to keep the initial rubric defensible
 
 ```jsonc
 {
-  "rubric_version": "0.8.0",
+  "rubric_version": "0.9.0",
   "pinprick_version": "…",
   "target": { "kind": "repo", "path": "./" },
   "score": 72,
@@ -151,7 +146,7 @@ These are deliberately out of scope for v1 to keep the initial rubric defensible
 A compact summary:
 
 ```
-pinprick score  v0.8.0 rubric
+pinprick score  v0.9.0 rubric
 
   Grade:  C   (72 / 100)
 
@@ -196,6 +191,10 @@ The rubric version is semver-ish:
 
 Re-scoring an existing scan against a newer rubric is always explicit in the UI. We never silently change a score.
 
+## Changelog
+
+- `0.9.0`: Removed `source.unverified`. `pinprick score --json` no longer emits publisher allowlist notes, and the `trusted-owners` config key has been removed.
+
 ## Worked example
 
 A hypothetical small repo:
@@ -214,7 +213,6 @@ Findings:
 | `pin.sliding`                      |    5   |
 | `pin.full_tag`                     |    2   |
 | `pin.branch`                       |   15   |
-| `source.unverified` (some-org)     |    0   |
 | `runtime.pipe_to_shell`            |   20   |
 | `workflow.permissions_write_all`   |   10   |
 
@@ -222,7 +220,7 @@ Total deducted: **52**. Score: **48**. Grade: **F**.
 
 Remediation priority (biggest point recovery first):
 1. Remove the `curl | sh` (+20)
-2. Pin `some-org/custom-action` to a SHA (+15); if `some-org` is a trusted vendor, add it to `trusted-owners` to clear the informational note
+2. Pin `some-org/custom-action` to a SHA (+15)
 3. Scope `permissions:` per-job (+10)
 4. Pin `actions/checkout` to a SHA (+5)
 5. Pin `actions/setup-node` to a SHA (+2)

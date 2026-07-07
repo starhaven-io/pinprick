@@ -35,10 +35,8 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 ";
 
-// SHA-pinned (no pin.* finding) but from a publisher outside the trusted
-// baseline — produces only the zero-point source.unverified note.
-const WORKFLOW_UNVERIFIED_ONLY: &str = "\
-name: unverified
+const WORKFLOW_UNKNOWN_OWNER_SHA_PINNED: &str = "\
+name: unknown-owner
 on: push
 jobs:
   a:
@@ -71,17 +69,24 @@ fn sliding_tag_exits_one() {
 }
 
 #[test]
-fn informational_only_findings_exit_zero() {
-    // source.unverified is a zero-point informational note: it must appear
-    // in the output without denting the score or failing the CI gate.
-    let dir = common::repo_with_workflow("ci.yml", WORKFLOW_UNVERIFIED_ONLY);
-    common::pinprick_cmd()
+fn unknown_owner_sha_pinned_action_scores_cleanly() {
+    let dir = common::repo_with_workflow("ci.yml", WORKFLOW_UNKNOWN_OWNER_SHA_PINNED);
+    let output = common::pinprick_cmd()
+        .arg("--json")
         .arg("score")
         .arg(dir.path())
-        .assert()
-        .code(0)
-        .stdout(predicate::str::contains("source.unverified"))
-        .stdout(predicate::str::contains("100 / 100"));
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains("source.unverified"));
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["score"], 100);
+    assert_eq!(json["totals"]["points_deducted"], 0);
+    assert_eq!(json["totals"]["findings"], 0);
+    assert!(json["findings"].as_array().unwrap().is_empty());
 }
 
 #[test]
@@ -119,7 +124,7 @@ fn json_output_shape() {
     assert_eq!(output.status.code(), Some(1));
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
 
-    assert_eq!(json["rubric_version"], "0.8.0");
+    assert_eq!(json["rubric_version"], "0.9.0");
     assert_eq!(json["grade"], "A");
     assert_eq!(json["score"], 95);
     assert_eq!(json["totals"]["findings"], 1);
@@ -288,32 +293,6 @@ jobs:
     assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!stderr.contains("note: the scanned repo's .pinprick.toml"));
-}
-
-#[test]
-fn repo_config_trusted_owners_notice() {
-    let workflow = "\
-name: vendor
-on: push
-jobs:
-  a:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: my-vendor/tool@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v1.0.0
-      - run: echo ok
-";
-    let dir = common::repo_with_config("ci.yml", workflow, "trusted-owners = [\"my-vendor\"]\n");
-
-    let output = common::pinprick_cmd()
-        .arg("score")
-        .arg(dir.path())
-        .output()
-        .unwrap();
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("actions exempted via trusted-owners: 1"),
-        "expected a trusted-owners notice on stderr, got: {stderr}"
-    );
 }
 
 #[test]

@@ -180,7 +180,7 @@ Compute a posture grade against the public, versioned rubric in [`docs/scoring.m
 
 ```
 $ pinprick score
-pinprick score  v0.8.0 rubric
+pinprick score  v0.9.0 rubric
 
   Grade:  A   (95 / 100)
 
@@ -192,7 +192,7 @@ pinprick score  v0.8.0 rubric
   Run with --json for the full report.
 ```
 
-`source.unverified` is informational: it inventories publishers outside the baseline trusted set (`actions`, `github`) and your configured `trusted-owners`, but it deducts zero points and does not fail CI. `score` exits 1 only when at least one finding deducts points. Use `pinprick score --html > report.html` for a shareable static report.
+`score` exits 1 only when at least one finding deducts points. Use `pinprick score --html > report.html` for a shareable static report.
 
 ### Configuration
 
@@ -209,9 +209,6 @@ fetch-remote = false
 # Hosts whose unversioned URL fetches are downgraded to allowed matches.
 # Case-insensitive exact match. Only applies to the unversioned-URL rules.
 trusted-hosts = ["crates.io"]
-
-# Additional GitHub owners trusted for the source.unverified scoring note.
-trusted-owners = ["my-org"]
 
 # Extra file extensions (beyond .json/.yaml/.toml/.csv/.tsv/.xml/.md/.rst/.txt)
 # to treat as data formats for the unversioned-URL exemption.

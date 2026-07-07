@@ -36,12 +36,6 @@ pub struct Config {
     #[serde(default)]
     pub trusted_hosts: Vec<String>,
 
-    /// Additional GitHub owners (users or orgs) whose actions are considered
-    /// trusted publishers for the `source.unverified` scoring rule. Appended
-    /// to the built-in baseline (`actions`, `github`). Case-insensitive.
-    #[serde(default)]
-    pub trusted_owners: Vec<String>,
-
     /// Where this configuration was loaded from. Not part of the file format —
     /// used to attribute suppressions to the scanned repo's own config, which
     /// matters when auditing a repository you don't control.
@@ -57,11 +51,6 @@ pub enum ConfigSource {
     Global,
     RepoLocal,
 }
-
-/// Baseline list of trusted action publishers. GitHub's own orgs are
-/// always considered trusted; users extend this list via `trusted-owners`
-/// in `.pinprick.toml`.
-const BASELINE_TRUSTED_OWNERS: &[&str] = &["actions", "github"];
 
 /// Minimum severity threshold for reporting, set via `severity` in
 /// `.pinprick.toml`. Deserializing rejects unknown values so a typo can't
@@ -187,25 +176,6 @@ impl Config {
         self.trusted_hosts
             .iter()
             .any(|h| h.eq_ignore_ascii_case(host))
-    }
-
-    /// Check if an action publisher (owner) is trusted. Combines the
-    /// built-in baseline (`actions`, `github`) with the user-configured
-    /// `trusted_owners` list. Case-insensitive.
-    pub fn is_owner_trusted(&self, owner: &str) -> bool {
-        BASELINE_TRUSTED_OWNERS
-            .iter()
-            .any(|b| b.eq_ignore_ascii_case(owner))
-            || self.is_owner_trusted_by_config(owner)
-    }
-
-    /// Whether `owner` is trusted via the configured `trusted-owners` list
-    /// specifically (not the built-in baseline). Used to attribute
-    /// `source.unverified` exemptions to the active config file.
-    pub fn is_owner_trusted_by_config(&self, owner: &str) -> bool {
-        self.trusted_owners
-            .iter()
-            .any(|o| o.eq_ignore_ascii_case(owner))
     }
 }
 
