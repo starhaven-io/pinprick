@@ -29,9 +29,6 @@ extra-data-formats = ["proto", "graphql"]
 # match. Case-insensitive.
 trusted-hosts = ["artifacts.example.com"]
 
-# Additional GitHub owners trusted for the zero-point source.unverified score note.
-trusted-owners = ["my-org"]
-
 # Suppress specific findings
 [ignore]
 # Skip audit for these actions entirely
@@ -84,12 +81,6 @@ trusted-hosts = [
 - Package manager installs (`pip install foo`, `npm install foo`) — those are package registries, not HTTP hosts
 
 To suppress a specific pattern that `trusted-hosts` doesn't cover, use [`ignore.patterns`](#ignorepatterns) instead.
-
-### `trusted-owners`
-
-A list of GitHub owners to treat as trusted for the `source.unverified` scoring note. The baseline trusted set is `actions` and `github`; this setting extends that list for your own org or reviewed vendors.
-
-Matching is exact owner, case-insensitive. This option only affects the zero-point `source.unverified` note in `pinprick score`. It does not skip auditing, suppress runtime findings, or trust downloads from the owner.
 
 ### `ignore.actions`
 

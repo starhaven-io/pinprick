@@ -20,7 +20,7 @@ use crate::github::{AdvisoryVulnerability, GitHubClient, GitHubError, SecurityAd
 use crate::output::AuditFinding;
 use crate::workflow::{self, ActionRef, RefType};
 
-pub const RUBRIC_VERSION: &str = "0.8.0";
+pub const RUBRIC_VERSION: &str = "0.9.0";
 
 // ── Rule catalog ────────────────────────────────────────────────────────────
 
@@ -48,7 +48,6 @@ pub enum RuleId {
     PinFullTag,
     SourceAdvisory,
     SourceArchived,
-    SourceUnverified,
     RuntimePipeToShell,
     RuntimeFetchHigh,
     RuntimeFetchMedium,
@@ -66,7 +65,6 @@ impl RuleId {
             Self::PinFullTag => "pin.full_tag",
             Self::SourceAdvisory => "source.advisory",
             Self::SourceArchived => "source.archived",
-            Self::SourceUnverified => "source.unverified",
             Self::RuntimePipeToShell => "runtime.pipe_to_shell",
             Self::RuntimeFetchHigh => "runtime.fetch.high",
             Self::RuntimeFetchMedium => "runtime.fetch.medium",
@@ -80,9 +78,7 @@ impl RuleId {
     pub fn category(self) -> Category {
         match self {
             Self::PinBranch | Self::PinSliding | Self::PinFullTag => Category::Pin,
-            Self::SourceAdvisory | Self::SourceArchived | Self::SourceUnverified => {
-                Category::Source
-            }
+            Self::SourceAdvisory | Self::SourceArchived => Category::Source,
             Self::RuntimePipeToShell
             | Self::RuntimeFetchHigh
             | Self::RuntimeFetchMedium
@@ -105,7 +101,7 @@ impl RuleId {
             Self::PinSliding | Self::RuntimeFetchMedium | Self::WorkflowWorkflowRun => {
                 Severity::Medium
             }
-            Self::PinFullTag | Self::SourceUnverified | Self::RuntimeFetchLow => Severity::Low,
+            Self::PinFullTag | Self::RuntimeFetchLow => Severity::Low,
         }
     }
 
@@ -118,12 +114,6 @@ impl RuleId {
             Self::PinSliding | Self::WorkflowPullRequestTarget => 5,
             Self::RuntimeFetchLow | Self::WorkflowWorkflowRun => 3,
             Self::PinFullTag => 2,
-            // Informational: no evidence input distinguishes an established
-            // vendor from a week-old account, so deducting points here would
-            // score config curation rather than posture. The evidence-backed
-            // publisher risks (source.archived / source.advisory) carry the
-            // points; this note survives as the per-publisher review prompt.
-            Self::SourceUnverified => 0,
         }
     }
 
@@ -136,9 +126,6 @@ impl RuleId {
                 "Update past the vulnerable version range; see the referenced GHSA"
             }
             Self::SourceArchived => "Migrate to an actively maintained replacement",
-            Self::SourceUnverified => {
-                "Informational — no points deducted. Review the publisher once; add trusted publishers to `trusted-owners` in .pinprick.toml to clear this note."
-            }
             Self::RuntimePipeToShell => {
                 "Download the payload to disk, verify it (checksum or signature), then execute. Never pipe directly to a shell."
             }
@@ -228,9 +215,6 @@ pub fn grade_for(score: u32) -> &'static str {
 pub struct ConfigImpact {
     /// Runtime findings dropped via `ignore.patterns`.
     pub findings_suppressed: usize,
-    /// Unique action refs exempted from `source.unverified` via the
-    /// configured `trusted-owners` list (baseline owners not counted).
-    pub actions_exempted: usize,
     /// Runtime fetches exempted via the configured `trusted-hosts` list.
     pub trusted_host_fetches: usize,
     /// Runtime fetches exempted via the configured `extra-data-formats` list.
@@ -241,7 +225,6 @@ pub struct ConfigImpact {
 /// up into a single report, alongside what the config changed about it.
 pub fn score_repo(repo_root: &Path, config: &Config) -> Result<(ScoreReport, ConfigImpact)> {
     let mut impact = ConfigImpact::default();
-    let mut exempted_refs: std::collections::BTreeSet<String> = Default::default();
     let files = workflow::find_workflows(repo_root)?;
 
     // Accumulate action-level findings keyed by (rule, action_ref).
@@ -257,7 +240,7 @@ pub fn score_repo(repo_root: &Path, config: &Config) -> Result<(ScoreReport, Con
         let display = workflow::display_path(file.path(), repo_root);
         let content = workflow::read_workflow(file)?;
 
-        // Action-level findings (pin.*, source.*)
+        // Action-level pinning findings.
         for a in workflow::scan_content(&content) {
             let action_ref = format!("{}@{}", a.full_name(), a.ref_string);
             unique_actions.insert(action_ref.clone());
@@ -268,17 +251,6 @@ pub fn score_repo(repo_root: &Path, config: &Config) -> Result<(ScoreReport, Con
                     workflow: display.clone(),
                     line: a.line_number,
                 });
-            }
-
-            if !config.is_owner_trusted(&a.owner) {
-                let key = (RuleId::SourceUnverified, action_ref.clone());
-                action_findings.entry(key).or_default().push(Occurrence {
-                    workflow: display.clone(),
-                    line: a.line_number,
-                });
-            } else if config.is_owner_trusted_by_config(&a.owner) {
-                // Trusted via the config file, not the baseline — attributable.
-                exempted_refs.insert(action_ref.clone());
             }
         }
 
@@ -386,7 +358,6 @@ pub fn score_repo(repo_root: &Path, config: &Config) -> Result<(ScoreReport, Con
         findings,
     };
     recompute_score(&mut report);
-    impact.actions_exempted = exempted_refs.len();
     Ok((report, impact))
 }
 
@@ -858,12 +829,6 @@ pub async fn run(
                 impact.findings_suppressed
             ));
         }
-        if impact.actions_exempted > 0 {
-            parts.push(format!(
-                "actions exempted via trusted-owners: {}",
-                impact.actions_exempted
-            ));
-        }
         if impact.trusted_host_fetches > 0 {
             parts.push(format!(
                 "trusted-host fetches: {}",
@@ -903,10 +868,8 @@ pub async fn run(
     }
 
     // Exit 1 whenever any finding deducts points — matches `audit`'s
-    // convention so the subcommand gates CI cleanly. Zero-point findings
-    // (informational notes like source.unverified) never fail a gate: a
-    // deduction-free repo is a passing repo. Grade bands are a
-    // presentation detail.
+    // convention so the subcommand gates CI cleanly. A deduction-free repo is
+    // a passing repo; grade bands are a presentation detail.
     if has_deductions(&report) {
         Ok(ExitCode::from(1))
     } else {
@@ -914,8 +877,7 @@ pub async fn run(
     }
 }
 
-/// True when at least one finding actually deducts points. Zero-point
-/// findings are informational and must not fail a CI gate.
+/// True when at least one finding actually deducts points.
 fn has_deductions(report: &ScoreReport) -> bool {
     report.findings.iter().any(|f| f.points > 0)
 }
@@ -1239,7 +1201,6 @@ jobs:
         let (report, _) = score_repo(dir.path(), &Config::default()).unwrap();
         // pin.sliding (5) + pin.full_tag (2) + pin.branch (15)
         //   + workflow.permissions_write_all (10)
-        //   + source.unverified for some-org/custom-action (0, informational)
         //   = 32; score = 68; grade = D
         assert_eq!(report.totals.points_deducted, 32);
         assert_eq!(report.score, 68);
@@ -1304,7 +1265,6 @@ jobs:
             RuleId::PinFullTag,
             RuleId::SourceAdvisory,
             RuleId::SourceArchived,
-            RuleId::SourceUnverified,
             RuleId::RuntimePipeToShell,
             RuleId::RuntimeFetchHigh,
             RuleId::RuntimeFetchMedium,
@@ -1318,18 +1278,7 @@ jobs:
                 !rule.remediation().is_empty(),
                 "rule {rule:?} has empty remediation"
             );
-            // Every rule deducts points except the explicitly informational
-            // ones — zero-point notes that inventory rather than score.
-            let informational = matches!(rule, RuleId::SourceUnverified);
-            if informational {
-                assert_eq!(
-                    rule.points(),
-                    0,
-                    "informational rule {rule:?} must not deduct points"
-                );
-            } else {
-                assert!(rule.points() > 0, "rule {rule:?} has zero points");
-            }
+            assert!(rule.points() > 0, "rule {rule:?} has zero points");
             // Just call category/severity to exercise every match arm.
             let _ = rule.category();
             let _ = rule.severity();
@@ -1521,7 +1470,7 @@ jobs:
     }
 
     #[test]
-    fn source_unverified_fires_for_untrusted_owner() {
+    fn unknown_owner_sha_pinned_action_scores_cleanly() {
         let dir = tempfile::TempDir::new().unwrap();
         let wfdir = dir.path().join(".github").join("workflows");
         std::fs::create_dir_all(&wfdir).unwrap();
@@ -1529,46 +1478,10 @@ jobs:
         std::fs::write(wfdir.join("ci.yml"), yaml).unwrap();
 
         let (report, _) = score_repo(dir.path(), &Config::default()).unwrap();
-        let ids: Vec<_> = report.findings.iter().map(|f| f.id).collect();
-        assert_eq!(ids, vec!["source.unverified"]);
-        // Informational: the note is emitted but deducts nothing — an
-        // otherwise-clean repo still scores 100 and passes a CI gate.
-        assert_eq!(report.findings[0].points, 0);
+        assert!(report.findings.is_empty());
         assert_eq!(report.score, 100);
+        assert_eq!(report.totals.findings, 0);
         assert!(!has_deductions(&report));
-    }
-
-    #[test]
-    fn source_unverified_skipped_for_trusted_baseline() {
-        // `actions` and `github` are in the built-in baseline.
-        let dir = tempfile::TempDir::new().unwrap();
-        let wfdir = dir.path().join(".github").join("workflows");
-        std::fs::create_dir_all(&wfdir).unwrap();
-        let yaml = "name: x\non: push\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6\n      - uses: github/codeql-action/init@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v3\n";
-        std::fs::write(wfdir.join("ci.yml"), yaml).unwrap();
-
-        let (report, _) = score_repo(dir.path(), &Config::default()).unwrap();
-        assert!(report.findings.is_empty());
-        assert_eq!(report.score, 100);
-    }
-
-    #[test]
-    fn source_unverified_respects_config_trusted_owners() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let wfdir = dir.path().join(".github").join("workflows");
-        std::fs::create_dir_all(&wfdir).unwrap();
-        let yaml = "name: x\non: push\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: my-vendor/tool@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v1\n";
-        std::fs::write(wfdir.join("ci.yml"), yaml).unwrap();
-
-        let cfg = Config {
-            trusted_owners: vec!["my-vendor".to_string()],
-            ..Config::default()
-        };
-        let (report, impact) = score_repo(dir.path(), &cfg).unwrap();
-        assert!(report.findings.is_empty());
-        // The exemption is attributed to the config, not the baseline.
-        assert_eq!(impact.actions_exempted, 1);
-        assert_eq!(impact.findings_suppressed, 0);
     }
 
     fn make_adv(
@@ -2192,8 +2105,7 @@ jobs:
         // Exercise the escaping path for action refs / workflow paths that
         // could (in theory) contain HTML metacharacters. The finding uses
         // `pin.full_tag` (2 points) so the fixture models a state the rubric
-        // can actually produce — `source.unverified` is 0-point informational
-        // and must never carry a deduction.
+        // can actually produce.
         let report = ScoreReport {
             rubric_version: RUBRIC_VERSION,
             pinprick_version: env!("CARGO_PKG_VERSION"),
