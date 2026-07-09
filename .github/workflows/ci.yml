@@ -371,20 +371,10 @@ jobs:
     name: zizmor
     needs: generate-matrix
     if: needs.generate-matrix.outputs.run_zizmor == 'true'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
     permissions:
       contents: read
       security-events: write # required for zizmor SARIF upload
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          persist-credentials: false
-
-      - name: Run zizmor
-        uses: zizmorcore/zizmor-action@192e21d79ab29983730a13d1382995c2307fbcaa # v0.5.7
-        with:
-          persona: auditor
+    uses: starhaven-io/.github/.github/workflows/reusable-zizmor.yml@03a3794cb337d13703059eb02b44a8d419833ebd # v2026.07.08.1
 
   conclusion:
     name: conclusion
