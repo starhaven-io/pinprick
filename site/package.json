@@ -16,15 +16,15 @@
     "format:check": "prettier --check ."
   },
   "dependencies": {
-    "@astrojs/cloudflare": "^14.1.0",
+    "@astrojs/cloudflare": "^14.1.1",
     "@astrojs/starlight": "^0.41.2",
-    "astro": "^7.0.5",
+    "astro": "^7.0.6",
     "sharp": "^0.35.3"
   },
   "devDependencies": {
     "prettier": "^3.9.4",
     "prettier-plugin-astro": "^0.14.1",
-    "wrangler": "^4.106.0"
+    "wrangler": "^4.107.0"
   },
   "overrides": {
     "esbuild": "0.28.1"
