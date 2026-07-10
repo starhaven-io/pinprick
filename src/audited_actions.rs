@@ -100,31 +100,34 @@ impl AuditedActions {
         subpath: Option<&str>,
         sha: &str,
     ) -> Option<AuditSource> {
-        let key = action_key(owner, repo, subpath)?;
+        let keys = action_keys(owner, repo, subpath)?;
 
-        if self
-            .bundled
-            .get(&key)
-            .is_some_and(|shas| shas.contains(sha))
+        if keys
+            .iter()
+            .any(|key| self.bundled.get(key).is_some_and(|shas| shas.contains(sha)))
         {
             return Some(AuditSource::Bundled);
         }
 
-        if !self.local.contains_key(&key) {
-            let shas = self.load_local_cache(owner, repo, &key);
-            self.local.insert(key.clone(), shas);
-        }
-        if self.local.get(&key).is_some_and(|shas| shas.contains(sha)) {
-            return Some(AuditSource::LocalCache);
+        for key in &keys {
+            if !self.local.contains_key(key) {
+                let shas = self.load_local_cache(owner, repo, key);
+                self.local.insert(key.clone(), shas);
+            }
+            if self.local.get(key).is_some_and(|shas| shas.contains(sha)) {
+                return Some(AuditSource::LocalCache);
+            }
         }
 
         if self.fetch_remote {
-            if !self.remote.contains_key(&key) {
-                let shas = self.fetch_remote_list(&key).await.unwrap_or_default();
-                self.remote.insert(key.clone(), shas);
-            }
-            if self.remote.get(&key).is_some_and(|shas| shas.contains(sha)) {
-                return Some(AuditSource::Remote);
+            for key in &keys {
+                if !self.remote.contains_key(key) {
+                    let shas = self.fetch_remote_list(key).await.unwrap_or_default();
+                    self.remote.insert(key.clone(), shas);
+                }
+                if self.remote.get(key).is_some_and(|shas| shas.contains(sha)) {
+                    return Some(AuditSource::Remote);
+                }
             }
         }
 
@@ -353,6 +356,17 @@ fn action_key(owner: &str, repo: &str, subpath: Option<&str>) -> Option<String> 
     }
 }
 
+/// A repository-level clean verdict covers every action at that commit, while
+/// a subpath verdict covers only that subpath. Keep the fallback one-way so a
+/// clean sibling action can never suppress scanning another sibling.
+fn action_keys(owner: &str, repo: &str, subpath: Option<&str>) -> Option<Vec<String>> {
+    let exact = action_key(owner, repo, subpath)?;
+    match subpath {
+        Some(_) => Some(vec![action_key(owner, repo, None)?, exact]),
+        None => Some(vec![exact]),
+    }
+}
+
 fn is_safe_subpath(path: &str) -> bool {
     !path.is_empty() && path.split('/').all(is_safe_segment)
 }
@@ -391,6 +405,63 @@ mod tests {
         }
         assert_eq!(action_key("owner/name", "repo", Some("a")), None);
         assert_eq!(action_key("owner", "repo/name", Some("a")), None);
+    }
+
+    #[test]
+    fn subpath_lookup_uses_parent_then_exact_identity() {
+        assert_eq!(
+            action_keys("owner", "repo", Some("a/b")),
+            Some(vec!["owner/repo".to_string(), "owner/repo/a/b".to_string()])
+        );
+        assert_eq!(
+            action_keys("owner", "repo", None),
+            Some(vec!["owner/repo".to_string()])
+        );
+        assert_eq!(action_keys("owner", "repo", Some("../a")), None);
+    }
+
+    #[tokio::test]
+    async fn parent_bundled_verdict_covers_subpath() {
+        let mut aa = AuditedActions::new(false);
+        aa.bundled.clear();
+        aa.bundled
+            .insert("owner/repo".to_string(), HashSet::from(["aaa".to_string()]));
+        aa.cache_dir = None;
+
+        assert_eq!(
+            aa.check("owner", "repo", Some("restore"), "aaa").await,
+            Some(AuditSource::Bundled)
+        );
+    }
+
+    #[tokio::test]
+    async fn sibling_bundled_verdict_does_not_cover_subpath() {
+        let mut aa = AuditedActions::new(false);
+        aa.bundled.clear();
+        aa.bundled.insert(
+            "owner/repo/save".to_string(),
+            HashSet::from(["aaa".to_string()]),
+        );
+        aa.cache_dir = None;
+
+        assert_eq!(
+            aa.check("owner", "repo", Some("restore"), "aaa").await,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn parent_local_cache_verdict_covers_subpath() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut aa = AuditedActions::new(false);
+        aa.bundled.clear();
+        aa.cache_dir = Some(dir.path().to_path_buf());
+        aa.cache_clean("owner", "repo", None, "aaa", "v1");
+
+        assert_eq!(
+            aa.check("owner", "repo", Some("restore"), "aaa").await,
+            Some(AuditSource::LocalCache)
+        );
     }
 
     #[test]
@@ -788,6 +859,26 @@ mod tests {
             );
             assert_eq!(
                 aa.check("some", "action", Some("a"), "feedface").await,
+                Some(AuditSource::Remote)
+            );
+        }
+
+        #[tokio::test]
+        async fn parent_remote_verdict_covers_subpath() {
+            let (key, sign) = test_identity();
+            let body = serde_json::to_string(&json!([{ "sha": "feedface", "tag": "v3" }])).unwrap();
+
+            let server = MockServer::start().await;
+            mount_signed(&server, "some/action", &body, &sign(body.as_bytes())).await;
+
+            let mut aa = AuditedActions::new(true);
+            aa.bundled.clear();
+            aa.catalog_key = Some(key);
+            aa.remote_url = server.uri();
+            aa.cache_dir = None;
+
+            assert_eq!(
+                aa.check("some", "action", Some("sub"), "feedface").await,
                 Some(AuditSource::Remote)
             );
         }

@@ -26,6 +26,35 @@ fn clean_workflow_human_output() {
 }
 
 #[test]
+fn bundled_parent_audit_covers_action_subpaths() {
+    let workflow = "\
+name: cache
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+";
+    let dir = common::repo_with_workflow("ci.yml", workflow);
+
+    common::pinprick_cmd()
+        .env("GITHUB_TOKEN", "dummy")
+        .arg("audit")
+        .arg(dir.path())
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "actions/cache/restore@55cc834 audited (bundled)",
+        ))
+        .stderr(predicate::str::contains(
+            "actions/cache/save@55cc834 audited (bundled)",
+        ))
+        .stderr(predicate::str::contains("Fetching actions/cache").not());
+}
+
+#[test]
 fn human_output_sanitizes_terminal_escapes() {
     // A matched run-block line carrying an ANSI escape must not reach the
     // terminal verbatim — otherwise a hostile action could spoof or hide a
