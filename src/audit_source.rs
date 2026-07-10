@@ -92,13 +92,21 @@ fn select_source_files(
                 .unwrap_or(path)
                 .trim_start_matches('/')
         };
-        let kind = if relative == "action.yml" || relative == "action.yaml" {
+        let filename = path.rsplit('/').next().unwrap_or(path);
+        let whole_repo = base.is_empty();
+        let kind = if relative == "action.yml"
+            || relative == "action.yaml"
+            || whole_repo && matches!(filename, "action.yml" | "action.yaml")
+        {
             SourceFileKind::ActionYml
         } else if is_javascript_source(path) {
             SourceFileKind::JavaScript
         } else if path.ends_with(".py") {
             SourceFileKind::Python
-        } else if relative == "Dockerfile" || path.ends_with(".dockerfile") {
+        } else if relative == "Dockerfile"
+            || whole_repo && filename == "Dockerfile"
+            || path.ends_with(".dockerfile")
+        {
             SourceFileKind::Dockerfile
         } else {
             continue;
@@ -109,28 +117,28 @@ fn select_source_files(
 }
 
 fn force_include_remote_action_entrypoints(
-    base: &str,
     targets: &mut Vec<(String, SourceFileKind)>,
     contents: &[Option<Result<String>>],
 ) {
-    let metadata: Vec<String> = targets
+    let metadata: Vec<(String, String)> = targets
         .iter()
         .zip(contents)
-        .filter_map(|((_, kind), content)| {
+        .filter_map(|((path, kind), content)| {
             if *kind != SourceFileKind::ActionYml {
                 return None;
             }
             let Some(Ok(content)) = content.as_ref() else {
                 return None;
             };
-            Some(content.clone())
+            Some((path.clone(), content.clone()))
         })
         .collect();
 
-    for content in metadata {
+    for (path, content) in metadata {
         let Ok(yaml) = serde_norway::from_str::<Value>(&content) else {
             continue;
         };
+        let base = path.rsplit_once('/').map_or("", |(base, _)| base);
         for entrypoint in action_yml_entrypoint_paths(&yaml, base) {
             push_unique_source_target(targets, entrypoint, SourceFileKind::JavaScript);
         }
@@ -427,7 +435,7 @@ pub(crate) async fn scan_action_source(
     // makes the scan incomplete, so the caller will not cache a clean verdict.
     let (mut contents, mut complete) = fetch_remote_source_files(client, action, &targets).await;
     let initial_len = targets.len();
-    force_include_remote_action_entrypoints(base, &mut targets, &contents);
+    force_include_remote_action_entrypoints(&mut targets, &contents);
     if targets.len() > initial_len {
         let (new_contents, new_complete) =
             fetch_remote_source_files(client, action, &targets[initial_len..]).await;
@@ -687,12 +695,14 @@ runs:
     fn select_source_files_classifies_and_filters_in_order() {
         let tree = vec![
             tree_entry("action.yml", "blob"),
+            tree_entry("sub/action.yaml", "blob"),
             tree_entry("dist/index.js", "blob"), // bundled action code — kept
             tree_entry("dist/index.mjs", "blob"),
             tree_entry("src/main.cjs", "blob"),
             tree_entry("src/main.ts", "blob"),
             tree_entry("setup.py", "blob"),
             tree_entry("Dockerfile", "blob"),
+            tree_entry("sub/Dockerfile", "blob"),
             tree_entry("README.md", "blob"), // not scannable
             tree_entry("node_modules/dep/i.js", "blob"), // vendored — skipped
             tree_entry("src", "tree"),       // directory entry — skipped
@@ -702,12 +712,14 @@ runs:
             got,
             vec![
                 ("action.yml".to_string(), SourceFileKind::ActionYml),
+                ("sub/action.yaml".to_string(), SourceFileKind::ActionYml),
                 ("dist/index.js".to_string(), SourceFileKind::JavaScript),
                 ("dist/index.mjs".to_string(), SourceFileKind::JavaScript),
                 ("src/main.cjs".to_string(), SourceFileKind::JavaScript),
                 ("src/main.ts".to_string(), SourceFileKind::JavaScript),
                 ("setup.py".to_string(), SourceFileKind::Python),
                 ("Dockerfile".to_string(), SourceFileKind::Dockerfile),
+                ("sub/Dockerfile".to_string(), SourceFileKind::Dockerfile),
             ]
         );
     }
@@ -1026,5 +1038,64 @@ runs:
         assert_eq!(status, ActionScanStatus::Complete);
         assert_eq!(collector.findings.len(), 1);
         assert_eq!(collector.findings[0].source_file, "o/r (dist/runner)");
+    }
+
+    #[tokio::test]
+    async fn repo_scan_includes_subpath_metadata_entrypoint() {
+        use serde_json::json;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/repos/o/r/git/trees/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "tree": [
+                    { "path": "sub/action.yml", "type": "blob" },
+                    { "path": "sub/runner", "type": "blob" }
+                ]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/contents/sub/action.yml"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("runs:\n  using: node20\n  main: runner\n"),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/contents/sub/runner"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"fetch("https://example.com/install")"#),
+            )
+            .mount(&server)
+            .await;
+
+        let client = GitHubClient::with_base("t".into(), server.uri());
+        let action = ActionRef {
+            owner: "o".into(),
+            repo: "r".into(),
+            subpath: None,
+            ref_string: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            ref_type: workflow::RefType::Sha,
+            tag_comment: Some("v1.0.0".into()),
+            line_number: 1,
+            raw_line: String::new(),
+        };
+        let mut collector = AuditCollector::new(false);
+
+        let status = scan_action_source(&client, &action, &mut collector, &DEFAULT_CONFIG)
+            .await
+            .unwrap();
+
+        assert_eq!(status, ActionScanStatus::Complete);
+        assert_eq!(collector.findings.len(), 1);
+        assert_eq!(collector.findings[0].source_file, "o/r (sub/runner)");
     }
 }

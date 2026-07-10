@@ -28,6 +28,8 @@ Each SHA was scanned for **unversioned runtime fetch patterns**. Specifically:
 - Python: `urllib.request.urlopen`/`requests.get` to `/latest/` or unversioned URLs, `subprocess` shelling out to `curl`/`wget`
 - Docker: `FROM :latest` or untagged, `curl`/`wget` in `RUN` instructions, and remote `ADD` sources
 
+A clean repository-level audit also covers actions exposed from subpaths at the same SHA. A clean subpath audit applies only to that subpath, not to sibling actions or the repository as a whole.
+
 ## What "audited" does NOT mean
 
 This is not a full security review. An action listed as audited may still:

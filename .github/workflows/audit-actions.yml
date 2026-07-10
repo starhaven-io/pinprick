@@ -160,17 +160,28 @@ jobs:
                 - uses: ${OWNER}/${REPO}@${TAG_SHA} # ${TAG}
           YAML
 
-              if ./target/debug/pinprick --json audit "${TMPDIR}" 2>/dev/null; then
-                echo "  Clean — adding ${TAG}"
-                jq -r --arg sha "${TAG_SHA}" --arg tag "${TAG}" '
-                  (if any(.[]; .sha == $sha) then . else [{sha: $sha, tag: $tag}] + . end)
-                  | sort_by([(.tag | ltrimstr("v") | split(".") | map(tonumber? // 0)), .tag]) | reverse
-                  | "[\n" + ([.[] | "  { \"sha\": \"\(.sha)\", \"tag\": \"\(.tag)\" }"] | join(",\n")) + "\n]"
-                ' "${JSON_FILE}" > "${JSON_FILE}.tmp"
-                mv "${JSON_FILE}.tmp" "${JSON_FILE}"
-                UPDATED=1
-              else
+              AUDIT_STATUS=0
+              AUDIT_JSON=$(./target/debug/pinprick --json audit "${TMPDIR}" 2>/dev/null) || AUDIT_STATUS=$?
+              if [[ "${AUDIT_STATUS}" -eq 0 ]]; then
+                if jq -e '
+                  (.audited_bundled + .audited_local_cache + .audited_remote + .scanned_fresh) == 1
+                  and .ignored == 0
+                ' <<< "${AUDIT_JSON}" > /dev/null; then
+                  echo "  Clean — adding ${TAG}"
+                  jq -r --arg sha "${TAG_SHA}" --arg tag "${TAG}" '
+                    (if any(.[]; .sha == $sha) then . else [{sha: $sha, tag: $tag}] + . end)
+                    | sort_by([(.tag | ltrimstr("v") | split(".") | map(tonumber? // 0)), .tag]) | reverse
+                    | "[\n" + ([.[] | "  { \"sha\": \"\(.sha)\", \"tag\": \"\(.tag)\" }"] | join(",\n")) + "\n]"
+                  ' "${JSON_FILE}" > "${JSON_FILE}.tmp"
+                  mv "${JSON_FILE}.tmp" "${JSON_FILE}"
+                  UPDATED=1
+                else
+                  echo "  Incomplete scan — skipping ${TAG}"
+                fi
+              elif [[ "${AUDIT_STATUS}" -eq 1 ]]; then
                 echo "  Findings detected — skipping ${TAG}"
+              else
+                echo "  Audit failed (exit ${AUDIT_STATUS}) — skipping ${TAG}"
               fi
               rm -rf "${TMPDIR}"
             done
