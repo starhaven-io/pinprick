@@ -322,6 +322,58 @@ fn checksum_suppressed() {
 }
 
 #[test]
+fn unrelated_checksum_does_not_suppress() {
+    let workflow = "\
+name: checksum
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          curl -L https://example.com/install.sh -o tool.sh
+          sha256sum unrelated.txt
+";
+    let dir = common::repo_with_workflow("ci.yml", workflow);
+    let output = common::pinprick_cmd()
+        .arg("--json")
+        .arg("audit")
+        .arg(dir.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["findings"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn mid_token_checksum_flag_does_not_suppress() {
+    let workflow = "\
+name: checksum
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          curl -L https://example.com/install.sh -o tool.sh
+          sha256sum data-c tool.sh
+";
+    let dir = common::repo_with_workflow("ci.yml", workflow);
+    let output = common::pinprick_cmd()
+        .arg("--json")
+        .arg("audit")
+        .arg(dir.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["findings"].as_array().unwrap().len(), 1);
+}
+
+#[test]
 fn multiple_findings() {
     let dir = common::repo_with_workflow("ci.yml", common::WORKFLOW_MULTI_FINDINGS);
     let output = common::pinprick_cmd()

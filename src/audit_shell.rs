@@ -511,29 +511,54 @@ fn url_basename(url: &str) -> Option<String> {
 }
 
 pub(crate) fn checksum_verifies_target(line: &str, target: &str) -> bool {
+    if line.contains("||") {
+        return false;
+    }
     parse_shell_line(line).into_iter().any(|command| {
         command
             .stages
             .iter()
-            .any(|stage| checksum_stage_verifies_target(stage, target))
+            .enumerate()
+            .filter(|(_, stage)| has_checksum_verify(&stage.text))
+            .any(|(checksum_stage, stage)| {
+                stage
+                    .words
+                    .iter()
+                    .any(|word| checksum_word_matches_target(word, target))
+                    || checksum_stage_reads_manifest_stdin(stage)
+                        && command.stages[..checksum_stage].iter().any(|stage| {
+                            stage_supplies_checksum_manifest(stage)
+                                && stage
+                                    .words
+                                    .iter()
+                                    .any(|word| checksum_word_matches_target(word, target))
+                        })
+            })
     })
 }
 
-fn checksum_stage_verifies_target(stage: &ShellStage, target: &str) -> bool {
-    has_checksum_verify(&stage.text)
-        && stage
-            .words
-            .iter()
-            .any(|word| checksum_word_matches_target(word, target))
+fn checksum_stage_reads_manifest_stdin(stage: &ShellStage) -> bool {
+    stage.words.iter().any(|word| word == "-")
+}
+
+fn stage_supplies_checksum_manifest(stage: &ShellStage) -> bool {
+    command_word_index(&stage.words)
+        .and_then(|idx| stage.words.get(idx))
+        .and_then(|word| word.rsplit('/').next())
+        .is_some_and(|command| matches!(command, "cat" | "echo" | "printf" | "Write-Output"))
 }
 
 fn checksum_word_matches_target(word: &str, target: &str) -> bool {
-    let word = normalize_path_token(word);
     let target = normalize_path_token(target);
-    word == target
-        || word
-            .strip_prefix(&target)
-            .is_some_and(|suffix| matches!(suffix, ".sha256" | ".sha512" | ".sha1" | ".sig"))
+    word.split_whitespace().any(|word| {
+        let word = normalize_path_token(word);
+        let word = word.strip_prefix('*').unwrap_or(&word);
+        word == target
+            || word.strip_prefix(&target).is_some_and(|suffix| {
+                matches!(suffix, ".sha256" | ".sha512" | ".sha1" | ".sig")
+                    || suffix.eq_ignore_ascii_case(").Hash")
+            })
+    })
 }
 
 pub(crate) fn git_clone_has_bound_sha_checkout(logical: &[(usize, String)], li: usize) -> bool {
@@ -732,6 +757,34 @@ mod tests {
         assert!(is_shell_comment_line("# comment"));
         assert!(is_shell_comment_line("    # indented comment"));
         assert!(is_shell_comment_line("\t# tab indent"));
+    }
+
+    #[test]
+    fn piped_checksum_manifest_verifies_named_target() {
+        assert!(checksum_verifies_target(
+            "echo \"abcdef  tool\" | shasum -a 256 -c -",
+            "tool"
+        ));
+    }
+
+    #[test]
+    fn unrelated_pipeline_target_does_not_bind_checksum() {
+        assert!(!checksum_verifies_target(
+            "curl -o tool https://example.com/tool | sha256sum unrelated.txt",
+            "tool"
+        ));
+        assert!(!checksum_verifies_target(
+            "echo tool && sha256sum unrelated.txt",
+            "tool"
+        ));
+    }
+
+    #[test]
+    fn masked_checksum_failure_does_not_verify_target() {
+        assert!(!checksum_verifies_target(
+            "sha256sum -c tool.sha256 || true",
+            "tool"
+        ));
     }
 
     #[test]

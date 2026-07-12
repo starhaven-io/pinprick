@@ -19,7 +19,7 @@ pinprick scans line by line. Each rule is an anchored regex, compiled once at st
 - **Versioned-URL downgrade.** Non-pipe shell, JavaScript, and Python fetch rules only fire if the URL is _unversioned_. A URL is versioned if any path segment matches `v?\d+(\.\d+)+` — e.g. `/v1.2.3/`, `/0.55.8/`. See [Versioned URL heuristic](#versioned-url-heuristic).
 - **Trusted hosts exemption.** Unversioned-URL rules are downgraded to allowed matches when the URL host matches an entry in the user's [`trusted-hosts`](#trusted-hosts-exemption) list.
 - **Data-format exemption.** If a fetch targets a URL whose path ends in a known data-format extension (`.json`, `.yaml`, `.toml`, etc.), it is treated as a data fetch, not a code fetch, and downgraded to an allowed match instead of a finding. See [Data-format exemption](#data-format-exemption).
-- **Checksum suppression.** A non-pipe finding followed within 3 lines by `sha256sum`, `shasum`, `openssl dgst`, `gpg --verify`, or `Get-FileHash` is suppressed and recorded as an allowed match — the checksum deterministically detects a tampered download, so the fetch is pinned by content rather than merely flagged.
+- **Checksum suppression.** A non-pipe finding followed within 3 lines by `sha256sum`, `shasum`, `openssl dgst`, `gpg --verify`, or `Get-FileHash` is suppressed only when the command performs an actual comparison or signature check, does not mask failure with `||`, and names every downloaded target, a target-specific sidecar such as `tool.sha256`, or an inline manifest piped to the verifier. Merely calculating a hash, checking an unrelated file, or using a generic manifest whose contents cannot be inspected does not suppress findings. Verified matches are recorded as allowed.
 
 :::caution[Pipe-to-shell is never suppressed]
 A piped payload is never written to disk, so no checksum command can verify it. Trusted-host and data-format exemptions also do not apply — the risk is the execution model, not the source.
@@ -675,7 +675,7 @@ RUN curl -L https://example.com/install.sh -o /usr/local/bin/install
 RUN wget https://example.com/tool
 ```
 
-Not flagged: a `curl` line followed within 3 lines by a checksum command, which is suppressed (recorded as an allowed match).
+Not flagged: a `curl` line followed within 3 lines by a checksum command that names the downloaded target or its sidecar, which is suppressed and recorded as an allowed match.
 
 ### ADD with a URL source
 
