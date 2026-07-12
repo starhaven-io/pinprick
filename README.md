@@ -258,7 +258,7 @@ Pipe-to-shell is flagged even when the URL is versioned — a piped payload is n
 
 Unversioned-URL rules don't fire when the URL's path ends in a data-format extension (`.json`, `.yaml`, `.toml`, `.csv`, etc.), or when the fetch is piped into `jq` — the payload is consumed as data, not executed. These matches are only visible under `--verbose`. (Pipe-to-shell takes precedence, so `curl … | jq … | bash` is still flagged.)
 
-Findings followed by checksum verification (`sha256sum`, `gpg --verify`, etc.) within 3 lines are suppressed and recorded as allowed matches (shown under `--verbose`) — the checksum deterministically detects tampering, so the download is pinned by content. Pipe-to-shell findings are exempt; the piped payload is never written to disk for a checksum to verify.
+Findings followed within 3 lines by checksum verification (`sha256sum --check`, `gpg --verify`, etc.) are suppressed only when the command performs an actual comparison or signature check, does not mask failure with `||`, and names every downloaded target, a target-specific sidecar such as `tool.sha256`, or an inline manifest piped to the verifier. Merely calculating a hash, checking an unrelated file, or using a generic manifest whose contents cannot be inspected does not suppress findings. Verified matches are recorded as allowed under `--verbose`. Pipe-to-shell findings are exempt; the piped payload is never written to disk for a checksum to verify.
 
 ## Exit codes
 

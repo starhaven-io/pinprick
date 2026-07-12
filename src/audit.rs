@@ -737,10 +737,9 @@ fn checksum_within_window(logical: &[(usize, String)], li: usize, targets: &[Str
     (0..=3).any(|offset| {
         li + offset < logical.len()
             && !is_shell_comment_line(&logical[li + offset].1)
-            && (audit_patterns::has_checksum_verify(&logical[li + offset].1)
-                || targets
-                    .iter()
-                    .all(|target| checksum_verifies_target(&logical[li + offset].1, target)))
+            && targets
+                .iter()
+                .all(|target| checksum_verifies_target(&logical[li + offset].1, target))
     })
 }
 
@@ -2732,10 +2731,10 @@ const d = require("node:https").get("https://example.com/install.sh", cb);
     }
 
     #[test]
-    fn shell_scan_direct_checksum_manifest_suppresses_fetch() {
+    fn shell_scan_target_specific_checksum_manifest_suppresses_fetch() {
         let mut c = AuditCollector::new(true);
         scan_shell_content(
-            "curl -o tool https://example.com/tool\nshasum -a 256 -c checksums.txt",
+            "curl -o tool https://example.com/tool\nshasum -a 256 -c tool.sha256",
             "test.sh",
             1,
             "",
@@ -2751,7 +2750,7 @@ const d = require("node:https").get("https://example.com/install.sh", cb);
     fn shell_scan_continuation_curl_checksum_suppressed() {
         let mut c = AuditCollector::new(true);
         scan_shell_content(
-            "curl -L \\\n  https://example.com/tool -o tool\nsha256sum -c checksums.txt",
+            "curl -L \\\n  https://example.com/tool -o tool\nsha256sum -c tool.sha256",
             "test.sh",
             1,
             "",
@@ -2766,10 +2765,10 @@ const d = require("node:https").get("https://example.com/install.sh", cb);
     #[test]
     fn shell_scan_checksum_command_variants_suppress_fetch() {
         for checksum in [
-            "sha256sum -c checksums.txt",
-            "openssl dgst -sha256 tool",
+            "sha256sum -c tool.sha256",
+            "openssl dgst -sha256 -verify public.pem -signature tool.sig tool",
             "gpg --verify tool.sig tool",
-            "Get-FileHash -Algorithm SHA256 tool",
+            "if ((Get-FileHash tool).Hash -ne $EXPECTED) { throw 'checksum mismatch' }",
         ] {
             let mut c = AuditCollector::new(true);
             let content = format!("curl -o tool https://example.com/tool\n{checksum}");
@@ -2784,7 +2783,7 @@ const d = require("node:https").get("https://example.com/install.sh", cb);
     }
 
     #[test]
-    fn shell_scan_nearby_checksum_suppresses_fetch() {
+    fn shell_scan_unrelated_checksum_does_not_suppress_fetch() {
         let mut c = AuditCollector::new(true);
         scan_shell_content(
             "curl -o tool.sh https://example.com/install.sh\nsha256sum unrelated.txt",
@@ -2794,13 +2793,12 @@ const d = require("node:https").get("https://example.com/install.sh", cb);
             &mut c,
             &DEFAULT_CONFIG,
         );
-        assert!(c.findings.is_empty());
-        assert_eq!(c.allowed.len(), 1);
-        assert_eq!(c.allowed[0].reason, "followed by checksum verification");
+        assert_eq!(c.findings.len(), 1);
+        assert!(c.allowed.is_empty());
     }
 
     #[test]
-    fn shell_scan_matching_checksum_suppresses_fetch() {
+    fn shell_scan_checksum_calculation_does_not_suppress_fetch() {
         let mut c = AuditCollector::new(true);
         scan_shell_content(
             "curl -o tool.sh https://example.com/install.sh\nsha256sum tool.sh",
@@ -2810,13 +2808,12 @@ const d = require("node:https").get("https://example.com/install.sh", cb);
             &mut c,
             &DEFAULT_CONFIG,
         );
-        assert!(c.findings.is_empty());
-        assert_eq!(c.allowed.len(), 1);
-        assert_eq!(c.allowed[0].reason, "followed by checksum verification");
+        assert_eq!(c.findings.len(), 1);
+        assert!(c.allowed.is_empty());
     }
 
     #[test]
-    fn shell_scan_generic_checksum_manifest_suppresses_fetch() {
+    fn shell_scan_generic_checksum_manifest_does_not_suppress_fetch() {
         let mut c = AuditCollector::new(true);
         scan_shell_content(
             "curl -o tool.tgz https://example.com/tool.tgz\nsha256sum -c SHA256SUMS",
@@ -2826,9 +2823,23 @@ const d = require("node:https").get("https://example.com/install.sh", cb);
             &mut c,
             &DEFAULT_CONFIG,
         );
-        assert!(c.findings.is_empty());
-        assert_eq!(c.allowed.len(), 1);
-        assert_eq!(c.allowed[0].reason, "followed by checksum verification");
+        assert_eq!(c.findings.len(), 1);
+        assert!(c.allowed.is_empty());
+    }
+
+    #[test]
+    fn shell_scan_checksum_must_verify_every_fetch_target() {
+        let mut c = AuditCollector::new(true);
+        scan_shell_content(
+            "curl -o tool https://example.com/tool && wget -O helper https://example.com/helper\nsha256sum tool",
+            "test.sh",
+            1,
+            "",
+            &mut c,
+            &DEFAULT_CONFIG,
+        );
+        assert_eq!(c.findings.len(), 1);
+        assert!(c.allowed.is_empty());
     }
 
     #[test]

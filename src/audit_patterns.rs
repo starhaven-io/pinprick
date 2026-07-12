@@ -527,7 +527,16 @@ pub static PY_URL_PATTERNS: LazyLock<Vec<Pattern>> = LazyLock::new(|| {
 
 re!(
     CHECKSUM_VERIFY,
-    r"(?i)(sha256sum|sha512sum|shasum|openssl\s+dgst|gpg\b[^\n]*--verify|cosign\s+verify|minisign\s+-V|Get-FileHash)"
+    concat!(
+        r"(?i)(",
+        r"(?:sha256sum|sha512sum|shasum)\b[^\n]*\s(?:--check|-c)(?:\s|$)",
+        r"|openssl\s+dgst\b[^\n]*\s-(?:verify|prverify)(?:\s|$)",
+        r"|gpg\b[^\n]*\s--verify(?:\s|$)",
+        r"|cosign\s+verify(?:-blob)?(?:\s|$)",
+        r"|minisign\b[^\n]*\s-V(?:\s|$)",
+        r"|Get-FileHash\b[^\n]*\s-ne(?:\s|$)[^\n]*(?:[\s;{]throw\b|[\s;{]exit\s+[1-9][0-9]*\b)",
+        r")"
+    )
 );
 
 pub fn has_checksum_verify(line: &str) -> bool {
@@ -1691,7 +1700,9 @@ mod tests {
 
     #[test]
     fn checksum_openssl_detected() {
-        assert!(has_checksum_verify("openssl dgst -sha256 file.tar.gz"));
+        assert!(has_checksum_verify(
+            "openssl dgst -sha256 -verify public.pem -signature file.sig file.tar.gz"
+        ));
     }
 
     #[test]
@@ -1718,8 +1729,37 @@ mod tests {
     #[test]
     fn checksum_powershell_detected() {
         assert!(has_checksum_verify(
+            "if ((Get-FileHash file.tar.gz).Hash -ne $EXPECTED) { throw 'checksum mismatch' }"
+        ));
+    }
+
+    #[test]
+    fn checksum_calculation_without_comparison_is_not_verification() {
+        assert!(!has_checksum_verify("sha256sum file.tar.gz"));
+        assert!(!has_checksum_verify("openssl dgst -sha256 file.tar.gz"));
+        assert!(!has_checksum_verify(
             "Get-FileHash -Algorithm SHA256 file.tar.gz"
         ));
+    }
+
+    #[test]
+    fn checksum_flags_must_be_standalone_tokens() {
+        for command in [
+            "sha256sum data-c file.tar.gz",
+            "sha256sum data--check file.tar.gz",
+            "openssl dgst -sha256 my-verify file.tar.gz",
+            "gpg x--verify file.sig file.tar.gz",
+            "cosign verify-blob.txt file.tar.gz",
+            "minisign x-V file.tar.gz",
+            "Get-FileHash file.tar.gz x-ne expected throw",
+            "Get-FileHash file.tar.gz -ne expected xthrow",
+            "Get-FileHash file.tar.gz -ne expected noexit 1",
+        ] {
+            assert!(
+                !has_checksum_verify(command),
+                "mid-token flag was treated as verification: {command}"
+            );
+        }
     }
 
     #[test]
