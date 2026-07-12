@@ -114,6 +114,14 @@ pub struct Release {
 #[derive(Deserialize)]
 struct Tree {
     tree: Vec<TreeEntry>,
+    #[serde(default)]
+    truncated: bool,
+}
+
+#[derive(Debug)]
+pub struct RepoTree {
+    pub entries: Vec<TreeEntry>,
+    pub truncated: bool,
 }
 
 #[derive(Deserialize)]
@@ -504,7 +512,7 @@ impl GitHubClient {
     }
 
     /// Fetch the file tree for a repo at a given SHA.
-    pub async fn fetch_tree(&self, owner: &str, repo: &str, sha: &str) -> Result<Vec<TreeEntry>> {
+    pub async fn fetch_tree(&self, owner: &str, repo: &str, sha: &str) -> Result<RepoTree> {
         let url = format!(
             "{}/git/trees/{}?recursive=1",
             self.repo_url(owner, repo)?,
@@ -520,7 +528,10 @@ impl GitHubClient {
         ensure_success(&resp, format!("fetching tree for {owner}/{repo}@{sha}"))?;
         let bytes = read_capped(resp).await?;
         let tree: Tree = serde_json::from_slice(&bytes).context("parsing tree")?;
-        Ok(tree.tree)
+        Ok(RepoTree {
+            entries: tree.tree,
+            truncated: tree.truncated,
+        })
     }
 
     /// Fetch raw file content from a repo at a given ref.
@@ -1046,7 +1057,8 @@ mod tests {
 
             let c = client_for(&server).await;
             let tree = c.fetch_tree("o", "r", "sha").await.unwrap();
-            assert_eq!(tree[0].path, "action.yml");
+            assert_eq!(tree.entries[0].path, "action.yml");
+            assert!(!tree.truncated);
             let body = c.fetch_file("o", "r", "action.yml", "sha").await.unwrap();
             assert!(body.contains("using: node20"));
         }

@@ -635,16 +635,30 @@ pub fn scan_shell_content(
             ));
         }
 
-        if fetches_non_literal_executable(line, config) {
-            collector.push_finding(AuditFinding::new(
-                &audit_patterns::Severity::Low,
-                &audit_patterns::Category::ShellFetch,
-                action_name,
-                source_file,
-                line_num,
-                line,
-                "curl/wget downloads executable from non-literal source — cannot verify URL version",
-            ));
+        match classify_non_literal_executable(line, config) {
+            NonLiteralFetch::Finding => {
+                collector.push_finding(AuditFinding::new(
+                    &audit_patterns::Severity::Low,
+                    &audit_patterns::Category::ShellFetch,
+                    action_name,
+                    source_file,
+                    line_num,
+                    line,
+                    "curl/wget downloads executable from non-literal source — cannot verify URL version",
+                ));
+            }
+            NonLiteralFetch::ExtraDataFormat => {
+                collector.push_allowed(AuditMatch::new(
+                    &audit_patterns::Severity::Low,
+                    &audit_patterns::Category::ShellFetch,
+                    action_name,
+                    source_file,
+                    line_num,
+                    line,
+                    REASON_EXTRA_DATA_FORMAT,
+                ));
+            }
+            NonLiteralFetch::None => {}
         }
 
         if SH_GIT_CLONE.is_match(line) && !git_clone_has_pinned_ref(line) {
@@ -920,13 +934,32 @@ pub(crate) fn scan_dockerfile_content(
     }
 }
 
-fn fetches_non_literal_executable(line: &str, config: &Config) -> bool {
+enum NonLiteralFetch {
+    None,
+    Finding,
+    ExtraDataFormat,
+}
+
+fn classify_non_literal_executable(line: &str, config: &Config) -> NonLiteralFetch {
     if extract_urls(line).next().is_some() || !line.contains('$') {
-        return false;
+        return NonLiteralFetch::None;
     }
-    fetch_output_targets(line).into_iter().any(|target| {
-        !target.contains('$') && target != "/dev/null" && !config.is_data_format_exempt(&target)
-    })
+    let mut extra_data_format = false;
+    for target in fetch_output_targets(line) {
+        if target.contains('$') || target == "/dev/null" {
+            continue;
+        }
+        if config.is_extra_data_format_exempt(&target) {
+            extra_data_format = true;
+        } else if !config.is_data_format_exempt(&target) {
+            return NonLiteralFetch::Finding;
+        }
+    }
+    if extra_data_format {
+        NonLiteralFetch::ExtraDataFormat
+    } else {
+        NonLiteralFetch::None
+    }
 }
 
 fn push_pkg_finding(
@@ -1498,6 +1531,7 @@ docker run "${{ matrix.image }}" echo hi"#,
             &DEFAULT_CONFIG,
         );
         assert!(c.findings.is_empty());
+        assert_eq!(c.extra_data_format_allowed, 0);
     }
 
     #[test]

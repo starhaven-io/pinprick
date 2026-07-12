@@ -397,7 +397,7 @@ impl AuditReport {
                 "      {}",
                 sanitize_for_terminal(&f.pattern_matched).dimmed()
             );
-            println!("      {}", f.description);
+            println!("      {}", sanitize_for_terminal(&f.description));
             println!();
         }
 

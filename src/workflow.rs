@@ -86,6 +86,12 @@ impl UnsafeWorkflowPath {
             ),
         }
     }
+
+    fn symlinked_file(path: &Path) -> Self {
+        Self {
+            message: format!("Refusing to scan symlinked file {}", path.display()),
+        }
+    }
 }
 
 pub fn is_unsafe_workflow_path(err: &anyhow::Error) -> bool {
@@ -435,6 +441,48 @@ pub fn open_child_dir_path(repo_root: &Path, rel: &Path) -> Result<Option<File>>
     }
 
     Ok(Some(current))
+}
+
+pub fn open_child_file_path(repo_root: &Path, rel: &Path) -> Result<Option<File>> {
+    let mut current = open_repo_root(repo_root)?;
+    let mut display_path = repo_root.to_path_buf();
+    let mut components = rel.components().peekable();
+
+    while let Some(component) = components.next() {
+        let Component::Normal(name) = component else {
+            anyhow::bail!("child path escapes the repository");
+        };
+        let Some(name) = name.to_str() else {
+            anyhow::bail!("child path contains non-UTF-8 components");
+        };
+        display_path.push(name);
+
+        if components.peek().is_some() {
+            let Some(next) = open_child_dir(&current, name, &display_path)? else {
+                return Ok(None);
+            };
+            current = next;
+            continue;
+        }
+
+        let file = match openat_file(
+            &current,
+            name,
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        ) {
+            Ok(file) => file,
+            Err(e) if e == Errno::LOOP || path_is_symlink(&display_path) => {
+                return Err(UnsafeWorkflowPath::symlinked_file(&display_path).into());
+            }
+            Err(e) if e == Errno::NOENT || e == Errno::NOTDIR => return Ok(None),
+            Err(e) => {
+                return Err(e).with_context(|| format!("checking {}", display_path.display()));
+            }
+        };
+        return Ok(file.metadata()?.file_type().is_file().then_some(file));
+    }
+
+    Ok(None)
 }
 
 fn open_repo_root(repo_root: &Path) -> Result<File> {

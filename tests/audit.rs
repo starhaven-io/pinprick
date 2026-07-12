@@ -89,6 +89,33 @@ jobs:
 }
 
 #[test]
+fn human_output_sanitizes_escapes_in_finding_description() {
+    let workflow = "\
+name: evil
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: \"docker run alpine\\x1b[2J\\x1b[31mSPOOFED\"
+";
+    let dir = common::repo_with_workflow("ci.yml", workflow);
+    let output = common::pinprick_cmd()
+        .arg("audit")
+        .arg(dir.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("unpinned image"));
+    assert!(
+        !stdout.contains('\u{1b}'),
+        "raw ESC leaked through finding description: {stdout:?}"
+    );
+}
+
+#[test]
 fn pipe_to_shell_exits_one() {
     let dir = common::repo_with_workflow("ci.yml", common::WORKFLOW_PIPE_TO_SHELL);
     common::pinprick_cmd()
@@ -708,6 +735,34 @@ fn repo_config_trusted_host_notice_without_verbose() {
         stderr.contains("trusted-host fetches: 1"),
         "expected a trusted-host notice on stderr, got: {stderr}"
     );
+}
+
+#[test]
+fn repo_config_non_literal_extra_data_format_prints_notice() {
+    let workflow = "\
+name: non-literal
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: curl -fsSL \"$RELEASE_URL\" -o tool.bin
+";
+    let dir = common::repo_with_config("ci.yml", workflow, "extra-data-formats = [\"bin\"]\n");
+
+    let output = common::pinprick_cmd()
+        .arg("audit")
+        .arg(dir.path())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("extra-data-format fetches: 1"),
+        "expected a repo-config notice on stderr, got: {stderr}"
+    );
+    assert!(stderr.contains("--no-repo-config"));
 }
 
 #[test]
