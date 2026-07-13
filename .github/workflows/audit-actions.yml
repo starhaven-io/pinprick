@@ -130,7 +130,7 @@ jobs:
 
             for TAG in "${TAGS[@]}"; do
               # Check by tag name first (no API call) to skip already-audited releases.
-              if jq -e ".[] | select(.tag == \"${TAG}\")" "${JSON_FILE}" > /dev/null 2>&1; then
+              if jq -e --arg tag "${TAG}" '.[] | select(.tag == $tag)' "${JSON_FILE}" > /dev/null 2>&1; then
                 echo "  ${TAG} already audited"
                 continue
               fi

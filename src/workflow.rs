@@ -590,7 +590,17 @@ pub fn rewrite_actions(
     file: &WorkflowFile,
     replacements: &[(usize, String, String)],
 ) -> Result<usize> {
-    let content = read_workflow(file)?;
+    // Read content and mode from the same nofollow handle so a path swap cannot
+    // mix one file's contents with another file's permissions.
+    let mut source = open_workflow_file(file)?;
+    let permissions = source
+        .metadata()
+        .with_context(|| format!("reading permissions for {}", file.path.display()))?
+        .permissions();
+    let mut content = String::new();
+    source
+        .read_to_string(&mut content)
+        .with_context(|| format!("reading {}", file.path.display()))?;
 
     // Preserve CRLF: `str::lines()` strips `\r`, so we'd otherwise rewrite the
     // whole file to LF.
@@ -647,6 +657,15 @@ pub fn rewrite_actions(
     if let Err(e) = tmp_file.write_all(output.as_bytes()) {
         let _ = remove_workflow_tmp(file, &tmp);
         return Err(e).with_context(|| format!("writing {}", tmp_path(file, &tmp).display()));
+    }
+    if let Err(e) = tmp_file.set_permissions(permissions) {
+        let _ = remove_workflow_tmp(file, &tmp);
+        return Err(e).with_context(|| {
+            format!(
+                "preserving permissions on {}",
+                tmp_path(file, &tmp).display()
+            )
+        });
     }
     drop(tmp_file);
 
@@ -1319,6 +1338,23 @@ jobs:
         assert_eq!(count, 1);
         let result = std::fs::read_to_string(file.path()).unwrap();
         assert_eq!(result, "replaced\r\nline2\r\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rewrite_preserves_unix_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for mode in [0o600, 0o750] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let file = write_temp_workflow(&dir, "test.yml", "line1\nline2\n");
+            std::fs::set_permissions(file.path(), std::fs::Permissions::from_mode(mode)).unwrap();
+
+            rewrite_actions(&file, &[(1, "line1".to_string(), "replaced".to_string())]).unwrap();
+
+            let actual = std::fs::metadata(file.path()).unwrap().permissions().mode() & 0o777;
+            assert_eq!(actual, mode, "rewrite changed mode {mode:o} to {actual:o}");
+        }
     }
 
     #[test]
