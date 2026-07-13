@@ -1,3 +1,5 @@
+set positional-arguments := true
+
 # Build
 
 # Build the project
@@ -47,7 +49,7 @@ typos:
 add-action owner_repo:
     #!/usr/bin/env bash
     set -euo pipefail
-    OWNER_REPO="{{ owner_repo }}"
+    OWNER_REPO="$1"
     if [[ ! "$OWNER_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ || "$OWNER_REPO" == *..* ]]; then
         echo "error: expected OWNER/REPO, got '$OWNER_REPO'" >&2
         exit 2

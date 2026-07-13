@@ -88,4 +88,4 @@ Skip scanning specific actions entirely. Useful for actions you've reviewed manu
 
 ### `ignore.patterns`
 
-Suppress individual findings by description substring. Useful for silencing specific pattern types across all actions.
+Suppress individual findings by description substring. Useful for silencing specific pattern types across all actions. Empty entries match nothing.

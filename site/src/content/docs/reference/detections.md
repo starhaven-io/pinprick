@@ -808,7 +808,7 @@ patterns = [
 ]
 ```
 
-Use this to silence a specific _rule_ across all actions. Matches by substring against the rule's description — so `"pip install"` silences the pip rule, `"unversioned URL"` silences every unversioned-URL rule. Findings matching a suppressed pattern are removed entirely, not visible under `--verbose`.
+Use this to silence a specific _rule_ across all actions. Matches by substring against the rule's description — so `"pip install"` silences the pip rule, `"unversioned URL"` silences every unversioned-URL rule. Empty entries match nothing. Findings matching a suppressed pattern are removed entirely, not visible under `--verbose`.
 
 Prefer `extra-data-formats` or `trusted-hosts` when they fit — those keep the audit trail; this one doesn't.
 
