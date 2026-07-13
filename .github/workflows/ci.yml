@@ -177,7 +177,7 @@ jobs:
 
       - name: Install cargo-deny
         if: matrix.check == 'lint'
-        run: cargo install cargo-deny --locked --version 0.19.9
+        run: cargo install cargo-deny --locked --version 0.20.2
 
       - name: Clippy
         if: matrix.check == 'lint'
