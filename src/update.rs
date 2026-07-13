@@ -36,7 +36,7 @@ pub async fn run(
         }
 
         let actions = workflow::scan_workflow(file)?;
-        let mut replacements: Vec<(usize, String)> = Vec::new();
+        let mut replacements: Vec<(usize, String, String)> = Vec::new();
 
         for action in &actions {
             if action.ref_type != RefType::Sha {
@@ -178,7 +178,7 @@ pub async fn run(
                 && let Some(new_line) =
                     workflow::build_pinned_line(&action.raw_line, &new_sha, &latest_tag)
             {
-                replacements.push((action.line_number, new_line));
+                replacements.push((action.line_number, action.raw_line.clone(), new_line));
             }
         }
 

@@ -573,13 +573,15 @@ pub fn display_path(path: &Path, root: &Path) -> String {
 
 /// Rewrite action references in a file. Returns the number of replacements made.
 ///
-/// Each entry's line number must be unique — a `uses:` line maps to a single
+/// Each entry contains the line number, the line observed during scanning, and
+/// its replacement. The observed line must still match when the file is
+/// rewritten. Line numbers must be unique — a `uses:` line maps to a single
 /// action. In debug builds a duplicate trips an assertion; in release it is
 /// silently skipped so a caller bug can't corrupt a workflow by letting the
 /// later entry clobber the earlier one.
 pub fn rewrite_actions(
     file: &WorkflowFile,
-    replacements: &[(usize, String)], // (line_number, new_line)
+    replacements: &[(usize, String, String)],
 ) -> Result<usize> {
     let content = read_workflow(file)?;
 
@@ -595,7 +597,7 @@ pub fn rewrite_actions(
         std::collections::HashSet::with_capacity(replacements.len());
     let mut count = 0;
 
-    for (line_num, new_line) in replacements {
+    for (line_num, expected_line, new_line) in replacements {
         if !seen.insert(*line_num) {
             debug_assert!(
                 false,
@@ -604,11 +606,26 @@ pub fn rewrite_actions(
             );
             continue;
         }
-        let idx = line_num - 1; // 1-based to 0-based
-        if idx < lines.len() {
-            lines[idx] = new_line.clone();
-            count += 1;
+        let Some(idx) = line_num.checked_sub(1) else {
+            anyhow::bail!(
+                "refusing to rewrite {}: invalid line number 0; rerun pinprick",
+                file.path.display()
+            );
+        };
+        let Some(current_line) = lines.get_mut(idx) else {
+            anyhow::bail!(
+                "refusing to rewrite {}: line {line_num} no longer exists; rerun pinprick",
+                file.path.display()
+            );
+        };
+        if current_line != expected_line {
+            anyhow::bail!(
+                "refusing to rewrite {}: line {line_num} changed since it was scanned; rerun pinprick",
+                file.path.display()
+            );
         }
+        *current_line = new_line.clone();
+        count += 1;
     }
 
     let mut output = lines.join(newline);
@@ -1227,7 +1244,8 @@ jobs:
     fn rewrite_preserves_trailing_newline() {
         let dir = tempfile::TempDir::new().unwrap();
         let file = write_temp_workflow(&dir, "test.yml", "line1\nline2\n");
-        let count = rewrite_actions(&file, &[(1, "replaced".to_string())]).unwrap();
+        let count =
+            rewrite_actions(&file, &[(1, "line1".to_string(), "replaced".to_string())]).unwrap();
         assert_eq!(count, 1);
         let result = std::fs::read_to_string(file.path()).unwrap();
         assert!(result.ends_with('\n'));
@@ -1238,7 +1256,8 @@ jobs:
     fn rewrite_preserves_crlf() {
         let dir = tempfile::TempDir::new().unwrap();
         let file = write_temp_workflow(&dir, "test.yml", "line1\r\nline2\r\n");
-        let count = rewrite_actions(&file, &[(1, "replaced".to_string())]).unwrap();
+        let count =
+            rewrite_actions(&file, &[(1, "line1".to_string(), "replaced".to_string())]).unwrap();
         assert_eq!(count, 1);
         let result = std::fs::read_to_string(file.path()).unwrap();
         assert_eq!(result, "replaced\r\nline2\r\n");
@@ -1248,18 +1267,106 @@ jobs:
     fn rewrite_no_trailing_newline() {
         let dir = tempfile::TempDir::new().unwrap();
         let file = write_temp_workflow(&dir, "test.yml", "line1\nline2");
-        let count = rewrite_actions(&file, &[(1, "replaced".to_string())]).unwrap();
+        let count =
+            rewrite_actions(&file, &[(1, "line1".to_string(), "replaced".to_string())]).unwrap();
         assert_eq!(count, 1);
         let result = std::fs::read_to_string(file.path()).unwrap();
         assert!(!result.ends_with('\n'));
     }
 
     #[test]
-    fn rewrite_out_of_bounds_skipped() {
+    fn rewrite_rejects_missing_line() {
         let dir = tempfile::TempDir::new().unwrap();
         let file = write_temp_workflow(&dir, "test.yml", "line1\n");
-        let count = rewrite_actions(&file, &[(99, "nope".to_string())]).unwrap();
-        assert_eq!(count, 0);
+        let err =
+            rewrite_actions(&file, &[(99, "old".to_string(), "nope".to_string())]).unwrap_err();
+        assert!(err.to_string().contains("line 99 no longer exists"));
+        assert_eq!(std::fs::read_to_string(file.path()).unwrap(), "line1\n");
+    }
+
+    #[test]
+    fn rewrite_does_not_clobber_line_changed_since_scan() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let original = "name: ci\njobs:\n  test:\n    steps:\n      - uses: actions/checkout@v4\n";
+        let file = write_temp_workflow(&dir, "test.yml", original);
+        let action = scan_workflow(&file).unwrap().remove(0);
+        let replacement = build_pinned_line(
+            &action.raw_line,
+            "0123456789abcdef0123456789abcdef01234567",
+            "v4.2.2",
+        )
+        .unwrap();
+
+        let concurrent = original.replace(
+            &action.raw_line,
+            "      - run: echo 'concurrent edit must survive'",
+        );
+        std::fs::write(file.path(), &concurrent).unwrap();
+
+        let err = rewrite_actions(&file, &[(action.line_number, action.raw_line, replacement)])
+            .unwrap_err();
+        assert!(err.to_string().contains("changed since it was scanned"));
+        assert_eq!(std::fs::read_to_string(file.path()).unwrap(), concurrent);
+    }
+
+    #[test]
+    fn rewrite_preserves_unrelated_changes_since_scan() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let original = "name: ci\njobs:\n  test:\n    steps:\n      - uses: actions/checkout@v4\n";
+        let file = write_temp_workflow(&dir, "test.yml", original);
+        let action = scan_workflow(&file).unwrap().remove(0);
+        let replacement = build_pinned_line(
+            &action.raw_line,
+            "0123456789abcdef0123456789abcdef01234567",
+            "v4.2.2",
+        )
+        .unwrap();
+
+        let concurrent = original.replace("name: ci", "name: concurrently-renamed");
+        std::fs::write(file.path(), concurrent).unwrap();
+
+        let count = rewrite_actions(
+            &file,
+            &[(action.line_number, action.raw_line, replacement.clone())],
+        )
+        .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(
+            std::fs::read_to_string(file.path()).unwrap(),
+            format!("name: concurrently-renamed\njobs:\n  test:\n    steps:\n{replacement}\n")
+        );
+    }
+
+    #[test]
+    fn rewrite_writes_nothing_when_any_target_changed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let original = "steps:\n  - uses: actions/checkout@v4\n  - uses: actions/setup-node@v4\n";
+        let file = write_temp_workflow(&dir, "test.yml", original);
+        let actions = scan_workflow(&file).unwrap();
+        let replacements: Vec<_> = actions
+            .iter()
+            .map(|action| {
+                (
+                    action.line_number,
+                    action.raw_line.clone(),
+                    build_pinned_line(
+                        &action.raw_line,
+                        "0123456789abcdef0123456789abcdef01234567",
+                        "v4.2.2",
+                    )
+                    .unwrap(),
+                )
+            })
+            .collect();
+
+        let concurrent = original.replace(
+            "  - uses: actions/setup-node@v4",
+            "  - run: echo 'second target changed'",
+        );
+        std::fs::write(file.path(), &concurrent).unwrap();
+
+        assert!(rewrite_actions(&file, &replacements).is_err());
+        assert_eq!(std::fs::read_to_string(file.path()).unwrap(), concurrent);
     }
 
     #[test]
@@ -1283,7 +1390,15 @@ jobs:
         let replacement =
             "      - uses: actions/checkout@0123456789abcdef0123456789abcdef01234567 # v4"
                 .to_string();
-        let count = rewrite_actions(&file, &[(1, replacement.clone())]).unwrap();
+        let count = rewrite_actions(
+            &file,
+            &[(
+                1,
+                "      - uses: actions/checkout@v4".to_string(),
+                replacement.clone(),
+            )],
+        )
+        .unwrap();
 
         assert_eq!(count, 1);
         assert_eq!(
@@ -1303,7 +1418,8 @@ jobs:
         std::fs::remove_file(file.path()).unwrap();
         std::os::unix::fs::symlink(&outside, file.path()).unwrap();
 
-        let err = rewrite_actions(&file, &[(1, "replaced".to_string())]).unwrap_err();
+        let err = rewrite_actions(&file, &[(1, "line1".to_string(), "replaced".to_string())])
+            .unwrap_err();
         assert!(is_unsafe_workflow_path(&err));
         assert!(err.to_string().contains("symlinked workflow file"));
         assert_eq!(std::fs::read_to_string(&outside).unwrap(), "outside\n");
@@ -1318,8 +1434,12 @@ jobs:
         let count = rewrite_actions(
             &file,
             &[
-                (1, "first".to_string()),
-                (1, "second-should-be-ignored".to_string()),
+                (1, "line1".to_string(), "first".to_string()),
+                (
+                    1,
+                    "line1".to_string(),
+                    "second-should-be-ignored".to_string(),
+                ),
             ],
         )
         .unwrap();
@@ -1336,7 +1456,10 @@ jobs:
         let file = write_temp_workflow(&dir, "test.yml", "line1\nline2\n");
         let _ = rewrite_actions(
             &file,
-            &[(1, "first".to_string()), (1, "second".to_string())],
+            &[
+                (1, "line1".to_string(), "first".to_string()),
+                (1, "line1".to_string(), "second".to_string()),
+            ],
         );
     }
 }

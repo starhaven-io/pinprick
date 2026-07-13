@@ -34,7 +34,7 @@ pub async fn run(repo_root: &Path, json: bool, apply: bool) -> Result<ExitCode> 
         }
 
         let actions = workflow::scan_workflow(file)?;
-        let mut replacements: Vec<(usize, String)> = Vec::new();
+        let mut replacements: Vec<(usize, String, String)> = Vec::new();
 
         for action in &actions {
             match action.ref_type {
@@ -107,7 +107,11 @@ pub async fn run(repo_root: &Path, json: bool, apply: bool) -> Result<ExitCode> 
                             if let Some(new_line) =
                                 workflow::build_pinned_line(&action.raw_line, &sha, &tag)
                             {
-                                replacements.push((action.line_number, new_line));
+                                replacements.push((
+                                    action.line_number,
+                                    action.raw_line.clone(),
+                                    new_line,
+                                ));
                                 report.pinned.push(PinResult {
                                     file: workflow::display_path(file.path(), repo_root),
                                     action: action.full_name(),
