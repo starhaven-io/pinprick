@@ -123,7 +123,7 @@ Git clone ref pinning: `git clone` without `--branch`/`-b` or with a branch name
 - **deploy-site.yml** — Build and deploy Astro site to Cloudflare Workers
 - **link-check.yml** — Weekly lychee broken-link check across the built site and README
 - **pinprick-audit.yml** — Run pinprick audit on its own workflows with SARIF upload
-- **release.yml** — Manual dispatch: dry-run crate publishing, build cross-platform binaries (linux-amd64 and linux-arm64, each in glibc and static musl variants, plus darwin-arm64), create GitHub release with build provenance attestations, publish the crate to crates.io, bump the Homebrew cask (glibc/macOS only)
+- **release.yml** — Manual dispatch: dry-run crate publishing, build cross-platform binaries (linux-amd64 and linux-arm64, each in glibc and static musl variants, plus darwin-arm64), create GitHub release with build provenance attestations, publish the crate to crates.io, open a pinprick-action default-version bump PR, and bump the Homebrew cask (glibc/macOS only)
 - **zizmor.yml** — GitHub Actions security audit on push to main
 
 ## Safety / do-not-touch rules

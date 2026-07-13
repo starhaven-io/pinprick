@@ -334,6 +334,183 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
         run: cargo publish --locked
 
+  bump-action:
+    name: Bump pinprick-action
+    needs: release
+    runs-on: ubuntu-slim
+    timeout-minutes: 15
+    environment:
+      name: release
+      deployment: false
+    permissions: {}
+    env:
+      TARGET_REPOSITORY: starhaven-io/pinprick-action
+      VERSION: ${{ needs.release.outputs.version }}
+    steps:
+      - name: Mint bot token for pinprick-action
+        id: action-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.APP_CLIENT_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: pinprick-action
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Checkout pinprick-action
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: ${{ env.TARGET_REPOSITORY }}
+          ref: main
+          path: pinprick-action
+          token: ${{ steps.action-token.outputs.token }}
+          persist-credentials: false
+
+      - name: Update default pinprick version
+        id: update
+        working-directory: pinprick-action
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          version = os.environ["VERSION"]
+          action_path = Path("action.yml")
+          readme_path = Path("README.md")
+          action = action_path.read_text(encoding="utf-8")
+          readme = readme_path.read_text(encoding="utf-8")
+
+          match = re.search(
+              r'(?ms)^inputs:\n(?:(?!^\S).)*?^  version:\n'
+              r'(?:    [^\n]*\n)*?^    default: "('
+              r'[0-9]+\.[0-9]+\.[0-9]+'
+              r'(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?'
+              r')"$',
+              action,
+          )
+          if not match:
+              raise SystemExit("could not find the action.yml version default")
+          current = match.group(1)
+          if current == version:
+              print(f"pinprick-action already defaults to {version}")
+              raise SystemExit(0)
+
+          if action.count(current) != 3:
+              raise SystemExit(
+                  f"expected three {current} references in action.yml, found {action.count(current)}"
+              )
+          if readme.count(current) != 2:
+              raise SystemExit(
+                  f"expected two {current} references in README.md, found {readme.count(current)}"
+              )
+
+          action_path.write_text(action.replace(current, version), encoding="utf-8")
+          readme_path.write_text(readme.replace(current, version), encoding="utf-8")
+          PY
+
+          if git diff --quiet -- action.yml README.md; then
+            echo "changed=false" >> "${GITHUB_OUTPUT}"
+          else
+            git diff --check
+            echo "changed=true" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Create signed commit and open PR
+        if: steps.update.outputs.changed == 'true'
+        working-directory: pinprick-action
+        env:
+          GH_TOKEN: ${{ steps.action-token.outputs.token }}
+          APP_SLUG: ${{ steps.action-token.outputs.app-slug }}
+        run: |
+          BOT_USER="${APP_SLUG}[bot]"
+          BOT_ID=$(gh api "/users/${BOT_USER}" --jq .id)
+          BASE_SHA=$(git rev-parse HEAD)
+          BRANCH="chore/pin-pinprick-${VERSION}"
+          TITLE="feat: pin pinprick ${VERSION} as the default version"
+          PR_BODY="Bump the default pinprick version to ${VERSION} and update the README input reference."
+          COMMIT_BODY="Signed-off-by: ${BOT_USER} <${BOT_ID}+${BOT_USER}@users.noreply.github.com>"
+
+          EXISTING_PR=$(gh pr list \
+            --repo "${TARGET_REPOSITORY}" \
+            --head "${BRANCH}" \
+            --state open \
+            --json url \
+            --jq '.[0].url // ""')
+          if [[ -n "${EXISTING_PR}" ]]; then
+            echo "Bump PR already exists: ${EXISTING_PR}"
+            exit 0
+          fi
+
+          BRANCH_SHA=$(gh api \
+            "repos/${TARGET_REPOSITORY}/git/ref/heads/${BRANCH}" \
+            --jq .object.sha 2>/dev/null || true)
+          if [[ -z "${BRANCH_SHA}" ]]; then
+            gh api "repos/${TARGET_REPOSITORY}/git/refs" -X POST \
+              -f "ref=refs/heads/${BRANCH}" \
+              -f "sha=${BASE_SHA}"
+            BRANCH_SHA="${BASE_SHA}"
+          fi
+
+          if [[ "${BRANCH_SHA}" == "${BASE_SHA}" ]]; then
+            ADDITIONS=$(
+              for file in action.yml README.md; do
+                CONTENT=$(base64 < "${file}" | tr -d '\n')
+                jq -n --arg path "${file}" --arg contents "${CONTENT}" \
+                  '{path: $path, contents: $contents}'
+              done | jq -s .
+            )
+
+            jq -n \
+              --arg repo "${TARGET_REPOSITORY}" \
+              --arg branch "${BRANCH}" \
+              --arg title "${TITLE}" \
+              --arg body "${COMMIT_BODY}" \
+              --arg head "${BASE_SHA}" \
+              --argjson additions "${ADDITIONS}" \
+              '{
+                query: "mutation($input: CreateCommitOnBranchInput!) { createCommitOnBranch(input: $input) { commit { oid url } } }",
+                variables: {
+                  input: {
+                    branch: { repositoryNameWithOwner: $repo, branchName: $branch },
+                    message: { headline: $title, body: $body },
+                    fileChanges: { additions: $additions },
+                    expectedHeadOid: $head
+                  }
+                }
+              }' | gh api graphql --input -
+          else
+            COMPARE=$(gh api \
+              "repos/${TARGET_REPOSITORY}/compare/${BASE_SHA}...${BRANCH_SHA}")
+            if ! jq -e \
+              '.ahead_by == 1 and ([.files[].filename] | sort) == ["README.md", "action.yml"]' \
+              <<< "${COMPARE}" >/dev/null; then
+              echo "Existing branch ${BRANCH} is not the expected one-commit version bump" >&2
+              exit 1
+            fi
+
+            for file in action.yml README.md; do
+              if ! gh api \
+                "repos/${TARGET_REPOSITORY}/contents/${file}" \
+                --method GET \
+                -f "ref=${BRANCH_SHA}" \
+                --jq .content | tr -d '\n' | base64 --decode | cmp -s "${file}" -; then
+                echo "Existing branch ${BRANCH} has unexpected ${file} content" >&2
+                exit 1
+              fi
+            done
+
+            echo "Reusing verified bump branch ${BRANCH} at ${BRANCH_SHA}"
+          fi
+
+          gh pr create \
+            --repo "${TARGET_REPOSITORY}" \
+            --base main \
+            --head "${BRANCH}" \
+            --title "${TITLE}" \
+            --body "${PR_BODY}"
+
   bump-cask:
     name: Bump Homebrew cask
     needs: release
