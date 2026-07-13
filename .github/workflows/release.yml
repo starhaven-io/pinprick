@@ -443,9 +443,11 @@ jobs:
             exit 0
           fi
 
+          # gh api writes the error body to stdout on a 404, so capture the sha
+          # only when the request succeeds; a missing branch must read as empty.
           BRANCH_SHA=$(gh api \
             "repos/${TARGET_REPOSITORY}/git/ref/heads/${BRANCH}" \
-            --jq .object.sha 2>/dev/null || true)
+            --jq .object.sha 2>/dev/null) || BRANCH_SHA=""
           if [[ -z "${BRANCH_SHA}" ]]; then
             gh api "repos/${TARGET_REPOSITORY}/git/refs" -X POST \
               -f "ref=refs/heads/${BRANCH}" \
