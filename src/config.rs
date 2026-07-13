@@ -142,7 +142,7 @@ impl Config {
         self.ignore
             .patterns
             .iter()
-            .any(|p| description.contains(p.as_str()))
+            .any(|p| !p.is_empty() && description.contains(p.as_str()))
     }
 
     /// Check if a URL is exempt from unversioned-fetch rules because its
@@ -621,5 +621,17 @@ trusted-hosts = ["artifacts.example.com", "releases.example.org"]
         assert!(cfg.is_action_ignored("aws-actions/configure-aws-credentials"));
         assert!(!cfg.is_action_ignored("actions/setup-node"));
         assert!(!cfg.is_action_ignored("actions/checkout-action"));
+    }
+
+    #[test]
+    fn empty_finding_pattern_matches_nothing() {
+        let cfg = Config {
+            ignore: IgnoreConfig {
+                actions: vec![],
+                patterns: vec![String::new()],
+            },
+            ..Config::default()
+        };
+        assert!(!cfg.is_pattern_ignored("curl fetching unversioned URL"));
     }
 }

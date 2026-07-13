@@ -699,6 +699,26 @@ fn config_ignore_patterns() {
 }
 
 #[test]
+fn empty_config_ignore_pattern_does_not_suppress() {
+    let dir = common::repo_with_config(
+        "ci.yml",
+        common::WORKFLOW_PIPE_TO_SHELL,
+        "[ignore]\npatterns = [\"\"]\n",
+    );
+
+    let output = common::pinprick_cmd()
+        .arg("--json")
+        .arg("audit")
+        .arg(dir.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["findings"].as_array().unwrap().len(), 1);
+}
+
+#[test]
 fn repo_config_suppression_prints_notice() {
     let dir = common::repo_with_config(
         "ci.yml",

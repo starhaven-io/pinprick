@@ -56,7 +56,14 @@ static LOCAL_USES_RE: LazyLock<Regex> = LazyLock::new(|| {
 // indent/chomping indicators (`|2-`, `>+`). Every block body is skipped so
 // literal docs or scripts cannot false-match on `uses:` text.
 static BLOCK_SCALAR_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^(\s*)(?:-\s+)?[A-Za-z0-9_-]+\s*:\s*[|>][0-9+\-]*\s*(?:#.*)?$").unwrap()
+    Regex::new(concat!(
+        r#"^(\s*)(?:"#,
+        r#"(?:-\s+)?(?:[A-Za-z0-9_-]+|\"(?:[^\"\\]|\\.)*\"|'[^']*')\s*:\s*"#,
+        r#"(?:(?:&[^\s]+|![^\s]+)\s+)*"#,
+        r#"|-\s+(?:(?:&[^\s]+|![^\s]+)\s+)*"#,
+        r#")[|>][0-9+\-]*\s*(?:#.*)?$"#,
+    ))
+    .unwrap()
 });
 
 #[derive(Debug, Clone)]
@@ -941,6 +948,57 @@ jobs:
             );
             assert_eq!(refs[0].full_name(), "good/action");
         }
+    }
+
+    #[test]
+    fn scan_skips_extended_block_scalar_openers() {
+        for opener in [
+            "- |",
+            "- &script |",
+            "- !!str >",
+            "- run: &script |",
+            "- run: !!str >",
+            "- run: &script !!str |",
+            "- run: !!str &script >",
+            "- \"run\": |",
+            "- 'run': >",
+            "- \"ru\\\"n\": | # quoted key",
+        ] {
+            let yaml = format!(
+                "steps:\n  {opener}\n      - uses: evil/action@v1\n      - uses: ./fake\n  - uses: good/action@v2\n  - uses: ./real\n"
+            );
+            let refs = scan_content(&yaml);
+            assert_eq!(
+                refs.len(),
+                1,
+                "opener {opener:?} should hide external uses in its body"
+            );
+            assert_eq!(refs[0].full_name(), "good/action");
+
+            let local = scan_local_actions(&yaml);
+            assert_eq!(
+                local.len(),
+                1,
+                "opener {opener:?} should hide local uses in its body"
+            );
+            assert_eq!(local[0].path, "./real");
+        }
+    }
+
+    #[test]
+    fn scan_tagged_flow_scalar_does_not_trigger_skip() {
+        let yaml = "steps:\n  - run: !!str echo hello\n  - uses: actions/checkout@v4\n";
+        let refs = scan_content(yaml);
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].full_name(), "actions/checkout");
+    }
+
+    #[test]
+    fn scan_bare_marker_without_yaml_context_does_not_trigger_skip() {
+        let yaml = "steps:\n  |\n    - uses: actions/checkout@v4\n";
+        let refs = scan_content(yaml);
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].full_name(), "actions/checkout");
     }
 
     #[test]
