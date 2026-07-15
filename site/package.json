@@ -24,7 +24,7 @@
   "devDependencies": {
     "prettier": "^3.9.4",
     "prettier-plugin-astro": "^0.14.1",
-    "wrangler": "^4.107.0"
+    "wrangler": "^4.107.1"
   },
   "overrides": {
     "esbuild": "0.28.1"
