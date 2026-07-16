@@ -1,4 +1,4 @@
-name: Bump Cargo Tools
+name: Bump Build Tools
 
 on:
   schedule:
@@ -10,7 +10,7 @@ defaults:
     shell: bash -euo pipefail {0}
 
 concurrency:
-  group: bump-cargo-tools
+  group: bump-build-tools
   cancel-in-progress: false
 
 permissions: {}
@@ -32,15 +32,53 @@ jobs:
       - name: Check for newer tool versions
         id: bump
         run: |
+          CHANGED=0
+
+          CURRENT_RUST=$(sed -nE 's/^channel = "([0-9]+\.[0-9]+\.[0-9]+)"$/\1/p' rust-toolchain.toml)
+          if [[ ! "${CURRENT_RUST}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Could not resolve the pinned Rust version from rust-toolchain.toml"
+            exit 1
+          fi
+
+          if RUST_MANIFEST=$(curl -fsSL https://static.rust-lang.org/dist/channel-rust-stable.toml); then
+            LATEST_RUST=$(awk '
+              /^\[pkg\.rust\]$/ { in_rust = 1; next }
+              /^\[/ { in_rust = 0 }
+              in_rust && /^version = / {
+                version = $3
+                gsub(/"/, "", version)
+                print version
+                exit
+              }
+            ' <<< "${RUST_MANIFEST}")
+          else
+            LATEST_RUST=""
+          fi
+
+          if [[ -z "${LATEST_RUST}" ]]; then
+            echo "::warning::Could not fetch or resolve the stable Rust version, skipping"
+          elif [[ ! "${LATEST_RUST}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::warning::Unexpected stable Rust version format: ${LATEST_RUST}, skipping"
+            LATEST_RUST=""
+          fi
+
+          if [[ -n "${LATEST_RUST}" ]]; then
+            if [[ "${LATEST_RUST}" == "${CURRENT_RUST}" ]]; then
+              echo "  rust: up to date (${CURRENT_RUST})"
+            else
+              echo "  rust: ${CURRENT_RUST} -> ${LATEST_RUST}"
+              sed -i "s|channel = \"${CURRENT_RUST}\"|channel = \"${LATEST_RUST}\"|" rust-toolchain.toml
+              CHANGED=1
+            fi
+          fi
+
           # Tools tracked in ci.yml. Each entry: crate name on crates.io.
           TOOLS=("typos-cli" "cargo-deny" "cargo-nextest" "cargo-llvm-cov")
           # crates.io rejects API requests without a descriptive User-Agent (403).
           UA="pinprick-ci (https://github.com/${GITHUB_REPOSITORY})"
-          CHANGED=0
           for TOOL in "${TOOLS[@]}"; do
-            LATEST=$(curl -fsSL -H "User-Agent: ${UA}" "https://crates.io/api/v1/crates/${TOOL}" | jq -r '.crate.max_stable_version')
-            if [[ -z "${LATEST}" || "${LATEST}" == "null" ]]; then
-              echo "::warning::Could not resolve latest version for ${TOOL}, skipping"
+            if ! LATEST=$(curl -fsSL -H "User-Agent: ${UA}" "https://crates.io/api/v1/crates/${TOOL}" | jq -er '.crate.max_stable_version'); then
+              echo "::warning::Could not fetch or resolve latest version for ${TOOL}, skipping"
               continue
             fi
             # The version flows into the sed replacements below — reject anything
@@ -70,14 +108,32 @@ jobs:
             fi
             CHANGED=1
           done
+
+          CI_CARGO_DENY=$(grep -oE 'cargo install cargo-deny --locked --version [0-9]+\.[0-9]+\.[0-9]+' .github/workflows/ci.yml | awk '{print $NF}' | head -1 || true)
+          SCHEDULED_CARGO_DENY=$(grep -oE 'cargo install cargo-deny --locked --version [0-9]+\.[0-9]+\.[0-9]+' .github/workflows/cargo-deny.yml | awk '{print $NF}' | head -1 || true)
+          if [[ ! "${CI_CARGO_DENY}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ || ! "${SCHEDULED_CARGO_DENY}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Could not resolve both cargo-deny pins"
+            exit 1
+          fi
+          if [[ "${SCHEDULED_CARGO_DENY}" != "${CI_CARGO_DENY}" ]]; then
+            echo "  cargo-deny (scheduled): ${SCHEDULED_CARGO_DENY} -> ${CI_CARGO_DENY}"
+            sed -i "s|cargo install cargo-deny --locked --version ${SCHEDULED_CARGO_DENY}|cargo install cargo-deny --locked --version ${CI_CARGO_DENY}|" .github/workflows/cargo-deny.yml
+            CHANGED=1
+          fi
+
           echo "changed=${CHANGED}" >> "${GITHUB_OUTPUT}"
 
-      - name: Upload updated workflow
+      - name: Upload updated pins
         if: steps.bump.outputs.changed == '1'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: ci-yml
-          path: .github/workflows/ci.yml
+          name: build-tool-pins
+          include-hidden-files: true
+          if-no-files-found: error
+          path: |
+            .github/workflows/ci.yml
+            .github/workflows/cargo-deny.yml
+            rust-toolchain.toml
 
   update:
     name: Update
@@ -96,11 +152,11 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Download updated workflow
+      - name: Download updated pins
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: ci-yml
-          path: .github/workflows/
+          name: build-tool-pins
+          path: .
 
       - name: Mint bot token
         id: app-token
@@ -121,14 +177,39 @@ jobs:
           BOT_USER="${APP_SLUG}[bot]"
           BOT_ID=$(gh api "/users/${BOT_USER}" --jq .id)
           BASE_SHA=$(git rev-parse HEAD)
-          BRANCH="chore/bump-cargo-tools-$(date -u +%Y%m%d)"
-          TITLE="chore(ci): bump cargo-installed tool versions"
-          PR_BODY="Automated bump of cargo-installed lint tool versions in \`ci.yml\`."
+          BRANCH="chore/bump-build-tools-$(date -u +%Y%m%d)"
           COMMIT_BODY="Signed-off-by: ${BOT_USER} <${BOT_ID}+${BOT_USER}@users.noreply.github.com>"
 
-          CONTENT=$(base64 < .github/workflows/ci.yml | tr -d '\n')
-          ADDITIONS=$(jq -n --arg path ".github/workflows/ci.yml" --arg contents "${CONTENT}" \
-            '[{path: $path, contents: $contents}]')
+          RUST_CHANGED=0
+          CARGO_CHANGED=0
+          git diff --quiet -- rust-toolchain.toml || RUST_CHANGED=1
+          git diff --quiet -- .github/workflows/ci.yml .github/workflows/cargo-deny.yml || CARGO_CHANGED=1
+          if [[ "${RUST_CHANGED}" == "0" && "${CARGO_CHANGED}" == "0" ]]; then
+            echo "::notice::Pins are already current on main, nothing to do"
+            exit 0
+          elif [[ "${RUST_CHANGED}" == "1" && "${CARGO_CHANGED}" == "1" ]]; then
+            TITLE="chore(ci): bump Rust and cargo tool versions"
+            PR_BODY="Automated update of the pinned Rust toolchain and cargo-installed CI tool versions."
+          elif [[ "${RUST_CHANGED}" == "1" ]]; then
+            TITLE="chore(ci): bump Rust toolchain"
+            PR_BODY="Automated update of the pinned Rust toolchain."
+          else
+            TITLE="chore(ci): bump cargo-installed tool versions"
+            PR_BODY="Automated update of cargo-installed CI tool versions."
+          fi
+
+          CI_CONTENT=$(base64 < .github/workflows/ci.yml | tr -d '\n')
+          DENY_CONTENT=$(base64 < .github/workflows/cargo-deny.yml | tr -d '\n')
+          RUST_CONTENT=$(base64 < rust-toolchain.toml | tr -d '\n')
+          ADDITIONS=$(jq -n \
+            --arg ci_contents "${CI_CONTENT}" \
+            --arg deny_contents "${DENY_CONTENT}" \
+            --arg rust_contents "${RUST_CONTENT}" \
+            '[
+              {path: ".github/workflows/ci.yml", contents: $ci_contents},
+              {path: ".github/workflows/cargo-deny.yml", contents: $deny_contents},
+              {path: "rust-toolchain.toml", contents: $rust_contents}
+            ]')
 
           gh api "repos/${REPOSITORY}/git/refs" -X POST \
             -f "ref=refs/heads/${BRANCH}" \
