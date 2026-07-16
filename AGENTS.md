@@ -140,6 +140,10 @@ Git clone ref pinning: `git clone` without `--branch`/`-b` or with a branch name
 
 ## Required checks
 
+`rust-toolchain.toml` pins CI and rustup-based workstations to the reviewed
+stable toolchain. Homebrew's standalone Rust does not honor that file, so verify
+`rustc --version` matches its `channel` before running the required checks.
+
 - `cargo clippy` with zero warnings
 - `cargo fmt` for formatting
 - No unnecessary abstractions — flat module structure, no nested directories

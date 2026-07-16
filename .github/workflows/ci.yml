@@ -71,7 +71,7 @@ jobs:
           CHANGED=$(git diff --name-only "${BASE_SHA}...HEAD")
 
           # Rust or build workflow changes: lint + test + MSRV
-          if echo "${CHANGED}" | grep -qE '\.rs$|^Cargo\.(toml|lock)$|^clippy\.toml$|^rustfmt\.toml$|^\.github/workflows/(ci|release)\.yml$'; then
+          if echo "${CHANGED}" | grep -qE '\.rs$|^Cargo\.(toml|lock)$|^rust-toolchain\.toml$|^clippy\.toml$|^rustfmt\.toml$|^\.github/workflows/(ci|release)\.yml$'; then
             add_check '{"name":"Lint","check":"lint","runner":"ubuntu-24.04"}'
             add_check '{"name":"Test (Linux)","check":"test","runner":"ubuntu-24.04"}'
             add_check '{"name":"Test (Linux ARM)","check":"test","runner":"ubuntu-24.04-arm"}'
@@ -138,7 +138,7 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: ${{ runner.os }}-${{ runner.arch }}-cargo-debug-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-debug-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
 
       - name: Restore coverage tools cache
         id: cov-tools-cache
@@ -165,11 +165,6 @@ jobs:
             ~/.cargo/.crates2.json
           key: ${{ runner.os }}-${{ runner.arch }}-cargo-lint-tools-${{ hashFiles('.github/workflows/ci.yml') }}
           restore-keys: ${{ runner.os }}-${{ runner.arch }}-cargo-lint-tools-
-
-
-      - name: Add Clippy and Rustfmt
-        if: matrix.check == 'lint'
-        run: rustup component add clippy rustfmt
 
       - name: Install typos-cli
         if: matrix.check == 'lint'
@@ -204,7 +199,7 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: ${{ runner.os }}-${{ runner.arch }}-cargo-debug-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-debug-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
 
       - name: Save lint tools cache
         if: matrix.check == 'lint' && github.event_name == 'push' && steps.lint-tools-cache.outputs.cache-hit != 'true'
@@ -227,7 +222,7 @@ jobs:
         if: matrix.check == 'msrv'
         run: |
           # The declared rust-version is only a promise if something builds
-          # with it — the other legs all use the runner's latest stable.
+          # with it — the other legs use the current toolchain pinned by the repo.
           MSRV=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].rust_version')
           rustup toolchain install "${MSRV}" --profile minimal
           echo "MSRV=${MSRV}" >> "${GITHUB_ENV}"

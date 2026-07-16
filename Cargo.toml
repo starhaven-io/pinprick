@@ -11,6 +11,7 @@ keywords = ["github-actions", "security", "supply-chain", "sha", "cli"]
 categories = ["command-line-utilities", "development-tools"]
 exclude = [
     "/.github/",
+    "/rust-toolchain.toml",
     "/site/",
     "/scripts/",
 ]
