@@ -38,9 +38,12 @@ jobs:
           node-version: 26
           package-manager-cache: false
 
+      - name: Check npm install-script policy
+        run: node scripts/check-npm-install-policy.mjs site
+
       - name: Install dependencies
         working-directory: site
-        # Fail closed on unreviewed install scripts (npm v12 default; see allowScripts in package.json).
+        # Fail if an unreviewed dependency install script is introduced.
         run: npm ci --strict-allow-scripts
 
       - name: Build site

@@ -283,10 +283,14 @@ jobs:
         with:
           node-version: 26
 
+      - name: Check npm install-script policy
+        if: matrix.check == 'site'
+        run: node scripts/check-npm-install-policy.mjs site
+
       - name: Install site dependencies
         if: matrix.check == 'site'
         working-directory: site
-        # Fail closed on unreviewed install scripts (npm v12 default; see allowScripts in package.json).
+        # Fail if an unreviewed dependency install script is introduced.
         run: npm ci --strict-allow-scripts
 
       - name: Check formatting

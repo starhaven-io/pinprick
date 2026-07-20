@@ -146,6 +146,7 @@ stable toolchain. Homebrew's standalone Rust does not honor that file, so verify
 
 - `cargo clippy` with zero warnings
 - `cargo fmt` for formatting
+- `just npm-policy` for the site dependency install-script policy
 - No unnecessary abstractions — flat module structure, no nested directories
 - `thiserror` for typed errors in library code, `anyhow` for context-rich error propagation in commands
 - `LazyLock` for compiled regex constants
