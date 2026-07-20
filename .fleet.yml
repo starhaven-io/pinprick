@@ -14,6 +14,8 @@ params:
     - package-ecosystem: "npm"
       group: "npm-dependencies"
       directory: "/site"
+  npm-policy:
+    projects: ["site"]
   link-check:
     targets: "--config lychee.toml --root-dir site/dist/client './site/dist/client/**/*.html' README.md"
     build-site: true
