@@ -26,9 +26,6 @@
     "prettier-plugin-astro": "^0.14.1",
     "wrangler": "^4.110.0"
   },
-  "overrides": {
-    "esbuild": "0.28.1"
-  },
   "allowScripts": {
     "esbuild": false,
     "fsevents": false,
