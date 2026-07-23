@@ -175,6 +175,8 @@ check:
     (cd site && npm run format:check) || failed=1
     echo "--- site-build ---"
     (cd site && npm run build) || failed=1
+    echo "--- site-deploy-dry ---"
+    (cd site && WRANGLER_SEND_METRICS=false npm run deploy:dry) || failed=1
     if [ ${#skipped[@]} -gt 0 ]; then
         echo ""
         echo "Checks skipped due to missing tools:"
