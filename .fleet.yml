@@ -14,6 +14,10 @@ params:
     - package-ecosystem: "npm"
       group: "npm-dependencies"
       directory: "/site"
+      ignore:
+        - dependency-name: "wrangler"
+          reason: "Wrangler 4.111.0 rejects the legacy_env field emitted by the Astro/Cloudflare adapter's generated config; reassess when the adapter fix is usable"
+          versions: [">=4.111.0"]
   npm-policy:
     projects: ["site"]
   link-check:

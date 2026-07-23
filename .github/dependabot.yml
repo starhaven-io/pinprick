@@ -36,6 +36,11 @@ updates:
       interval: "daily"
     cooldown:
       default-days: 7
+    ignore:
+      # Wrangler 4.111.0 rejects the legacy_env field emitted by the Astro/Cloudflare adapter's generated config; reassess when the adapter fix is usable
+      - dependency-name: "wrangler"
+        versions:
+          - ">=4.111.0"
     groups:
       "npm-dependencies":
         patterns:
