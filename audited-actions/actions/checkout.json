@@ -1,13 +1,19 @@
 [
+  { "sha": "3d3c42e5aac5ba805825da76410c181273ba90b1", "tag": "v7.0.1" },
   { "sha": "9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0", "tag": "v7.0.0" },
+  { "sha": "d23441a48e516b6c34aea4fa41551a30e30af803", "tag": "v6.1.0" },
   { "sha": "df4cb1c069e1874edd31b4311f1884172cec0e10", "tag": "v6.0.3" },
   { "sha": "de0fac2e4500dabe0009e67214ff5f5447ce83dd", "tag": "v6.0.2" },
   { "sha": "8e8c483db84b4bee98b60c0593521ed34d9990e8", "tag": "v6.0.1" },
   { "sha": "1af3b93b6815bc44a9784bd300feb67ff0d1eeb3", "tag": "v6.0.0" },
+  { "sha": "fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09", "tag": "v5.1.0" },
   { "sha": "93cb6efe18208431cddfb8368fd83d5badbf9bfd", "tag": "v5.0.1" },
   { "sha": "08c6903cd8c0fde910a37f88322edcfb5dd907a8", "tag": "v5.0.0" },
+  { "sha": "11d5960a326750d5838078e36cf38b85af677262", "tag": "v4.4.0" },
   { "sha": "34e114876b0b11c390a56381ad16ebd13914f8d5", "tag": "v4.3.1" },
   { "sha": "08eba0b27e820071cde6df949e0beb9ba4906955", "tag": "v4.3.0" },
   { "sha": "11bd71901bbe5b1630ceea73d27597364c9af683", "tag": "v4.2.2" },
-  { "sha": "eef61447b9ff4aafe5dcd4e0bbf5d482be7e7871", "tag": "v4.2.1" }
+  { "sha": "eef61447b9ff4aafe5dcd4e0bbf5d482be7e7871", "tag": "v4.2.1" },
+  { "sha": "a37ce9120846195fa4ece8f58b268e6043cb2f26", "tag": "v3.7.0" },
+  { "sha": "0717577d45739eb3c851188b29f50ed6c0b2194e", "tag": "v2.8.0" }
 ]
