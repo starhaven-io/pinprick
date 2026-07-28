@@ -71,7 +71,7 @@ jobs:
           CHANGED=$(git diff --name-only "${BASE_SHA}...HEAD")
 
           # Rust or build workflow changes: lint + test + MSRV
-          if echo "${CHANGED}" | grep -qE '\.rs$|^Cargo\.(toml|lock)$|^rust-toolchain\.toml$|^clippy\.toml$|^rustfmt\.toml$|^\.github/workflows/(ci|release)\.yml$'; then
+          if echo "${CHANGED}" | grep -qE '\.rs$|^Cargo\.(toml|lock)$|^rust-toolchain\.toml$|^clippy\.toml$|^rustfmt\.toml$|^\.github/workflows/(ci|cargo-deny|release)\.yml$'; then
             add_check '{"name":"Lint","check":"lint","runner":"ubuntu-24.04"}'
             add_check '{"name":"Test (Linux)","check":"test","runner":"ubuntu-24.04"}'
             add_check '{"name":"Test (Linux ARM)","check":"test","runner":"ubuntu-24.04-arm"}'
