@@ -2,6 +2,7 @@ schema: 1
 license: "agpl"
 params:
   astro-docs: true
+  renovate: true
   dependabot:
     - package-ecosystem: "cargo"
       group: "cargo-dependencies"
