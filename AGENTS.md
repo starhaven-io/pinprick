@@ -117,7 +117,6 @@ Git clone ref pinning: `git clone` without `--branch`/`-b` or with a branch name
 ### CI workflows (`.github/workflows/`)
 
 - **audit-actions.yml** — Weekly scan of tracked actions for new releases, automated PRs for clean entries
-- **bump-cargo-tools.yml** — Weekly check for newer versions of the cargo-installed CI lint tools (typos, cargo-deny, cargo-nextest, cargo-llvm-cov); opens a PR bumping the pins in ci.yml
 - **ci.yml** — Dynamic PR checks: conventional commits, clippy + rustfmt + typos, cargo test, coverage, site format + build, audited-actions verification, and a separate zizmor job with `security-events: write`
 - **codeql.yml** — CodeQL security analysis (actions queries) on push to main
 - **deploy-site.yml** — Build and deploy Astro site to Cloudflare Workers

@@ -2033,8 +2033,8 @@ const d = require("node:https").get("https://example.com/install.sh", cb);
 
     #[test]
     fn shell_scan_fetch_piped_to_jq_is_allowed_not_finding() {
-        // The crates.io registry query from bump-cargo-tools.yml: an
-        // extensionless JSON API piped to jq. Data, not code — no config needed.
+        // A crates.io registry query: an extensionless JSON API piped to jq.
+        // Data, not code — no config needed.
         let mut c = AuditCollector::new(true);
         scan_shell_content(
             r#"LATEST=$(curl -fsSL -H "$UA" "https://crates.io/api/v1/crates/${TOOL}" | jq -r '.crate.max_stable_version')"#,

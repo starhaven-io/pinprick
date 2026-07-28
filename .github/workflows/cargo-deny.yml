@@ -39,9 +39,9 @@ jobs:
           persist-credentials: false
 
       - name: Install cargo-deny
-        # Pinned to the version CI enforces (.github/workflows/ci.yml);
-        # bump-cargo-tools.yml keeps the two in lockstep. No cache: GitHub evicts
-        # caches after 7 days, so a weekly job would miss almost every run.
+        # Pinned to the version CI enforces (.github/workflows/ci.yml); Renovate
+        # rewrites both occurrences together. No cache: GitHub evicts caches
+        # after 7 days, so a weekly job would miss almost every run.
         run: cargo install cargo-deny --locked --version 0.20.2
 
       - name: Run cargo deny check
