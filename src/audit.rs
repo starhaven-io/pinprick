@@ -158,6 +158,7 @@ pub async fn run(
     json: bool,
     sarif: bool,
     verbose: bool,
+    no_audited_catalog: bool,
     config: &Config,
 ) -> Result<ExitCode> {
     // Machine-readable formats must keep stdout clean.
@@ -265,14 +266,15 @@ pub async fn run(
                     continue;
                 }
 
-                if let Some(source) = audited
-                    .check(
-                        &action.owner,
-                        &action.repo,
-                        action.subpath.as_deref(),
-                        &action.ref_string,
-                    )
-                    .await
+                if !no_audited_catalog
+                    && let Some(source) = audited
+                        .check(
+                            &action.owner,
+                            &action.repo,
+                            action.subpath.as_deref(),
+                            &action.ref_string,
+                        )
+                        .await
                 {
                     match source {
                         AuditSource::Bundled => audited_bundled += 1,

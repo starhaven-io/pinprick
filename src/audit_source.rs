@@ -104,12 +104,12 @@ fn select_source_files(
             SourceFileKind::JavaScript
         } else if path.ends_with(".py") {
             SourceFileKind::Python
-        } else if relative == "Dockerfile"
-            || whole_repo && filename == "Dockerfile"
-            || path.ends_with(".dockerfile")
-        {
-            SourceFileKind::Dockerfile
         } else {
+            // Dockerfiles are never selected by name. A repository may carry
+            // ones no action builds (test fixtures, examples, its own CI
+            // images), and those never run for a consumer. The only path that
+            // adds one is `force_include_*_action_entrypoints`, from the
+            // `runs.image` of a container action.
             continue;
         };
         targets.push((path.clone(), kind));
@@ -143,6 +143,9 @@ fn force_include_remote_action_entrypoints(
         for entrypoint in action_yml_entrypoint_paths(&yaml, base) {
             push_unique_source_target(targets, entrypoint, SourceFileKind::JavaScript);
         }
+        if let Some(dockerfile) = action_yml_dockerfile_path(&yaml, base) {
+            push_unique_source_target(targets, dockerfile, SourceFileKind::Dockerfile);
+        }
     }
 }
 
@@ -163,7 +166,11 @@ fn force_include_local_action_entrypoints(
         let Ok(yaml) = serde_norway::from_str::<Value>(&content) else {
             continue;
         };
-        for entrypoint in action_yml_entrypoint_paths(&yaml, "") {
+        let entrypoints = action_yml_entrypoint_paths(&yaml, "")
+            .into_iter()
+            .map(|p| (p, SourceFileKind::JavaScript))
+            .chain(action_yml_dockerfile_path(&yaml, "").map(|p| (p, SourceFileKind::Dockerfile)));
+        for (entrypoint, kind) in entrypoints {
             let path = action_dir.join(&entrypoint);
             let Some(relative) = path.strip_prefix(repo_root).ok() else {
                 continue;
@@ -172,7 +179,7 @@ fn force_include_local_action_entrypoints(
                 workflow::open_child_file_path(repo_root, relative),
                 Ok(Some(_))
             ) {
-                push_unique_local_source_target(targets, path, SourceFileKind::JavaScript);
+                push_unique_local_source_target(targets, path, kind);
             }
         }
     }
@@ -188,6 +195,29 @@ fn action_yml_entrypoint_paths(yaml: &Value, base: &str) -> Vec<String> {
         .filter_map(|key| runs.get(key).and_then(|v| v.as_str()))
         .filter_map(|path| normalize_action_entrypoint_path(base, path))
         .collect()
+}
+
+/// The Dockerfile a container action builds from, when its metadata names one.
+///
+/// A repository may carry Dockerfiles that no action references (test
+/// fixtures, examples, its own CI images). Those never run for a consumer, so
+/// reachability comes from `runs.image` rather than from a file being named
+/// `Dockerfile`. A `docker://` image is a registry reference, not a path in
+/// this repository, and the container-ref rules cover it instead.
+fn action_yml_dockerfile_path(yaml: &Value, base: &str) -> Option<String> {
+    let runs = yaml.get("runs").and_then(|r| r.as_mapping())?;
+    if !runs
+        .get("using")
+        .and_then(|v| v.as_str())
+        .is_some_and(|using| using.eq_ignore_ascii_case("docker"))
+    {
+        return None;
+    }
+    let image = runs.get("image").and_then(|v| v.as_str())?;
+    if image.starts_with("docker://") {
+        return None;
+    }
+    normalize_action_entrypoint_path(base, image)
 }
 
 fn normalize_action_entrypoint_path(base: &str, path: &str) -> Option<String> {
@@ -342,9 +372,9 @@ fn source_file_kind(relative: &str) -> Option<SourceFileKind> {
         Some(SourceFileKind::JavaScript)
     } else if relative.ends_with(".py") {
         Some(SourceFileKind::Python)
-    } else if relative == "Dockerfile" || relative.ends_with(".dockerfile") {
-        Some(SourceFileKind::Dockerfile)
     } else {
+        // See `select_source_files`: a Dockerfile is scanned only when the
+        // action's `runs.image` names it, never because of its filename.
         None
     }
 }
@@ -718,6 +748,59 @@ runs:
     }
 
     #[test]
+    fn dockerfile_path_comes_from_action_metadata() {
+        let docker: Value =
+            serde_norway::from_str("runs:\n  using: docker\n  image: Dockerfile\n").unwrap();
+        assert_eq!(
+            action_yml_dockerfile_path(&docker, ""),
+            Some("Dockerfile".to_string())
+        );
+        assert_eq!(
+            action_yml_dockerfile_path(&docker, "actions/sub"),
+            Some("actions/sub/Dockerfile".to_string())
+        );
+
+        // A registry image is not a path in this repository; the container-ref
+        // rules cover it instead.
+        let registry: Value =
+            serde_norway::from_str("runs:\n  using: docker\n  image: docker://alpine:3.20\n")
+                .unwrap();
+        assert!(action_yml_dockerfile_path(&registry, "").is_none());
+
+        // A JavaScript action never builds an image, even in a repo that
+        // happens to contain Dockerfiles.
+        let js: Value =
+            serde_norway::from_str("runs:\n  using: node20\n  main: dist/index.js\n").unwrap();
+        assert!(action_yml_dockerfile_path(&js, "").is_none());
+
+        let no_image: Value = serde_norway::from_str("runs:\n  using: docker\n").unwrap();
+        assert!(action_yml_dockerfile_path(&no_image, "").is_none());
+    }
+
+    #[test]
+    fn referenced_dockerfile_is_force_included_unreferenced_is_not() {
+        let targets_for = |image: &str| {
+            let mut targets = vec![("action.yml".to_string(), SourceFileKind::ActionYml)];
+            let contents = vec![Some(Ok(format!(
+                "runs:\n  using: docker\n  image: {image}\n"
+            )))];
+            force_include_remote_action_entrypoints(&mut targets, &contents);
+            targets
+        };
+        // `runs.image` names it, so the consumer builds it: scanned.
+        assert!(
+            targets_for("test/Dockerfile")
+                .contains(&("test/Dockerfile".to_string(), SourceFileKind::Dockerfile))
+        );
+        // Nothing references `test/Dockerfile`, so it stays out.
+        assert!(
+            !targets_for("docker://alpine:3.20")
+                .iter()
+                .any(|(_, kind)| *kind == SourceFileKind::Dockerfile)
+        );
+    }
+
+    #[test]
     fn select_source_files_classifies_and_filters_in_order() {
         let tree = vec![
             tree_entry("action.yml", "blob"),
@@ -727,8 +810,15 @@ runs:
             tree_entry("src/main.cjs", "blob"),
             tree_entry("src/main.ts", "blob"),
             tree_entry("setup.py", "blob"),
+            // Dockerfiles are never selected by name, at any depth. A nested
+            // one no action metadata points at (a test
+            // fixture, an example image) is not reachable, and neither is a
+            // root one in a repository whose action is not a container action.
+            // `force_include_remote_action_entrypoints` adds the ones that
+            // `runs.image` actually names.
             tree_entry("Dockerfile", "blob"),
             tree_entry("sub/Dockerfile", "blob"),
+            tree_entry("test/Dockerfile", "blob"),
             tree_entry("README.md", "blob"), // not scannable
             tree_entry("node_modules/dep/i.js", "blob"), // vendored — skipped
             tree_entry("src", "tree"),       // directory entry — skipped
@@ -744,8 +834,6 @@ runs:
                 ("src/main.cjs".to_string(), SourceFileKind::JavaScript),
                 ("src/main.ts".to_string(), SourceFileKind::JavaScript),
                 ("setup.py".to_string(), SourceFileKind::Python),
-                ("Dockerfile".to_string(), SourceFileKind::Dockerfile),
-                ("sub/Dockerfile".to_string(), SourceFileKind::Dockerfile),
             ]
         );
     }

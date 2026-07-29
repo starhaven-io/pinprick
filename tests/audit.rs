@@ -55,6 +55,36 @@ jobs:
 }
 
 #[test]
+fn no_audited_catalog_bypasses_bundled_verdict() {
+    // --no-audited-catalog must force a fresh scan even for a SHA the bundled
+    // catalog vouches for — that is what lets CI re-verify catalog entries
+    // against the current detection rules. The dummy token makes the fetch
+    // fail, which is fine: the assertion is that a fetch was attempted instead
+    // of the bundled short-circuit, and a failed scan is a warning, not a
+    // finding.
+    let workflow = "\
+name: cache
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+";
+    let dir = common::repo_with_workflow("ci.yml", workflow);
+
+    common::pinprick_cmd()
+        .env("GITHUB_TOKEN", "dummy")
+        .arg("audit")
+        .arg("--no-audited-catalog")
+        .arg(dir.path())
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("audited (bundled)").not())
+        .stderr(predicate::str::contains("Fetching actions/cache/restore"));
+}
+
+#[test]
 fn human_output_sanitizes_terminal_escapes() {
     // A matched run-block line carrying an ANSI escape must not reach the
     // terminal verbatim — otherwise a hostile action could spoof or hide a
@@ -952,4 +982,82 @@ fn git_clone_versioned_branch_clean() {
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     let findings = json["findings"].as_array().unwrap();
     assert!(findings.is_empty());
+}
+
+/// A local action that ships an unrelated `Dockerfile` (an example image, a CI
+/// image, a leftover) must not be audited as if a consumer built it: the
+/// action is a Node action and `runs` never names the file.
+#[test]
+fn node_action_with_unrelated_dockerfile_is_clean() {
+    let dir = common::repo_with_workflow(
+        "ci.yml",
+        "\
+name: local
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: ./.github/actions/mine
+",
+    );
+    let action = dir.path().join(".github/actions/mine");
+    std::fs::create_dir_all(action.join("dist")).unwrap();
+    std::fs::write(
+        action.join("action.yml"),
+        "name: mine\ndescription: node action\nruns:\n  using: node20\n  main: dist/index.js\n",
+    )
+    .unwrap();
+    std::fs::write(action.join("dist/index.js"), "console.log('hi');\n").unwrap();
+    std::fs::write(action.join("Dockerfile"), "FROM alpine\nRUN echo hi\n").unwrap();
+
+    let output = common::pinprick_cmd()
+        .arg("--json")
+        .arg("audit")
+        .arg(dir.path())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(json["findings"].as_array().unwrap().is_empty());
+}
+
+/// The counterpart: when the action really is a container action, the
+/// Dockerfile its `runs.image` names is still scanned.
+#[test]
+fn docker_action_dockerfile_named_by_runs_image_is_scanned() {
+    let dir = common::repo_with_workflow(
+        "ci.yml",
+        "\
+name: local
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: ./.github/actions/mine
+",
+    );
+    let action = dir.path().join(".github/actions/mine");
+    std::fs::create_dir_all(&action).unwrap();
+    std::fs::write(
+        action.join("action.yml"),
+        "name: mine\ndescription: container action\nruns:\n  using: docker\n  image: Dockerfile\n",
+    )
+    .unwrap();
+    std::fs::write(action.join("Dockerfile"), "FROM alpine\nRUN echo hi\n").unwrap();
+
+    let output = common::pinprick_cmd()
+        .arg("--json")
+        .arg("audit")
+        .arg(dir.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let findings = json["findings"].as_array().unwrap();
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0]["category"], "docker_unpinned");
 }

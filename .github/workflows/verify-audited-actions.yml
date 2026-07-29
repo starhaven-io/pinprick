@@ -1,0 +1,182 @@
+name: Verify Audited Actions
+
+# Scheduled re-verification of the audited-actions catalog. Bundled clean
+# verdicts suppress scanning for every pinprick user, so they are trusted as
+# hard as the binary itself — and a detection-rule improvement can invalidate
+# a verdict recorded under older rules. ci.yml re-verifies changed catalog
+# files and the latest entries on PRs; this workflow walks the full history on
+# a weekly shard rotation that attempts every entry once per four-week cycle,
+# and records a tracking issue when one fails.
+
+on:
+  schedule:
+    - cron: "23 6 * * 2" # every Tuesday at 06:23 UTC
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Which catalog entries to verify
+        type: choice
+        options:
+          - all
+          - latest
+          - shard
+        default: all
+
+env:
+  CARGO_INCREMENTAL: 0
+
+defaults:
+  run:
+    shell: bash -xeuo pipefail {0}
+
+concurrency:
+  group: verify-audited-actions
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  verify:
+    name: Verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      issues: write # open/close the tracking issue when verification flips
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build pinprick
+        run: cargo build --locked --release
+
+      - name: Verify catalog entries
+        id: verify
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          MODE: ${{ inputs.mode || 'shard' }}
+        run: |
+          # Four weekly shards: every entry is re-verified at least monthly
+          # while each run stays inside the GITHUB_TOKEN API budget (a fresh
+          # scan costs one tree call plus one call per scanned source file).
+          SHARD_COUNT=4
+          SHARD=$((($(date +%s) / 604800) % SHARD_COUNT))
+          ARGS=("${MODE}")
+          if [[ "${MODE}" == "shard" ]]; then
+            ARGS=(shard "${SHARD}" "${SHARD_COUNT}")
+          fi
+          set +e
+          scripts/verify-audited-actions.sh target/release/pinprick "${ARGS[@]}" 2>&1 | tee verify-output.txt
+          VERIFY_EXIT=${PIPESTATUS[0]}
+          set -e
+          {
+            echo "mode=${MODE}"
+            echo "scope=${ARGS[*]}"
+            echo "shard=${SHARD}"
+            echo "shard_count=${SHARD_COUNT}"
+            echo "exit=${VERIFY_EXIT}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Open or update tracking issue
+        if: steps.verify.outputs.exit != '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          VERIFY_MODE: ${{ steps.verify.outputs.mode }}
+          VERIFY_SCOPE: ${{ steps.verify.outputs.scope }}
+          VERIFY_SHARD: ${{ steps.verify.outputs.shard }}
+          SHARD_COUNT: ${{ steps.verify.outputs.shard_count }}
+        run: |
+          TITLE="audited-actions catalog re-verification is failing"
+          {
+            for ((I = 0; I < SHARD_COUNT; I++)); do
+              STATE=pending
+              if [[ "${VERIFY_MODE}" == "shard" && "${I}" -eq "${VERIFY_SHARD}" ]]; then
+                STATE=failed
+              fi
+              echo "<!-- pinprick-shard-${I}:${STATE} -->"
+            done
+            echo
+            echo "Re-scanning the audited-actions catalog (\`${VERIFY_SCOPE}\`) against the current detection rules reported at least one entry that no longer verifies. Either a rule improvement now flags source that was previously recorded clean — in which case the entry must be removed from the catalog — or the scan could not complete (rate limit, network) and the verdict is unconfirmed."
+            echo
+            echo "Bundled verdicts suppress scanning for every pinprick user, so a stale entry keeps vouching for source the current rules would flag."
+            echo
+            echo "Run: ${RUN_URL}"
+            echo
+            echo "<details><summary>verification output</summary>"
+            echo
+            echo '```'
+            grep -E '^(---|::error::|  finding: )' verify-output.txt | tail -c 60000 || true
+            echo '```'
+            echo
+            echo "</details>"
+          } > issue-body.md
+          EXISTING=$(gh issue list --state open --limit 50 \
+            --search "in:title catalog re-verification is failing" \
+            --json number,title \
+            --jq ".[] | select(.title == \"${TITLE}\") | .number" | head -1)
+          if [[ -n "${EXISTING}" ]]; then
+            gh issue edit "${EXISTING}" --body-file issue-body.md
+            gh issue comment "${EXISTING}" --body-file issue-body.md
+          else
+            gh issue create --title "${TITLE}" --body-file issue-body.md
+          fi
+
+      - name: Advance or resolve tracking issue
+        if: steps.verify.outputs.exit == '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          VERIFY_MODE: ${{ steps.verify.outputs.mode }}
+          VERIFY_SHARD: ${{ steps.verify.outputs.shard }}
+          SHARD_COUNT: ${{ steps.verify.outputs.shard_count }}
+        run: |
+          TITLE="audited-actions catalog re-verification is failing"
+          for N in $(gh issue list --state open --limit 50 \
+            --search "in:title catalog re-verification is failing" \
+            --json number,title \
+            --jq ".[] | select(.title == \"${TITLE}\") | .number"); do
+            if [[ "${VERIFY_MODE}" == "all" ]]; then
+              gh issue comment "${N}" --body "A full catalog re-verification passed as of ${RUN_URL}. Closing."
+              gh issue close "${N}"
+              continue
+            fi
+            if [[ "${VERIFY_MODE}" != "shard" ]]; then
+              continue
+            fi
+
+            gh issue view "${N}" --json body --jq .body > issue-body.md
+            if ! grep -q '<!-- pinprick-shard-' issue-body.md; then
+              {
+                for ((I = 0; I < SHARD_COUNT; I++)); do
+                  echo "<!-- pinprick-shard-${I}:pending -->"
+                done
+                echo
+                cat issue-body.md
+              } > issue-body-new.md
+              mv issue-body-new.md issue-body.md
+            fi
+            sed -i "s/<!-- pinprick-shard-${VERIFY_SHARD}:[a-z]* -->/<!-- pinprick-shard-${VERIFY_SHARD}:passed -->/" issue-body.md
+            gh issue edit "${N}" --body-file issue-body.md
+            gh issue comment "${N}" --body "Shard ${VERIFY_SHARD}/${SHARD_COUNT} passed as of ${RUN_URL}."
+
+            ALL_PASSED=true
+            for ((I = 0; I < SHARD_COUNT; I++)); do
+              if ! grep -q "<!-- pinprick-shard-${I}:passed -->" issue-body.md; then
+                ALL_PASSED=false
+              fi
+            done
+            if [[ "${ALL_PASSED}" == "true" ]]; then
+              gh issue comment "${N}" --body "Every catalog shard has passed since the most recent failure. Closing."
+              gh issue close "${N}"
+            fi
+          done
+
+      - name: Fail the run if verification failed
+        if: steps.verify.outputs.exit != '0'
+        run: |
+          echo "::error::audited-actions catalog re-verification failed; see the tracking issue."
+          exit 1
