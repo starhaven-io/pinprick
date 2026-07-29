@@ -342,6 +342,70 @@ fn html_output_contains_expected_markers() {
     assert!(html.ends_with("</html>\n"));
 }
 
+const WORKFLOW_DOCKER_REFS: &str = "\
+name: docker
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: docker://alpine:latest
+      - uses: docker://alpine:3.20
+      - uses: docker://ghcr.io/org/tool@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+";
+
+#[test]
+fn docker_refs_fire_pin_docker_rules() {
+    let dir = common::repo_with_workflow("ci.yml", WORKFLOW_DOCKER_REFS);
+    let output = common::pinprick_cmd()
+        .arg("--json")
+        .arg("score")
+        .arg(dir.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+
+    // latest (15) + mutable tag (5); the digest-pinned image deducts nothing.
+    assert_eq!(json["score"], 80);
+    let findings = json["findings"].as_array().unwrap();
+    assert_eq!(findings.len(), 2);
+    assert_eq!(findings[0]["id"], "pin.docker_latest");
+    assert_eq!(findings[0]["points"], 15);
+    assert_eq!(findings[0]["severity"], "high");
+    assert_eq!(findings[0]["action_ref"], "docker://alpine:latest");
+    assert_eq!(findings[1]["id"], "pin.docker_tag");
+    assert_eq!(findings[1]["points"], 5);
+    assert_eq!(findings[1]["severity"], "medium");
+    assert_eq!(findings[1]["action_ref"], "docker://alpine:3.20");
+    // All three container refs count as unique actions.
+    assert_eq!(json["totals"]["unique_actions"], 3);
+}
+
+#[test]
+fn docker_digest_only_scores_clean() {
+    let workflow = "\
+name: docker
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: docker://ghcr.io/org/tool@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+";
+    let dir = common::repo_with_workflow("ci.yml", workflow);
+    let output = common::pinprick_cmd()
+        .arg("--json")
+        .arg("score")
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["coverage_complete"], true);
+}
+
 #[test]
 fn badge_output_is_shields_endpoint_json() {
     let dir = common::repo_with_workflow("ci.yml", common::WORKFLOW_CLEAN);

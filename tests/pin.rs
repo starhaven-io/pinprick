@@ -82,3 +82,50 @@ fn no_token_json_error() {
             .contains("No GitHub token found")
     );
 }
+
+#[test]
+fn docker_unpinned_ref_is_reported_and_fails_dry_run() {
+    // No network: docker refs are classified syntactically, so a dummy token
+    // suffices. An unpinned container image is exactly what a pin gate exists
+    // to catch — dry-run must exit 1.
+    let workflow = "\
+name: docker
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: docker://alpine:latest
+      - uses: docker://alpine:3.20
+";
+    let dir = common::repo_with_workflow("ci.yml", workflow);
+    common::pinprick_cmd()
+        .env("GITHUB_TOKEN", "dummy")
+        .arg("pin")
+        .arg(dir.path())
+        .assert()
+        .code(1)
+        .stdout(predicate::str::contains("docker://alpine:latest"))
+        .stdout(predicate::str::contains("floating image ref"))
+        .stdout(predicate::str::contains("mutable image tag"));
+}
+
+#[test]
+fn docker_digest_pinned_ref_passes_dry_run() {
+    let workflow = "\
+name: docker
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: docker://ghcr.io/org/tool@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+";
+    let dir = common::repo_with_workflow("ci.yml", workflow);
+    common::pinprick_cmd()
+        .env("GITHUB_TOKEN", "dummy")
+        .arg("pin")
+        .arg(dir.path())
+        .assert()
+        .code(0);
+}

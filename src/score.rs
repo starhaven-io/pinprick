@@ -48,6 +48,8 @@ pub enum RuleId {
     PinBranch,
     PinSliding,
     PinFullTag,
+    PinDockerLatest,
+    PinDockerTag,
     SourceAdvisory,
     SourceArchived,
     RuntimePipeToShell,
@@ -65,6 +67,8 @@ impl RuleId {
             Self::PinBranch => "pin.branch",
             Self::PinSliding => "pin.sliding",
             Self::PinFullTag => "pin.full_tag",
+            Self::PinDockerLatest => "pin.docker_latest",
+            Self::PinDockerTag => "pin.docker_tag",
             Self::SourceAdvisory => "source.advisory",
             Self::SourceArchived => "source.archived",
             Self::RuntimePipeToShell => "runtime.pipe_to_shell",
@@ -79,7 +83,11 @@ impl RuleId {
 
     pub fn category(self) -> Category {
         match self {
-            Self::PinBranch | Self::PinSliding | Self::PinFullTag => Category::Pin,
+            Self::PinBranch
+            | Self::PinSliding
+            | Self::PinFullTag
+            | Self::PinDockerLatest
+            | Self::PinDockerTag => Category::Pin,
             Self::SourceAdvisory | Self::SourceArchived => Category::Source,
             Self::RuntimePipeToShell
             | Self::RuntimeFetchHigh
@@ -94,15 +102,17 @@ impl RuleId {
     pub fn severity(self) -> Severity {
         match self {
             Self::PinBranch
+            | Self::PinDockerLatest
             | Self::SourceAdvisory
             | Self::SourceArchived
             | Self::RuntimePipeToShell
             | Self::RuntimeFetchHigh
             | Self::WorkflowPermissionsWriteAll
             | Self::WorkflowPullRequestTarget => Severity::High,
-            Self::PinSliding | Self::RuntimeFetchMedium | Self::WorkflowWorkflowRun => {
-                Severity::Medium
-            }
+            Self::PinSliding
+            | Self::PinDockerTag
+            | Self::RuntimeFetchMedium
+            | Self::WorkflowWorkflowRun => Severity::Medium,
             Self::PinFullTag | Self::RuntimeFetchLow => Severity::Low,
         }
     }
@@ -110,10 +120,13 @@ impl RuleId {
     pub fn points(self) -> u32 {
         match self {
             Self::RuntimePipeToShell => 20,
-            Self::PinBranch | Self::SourceAdvisory | Self::RuntimeFetchHigh => 15,
+            Self::PinBranch
+            | Self::PinDockerLatest
+            | Self::SourceAdvisory
+            | Self::RuntimeFetchHigh => 15,
             Self::SourceArchived | Self::WorkflowPermissionsWriteAll => 10,
             Self::RuntimeFetchMedium => 8,
-            Self::PinSliding | Self::WorkflowPullRequestTarget => 5,
+            Self::PinSliding | Self::PinDockerTag | Self::WorkflowPullRequestTarget => 5,
             Self::RuntimeFetchLow | Self::WorkflowWorkflowRun => 3,
             Self::PinFullTag => 2,
         }
@@ -123,6 +136,9 @@ impl RuleId {
         match self {
             Self::PinBranch | Self::PinSliding | Self::PinFullTag => {
                 "Pin to a full 40-char SHA; keep the tag as a comment"
+            }
+            Self::PinDockerLatest | Self::PinDockerTag => {
+                "Pin the container image by digest (docker://image@sha256:…)"
             }
             Self::SourceAdvisory => {
                 "Update past the vulnerable version range; see the referenced GHSA"
@@ -271,6 +287,26 @@ pub fn score_repo(repo_root: &Path, config: &Config) -> Result<(ScoreReport, Con
                     line: a.line_number,
                 });
             }
+        }
+
+        // Container action pinning findings (`uses: docker://…`). A digest
+        // pin is the container analog of a SHA pin and deducts nothing.
+        for d in workflow::scan_docker_refs(&content) {
+            let action_ref = d.uses_ref();
+            unique_actions.insert(action_ref.clone());
+
+            let rule = match d.pin {
+                workflow::DockerPin::Digest => continue,
+                workflow::DockerPin::Tag => RuleId::PinDockerTag,
+                workflow::DockerPin::Latest => RuleId::PinDockerLatest,
+            };
+            action_findings
+                .entry((rule, action_ref))
+                .or_default()
+                .push(Occurrence {
+                    workflow: display.clone(),
+                    line: d.line_number,
+                });
         }
 
         // Workflow-level findings (workflow.*)

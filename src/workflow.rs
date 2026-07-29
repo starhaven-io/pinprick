@@ -52,6 +52,13 @@ static LOCAL_USES_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"^\s*-?\s*uses:\s*(?:"([^"]+)"|'([^']+)'|([^#\s]+))\s*(?:#.*)?$"#).unwrap()
 });
 
+static DOCKER_USES_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"^\s*-?\s*uses:\s*(?:"docker://([^"]+)"|'docker://([^']+)'|docker://([^#\s]+))\s*(?:#.*)?$"#,
+    )
+    .unwrap()
+});
+
 // YAML block scalar openers (`run: |`, `script: >`, etc.), including
 // indent/chomping indicators (`|2-`, `>+`). Every block body is skipped so
 // literal docs or scripts cannot false-match on `uses:` text.
@@ -70,6 +77,79 @@ static BLOCK_SCALAR_RE: LazyLock<Regex> = LazyLock::new(|| {
 pub struct LocalActionRef {
     pub path: String,
     pub line_number: usize,
+}
+
+/// A container action reference: `uses: docker://image[:tag][@sha256:digest]`.
+#[derive(Debug, Clone)]
+pub struct DockerRef {
+    /// The image reference as written, without the `docker://` scheme
+    /// (e.g. `alpine:3.20`, `ghcr.io/owner/image@sha256:…`).
+    pub image: String,
+    pub pin: DockerPin,
+    pub line_number: usize,
+    pub raw_line: String,
+}
+
+impl DockerRef {
+    pub fn uses_ref(&self) -> String {
+        format!("docker://{}", self.image)
+    }
+}
+
+/// How a container image reference is pinned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DockerPin {
+    /// `@sha256:<64 hex>` digest — immutable, the container analog of a SHA pin.
+    Digest,
+    /// A named tag other than `latest` (e.g. `:3.20`) — mutable; the registry
+    /// can re-push different content under the same tag.
+    Tag,
+    /// `:latest` or no tag at all — tracks whatever the registry currently
+    /// serves, the container analog of a branch ref.
+    Latest,
+}
+
+/// Parse a single line into a container action reference
+/// (`uses: docker://…`), if any.
+pub fn parse_docker_uses_line(line: &str, line_number: usize) -> Option<DockerRef> {
+    let caps = DOCKER_USES_RE.captures(line)?;
+    let image = caps
+        .get(1)
+        .or_else(|| caps.get(2))
+        .or_else(|| caps.get(3))?
+        .as_str();
+    if image.is_empty() {
+        return None;
+    }
+
+    Some(DockerRef {
+        image: image.to_string(),
+        pin: classify_docker_image(image),
+        line_number,
+        raw_line: line.to_string(),
+    })
+}
+
+fn classify_docker_image(image: &str) -> DockerPin {
+    // `image@sha256:<hex>` — only a well-formed digest counts as pinned; a
+    // malformed one would not resolve, and must not read as pinned.
+    if let Some((_, digest)) = image.split_once('@') {
+        if let Some(hex) = digest.strip_prefix("sha256:")
+            && hex.len() == 64
+            && hex.chars().all(|c| c.is_ascii_hexdigit())
+        {
+            return DockerPin::Digest;
+        }
+        return DockerPin::Latest;
+    }
+
+    // The tag separator is a `:` after the last `/` — a colon before that is
+    // a registry port (`registry:5000/image`), not a tag.
+    let name_start = image.rfind('/').map_or(0, |i| i + 1);
+    match image[name_start..].split_once(':') {
+        Some((_, tag)) if !tag.is_empty() && tag != "latest" => DockerPin::Tag,
+        _ => DockerPin::Latest,
+    }
 }
 
 #[derive(Debug, Error)]
@@ -157,8 +237,9 @@ pub fn parse_uses_line(line: &str, line_number: usize) -> Option<ActionRef> {
     }
 
     // `docker://image@sha256:…` is a container reference, not a GitHub repo —
-    // parsing it would misread `docker:` as an owner and a digest-pinned image
-    // as an unpinned branch ref.
+    // parsing it here would misread `docker:` as an owner and a digest-pinned
+    // image as an unpinned branch ref. Container refs are handled by
+    // `parse_docker_uses_line` instead.
     if action_path.contains("://") {
         return None;
     }
@@ -257,36 +338,36 @@ pub fn build_pinned_line(line: &str, sha: &str, original_tag: &str) -> Option<St
     Some(format!("{prefix}{action_path}@{sha} # {original_tag}"))
 }
 
-/// Scan workflow YAML text and return all external action references.
-///
-/// Lines inside block scalars are skipped so that shell heredocs, inline docs,
-/// and `with: script: |` snippets can't false-match on literal `- uses:` text.
-pub fn scan_content(content: &str) -> Vec<ActionRef> {
-    let mut refs = Vec::new();
+/// Iterate the scannable lines of workflow YAML as `(1-based line number,
+/// line)`, skipping the bodies of block scalars so that shell heredocs, inline
+/// docs, and `with: script: |` snippets can't false-match on literal
+/// `- uses:` text.
+fn scannable_lines(content: &str) -> impl Iterator<Item = (usize, &str)> {
     let mut block_parent_col: Option<usize> = None;
 
-    for (i, line) in content.lines().enumerate() {
-        let line_num = i + 1;
-
+    content.lines().enumerate().filter_map(move |(i, line)| {
         if let Some(start_col) = block_parent_col {
             let indent = line.chars().take_while(|c| *c == ' ').count();
             if line.trim().is_empty() || indent > start_col {
-                continue;
+                return None;
             }
             block_parent_col = None;
         }
 
         if let Some(caps) = BLOCK_SCALAR_RE.captures(line) {
             block_parent_col = Some(caps.get(1).unwrap().as_str().len());
-            continue;
+            return None;
         }
 
-        if let Some(r) = parse_uses_line(line, line_num) {
-            refs.push(r);
-        }
-    }
+        Some((i + 1, line))
+    })
+}
 
-    refs
+/// Scan workflow YAML text and return all external action references.
+pub fn scan_content(content: &str) -> Vec<ActionRef> {
+    scannable_lines(content)
+        .filter_map(|(line_num, line)| parse_uses_line(line, line_num))
+        .collect()
 }
 
 /// Scan workflow YAML text and return local action references (`uses: ./path`).
@@ -295,31 +376,17 @@ pub fn scan_content(content: &str) -> Vec<ActionRef> {
 /// references another local action from its own `action.yml` is not followed —
 /// such a nested action is scanned only if a workflow also uses it directly.
 pub fn scan_local_actions(content: &str) -> Vec<LocalActionRef> {
-    let mut refs = Vec::new();
-    let mut block_parent_col: Option<usize> = None;
+    scannable_lines(content)
+        .filter_map(|(line_num, line)| parse_local_uses_line(line, line_num))
+        .collect()
+}
 
-    for (i, line) in content.lines().enumerate() {
-        let line_num = i + 1;
-
-        if let Some(start_col) = block_parent_col {
-            let indent = line.chars().take_while(|c| *c == ' ').count();
-            if line.trim().is_empty() || indent > start_col {
-                continue;
-            }
-            block_parent_col = None;
-        }
-
-        if let Some(caps) = BLOCK_SCALAR_RE.captures(line) {
-            block_parent_col = Some(caps.get(1).unwrap().as_str().len());
-            continue;
-        }
-
-        if let Some(r) = parse_local_uses_line(line, line_num) {
-            refs.push(r);
-        }
-    }
-
-    refs
+/// Scan workflow YAML text and return container action references
+/// (`uses: docker://…`).
+pub fn scan_docker_refs(content: &str) -> Vec<DockerRef> {
+    scannable_lines(content)
+        .filter_map(|(line_num, line)| parse_docker_uses_line(line, line_num))
+        .collect()
 }
 
 /// Scan a workflow file and return all external action references.
@@ -836,6 +903,91 @@ mod tests {
     #[test]
     fn skip_local_action() {
         assert!(parse_uses_line("      - uses: ./.github/actions/my-action@v1", 1).is_none());
+    }
+
+    // ── parse_docker_uses_line ──────────────────────────────────────────
+
+    #[test]
+    fn parse_docker_digest_pinned() {
+        let digest = "a".repeat(64);
+        let line = format!("      - uses: docker://ghcr.io/owner/image:v1@sha256:{digest}");
+        let r = parse_docker_uses_line(&line, 3).unwrap();
+        assert_eq!(r.pin, DockerPin::Digest);
+        assert_eq!(r.image, format!("ghcr.io/owner/image:v1@sha256:{digest}"));
+        assert_eq!(r.uses_ref(), format!("docker://{}", r.image));
+        assert_eq!(r.line_number, 3);
+    }
+
+    #[test]
+    fn parse_docker_malformed_digest_is_not_pinned() {
+        // A digest that isn't 64 hex chars can't resolve — it must not read
+        // as pinned.
+        let r = parse_docker_uses_line("      - uses: docker://alpine@sha256:abc123", 1).unwrap();
+        assert_eq!(r.pin, DockerPin::Latest);
+        let r = parse_docker_uses_line("      - uses: docker://alpine@md5:abcd", 1).unwrap();
+        assert_eq!(r.pin, DockerPin::Latest);
+    }
+
+    #[test]
+    fn parse_docker_named_tag() {
+        let r = parse_docker_uses_line("      - uses: docker://alpine:3.20", 1).unwrap();
+        assert_eq!(r.pin, DockerPin::Tag);
+        assert_eq!(r.image, "alpine:3.20");
+    }
+
+    #[test]
+    fn parse_docker_latest_and_untagged() {
+        for line in [
+            "      - uses: docker://alpine:latest",
+            "      - uses: docker://alpine",
+            "      - uses: docker://ghcr.io/owner/image",
+        ] {
+            let r = parse_docker_uses_line(line, 1).unwrap();
+            assert_eq!(r.pin, DockerPin::Latest, "line {line:?}");
+        }
+    }
+
+    #[test]
+    fn parse_docker_registry_port_is_not_a_tag() {
+        // The colon before the last `/` is a registry port, not a tag.
+        let r =
+            parse_docker_uses_line("      - uses: docker://registry:5000/team/tool", 1).unwrap();
+        assert_eq!(r.pin, DockerPin::Latest);
+        let r = parse_docker_uses_line("      - uses: docker://registry:5000/team/tool:2.1", 1)
+            .unwrap();
+        assert_eq!(r.pin, DockerPin::Tag);
+    }
+
+    #[test]
+    fn parse_docker_quoted_with_comment() {
+        let r = parse_docker_uses_line("      - uses: \"docker://alpine:3.20\" # pinned-ish", 1)
+            .unwrap();
+        assert_eq!(r.pin, DockerPin::Tag);
+        let r = parse_docker_uses_line("      - uses: 'docker://alpine:latest'", 1).unwrap();
+        assert_eq!(r.pin, DockerPin::Latest);
+    }
+
+    #[test]
+    fn parse_docker_ignores_non_docker_lines() {
+        assert!(parse_docker_uses_line("      - uses: actions/checkout@v4", 1).is_none());
+        assert!(parse_docker_uses_line("      - uses: ./local/action", 1).is_none());
+        assert!(parse_docker_uses_line("      - run: docker://alpine", 1).is_none());
+    }
+
+    #[test]
+    fn scan_docker_refs_skips_block_scalars() {
+        let yaml = "\
+jobs:
+  test:
+    steps:
+      - run: |
+          echo uses: docker://fake:latest
+      - uses: docker://real:latest
+";
+        let refs = scan_docker_refs(yaml);
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].image, "real:latest");
+        assert_eq!(refs[0].line_number, 6);
     }
 
     #[test]

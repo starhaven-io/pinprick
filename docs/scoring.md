@@ -47,8 +47,12 @@ Each rule has an ID, a category, a severity, a point deduction, and a remediatio
 | `pin.branch`  | `@ref` is a branch name (`main`, `master`, custom) | high     |   15   | live   | Pin to a full 40-char SHA                             |
 | `pin.sliding` | `@ref` is a sliding tag (e.g., `@v4`)              | medium   |    5   | live   | Pin to a full 40-char SHA; keep the tag as a comment  |
 | `pin.full_tag`| `@ref` is a full version tag (e.g., `@v4.2.1`)     | low      |    2   | live   | Pin to a full 40-char SHA                             |
+| `pin.docker_latest` | `uses: docker://image` with `:latest` or no tag | high  |   15   | live   | Pin the container image by digest (`@sha256:…`)       |
+| `pin.docker_tag` | `uses: docker://image:tag` without a digest       | medium   |    5   | live   | Pin the container image by digest (`@sha256:…`)       |
 
 A SHA-pinned reference incurs no pinning deduction.
+
+Container action references (`uses: docker://…`, added in rubric 0.10.0) are the registry-side mirror of the git rules: a `@sha256:` digest is immutable and deducts nothing, a named tag is mutable (the registry can re-push different content under it, like a sliding git tag), and `:latest`/no tag tracks whatever the registry currently serves (like a branch ref). Only a well-formed `sha256:` digest — 64 hex characters — counts as pinned.
 
 `pin.none` is catalogued for completeness but currently unreachable: pinprick's `uses:` parser rejects lines without an `@ref`, so no-ref references never reach the scorer. The rule id is reserved so future parser changes (or other tooling that implements this rubric) can emit it without colliding.
 
@@ -203,7 +207,7 @@ Re-scoring an existing scan against a newer rubric is always explicit in the UI.
 
 ## Changelog
 
-- `0.10.0`: Token-gated runs now also score runtime findings from fetched remote action source (previously deferred). Reports and badges declare incomplete coverage instead of presenting a partial score as final.
+- `0.10.0`: Added container action pinning rules `pin.docker_latest` (high/-15) and `pin.docker_tag` (medium/-5); `uses: docker://…` references were previously invisible to scoring. Digest-pinned images deduct nothing. Token-gated runs now also score runtime findings from fetched remote action source.
 - `0.9.0`: Removed `source.unverified`. `pinprick score --json` no longer emits publisher allowlist notes, and the `trusted-owners` config key has been removed.
 
 ## Worked example
