@@ -12,3 +12,10 @@
 
 /_astro/*
   Cache-Control: public, max-age=31536000, immutable
+
+# Catalog files and their .minisig signatures share this prefix, so one rule
+# gives both the same short lifetime. After a deploy the pair could otherwise
+# be cached from different generations, making clients (fail-closed) warn
+# about signature mismatches for up to the cache TTL.
+/audited-actions/*
+  Cache-Control: public, max-age=300, must-revalidate

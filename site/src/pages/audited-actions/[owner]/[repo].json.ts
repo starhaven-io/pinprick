@@ -27,7 +27,10 @@ export const GET: APIRoute = ({ params }) => {
     return new Response(data, {
       headers: {
         'Content-Type': 'application/json',
-        'Cache-Control': 'public, max-age=3600',
+        // Keep in sync with public/_headers (/audited-actions/*): the catalog
+        // and its .minisig must age out together or clients see transient
+        // signature mismatches after a deploy.
+        'Cache-Control': 'public, max-age=300, must-revalidate',
       },
     });
   } catch {
