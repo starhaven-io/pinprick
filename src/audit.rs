@@ -220,6 +220,10 @@ pub async fn run(
             }
         }
 
+        for docker in workflow::scan_docker_refs(&content) {
+            push_docker_ref_result(&docker, &display_name, &mut collector);
+        }
+
         for action in workflow::scan_local_actions(&content) {
             let key = format!("local:{}", action.path);
             if !scanned_actions.insert(key) {
@@ -450,6 +454,51 @@ pub async fn run(
         Ok(ExitCode::from(1))
     } else {
         Ok(ExitCode::SUCCESS)
+    }
+}
+
+/// Surface `uses: docker://…` container refs. A digest-pinned image is the
+/// container analog of a SHA pin and is recorded as an allowed match;
+/// `:latest`/untagged floats with the registry (high), and a named tag is
+/// mutable and can be re-pushed (medium). No token or network is needed —
+/// the classification is purely syntactic.
+fn push_docker_ref_result(
+    docker: &workflow::DockerRef,
+    source_file: &str,
+    collector: &mut AuditCollector,
+) {
+    let action = docker.uses_ref();
+    match docker.pin {
+        workflow::DockerPin::Digest => collector.push_allowed(AuditMatch::new(
+            &audit_patterns::Severity::Low,
+            &audit_patterns::Category::DockerUnpinned,
+            &action,
+            source_file,
+            docker.line_number,
+            &docker.raw_line,
+            "digest-pinned image",
+        )),
+        workflow::DockerPin::Tag => collector.push_finding(AuditFinding::new(
+            &audit_patterns::Severity::Medium,
+            &audit_patterns::Category::DockerUnpinned,
+            &action,
+            source_file,
+            docker.line_number,
+            &docker.raw_line,
+            format!(
+                "container action image `{}` uses a mutable tag, not a digest",
+                docker.image
+            ),
+        )),
+        workflow::DockerPin::Latest => collector.push_finding(AuditFinding::new(
+            &audit_patterns::Severity::High,
+            &audit_patterns::Category::DockerUnpinned,
+            &action,
+            source_file,
+            docker.line_number,
+            &docker.raw_line,
+            format!("container action uses unpinned image `{}`", docker.image),
+        )),
     }
 }
 

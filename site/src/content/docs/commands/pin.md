@@ -22,6 +22,7 @@ pinprick pin /path/to/repo
 - Already-pinned refs (40-char hex SHAs) are skipped silently
 - Branch refs (e.g., `@main`) are flagged — pin to a SHA manually
 - Annotated tags are followed to their underlying commit SHA
+- `docker://` container references are audited and scored separately; registry tags must be replaced with a reviewed `@sha256:` digest manually
 
 ## Example
 

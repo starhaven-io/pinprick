@@ -984,6 +984,102 @@ fn git_clone_versioned_branch_clean() {
     assert!(findings.is_empty());
 }
 
+// ── docker:// container refs ────────────────────────────────────────────────
+
+#[test]
+fn docker_uses_latest_and_tag_are_findings_digest_is_allowed() {
+    let workflow = "\
+name: docker
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: docker://alpine:latest
+      - uses: docker://alpine
+      - uses: docker://alpine:3.20
+      - uses: docker://ghcr.io/org/tool@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+";
+    let dir = common::repo_with_workflow("ci.yml", workflow);
+    let output = common::pinprick_cmd()
+        .arg("--json")
+        .arg("audit")
+        .arg("--verbose")
+        .arg(dir.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+
+    let findings = json["findings"].as_array().unwrap();
+    assert_eq!(findings.len(), 3);
+    // Sorted high before medium.
+    assert_eq!(findings[0]["severity"], "high");
+    assert_eq!(findings[0]["category"], "docker_unpinned");
+    assert_eq!(findings[0]["action"], "docker://alpine:latest");
+    assert_eq!(findings[0]["line"], 7);
+    assert_eq!(findings[1]["severity"], "high");
+    assert_eq!(findings[1]["action"], "docker://alpine");
+    assert_eq!(findings[2]["severity"], "medium");
+    assert_eq!(findings[2]["action"], "docker://alpine:3.20");
+    assert!(
+        findings[2]["description"]
+            .as_str()
+            .unwrap()
+            .contains("mutable tag")
+    );
+
+    // The digest-pinned image is visible as an allowed match under --verbose.
+    let allowed = json["allowed"].as_array().unwrap();
+    assert!(allowed.iter().any(|entry| {
+        entry["reason"] == "digest-pinned image"
+            && entry["action"]
+                .as_str()
+                .unwrap()
+                .starts_with("docker://ghcr.io/org/tool@sha256:")
+    }));
+}
+
+#[test]
+fn docker_uses_digest_pinned_exits_zero() {
+    let workflow = "\
+name: docker
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: docker://alpine:3.20@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      - run: echo ok
+";
+    let dir = common::repo_with_workflow("ci.yml", workflow);
+    common::pinprick_cmd()
+        .arg("audit")
+        .arg(dir.path())
+        .assert()
+        .success();
+}
+
+#[test]
+fn docker_uses_inside_run_block_is_not_a_finding() {
+    let workflow = "\
+name: docker
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          echo 'uses: docker://alpine:latest'
+";
+    let dir = common::repo_with_workflow("ci.yml", workflow);
+    common::pinprick_cmd()
+        .arg("audit")
+        .arg(dir.path())
+        .assert()
+        .success();
+}
 #[test]
 fn no_token_reports_external_actions_skipped() {
     let workflow = "\

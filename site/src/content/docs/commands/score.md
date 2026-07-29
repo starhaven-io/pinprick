@@ -37,24 +37,28 @@ pinprick score --badge > badge.json
 
 The full catalog lives in [`docs/scoring.md`](https://github.com/starhaven-io/pinprick/blob/main/docs/scoring.md). Summary:
 
-| Category   | Rule                              | Severity | Points |
-| ---------- | --------------------------------- | -------- | ------ |
-| `pin`      | `pin.branch` (branch ref)         | high     | 15     |
-| `pin`      | `pin.sliding` (sliding tag `@v4`) | medium   | 5      |
-| `pin`      | `pin.full_tag` (e.g. `@v4.2.1`)   | low      | 2      |
-| `source`   | `source.archived`                 | high     | 10     |
-| `source`   | `source.advisory` (GHSA match)    | high     | 15     |
-| `runtime`  | `runtime.pipe_to_shell`           | high     | 20     |
-| `runtime`  | `runtime.fetch.high`              | high     | 15     |
-| `runtime`  | `runtime.fetch.medium`            | medium   | 8      |
-| `runtime`  | `runtime.fetch.low`               | low      | 3      |
-| `workflow` | `workflow.permissions_write_all`  | high     | 10     |
-| `workflow` | `workflow.pull_request_target`    | high     | 5      |
-| `workflow` | `workflow.workflow_run`           | medium   | 3      |
+| Category   | Rule                                                      | Severity | Points |
+| ---------- | --------------------------------------------------------- | -------- | ------ |
+| `pin`      | `pin.branch` (branch ref)                                 | high     | 15     |
+| `pin`      | `pin.sliding` (sliding tag `@v4`)                         | medium   | 5      |
+| `pin`      | `pin.full_tag` (e.g. `@v4.2.1`)                           | low      | 2      |
+| `pin`      | `pin.docker_latest` (`docker://` image, `:latest`/no tag) | high     | 15     |
+| `pin`      | `pin.docker_tag` (`docker://` image tag, no digest)       | medium   | 5      |
+| `source`   | `source.archived`                                         | high     | 10     |
+| `source`   | `source.advisory` (GHSA match)                            | high     | 15     |
+| `runtime`  | `runtime.pipe_to_shell`                                   | high     | 20     |
+| `runtime`  | `runtime.fetch.high`                                      | high     | 15     |
+| `runtime`  | `runtime.fetch.medium`                                    | medium   | 8      |
+| `runtime`  | `runtime.fetch.low`                                       | low      | 3      |
+| `workflow` | `workflow.permissions_write_all`                          | high     | 10     |
+| `workflow` | `workflow.pull_request_target`                            | high     | 5      |
+| `workflow` | `workflow.workflow_run`                                   | medium   | 3      |
 
 Grade bands: **A** 90–100, **B** 80–89, **C** 70–79, **D** 60–69, **F** 0–59.
 
 Because the scanned repository's own `.pinprick.toml` applies, a third-party repo can shape its own grade (`trusted-hosts`, `extra-data-formats`, `ignore` rules). Whenever a repo-local config changes the score, pinprick prints a note to stderr saying what it changed; pass `--no-repo-config` to ignore the file entirely.
+
+Container-action findings identify `docker://` references that use a tag instead of an immutable digest. `pinprick pin --write` does not resolve registry tags, so replace these references with a reviewed `@sha256:` digest manually.
 
 ## Example
 

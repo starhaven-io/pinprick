@@ -47,6 +47,27 @@ async fn run_with_client(
         let actions = workflow::scan_content(&content);
         let mut replacements: Vec<(usize, String, String)> = Vec::new();
 
+        // Container refs are report-only: resolving a tag to a registry digest
+        // needs a registry client, so an unpinned image is surfaced as a skip
+        // (and fails a dry-run gate) rather than rewritten. Digest-pinned
+        // images are the container analog of a SHA pin and pass silently.
+        for docker in workflow::scan_docker_refs(&content) {
+            let reason = match docker.pin {
+                workflow::DockerPin::Digest => continue,
+                workflow::DockerPin::Tag => "mutable image tag — pin a digest (@sha256:…) manually",
+                workflow::DockerPin::Latest => {
+                    "floating image ref — pin a digest (@sha256:…) manually"
+                }
+            };
+            unpinnable += 1;
+            report.skipped.push(PinSkip {
+                file: workflow::display_path(file.path(), repo_root),
+                action: docker.uses_ref(),
+                reason: reason.to_string(),
+                line: docker.line_number,
+            });
+        }
+
         for action in &actions {
             match action.ref_type {
                 RefType::Sha => {}
