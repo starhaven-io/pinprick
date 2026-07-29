@@ -66,6 +66,12 @@ enum Command {
         /// config (or defaults) — for auditing repositories you don't control
         #[arg(long)]
         no_repo_config: bool,
+
+        /// Ignore the audited-actions catalog (bundled, local cache, and
+        /// remote) and scan every action fresh — for re-verifying catalog
+        /// entries against the current detection rules
+        #[arg(long)]
+        no_audited_catalog: bool,
     },
     /// Remove locally cached audit results
     Clean,
@@ -147,9 +153,18 @@ async fn main() -> ExitCode {
             verbose,
             sarif,
             no_repo_config,
+            no_audited_catalog,
         } => {
             let config = config::Config::load(path, !no_repo_config);
-            audit::run(path, cli.json, *sarif, *verbose, &config).await
+            audit::run(
+                path,
+                cli.json,
+                *sarif,
+                *verbose,
+                *no_audited_catalog,
+                &config,
+            )
+            .await
         }
         Command::Clean => {
             let removed = match audited_actions::cache_dir() {

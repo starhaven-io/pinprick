@@ -55,6 +55,36 @@ jobs:
 }
 
 #[test]
+fn no_audited_catalog_bypasses_bundled_verdict() {
+    // --no-audited-catalog must force a fresh scan even for a SHA the bundled
+    // catalog vouches for — that is what lets CI re-verify catalog entries
+    // against the current detection rules. The dummy token makes the fetch
+    // fail, which is fine: the assertion is that a fetch was attempted instead
+    // of the bundled short-circuit, and a failed scan is a warning, not a
+    // finding.
+    let workflow = "\
+name: cache
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+";
+    let dir = common::repo_with_workflow("ci.yml", workflow);
+
+    common::pinprick_cmd()
+        .env("GITHUB_TOKEN", "dummy")
+        .arg("audit")
+        .arg("--no-audited-catalog")
+        .arg(dir.path())
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("audited (bundled)").not())
+        .stderr(predicate::str::contains("Fetching actions/cache/restore"));
+}
+
+#[test]
 fn human_output_sanitizes_terminal_escapes() {
     // A matched run-block line carrying an ANSI escape must not reach the
     // terminal verbatim — otherwise a hostile action could spoof or hide a

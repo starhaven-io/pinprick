@@ -50,7 +50,7 @@ pinprick/
 
 - `pinprick pin [PATH] [--write]` — Scan workflow files, resolve action tag refs to full SHAs via GitHub API. Dry-run by default (exits 1 when there are unpinned actions). `--write` rewrites files with `@sha # tag` format. Skips already-pinned (SHA) refs. Warns on branch refs (`@main`) and sliding tags (`@v4`), resolving sliding tags to exact versions.
 - `pinprick update [PATH] [--write] [--only PATTERN]` — Check SHA-pinned actions for newer releases. Dry-run by default, `--write` to apply changes. `--only` restricts the check to actions whose `owner/repo` contains the given substring.
-- `pinprick audit [PATH] [--verbose] [--sarif]` — Scan for runtime fetch patterns that bypass pinning. Without a GitHub token, scans local `run:` blocks and local actions referenced with `uses: ./...`. With a token, also fetches and scans remote action source code (JS/TS, Python, Dockerfiles, action.yml). `--verbose` shows allowed matches. `--sarif` outputs SARIF 2.1.0 for GitHub code scanning.
+- `pinprick audit [PATH] [--verbose] [--sarif] [--no-audited-catalog]` — Scan for runtime fetch patterns that bypass pinning. Without a GitHub token, scans local `run:` blocks and local actions referenced with `uses: ./...`. With a token, also fetches and scans remote action source code (JS/TS, Python, Dockerfiles, action.yml). `--verbose` shows allowed matches. `--sarif` outputs SARIF 2.1.0 for GitHub code scanning.
 - `pinprick score [PATH] [--html]` — Compute a supply-chain posture score (0–100, letter grade A–F) for a repository's workflows. Implements the public rubric in `docs/scoring.md` (rubric v0.9.0). The offline rules (`pin.*`, `workflow.*`, `runtime.*`) need no token; with a token it additionally emits the token-gated `source.archived` and `source.advisory` rules. `runtime.*` rules reuse the `audit` shell pipeline against each workflow's `run:` blocks, distinguishing pipe-to-shell (-20) from severity-graded fetches (-15/-8/-3). Exits 1 when any finding deducts points (matches `audit` for CI gating); outputs JSON with `--json` or a self-contained HTML report with `--html` (mutually exclusive with `--json`).
 - `pinprick clean` — Remove locally cached audit results (`~/.cache/pinprick/audited/`).
 - `pinprick completions <SHELL>` — Generate shell completions for bash, zsh, fish, etc.
@@ -124,6 +124,7 @@ Git clone ref pinning: `git clone` without `--branch`/`-b` or with a branch name
 - **link-check.yml** — Weekly lychee broken-link check across the built site and README
 - **pinprick-audit.yml** — Run pinprick audit on its own workflows with SARIF upload
 - **release.yml** — Manual dispatch: dry-run crate publishing, build cross-platform binaries (linux-amd64 and linux-arm64, each in glibc and static musl variants, plus darwin-arm64), create GitHub release with build provenance attestations, publish the crate to crates.io, open a pinprick-action default-version bump PR, and bump the Homebrew cask (glibc/macOS only)
+- **verify-audited-actions.yml** — Weekly sharded re-verification of audited-actions catalog entries against the current detection rules (`scripts/verify-audited-actions.sh`), with a tracking issue on failure
 - **zizmor.yml** — GitHub Actions security audit on push to main
 
 ## Safety / do-not-touch rules

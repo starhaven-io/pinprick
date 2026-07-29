@@ -42,6 +42,7 @@ When no GitHub token is available, audit scans workflow `run:` blocks and local 
 - `--sarif`: SARIF 2.1.0 for upload to GitHub code scanning
 - `--verbose`: also report _allowed_ matches (fetches that fired a rule but were dropped because the URL is versioned, data-shaped, piped to `jq`, checksum-verified, or matched by `trusted-hosts`)
 - `--no-repo-config`: ignore the scanned repository's `.pinprick.toml` and use the global config (or defaults)
+- `--no-audited-catalog`: ignore the audited-actions catalog (bundled, local cache, and remote) and scan every action fresh — pinprick's own CI uses this to re-verify catalog entries against the current detection rules
 
 For GitHub Actions CI, [`starhaven-io/pinprick-action`](/getting-started/github-action/) wraps this command and optional SARIF upload.
 
