@@ -3,7 +3,7 @@ title: clean
 description: Remove locally cached audit results.
 ---
 
-Remove the local audit cache at `~/.cache/pinprick/audited/`. This directory stores results from previous `pinprick audit` runs so that already-scanned action SHAs can be skipped on future runs.
+Remove the local audit cache at `$XDG_CACHE_HOME/pinprick/audited/` (default `~/.cache/pinprick/audited/`). This directory stores results from previous `pinprick audit` runs so that already-scanned action SHAs can be skipped on future runs.
 
 ```bash
 pinprick clean

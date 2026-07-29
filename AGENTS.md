@@ -24,7 +24,7 @@ pinprick/
 │   ├── audit_source.rs      # Action source selection and fetch (remote trees API, local ./ actions)
 │   ├── audited_actions.rs   # Layered lookup: bundled → local cache → remote → GitHub API
 │   ├── auth.rs              # GitHub token resolution (GITHUB_TOKEN/GH_TOKEN env → gh auth token fallback)
-│   ├── config.rs            # TOML config file loading (.pinprick.toml, ~/.config/pinprick/)
+│   ├── config.rs            # TOML config loading (repo-local or XDG config directory)
 │   ├── github.rs            # GitHub API client (tag→SHA, releases, file trees)
 │   ├── output.rs            # Human-readable (colored) and --json output formatting
 │   ├── pin.rs               # Pin command: resolve tags to SHAs, rewrite files
@@ -52,7 +52,7 @@ pinprick/
 - `pinprick update [PATH] [--write] [--only PATTERN]` — Check SHA-pinned actions for newer releases. Dry-run by default, `--write` to apply changes. `--only` restricts the check to actions whose `owner/repo` contains the given substring.
 - `pinprick audit [PATH] [--verbose] [--sarif] [--no-audited-catalog]` — Scan for runtime fetch patterns that bypass pinning. Without a GitHub token, scans local `run:` blocks and local actions referenced with `uses: ./...`. With a token, also fetches and scans remote action source code (JS/TS, Python, Dockerfiles, action.yml). `--verbose` shows allowed matches. `--sarif` outputs SARIF 2.1.0 for GitHub code scanning.
 - `pinprick score [PATH] [--html]` — Compute a supply-chain posture score (0–100, letter grade A–F) for a repository's workflows. Implements the public rubric in `docs/scoring.md` (rubric v0.9.0). The offline rules (`pin.*`, `workflow.*`, `runtime.*`) need no token; with a token it additionally emits the token-gated `source.archived` and `source.advisory` rules. `runtime.*` rules reuse the `audit` shell pipeline against each workflow's `run:` blocks, distinguishing pipe-to-shell (-20) from severity-graded fetches (-15/-8/-3). Exits 1 when any finding deducts points (matches `audit` for CI gating); outputs JSON with `--json` or a self-contained HTML report with `--html` (mutually exclusive with `--json`).
-- `pinprick clean` — Remove locally cached audit results (`~/.cache/pinprick/audited/`).
+- `pinprick clean` — Remove locally cached audit results (`$XDG_CACHE_HOME/pinprick/audited/`, default `~/.cache/pinprick/audited/`).
 - `pinprick completions <SHELL>` — Generate shell completions for bash, zsh, fish, etc.
 
 ### Global flags
@@ -84,7 +84,7 @@ Rate-limit handling: `github::get` retries once on network/5xx errors and sleeps
 
 ### Configuration
 
-A `.pinprick.toml` at the repo root (or `~/.config/pinprick/config.toml`) customizes behavior. Keys are all optional: `severity`, `fetch-remote`, `trusted-hosts`, `extra-data-formats`, `ignore.actions`, `ignore.patterns`. Per-repo wholly overrides global (no field-level merge). Because the scanned repo's own config applies, `audit`/`score` print a stderr notice whenever a repo-local config suppressed findings or extended runtime/data-format trust, and accept `--no-repo-config` to ignore the repo's file (for scanning repositories you don't control).
+A `.pinprick.toml` at the repo root (or `$XDG_CONFIG_HOME/pinprick/config.toml`, default `~/.config/pinprick/config.toml`) customizes behavior. Keys are all optional: `severity`, `fetch-remote`, `trusted-hosts`, `extra-data-formats`, `ignore.actions`, `ignore.patterns`. Per-repo wholly overrides global (no field-level merge). Because the scanned repo's own config applies, `audit`/`score` print a stderr notice whenever a repo-local config suppressed findings or extended runtime/data-format trust, and accept `--no-repo-config` to ignore the repo's file (for scanning repositories you don't control).
 
 ### Audit patterns
 

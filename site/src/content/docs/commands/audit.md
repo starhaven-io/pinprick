@@ -26,7 +26,7 @@ For the full list of every rule, including examples and severity, see the [Detec
 pinprick skips actions whose `owner/repo@sha` is already known to be clean. The check consults three sources, in order, and reports which one answered:
 
 - `bundled` — ships with the pinprick binary from `audited-actions/` in the repo
-- `local cache` — written to `~/.cache/pinprick/audited/` after a successful live scan on this machine
+- `local cache` — written to `$XDG_CACHE_HOME/pinprick/audited/` (default `~/.cache/pinprick/audited/`) after a successful live scan on this machine
 - `pinprick.rs` — fetched from the public audited-actions list (opt-in via `fetch-remote = true` in `.pinprick.toml`)
 
 See [Audited Actions](/configuration/audited-actions) for details on how the list works and how to contribute.

@@ -5,7 +5,7 @@ description: Configure pinprick behavior with .pinprick.toml.
 
 pinprick reads configuration from TOML files in two locations:
 
-1. **Global** — `~/.config/pinprick/config.toml`
+1. **Global** — `$XDG_CONFIG_HOME/pinprick/config.toml` (default `~/.config/pinprick/config.toml`)
 2. **Per-repo** — `.pinprick.toml` in the repository root
 
 Per-repo config overrides global config as a whole file; fields are not merged. Both are optional — pinprick uses sensible defaults.

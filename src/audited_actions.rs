@@ -68,7 +68,7 @@ const LOCAL_CACHE_PINPRICK_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub enum AuditSource {
     /// Compiled into the pinprick binary from `audited-actions/`.
     Bundled,
-    /// Read from `~/.cache/pinprick/audited/` (populated by previous scans).
+    /// Read from the XDG cache directory (populated by previous scans).
     LocalCache,
     /// Fetched from `https://pinprick.rs/audited-actions/`.
     Remote,
@@ -88,7 +88,7 @@ impl AuditSource {
 ///
 /// Resolution order:
 /// 1. **Bundled** — compiled into the binary from `audited-actions/`
-/// 2. **Local cache** — `~/.cache/pinprick/audited/{owner}/{repo}.json`
+/// 2. **Local cache** — `$XDG_CACHE_HOME/pinprick/audited/{owner}/{repo}.json`
 /// 3. **Remote** — `https://pinprick.rs/audited-actions/{owner}/{repo}.json` (opt-in)
 ///
 /// Misses are silent — "not audited" just means the action is scanned via
@@ -421,8 +421,13 @@ fn render_entries(entries: &[serde_json::Value]) -> Option<String> {
 }
 
 pub fn cache_dir() -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    Some(PathBuf::from(home).join(".cache/pinprick/audited"))
+    // XDG_CACHE_HOME wins when set to an absolute path; the spec says a
+    // relative value must be ignored.
+    let base = match std::env::var("XDG_CACHE_HOME") {
+        Ok(dir) if dir.starts_with('/') => PathBuf::from(dir),
+        _ => PathBuf::from(std::env::var("HOME").ok()?).join(".cache"),
+    };
+    Some(base.join("pinprick/audited"))
 }
 
 /// Build the on-disk cache path for an action, returning `None` if either
@@ -1090,7 +1095,7 @@ mod tests {
             let mut aa = AuditedActions::new(true);
             aa.catalog_key = Some(key);
             aa.remote_url = server.uri();
-            aa.cache_dir = None; // don't consult the real ~/.cache during the test
+            aa.cache_dir = None; // don't consult the real user cache during the test
             // Not bundled, no local cache hit → resolved by the remote layer.
             assert_eq!(
                 aa.check("some", "action", None, "feedface").await,
