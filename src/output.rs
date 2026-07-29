@@ -372,6 +372,12 @@ pub struct AuditReport {
     /// Number of actions skipped by `ignore.actions` in the config.
     #[serde(default)]
     pub ignored: usize,
+    /// Number of unique external actions that were NOT scanned because no
+    /// GitHub token was available. Without this, a token-less `--json` run
+    /// reports `actions_scanned: 0` and nothing else — a consumer could read
+    /// silence as cleanliness.
+    #[serde(default)]
+    pub external_actions_skipped: usize,
 }
 
 impl AuditReport {
@@ -460,10 +466,20 @@ impl AuditReport {
         }
 
         if !self.had_token {
-            println!(
-                "{}",
-                "Note: no GitHub token — action source code was not scanned.".dimmed()
-            );
+            let note = if self.external_actions_skipped > 0 {
+                format!(
+                    "Note: no GitHub token — {} external action{} not scanned.",
+                    self.external_actions_skipped,
+                    if self.external_actions_skipped == 1 {
+                        ""
+                    } else {
+                        "s"
+                    }
+                )
+            } else {
+                "Note: no GitHub token — action source code was not scanned.".to_string()
+            };
+            println!("{}", note.dimmed());
         }
     }
 
@@ -825,6 +841,7 @@ mod sarif_tests {
             scanned_unpinned_branch: 0,
             scanned_unpinned_sliding: 0,
             ignored: 0,
+            external_actions_skipped: 0,
         }
     }
 
@@ -997,6 +1014,7 @@ mod audit_summary_tests {
             scanned_unpinned_branch: 0,
             scanned_unpinned_sliding: 0,
             ignored: 0,
+            external_actions_skipped: 0,
         }
     }
 
