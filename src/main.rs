@@ -101,6 +101,11 @@ enum Command {
         #[arg(long)]
         html: bool,
 
+        /// Emit a shields.io endpoint-badge JSON document to stdout
+        /// (mutually exclusive with --json and --html)
+        #[arg(long)]
+        badge: bool,
+
         /// Ignore the scanned repository's .pinprick.toml and use the global
         /// config (or defaults) — for scoring repositories you don't control
         #[arg(long)]
@@ -135,14 +140,25 @@ async fn main() -> ExitCode {
 
     // clap can't enforce these conflicts: --json is a global arg on the parent
     // command, and conflicts_with does not reach across the subcommand boundary.
-    let conflicting_flag = match &cli.command {
-        Command::Audit { sarif: true, .. } if cli.json => Some("--sarif"),
-        Command::Score { html: true, .. } if cli.json => Some("--html"),
+    let conflict_error = match &cli.command {
+        Command::Audit { sarif: true, .. } if cli.json => {
+            Some("--sarif cannot be combined with --json")
+        }
+        Command::Score { html: true, .. } if cli.json => {
+            Some("--html cannot be combined with --json")
+        }
+        Command::Score { badge: true, .. } if cli.json => {
+            Some("--badge cannot be combined with --json")
+        }
+        Command::Score {
+            html: true,
+            badge: true,
+            ..
+        } => Some("--badge cannot be combined with --html"),
         _ => None,
     };
-    if let Some(flag) = conflicting_flag {
-        // --json is necessarily set for either conflict to fire.
-        let err = serde_json::json!({ "error": format!("{flag} cannot be combined with --json") });
+    if let Some(message) = conflict_error {
+        let err = serde_json::json!({ "error": message });
         eprintln!("{err}");
         return ExitCode::from(2);
     }
@@ -195,8 +211,9 @@ async fn main() -> ExitCode {
         Command::Score {
             path,
             html,
+            badge,
             no_repo_config,
-        } => score::run(path, cli.json, *html, *no_repo_config).await,
+        } => score::run(path, cli.json, *html, *badge, *no_repo_config).await,
         Command::Update { path, apply, only } => {
             update::run(path, *apply, cli.json, only.as_deref()).await
         }

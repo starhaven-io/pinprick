@@ -65,9 +65,17 @@ jobs:
             exit "${EXIT}"
           fi
 
+      - name: Run pinprick score
+        # Deliberately token-less: the offline rules (pin.*, workflow.*,
+        # runtime.*) reflect this repo's own posture and must stay at 100.
+        # The token-gated source.* rules depend on third-party upstream state
+        # (an action being archived or gaining an advisory), which must not
+        # fail unrelated PRs here.
+        run: ./target/debug/pinprick score .
+
       - name: Upload SARIF
         if: always() && (env.PINPRICK_AUDIT_EXIT == '0' || env.PINPRICK_AUDIT_EXIT == '1')
-        uses: github/codeql-action/upload-sarif@e0647621c2984b5ed2f768cb892365bf2a616ad1 # v4.37.2
+        uses: github/codeql-action/upload-sarif@7188fc363630916deb702c7fdcf4e481b751f97a # v4.37.1
         with:
           sarif_file: pinprick.sarif
           category: pinprick
