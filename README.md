@@ -121,6 +121,10 @@ pinprick score
 pinprick --json score
 pinprick score --html > report.html
 
+# Emit a shields.io endpoint-badge JSON document for a README badge.
+# Incomplete coverage produces a grey error badge instead of a green grade.
+pinprick score --badge > badge.json
+
 # Clear locally cached audit results
 pinprick clean
 

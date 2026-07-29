@@ -12,6 +12,7 @@ pinprick score
 pinprick score /path/to/repo
 pinprick score --json
 pinprick score --html > report.html
+pinprick score --badge > badge.json
 ```
 
 ## Behavior
@@ -19,14 +20,18 @@ pinprick score --html > report.html
 - Scans `.github/workflows/*.yml` and emits findings across four categories: `pin.*`, `workflow.*`, `source.*`, `runtime.*`
 - Each finding has a fixed point deduction; the score is `max(0, 100 - sum(points))`
 - Exits 1 when any finding deducts points
-- Runs fully offline by default. `source.archived` and `source.advisory` activate only when a GitHub token is available
+- Runs its workflow-owned rules offline. With a GitHub token, it also evaluates `source.archived`, `source.advisory`, and runtime findings in fetched remote action source
+- Marks report coverage incomplete when token-gated checks do not run, remote source cannot be fetched completely, or configuration suppresses coverage
 
 ## Output formats
 
 - Default: a compact human-readable summary with grade, finding count, prioritized rules, and targets
-- `--json`: the full finding list as JSON for CI integration or downstream processing
-- `--html`: a self-contained HTML report (mutually exclusive with `--json`)
+- `--json`: the full finding list and `coverage_complete` state as JSON for CI integration or downstream processing
+- `--html`: a self-contained HTML report that displays incomplete-coverage reasons
+- `--badge`: a [shields.io endpoint-badge](https://shields.io/badges/endpoint-badge) JSON document. Incomplete coverage produces a grey error badge instead of an unqualified grade
 - `--no-repo-config`: ignore the scanned repository's `.pinprick.toml` and use the global config (or defaults)
+
+`--json`, `--html`, and `--badge` are mutually exclusive.
 
 ## Rule catalog
 
@@ -55,7 +60,7 @@ Because the scanned repository's own `.pinprick.toml` applies, a third-party rep
 
 ```
 $ pinprick score
-pinprick score  v0.9.0 rubric
+pinprick score  v0.10.0 rubric
 
   Grade:  A   (95 / 100)
 
@@ -69,4 +74,4 @@ pinprick score  v0.9.0 rubric
 
 ## Versioning
 
-The rubric is independently versioned from the pinprick binary (currently `v0.9.0`). Every scan records the rubric version so historical scores remain interpretable as the rubric evolves. Re-scoring against a newer rubric is always explicit — pinprick never silently re-grades a past scan.
+The rubric is independently versioned from the pinprick binary (currently `v0.10.0`). Every scan records the rubric version so historical scores remain interpretable as the rubric evolves. Re-scoring against a newer rubric is always explicit — pinprick never silently re-grades a past scan.

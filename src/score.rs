@@ -14,13 +14,15 @@ use std::process::ExitCode;
 
 use crate::audit::{self, AuditCollector};
 use crate::audit_patterns::FindingKind;
+use crate::audit_source::{self, ActionScanStatus};
+use crate::audited_actions::AuditedActions;
 use crate::auth;
 use crate::config::Config;
 use crate::github::{AdvisoryVulnerability, GitHubClient, GitHubError, SecurityAdvisory};
 use crate::output::AuditFinding;
 use crate::workflow::{self, ActionRef, RefType};
 
-pub const RUBRIC_VERSION: &str = "0.9.0";
+pub const RUBRIC_VERSION: &str = "0.10.0";
 
 // ── Rule catalog ────────────────────────────────────────────────────────────
 
@@ -195,6 +197,22 @@ pub struct ScoreReport {
     pub grade: &'static str,
     pub totals: Totals,
     pub findings: Vec<Finding>,
+    /// Whether every applicable scoring input was evaluated without
+    /// configured suppressions.
+    pub coverage_complete: bool,
+    /// Reasons the score has partial coverage.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub coverage_notes: Vec<String>,
+}
+
+impl ScoreReport {
+    fn mark_coverage_incomplete(&mut self, note: impl Into<String>) {
+        self.coverage_complete = false;
+        let note = note.into();
+        if !self.coverage_notes.contains(&note) {
+            self.coverage_notes.push(note);
+        }
+    }
 }
 
 // ── Scoring ─────────────────────────────────────────────────────────────────
@@ -209,8 +227,7 @@ pub fn grade_for(score: u32) -> &'static str {
     }
 }
 
-/// What the active config file changed about the score — used to surface a
-/// notice when the scanned repo's own `.pinprick.toml` shaped its own grade.
+/// What the active config file excluded from the score.
 #[derive(Default)]
 pub struct ConfigImpact {
     /// Runtime findings dropped via `ignore.patterns`.
@@ -219,6 +236,8 @@ pub struct ConfigImpact {
     pub trusted_host_fetches: usize,
     /// Runtime fetches exempted via the configured `extra-data-formats` list.
     pub extra_data_format_fetches: usize,
+    /// Remote actions skipped from runtime-source scoring via `ignore.actions`.
+    pub remote_actions_ignored: usize,
 }
 
 /// Collect findings across all workflows, dedupe by rule + target, and roll
@@ -356,6 +375,8 @@ pub fn score_repo(repo_root: &Path, config: &Config) -> Result<(ScoreReport, Con
             unique_actions: unique_actions.len(),
         },
         findings,
+        coverage_complete: true,
+        coverage_notes: Vec::new(),
     };
     recompute_score(&mut report);
     Ok((report, impact))
@@ -447,9 +468,16 @@ async fn enrich_with_source_archived(
             Ok(archived) => archived,
             Err(e) if is_hard_github_error(&e) => {
                 warn_enrichment_incomplete("source.archived", &e);
+                report.mark_coverage_incomplete(format!("source.archived evaluation stopped: {e}"));
                 return Ok(());
             }
-            Err(_) => false,
+            Err(e) => {
+                warn_enrichment_incomplete("source.archived", &e);
+                report.mark_coverage_incomplete(format!(
+                    "source.archived unavailable for {owner}/{repo}: {e}"
+                ));
+                false
+            }
         };
         archived_cache.insert(key, archived);
     }
@@ -498,7 +526,8 @@ fn archived_findings(
 ///
 /// Tag-pinned and SHA-pinned actions are both eligible. SHAs are resolved
 /// to a tag via the GitHub tags endpoint with bounded pagination; if no
-/// matching tag exists in that bounded window, the action is silently skipped.
+/// matching tag exists in that bounded window, coverage is reported as
+/// incomplete.
 ///
 /// Sliding-tag refs (`@v4`) and branch refs are not version-precise, so
 /// no advisory matching is attempted — those refs already trigger
@@ -547,9 +576,18 @@ async fn enrich_with_source_advisory(
                         Ok(t) => t,
                         Err(e) if is_hard_github_error(&e) => {
                             warn_enrichment_incomplete("source.advisory", &e);
+                            report.mark_coverage_incomplete(format!(
+                                "source.advisory evaluation stopped: {e}"
+                            ));
                             return Ok(());
                         }
-                        Err(_) => None,
+                        Err(e) => {
+                            warn_enrichment_incomplete("source.advisory", &e);
+                            report.mark_coverage_incomplete(format!(
+                                "source.advisory could not resolve {action_ref}: {e}"
+                            ));
+                            None
+                        }
                     };
                     sha_tag_cache.insert(key, tag.clone());
                     tag
@@ -560,6 +598,10 @@ async fn enrich_with_source_advisory(
         };
         if let Some(tag) = resolved {
             action_resolved.insert(action_ref.clone(), (owner.clone(), repo.clone(), tag));
+        } else if *ref_type == RefType::Sha {
+            report.mark_coverage_incomplete(format!(
+                "source.advisory could not map {action_ref} to a version tag"
+            ));
         }
     }
 
@@ -574,14 +616,133 @@ async fn enrich_with_source_advisory(
             Ok(advs) => advs,
             Err(e) if is_hard_github_error(&e) => {
                 warn_enrichment_incomplete("source.advisory", &e);
+                report.mark_coverage_incomplete(format!("source.advisory evaluation stopped: {e}"));
                 return Ok(());
             }
-            Err(_) => Vec::new(),
+            Err(e) => {
+                warn_enrichment_incomplete("source.advisory", &e);
+                report.mark_coverage_incomplete(format!(
+                    "source.advisory unavailable for {owner}/{repo}: {e}"
+                ));
+                Vec::new()
+            }
         };
         advisories.insert(key, advs);
     }
 
     let new_findings = advisory_findings(&action_resolved, &advisories, &occurrences);
+    if !new_findings.is_empty() {
+        report.findings.extend(new_findings);
+        recompute_score(report);
+    }
+    Ok(())
+}
+
+/// Fire `runtime.*` findings from the source of remote actions. Actions
+/// covered by the audited-actions catalog are skipped, as are actions ignored
+/// by configuration. Findings remain anchored to the loading `uses:` line;
+/// the fetched source location is carried in `details`.
+async fn enrich_with_remote_runtime(
+    report: &mut ScoreReport,
+    repo_root: &Path,
+    client: &GitHubClient,
+    config: &Config,
+    impact: &mut ConfigImpact,
+) -> Result<()> {
+    let files = workflow::find_workflows(repo_root)?;
+    let mut occurrences: BTreeMap<String, Vec<Occurrence>> = BTreeMap::new();
+    let mut actions: BTreeMap<String, workflow::ActionRef> = BTreeMap::new();
+
+    for file in &files {
+        let display = workflow::display_path(file.path(), repo_root);
+        let content = workflow::read_workflow(file)?;
+        for action in workflow::scan_content(&content) {
+            let action_ref = format!("{}@{}", action.full_name(), action.ref_string);
+            occurrences
+                .entry(action_ref.clone())
+                .or_default()
+                .push(Occurrence {
+                    workflow: display.clone(),
+                    line: action.line_number,
+                });
+            actions.entry(action_ref).or_insert(action);
+        }
+    }
+
+    let mut audited = AuditedActions::new(config.fetch_remote);
+    let mut new_findings = Vec::new();
+
+    for (action_ref, action) in &actions {
+        if config.is_action_ignored(&action.owner_repo()) {
+            impact.remote_actions_ignored += 1;
+            continue;
+        }
+        if audited
+            .check(
+                &action.owner,
+                &action.repo,
+                action.subpath.as_deref(),
+                &action.ref_string,
+            )
+            .await
+            .is_some()
+        {
+            continue;
+        }
+
+        let mut collector = AuditCollector::new(false);
+        match audit_source::scan_action_source(client, action, &mut collector, config).await {
+            Ok(ActionScanStatus::Complete) => {}
+            Ok(ActionScanStatus::Incomplete) => {
+                report.mark_coverage_incomplete(format!(
+                    "remote source scan incomplete for {action_ref}"
+                ));
+            }
+            Err(e) if is_hard_github_error(&e) => {
+                warn_enrichment_incomplete("runtime (remote action source)", &e);
+                report.mark_coverage_incomplete(format!(
+                    "remote source scan stopped at {action_ref}: {e}"
+                ));
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!(
+                    "warning: could not scan {} for runtime scoring: {e}",
+                    action.full_name()
+                );
+                report.mark_coverage_incomplete(format!(
+                    "remote source scan failed for {action_ref}: {e}"
+                ));
+                continue;
+            }
+        }
+
+        let mut occs = occurrences.get(action_ref).cloned().unwrap_or_default();
+        occs.sort_by(|a, b| a.workflow.cmp(&b.workflow).then(a.line.cmp(&b.line)));
+
+        for finding in collector.findings {
+            if config.is_pattern_ignored(&finding.description) {
+                impact.findings_suppressed += 1;
+                continue;
+            }
+            let rule = runtime_rule_for(&finding);
+            let location = match finding.line {
+                Some(line) => format!("{}:{line}", finding.source_file),
+                None => finding.source_file.clone(),
+            };
+            new_findings.push(Finding {
+                id: rule.id(),
+                category: rule.category(),
+                severity: rule.severity(),
+                points: rule.points(),
+                action_ref: Some(action_ref.clone()),
+                occurrences: occs.clone(),
+                remediation: rule.remediation(),
+                details: Some(format!("{location} — {}", finding.description)),
+            });
+        }
+    }
+
     if !new_findings.is_empty() {
         report.findings.extend(new_findings);
         recompute_score(report);
@@ -808,53 +969,79 @@ fn trigger_present(on: &Value, name: &str) -> bool {
     }
 }
 
+fn has_remote_actions(repo_root: &Path) -> Result<bool> {
+    for file in workflow::find_workflows(repo_root)? {
+        let content = workflow::read_workflow(&file)?;
+        if !workflow::scan_content(&content).is_empty() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 // ── CLI entry point ─────────────────────────────────────────────────────────
 
 pub async fn run(
     repo_root: &Path,
     json: bool,
     html: bool,
+    badge: bool,
     no_repo_config: bool,
 ) -> Result<ExitCode> {
     let config = Config::load(repo_root, !no_repo_config);
-    let (mut report, impact) = score_repo(repo_root, &config)?;
+    let (mut report, mut impact) = score_repo(repo_root, &config)?;
 
-    // When scoring a repo you don't control, its own .pinprick.toml must not
-    // silently inflate its own grade — say what it changed and how to opt out.
-    if config.is_repo_local() {
-        let mut parts = Vec::new();
-        if impact.findings_suppressed > 0 {
-            parts.push(format!(
-                "runtime findings suppressed: {}",
-                impact.findings_suppressed
-            ));
-        }
-        if impact.trusted_host_fetches > 0 {
-            parts.push(format!(
-                "trusted-host fetches: {}",
-                impact.trusted_host_fetches
-            ));
-        }
-        if impact.extra_data_format_fetches > 0 {
-            parts.push(format!(
-                "extra-data-format fetches: {}",
-                impact.extra_data_format_fetches
-            ));
-        }
-        if !parts.is_empty() {
-            eprintln!(
-                "note: the scanned repo's .pinprick.toml affected the score ({}) — rerun with --no-repo-config to ignore it",
-                parts.join(", ")
-            );
-        }
-    }
-
-    // Rules that need the GitHub API run after the offline scan. Without a
-    // token we silently skip them — same behavior as `audit`.
+    // Rules that need the GitHub API run after the offline scan. A report
+    // remains usable without a token, but its coverage must say so.
     if let Some(token) = auth::resolve_token().await {
         let client = GitHubClient::new(token);
         enrich_with_source_archived(&mut report, repo_root, &client).await?;
         enrich_with_source_advisory(&mut report, repo_root, &client).await?;
+        enrich_with_remote_runtime(&mut report, repo_root, &client, &config, &mut impact).await?;
+    } else if has_remote_actions(repo_root)? {
+        report.mark_coverage_incomplete(
+            "GitHub token unavailable; remote action source and token-gated source rules were not evaluated",
+        );
+    }
+
+    let mut config_impact = Vec::new();
+    if impact.findings_suppressed > 0 {
+        config_impact.push(format!(
+            "runtime findings suppressed: {}",
+            impact.findings_suppressed
+        ));
+    }
+    if impact.trusted_host_fetches > 0 {
+        config_impact.push(format!(
+            "trusted-host fetches: {}",
+            impact.trusted_host_fetches
+        ));
+    }
+    if impact.extra_data_format_fetches > 0 {
+        config_impact.push(format!(
+            "extra-data-format fetches: {}",
+            impact.extra_data_format_fetches
+        ));
+    }
+    if impact.remote_actions_ignored > 0 {
+        config_impact.push(format!(
+            "remote actions skipped: {}",
+            impact.remote_actions_ignored
+        ));
+    }
+    if !config_impact.is_empty() {
+        report.mark_coverage_incomplete(format!(
+            "configuration affected coverage: {}",
+            config_impact.join(", ")
+        ));
+        // A target-controlled config is the dangerous case for third-party
+        // scoring, so keep its explicit stderr notice and opt-out guidance.
+        if config.is_repo_local() {
+            eprintln!(
+                "note: the scanned repo's .pinprick.toml affected the score ({}) — rerun with --no-repo-config to ignore it",
+                config_impact.join(", ")
+            );
+        }
     }
 
     if json {
@@ -863,6 +1050,8 @@ pub async fn run(
         // render_html terminates its output with a newline already;
         // `print!` avoids a spurious trailing blank line.
         print!("{}", render_html(&report));
+    } else if badge {
+        println!("{}", render_badge(&report));
     } else {
         print_human(&report);
     }
@@ -895,6 +1084,17 @@ fn print_human(report: &ScoreReport) {
         report.score.to_string().bold()
     );
     println!();
+
+    if !report.coverage_complete {
+        println!("  {}", "Coverage: incomplete".yellow().bold());
+        for note in &report.coverage_notes {
+            println!(
+                "    - {}",
+                crate::output::sanitize_for_terminal(note).dimmed()
+            );
+        }
+        println!();
+    }
 
     if report.findings.is_empty() {
         println!("  {}", "No findings.".green());
@@ -933,6 +1133,36 @@ fn print_human(report: &ScoreReport) {
     println!("  Run with {} for the full report.", "--json".bold());
 }
 
+/// Render a [shields.io endpoint badge](https://shields.io/badges/endpoint-badge)
+/// JSON document so a repo can put its grade in a README: serve (or commit)
+/// the output and point `img.shields.io/endpoint?url=…` at it.
+fn render_badge(report: &ScoreReport) -> String {
+    let color = if report.coverage_complete {
+        match report.grade {
+            "A" => "brightgreen",
+            "B" => "green",
+            "C" => "yellow",
+            "D" => "orange",
+            _ => "red",
+        }
+    } else {
+        "lightgrey"
+    };
+    let message = if report.coverage_complete {
+        format!("{} ({}/100)", report.grade, report.score)
+    } else {
+        format!("incomplete ({} {}/100)", report.grade, report.score)
+    };
+    serde_json::json!({
+        "schemaVersion": 1,
+        "label": "pinprick",
+        "message": message,
+        "color": color,
+        "isError": !report.coverage_complete,
+    })
+    .to_string()
+}
+
 fn color_for_grade(grade: &str) -> (colored::ColoredString, &'static str) {
     match grade {
         "A" => (grade.green().bold(), "green"),
@@ -953,7 +1183,7 @@ fn severity_label(s: Severity) -> colored::ColoredString {
 
 // ── HTML rendering ──────────────────────────────────────────────────────────
 
-const HTML_CSS: &str = r#":root{--bg:#0f1419;--fg:#e6edf3;--muted:#7d8590;--accent:#58a6ff;--border:#30363d;--a:#2da44e;--b:#7eb36a;--c:#d29922;--d:#f0883e;--f:#da3633}*{box-sizing:border-box}body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;background:var(--bg);color:var(--fg);line-height:1.5}.container{max-width:960px;margin:0 auto;padding:2rem 1.5rem}.header{display:flex;align-items:baseline;gap:1rem;margin-bottom:1.5rem;flex-wrap:wrap}.title{font-size:1.5rem;font-weight:600}.version{color:var(--muted);font-size:.875rem;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}.grade-banner{display:flex;align-items:center;gap:2rem;padding:2rem;border-radius:12px;border:1px solid var(--border);background:rgba(255,255,255,.02);margin-bottom:2rem;flex-wrap:wrap}.grade{font-size:5rem;font-weight:700;line-height:1}.grade-A{color:var(--a)}.grade-B{color:var(--b)}.grade-C{color:var(--c)}.grade-D{color:var(--d)}.grade-F{color:var(--f)}.score-number{font-size:2.25rem;font-weight:500}.totals{color:var(--muted);font-size:.875rem;margin-top:.25rem}.no-findings{text-align:center;padding:3rem 1rem;color:var(--muted);font-size:1rem}h2{font-size:1.125rem;margin:2rem 0 .5rem;border-bottom:1px solid var(--border);padding-bottom:.5rem}.finding{padding:1rem 0;border-bottom:1px solid var(--border)}.finding:last-child{border-bottom:none}.finding-header{display:flex;align-items:baseline;gap:.75rem;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.875rem;flex-wrap:wrap}.severity{font-size:.6875rem;text-transform:uppercase;padding:.15rem .5rem;border-radius:4px;letter-spacing:.03em;font-family:-apple-system,system-ui,sans-serif;font-weight:600}.severity-high{background:rgba(218,54,51,.15);color:var(--f)}.severity-medium{background:rgba(210,153,34,.15);color:var(--c)}.severity-low{background:rgba(125,133,144,.15);color:var(--muted)}.points{color:var(--muted);min-width:2.5rem}.rule-id{color:var(--accent)}.target{color:var(--muted);word-break:break-all}.remediation{margin-top:.5rem;font-size:.9375rem}.occurrences{margin:.5rem 0 0;padding:0 0 0 1.25rem;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.8125rem;color:var(--muted)}.occurrences li{margin:.125rem 0}.footer{margin-top:3rem;padding-top:1rem;border-top:1px solid var(--border);color:var(--muted);font-size:.8125rem}a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}"#;
+const HTML_CSS: &str = r#":root{--bg:#0f1419;--fg:#e6edf3;--muted:#7d8590;--accent:#58a6ff;--border:#30363d;--a:#2da44e;--b:#7eb36a;--c:#d29922;--d:#f0883e;--f:#da3633}*{box-sizing:border-box}body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;background:var(--bg);color:var(--fg);line-height:1.5}.container{max-width:960px;margin:0 auto;padding:2rem 1.5rem}.header{display:flex;align-items:baseline;gap:1rem;margin-bottom:1.5rem;flex-wrap:wrap}.title{font-size:1.5rem;font-weight:600}.version{color:var(--muted);font-size:.875rem;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}.grade-banner{display:flex;align-items:center;gap:2rem;padding:2rem;border-radius:12px;border:1px solid var(--border);background:rgba(255,255,255,.02);margin-bottom:2rem;flex-wrap:wrap}.grade{font-size:5rem;font-weight:700;line-height:1}.grade-A{color:var(--a)}.grade-B{color:var(--b)}.grade-C{color:var(--c)}.grade-D{color:var(--d)}.grade-F{color:var(--f)}.score-number{font-size:2.25rem;font-weight:500}.totals{color:var(--muted);font-size:.875rem;margin-top:.25rem}.coverage-warning{border:1px solid var(--c);background:rgba(210,153,34,.1);padding:1rem 1.25rem;border-radius:8px;margin-bottom:2rem}.coverage-warning strong{color:var(--c)}.coverage-warning ul{margin:.5rem 0 0;padding-left:1.25rem}.no-findings{text-align:center;padding:3rem 1rem;color:var(--muted);font-size:1rem}h2{font-size:1.125rem;margin:2rem 0 .5rem;border-bottom:1px solid var(--border);padding-bottom:.5rem}.finding{padding:1rem 0;border-bottom:1px solid var(--border)}.finding:last-child{border-bottom:none}.finding-header{display:flex;align-items:baseline;gap:.75rem;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.875rem;flex-wrap:wrap}.severity{font-size:.6875rem;text-transform:uppercase;padding:.15rem .5rem;border-radius:4px;letter-spacing:.03em;font-family:-apple-system,system-ui,sans-serif;font-weight:600}.severity-high{background:rgba(218,54,51,.15);color:var(--f)}.severity-medium{background:rgba(210,153,34,.15);color:var(--c)}.severity-low{background:rgba(125,133,144,.15);color:var(--muted)}.points{color:var(--muted);min-width:2.5rem}.rule-id{color:var(--accent)}.target{color:var(--muted);word-break:break-all}.remediation{margin-top:.5rem;font-size:.9375rem}.occurrences{margin:.5rem 0 0;padding:0 0 0 1.25rem;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.8125rem;color:var(--muted)}.occurrences li{margin:.125rem 0}.footer{margin-top:3rem;padding-top:1rem;border-top:1px solid var(--border);color:var(--muted);font-size:.8125rem}a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}"#;
 
 fn escape_html(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -1006,6 +1236,14 @@ pub fn render_html(report: &ScoreReport) -> String {
         report.totals.unique_actions,
         report.totals.findings
     ));
+
+    if !report.coverage_complete {
+        out.push_str("<div class=\"coverage-warning\"><strong>Coverage incomplete</strong><ul>");
+        for note in &report.coverage_notes {
+            out.push_str(&format!("<li>{}</li>", escape_html(note)));
+        }
+        out.push_str("</ul></div>\n");
+    }
 
     // Findings
     if report.findings.is_empty() {
@@ -1601,6 +1839,8 @@ jobs:
             },
             score: 100,
             grade: "A",
+            coverage_complete: true,
+            coverage_notes: vec![],
             totals: Totals {
                 points_deducted: 0,
                 findings: 0,
@@ -1974,6 +2214,8 @@ jobs:
             },
             score: 100,
             grade: "A",
+            coverage_complete: true,
+            coverage_notes: vec![],
             totals: Totals {
                 points_deducted: 0,
                 findings: 0,
@@ -2034,6 +2276,8 @@ jobs:
             },
             score: 100,
             grade: "A",
+            coverage_complete: true,
+            coverage_notes: vec![],
             totals: Totals {
                 points_deducted: 0,
                 findings: 0,
@@ -2049,6 +2293,21 @@ jobs:
         assert!(html.contains("No findings"));
         assert!(html.contains("3 workflows scanned"));
         assert!(html.ends_with("</html>\n"));
+
+        let badge: serde_json::Value = serde_json::from_str(&render_badge(&report)).unwrap();
+        assert_eq!(badge["message"], "A (100/100)");
+        assert_eq!(badge["color"], "brightgreen");
+        assert_eq!(badge["isError"], false);
+
+        let mut incomplete = report.clone();
+        incomplete.mark_coverage_incomplete("remote <source> was not fully scanned");
+        let html = render_html(&incomplete);
+        assert!(html.contains("Coverage incomplete"));
+        assert!(html.contains("remote &lt;source&gt; was not fully scanned"));
+        let badge: serde_json::Value = serde_json::from_str(&render_badge(&incomplete)).unwrap();
+        assert_eq!(badge["message"], "incomplete (A 100/100)");
+        assert_eq!(badge["color"], "lightgrey");
+        assert_eq!(badge["isError"], true);
     }
 
     #[test]
@@ -2062,6 +2321,8 @@ jobs:
             },
             score: 80,
             grade: "B",
+            coverage_complete: true,
+            coverage_notes: vec![],
             totals: Totals {
                 points_deducted: 20,
                 findings: 1,
@@ -2115,6 +2376,8 @@ jobs:
             },
             score: 98,
             grade: "A",
+            coverage_complete: true,
+            coverage_notes: vec![],
             totals: Totals {
                 points_deducted: 2,
                 findings: 1,
@@ -2156,6 +2419,8 @@ jobs:
             },
             score: 100,
             grade: "A",
+            coverage_complete: true,
+            coverage_notes: vec![],
             totals: Totals {
                 points_deducted: 0,
                 findings: 0,
@@ -2175,6 +2440,8 @@ jobs:
             },
             score: 55,
             grade: "F",
+            coverage_complete: true,
+            coverage_notes: vec![],
             totals: Totals {
                 points_deducted: 45,
                 findings: 3,
@@ -2316,6 +2583,31 @@ jobs:
         }
 
         #[tokio::test]
+        async fn source_advisory_marks_unmapped_sha_as_incomplete() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let mut report = base_report(dir.path());
+
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/repos/o/r/tags"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+                .mount(&server)
+                .await;
+            let client = GitHubClient::with_base("t".into(), server.uri());
+
+            enrich_with_source_advisory(&mut report, dir.path(), &client)
+                .await
+                .unwrap();
+            assert!(!report.coverage_complete);
+            assert!(
+                report
+                    .coverage_notes
+                    .iter()
+                    .any(|note| note.contains("could not map o/r@"))
+            );
+        }
+
+        #[tokio::test]
         async fn source_advisory_skips_when_package_does_not_match() {
             let dir = tempfile::TempDir::new().unwrap();
             let mut report = base_report(dir.path());
@@ -2355,6 +2647,150 @@ jobs:
                 .await
                 .unwrap();
             assert!(!report.findings.iter().any(|f| f.id == "source.advisory"));
+        }
+
+        #[tokio::test]
+        async fn remote_action_source_findings_are_scored() {
+            const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path(format!("/repos/scoretest/action/git/trees/{SHA}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "tree": [{ "path": "action.yml", "type": "blob" }]
+                })))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/repos/scoretest/action/contents/action.yml"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(
+                    "name: t\nruns:\n  using: composite\n  steps:\n    - run: curl -fsSL https://example.com/install.sh | bash\n      shell: bash\n",
+                ))
+                .mount(&server)
+                .await;
+
+            let dir = tempfile::TempDir::new().unwrap();
+            let workflows = dir.path().join(".github").join("workflows");
+            std::fs::create_dir_all(&workflows).unwrap();
+            std::fs::write(
+                workflows.join("ci.yml"),
+                format!(
+                    "jobs:\n  test:\n    steps:\n      - uses: scoretest/action@{SHA} # v1.0.0\n"
+                ),
+            )
+            .unwrap();
+
+            let config = Config::default();
+            let (mut report, mut impact) = score_repo(dir.path(), &config).unwrap();
+            let client = GitHubClient::with_base("t".into(), server.uri());
+            enrich_with_remote_runtime(&mut report, dir.path(), &client, &config, &mut impact)
+                .await
+                .unwrap();
+
+            assert_eq!(report.findings.len(), 1);
+            let finding = &report.findings[0];
+            assert_eq!(finding.id, "runtime.pipe_to_shell");
+            assert_eq!(finding.points, 20);
+            assert_eq!(
+                finding.action_ref.as_deref(),
+                Some(&*format!("scoretest/action@{SHA}"))
+            );
+            assert_eq!(finding.occurrences[0].workflow, ".github/workflows/ci.yml");
+            assert_eq!(finding.occurrences[0].line, 4);
+            let details = finding.details.as_deref().unwrap();
+            assert!(details.contains("action.yml"), "details: {details}");
+            assert!(details.contains("piped to shell"), "details: {details}");
+            assert_eq!(report.score, 80);
+            assert!(report.coverage_complete);
+        }
+
+        #[tokio::test]
+        async fn incomplete_remote_source_scan_marks_report_coverage() {
+            const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path(format!("/repos/scoretest/partial/git/trees/{SHA}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "tree": [
+                        { "path": "action.yml", "type": "blob" },
+                        { "path": "dist/index.js", "type": "blob" }
+                    ]
+                })))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/repos/scoretest/partial/contents/action.yml"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_string(
+                        "name: t\nruns:\n  using: node20\n  main: dist/index.js\n",
+                    ),
+                )
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/repos/scoretest/partial/contents/dist/index.js"))
+                .respond_with(ResponseTemplate::new(500))
+                .mount(&server)
+                .await;
+
+            let dir = tempfile::TempDir::new().unwrap();
+            let workflows = dir.path().join(".github").join("workflows");
+            std::fs::create_dir_all(&workflows).unwrap();
+            std::fs::write(
+                workflows.join("ci.yml"),
+                format!(
+                    "jobs:\n  test:\n    steps:\n      - uses: scoretest/partial@{SHA} # v1.0.0\n"
+                ),
+            )
+            .unwrap();
+
+            let config = Config::default();
+            let (mut report, mut impact) = score_repo(dir.path(), &config).unwrap();
+            let client = GitHubClient::with_base("t".into(), server.uri());
+            enrich_with_remote_runtime(&mut report, dir.path(), &client, &config, &mut impact)
+                .await
+                .unwrap();
+
+            assert_eq!(report.score, 100);
+            assert!(!report.coverage_complete);
+            assert!(
+                report
+                    .coverage_notes
+                    .iter()
+                    .any(|note| note.contains("scoretest/partial"))
+            );
+        }
+
+        #[tokio::test]
+        async fn ignored_remote_actions_are_counted_without_fetching() {
+            const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+            let server = MockServer::start().await;
+            let dir = tempfile::TempDir::new().unwrap();
+            let workflows = dir.path().join(".github").join("workflows");
+            std::fs::create_dir_all(&workflows).unwrap();
+            std::fs::write(
+                workflows.join("ci.yml"),
+                format!(
+                    "jobs:\n  test:\n    steps:\n      - uses: scoretest/ignored@{SHA} # v1.0.0\n"
+                ),
+            )
+            .unwrap();
+
+            let config = Config {
+                ignore: crate::config::IgnoreConfig {
+                    actions: vec!["scoretest/ignored".to_string()],
+                    patterns: vec![],
+                },
+                ..Config::default()
+            };
+            let (mut report, mut impact) = score_repo(dir.path(), &config).unwrap();
+            let client = GitHubClient::with_base("t".into(), server.uri());
+            enrich_with_remote_runtime(&mut report, dir.path(), &client, &config, &mut impact)
+                .await
+                .unwrap();
+
+            assert!(report.findings.is_empty());
+            assert_eq!(impact.remote_actions_ignored, 1);
+            assert!(server.received_requests().await.unwrap().is_empty());
         }
     }
 }

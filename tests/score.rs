@@ -124,9 +124,17 @@ fn json_output_shape() {
     assert_eq!(output.status.code(), Some(1));
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
 
-    assert_eq!(json["rubric_version"], "0.9.0");
+    assert_eq!(json["rubric_version"], "0.10.0");
     assert_eq!(json["grade"], "A");
     assert_eq!(json["score"], 95);
+    assert_eq!(json["coverage_complete"], false);
+    assert!(
+        json["coverage_notes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|note| note.as_str().unwrap().contains("GitHub token unavailable"))
+    );
     assert_eq!(json["totals"]["findings"], 1);
     assert_eq!(json["totals"]["workflows_scanned"], 1);
     assert_eq!(json["findings"][0]["id"], "pin.sliding");
@@ -327,8 +335,68 @@ fn html_output_contains_expected_markers() {
     assert!(html.contains("<title>pinprick score report</title>"));
     assert!(html.contains("grade-A"));
     assert!(html.contains("95 / 100"));
+    assert!(html.contains("Coverage incomplete"));
     assert!(html.contains("pin.sliding"));
     assert!(html.contains("actions/checkout@v4"));
     assert!(html.contains("pinprick.rs"));
     assert!(html.ends_with("</html>\n"));
+}
+
+#[test]
+fn badge_output_is_shields_endpoint_json() {
+    let dir = common::repo_with_workflow("ci.yml", common::WORKFLOW_CLEAN);
+    let output = common::pinprick_cmd()
+        .arg("score")
+        .arg("--badge")
+        .arg(dir.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["schemaVersion"], 1);
+    assert_eq!(json["label"], "pinprick");
+    assert_eq!(json["message"], "incomplete (A 100/100)");
+    assert_eq!(json["color"], "lightgrey");
+    assert_eq!(json["isError"], true);
+}
+
+#[test]
+fn badge_reflects_deductions_and_exits_one() {
+    let dir = common::repo_with_workflow("ci.yml", WORKFLOW_UNPINNED_SLIDING);
+    let output = common::pinprick_cmd()
+        .arg("score")
+        .arg("--badge")
+        .arg(dir.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["message"], "incomplete (A 95/100)");
+    assert_eq!(json["isError"], true);
+}
+
+#[test]
+fn badge_conflicts_with_json_and_html() {
+    let dir = common::repo_with_workflow("ci.yml", common::WORKFLOW_CLEAN);
+    common::pinprick_cmd()
+        .arg("--json")
+        .arg("score")
+        .arg("--badge")
+        .arg(dir.path())
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("cannot be combined with --json"));
+
+    common::pinprick_cmd()
+        .arg("score")
+        .arg("--badge")
+        .arg("--html")
+        .arg(dir.path())
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains(
+            "--badge cannot be combined with --html",
+        ));
 }
