@@ -2,9 +2,48 @@ use minisign_verify::{PublicKey, Signature};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const BUNDLED_JSON: &str = include_str!(concat!(env!("OUT_DIR"), "/bundled_audited_actions.json"));
 const REMOTE_URL: &str = "https://pinprick.rs/audited-actions";
+
+/// Reject a remote catalog whose signed `timestamp:` trusted comment is older
+/// than this. The site re-signs every catalog file on each deploy, and deploys
+/// fire on every main push touching `site/**`, `audited-actions/**`, or
+/// `Cargo.toml` (weekly catalog PRs, dependency bumps, releases), so
+/// production signatures refresh far more often than monthly. A signature
+/// past this window therefore strongly suggests a replayed, superseded
+/// catalog; the cost of a false positive is only a warning and a fresh scan.
+const MAX_REMOTE_CATALOG_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
+/// Tolerated clock skew for a signed timestamp that sits in the future.
+/// Deploy runners and clients are NTP-synced, so minutes cover legitimate
+/// drift; anything beyond is a signing-system clock fault or a forged
+/// far-future timestamp — which would otherwise stay "fresh" until
+/// `timestamp + MAX_REMOTE_CATALOG_AGE` and defeat the replay window.
+const MAX_CLOCK_SKEW: Duration = Duration::from_secs(10 * 60);
+
+/// Freshness verdict for a signed catalog timestamp.
+#[derive(Debug, PartialEq, Eq)]
+enum CatalogFreshness {
+    Fresh,
+    /// Older than [`MAX_REMOTE_CATALOG_AGE`] — a superseded catalog being
+    /// replayed, or serving infrastructure gone stale.
+    Stale,
+    /// More than [`MAX_CLOCK_SKEW`] in the future — never legitimate, since
+    /// a real signature cannot predate its own signing by more than drift.
+    FutureDated,
+}
+
+fn catalog_freshness(signed_at: u64, now: u64) -> CatalogFreshness {
+    if signed_at > now + MAX_CLOCK_SKEW.as_secs() {
+        CatalogFreshness::FutureDated
+    } else if now.saturating_sub(signed_at) > MAX_REMOTE_CATALOG_AGE.as_secs() {
+        CatalogFreshness::Stale
+    } else {
+        CatalogFreshness::Fresh
+    }
+}
 
 /// Minisign public key for the remote catalog, committed at the repo root and
 /// embedded at compile time. The remote layer is fail-closed: without a valid
@@ -244,11 +283,46 @@ impl AuditedActions {
             }
         };
         let sig_text = String::from_utf8_lossy(&sig_bytes);
-        if !verify_catalog_signature(key, &bytes, &sig_text) {
+        let Some(trusted_comment) = verify_catalog_signature(key, &bytes, &sig_text) else {
             eprintln!(
                 "warning: remote catalog for {action_key} failed signature verification — ignoring it"
             );
             return None;
+        };
+
+        // Anti-replay: minisign's default trusted comment carries the signing
+        // time (`timestamp:<epoch>`), and the verified global signature covers
+        // it. A CDN (or a MITM on a downgraded path) could otherwise serve a
+        // validly signed but superseded catalog forever — keeping an entry
+        // vouched-for after its audit was found wrong and it was removed.
+        // A missing timestamp cannot satisfy the replay bound. Accepting it
+        // would turn a valid signature into an indefinitely reusable verdict.
+        let Some(signed_at) = trusted_comment_timestamp(&trusted_comment) else {
+            eprintln!(
+                "warning: remote catalog for {action_key} has no signed timestamp — ignoring it"
+            );
+            return None;
+        };
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        match catalog_freshness(signed_at, now) {
+            CatalogFreshness::Fresh => {}
+            CatalogFreshness::Stale => {
+                eprintln!(
+                    "warning: remote catalog for {action_key} was signed more than {} days ago — ignoring it (possible replay of a superseded catalog)",
+                    MAX_REMOTE_CATALOG_AGE.as_secs() / 86_400
+                );
+                return None;
+            }
+            CatalogFreshness::FutureDated => {
+                eprintln!(
+                    "warning: remote catalog for {action_key} claims to be signed more than {} minutes in the future — ignoring it (check the signing system's clock; if your own clock is correct this may indicate a compromised or faulty signer)",
+                    MAX_CLOCK_SKEW.as_secs() / 60
+                );
+                return None;
+            }
         }
 
         Some(parse_entries(&String::from_utf8_lossy(&bytes)))
@@ -291,12 +365,27 @@ fn parse_catalog_key(content: &str) -> Option<PublicKey> {
     PublicKey::from_base64(line).ok()
 }
 
-fn verify_catalog_signature(key: &PublicKey, data: &[u8], sig_text: &str) -> bool {
-    match Signature::decode(sig_text) {
-        // true: also accept legacy (non-prehashed) signatures.
-        Ok(sig) => key.verify(data, &sig, true).is_ok(),
-        Err(_) => false,
-    }
+/// Verify `sig_text` over `data`. On success, returns the signature's trusted
+/// comment — which is authenticated: minisign's global signature covers the
+/// signature bytes plus the trusted comment, and `verify` checks it.
+///
+/// `allow_legacy` is `false`: the project controls the only signer (the
+/// deploy pipeline signs prehashed — enforced with `minisign -SH`), so
+/// legacy non-prehashed signatures are refused outright.
+fn verify_catalog_signature(key: &PublicKey, data: &[u8], sig_text: &str) -> Option<String> {
+    let sig = Signature::decode(sig_text).ok()?;
+    key.verify(data, &sig, false).ok()?;
+    Some(sig.trusted_comment().to_string())
+}
+
+/// Extract the `timestamp:<epoch seconds>` token that minisign embeds in its
+/// default trusted comment (`timestamp:1700000000\tfile:…\thashed`).
+/// `None` when the comment carries no parsable token.
+fn trusted_comment_timestamp(comment: &str) -> Option<u64> {
+    comment
+        .split(['\t', ' '])
+        .find_map(|token| token.strip_prefix("timestamp:"))
+        .and_then(|value| value.parse().ok())
 }
 
 fn load_bundled() -> HashMap<String, HashSet<String>> {
@@ -663,6 +752,177 @@ mod tests {
                 .respond_with(ResponseTemplate::new(200).set_body_string(sig.to_string()))
                 .mount(server)
                 .await;
+        }
+
+        /// Like `test_identity`, but the signer takes an explicit trusted
+        /// comment — for forging old or odd `timestamp:` tokens.
+        fn test_identity_with_trusted_comment() -> (PublicKey, impl Fn(&[u8], &str) -> String) {
+            let minisign::KeyPair { pk, sk } =
+                minisign::KeyPair::generate_unencrypted_keypair().unwrap();
+            let verify_key = parse_catalog_key(&pk.to_box().unwrap().to_string())
+                .expect("generated public key must parse");
+            let signer = move |data: &[u8], trusted: &str| {
+                minisign::sign(None, &sk, std::io::Cursor::new(data), Some(trusted), None)
+                    .unwrap()
+                    .to_string()
+            };
+            (verify_key, signer)
+        }
+
+        fn now_epoch() -> u64 {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+        }
+
+        #[test]
+        fn catalog_freshness_boundaries() {
+            let now = 2_000_000_000u64;
+            let skew = MAX_CLOCK_SKEW.as_secs();
+            let max_age = MAX_REMOTE_CATALOG_AGE.as_secs();
+
+            assert_eq!(catalog_freshness(now, now), CatalogFreshness::Fresh);
+            // Future timestamps: fresh up to exactly the skew bound, rejected
+            // one second past it — a far-future timestamp must not buy an
+            // extended replay window.
+            assert_eq!(catalog_freshness(now + skew, now), CatalogFreshness::Fresh);
+            assert_eq!(
+                catalog_freshness(now + skew + 1, now),
+                CatalogFreshness::FutureDated
+            );
+            assert_eq!(
+                catalog_freshness(now + max_age, now),
+                CatalogFreshness::FutureDated
+            );
+            // Past timestamps: fresh up to exactly the staleness window,
+            // rejected one second past it.
+            assert_eq!(
+                catalog_freshness(now - max_age, now),
+                CatalogFreshness::Fresh
+            );
+            assert_eq!(
+                catalog_freshness(now - max_age - 1, now),
+                CatalogFreshness::Stale
+            );
+            assert_eq!(catalog_freshness(0, now), CatalogFreshness::Stale);
+        }
+
+        #[test]
+        fn trusted_comment_timestamp_parses_minisign_default_format() {
+            assert_eq!(
+                trusted_comment_timestamp("timestamp:1700000000\tfile:x.json\thashed"),
+                Some(1_700_000_000)
+            );
+            assert_eq!(
+                trusted_comment_timestamp("timestamp:1700000000"),
+                Some(1_700_000_000)
+            );
+            // Space-separated variants and no-token comments.
+            assert_eq!(
+                trusted_comment_timestamp("file:x.json timestamp:42"),
+                Some(42)
+            );
+            assert_eq!(trusted_comment_timestamp("no clock here"), None);
+            assert_eq!(trusted_comment_timestamp("timestamp:not-a-number"), None);
+            assert_eq!(trusted_comment_timestamp(""), None);
+        }
+
+        #[tokio::test]
+        async fn fetch_remote_list_stale_signature_is_rejected() {
+            // A validly signed catalog whose signed timestamp is past the
+            // freshness window must be ignored — that is the replay defense:
+            // an old signature stays valid forever, but not fresh forever.
+            let (key, sign) = test_identity_with_trusted_comment();
+            let body = serde_json::to_string(&json!([{ "sha": "aaa", "tag": "v1" }])).unwrap();
+            let stale = now_epoch() - MAX_REMOTE_CATALOG_AGE.as_secs() - 86_400;
+            let sig = sign(
+                body.as_bytes(),
+                &format!("timestamp:{stale}\tfile:replayed.json\thashed"),
+            );
+
+            let server = MockServer::start().await;
+            mount_signed(&server, "actions/replayed", &body, &sig).await;
+
+            let mut aa = AuditedActions::new(true);
+            aa.catalog_key = Some(key);
+            aa.remote_url = server.uri();
+            assert!(aa.fetch_remote_list("actions/replayed").await.is_none());
+        }
+
+        #[tokio::test]
+        async fn fetch_remote_list_fresh_and_within_skew_timestamps_are_accepted() {
+            // Fresh: inside the window. Slightly future: NTP drift, not replay.
+            let (key, sign) = test_identity_with_trusted_comment();
+            let body = serde_json::to_string(&json!([{ "sha": "aaa", "tag": "v1" }])).unwrap();
+
+            let server = MockServer::start().await;
+            for (action_key, timestamp) in [
+                ("actions/fresh", now_epoch() - 60),
+                ("actions/skewed", now_epoch() + MAX_CLOCK_SKEW.as_secs() / 2),
+            ] {
+                let sig = sign(body.as_bytes(), &format!("timestamp:{timestamp}"));
+                mount_signed(&server, action_key, &body, &sig).await;
+            }
+
+            let mut aa = AuditedActions::new(true);
+            aa.catalog_key = Some(key);
+            aa.remote_url = server.uri();
+            assert!(
+                aa.fetch_remote_list("actions/fresh")
+                    .await
+                    .unwrap()
+                    .contains("aaa")
+            );
+            assert!(
+                aa.fetch_remote_list("actions/skewed")
+                    .await
+                    .unwrap()
+                    .contains("aaa")
+            );
+        }
+
+        #[tokio::test]
+        async fn fetch_remote_list_far_future_signature_is_rejected() {
+            // A validly signed catalog claiming to be signed well in the
+            // future must be ignored: it would otherwise stay "fresh" until
+            // its timestamp plus the staleness window, so one signing-clock
+            // fault (or a compromised signer) would grant a CDN an extended
+            // replay horizon for a later-revoked entry.
+            let (key, sign) = test_identity_with_trusted_comment();
+            let body = serde_json::to_string(&json!([{ "sha": "aaa", "tag": "v1" }])).unwrap();
+            let future = now_epoch() + MAX_CLOCK_SKEW.as_secs() + 3_600;
+            let sig = sign(
+                body.as_bytes(),
+                &format!("timestamp:{future}\tfile:fromthefuture.json\thashed"),
+            );
+
+            let server = MockServer::start().await;
+            mount_signed(&server, "actions/fromthefuture", &body, &sig).await;
+
+            let mut aa = AuditedActions::new(true);
+            aa.catalog_key = Some(key);
+            aa.remote_url = server.uri();
+            assert!(
+                aa.fetch_remote_list("actions/fromthefuture")
+                    .await
+                    .is_none()
+            );
+        }
+
+        #[tokio::test]
+        async fn fetch_remote_list_signature_without_timestamp_is_rejected() {
+            let (key, sign) = test_identity_with_trusted_comment();
+            let body = serde_json::to_string(&json!([{ "sha": "aaa", "tag": "v1" }])).unwrap();
+            let sig = sign(body.as_bytes(), "no clock here");
+
+            let server = MockServer::start().await;
+            mount_signed(&server, "actions/untimed", &body, &sig).await;
+
+            let mut aa = AuditedActions::new(true);
+            aa.catalog_key = Some(key);
+            aa.remote_url = server.uri();
+            assert!(aa.fetch_remote_list("actions/untimed").await.is_none());
         }
 
         #[tokio::test]

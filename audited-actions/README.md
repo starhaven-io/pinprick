@@ -52,7 +52,9 @@ Each file is named `{owner}/{repo}.json` and contains an array of audited SHAs w
 These files reach users two ways with different trust anchors:
 
 - **Bundled**: compiled into the pinprick binary at build time — same trust as the binary itself (which ships with build provenance attestations).
-- **Remote** (`https://pinprick.rs/audited-actions/`, opt-in): each served file is signed with [minisign](https://jedisct1.github.io/minisign/) during deploy, and the binary verifies the signature against a public key (`catalog-minisign.pub` at the repo root) embedded at build time. Verification is fail-closed: a missing or invalid signature means the remote entry is ignored and the action is scanned normally. TLS alone is deliberately not trusted — a catalog entry suppresses scanning, so a compromised CDN must not be able to forge one.
+- **Remote** (`https://pinprick.rs/audited-actions/`, opt-in): each served file is signed with [minisign](https://jedisct1.github.io/minisign/) during deploy, and the binary verifies the signature against a public key (`catalog-minisign.pub` at the repo root) embedded at build time. Verification is fail-closed: a missing, invalid, timestamp-less, stale (signed more than 30 days ago, judged by minisign's signed `timestamp:` trusted comment), or future-dated (more than 10 minutes ahead — a far-future timestamp would otherwise extend the replay window) signature means the remote entry is ignored and the action is scanned normally. TLS alone is deliberately not trusted — a catalog entry suppresses scanning, so a compromised CDN must not be able to forge one, nor replay a superseded one indefinitely.
+
+See [SECURITY.md](../SECURITY.md) for key custody and rotation.
 
 ## Contributing
 

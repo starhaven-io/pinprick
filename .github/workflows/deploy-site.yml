@@ -7,6 +7,7 @@ on:
     paths:
       - "site/**"
       - "audited-actions/**"
+      - "catalog-minisign.pub"
       - "Cargo.toml"
   workflow_dispatch:
 
@@ -65,13 +66,26 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq minisign
           KEYFILE="${RUNNER_TEMP}/catalog.key"
+          trap 'rm -f "${KEYFILE}"' EXIT
           printf '%s\n' "${CATALOG_SIGNING_KEY}" > "${KEYFILE}"
+          # -H (prehashed) pins the signature algorithm regardless of the
+          # installed minisign version; pinprick clients require prehashed
+          # signatures. The default trusted comment embeds `timestamp:<epoch>`,
+          # which clients enforce as the anti-replay freshness signal — never
+          # override it with -t.
           find site/dist -path '*audited-actions*' -name '*.json' -print0 \
             | while IFS= read -r -d '' f; do
-                minisign -S -s "${KEYFILE}" -m "${f}" -x "${f}.minisig"
+                minisign -SH -s "${KEYFILE}" -m "${f}" -x "${f}.minisig"
               done
-          rm -f "${KEYFILE}"
-          COUNT=$(find site/dist -name '*.json.minisig' | wc -l)
+          FIRST_SIGNATURE=$(find site/dist -path '*audited-actions*' -name '*.json.minisig' -print -quit)
+          if [[ -z "${FIRST_SIGNATURE}" ]]; then
+            echo "::error::No audited-actions catalog signatures were produced"
+            exit 1
+          fi
+          minisign -Vm "${FIRST_SIGNATURE%.minisig}" \
+            -x "${FIRST_SIGNATURE}" \
+            -p catalog-minisign.pub
+          COUNT=$(find site/dist -path '*audited-actions*' -name '*.json.minisig' | wc -l)
           echo "Signed ${COUNT} catalog files"
 
       - name: Deploy to Cloudflare Workers
