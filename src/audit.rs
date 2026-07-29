@@ -179,6 +179,7 @@ pub async fn run(
     let mut scanned_unpinned_branch = 0usize;
     let mut scanned_unpinned_sliding = 0usize;
     let mut ignored = 0usize;
+    let mut external_skipped: HashSet<String> = HashSet::new();
 
     for file in &files {
         let display_name = workflow::display_path(file.path(), repo_root);
@@ -365,6 +366,13 @@ pub async fn run(
                     }
                 }
             }
+        } else {
+            // No token: external actions are invisible to the scan. Count
+            // them so `--json` consumers see reduced scope instead of a
+            // misleading zero.
+            for action in workflow::scan_content(&content) {
+                external_skipped.insert(remote_action_scan_key(&action));
+            }
         }
     }
 
@@ -427,6 +435,7 @@ pub async fn run(
         scanned_unpinned_branch,
         scanned_unpinned_sliding,
         ignored,
+        external_actions_skipped: external_skipped.len(),
     };
 
     if sarif {

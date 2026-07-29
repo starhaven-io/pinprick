@@ -984,6 +984,49 @@ fn git_clone_versioned_branch_clean() {
     assert!(findings.is_empty());
 }
 
+#[test]
+fn no_token_reports_external_actions_skipped() {
+    let workflow = "\
+name: two-actions
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-node@v4
+";
+    let dir = common::repo_with_workflow("ci.yml", workflow);
+    let output = common::pinprick_cmd()
+        .arg("--json")
+        .arg("audit")
+        .arg(dir.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["had_token"], false);
+    assert_eq!(json["actions_scanned"], 0);
+    // Two unique external actions were invisible to the token-less scan; the
+    // duplicate checkout counts once.
+    assert_eq!(json["external_actions_skipped"], 2);
+}
+
+#[test]
+fn no_token_human_note_counts_skipped_actions() {
+    let dir = common::repo_with_workflow("ci.yml", common::WORKFLOW_CLEAN);
+    common::pinprick_cmd()
+        .arg("audit")
+        .arg(dir.path())
+        .assert()
+        .code(0)
+        .stdout(predicate::str::contains(
+            "no GitHub token — 1 external action not scanned",
+        ));
+}
+
 /// A local action that ships an unrelated `Dockerfile` (an example image, a CI
 /// image, a leftover) must not be audited as if a consumer built it: the
 /// action is a Node action and `runs` never names the file.
