@@ -983,3 +983,81 @@ fn git_clone_versioned_branch_clean() {
     let findings = json["findings"].as_array().unwrap();
     assert!(findings.is_empty());
 }
+
+/// A local action that ships an unrelated `Dockerfile` (an example image, a CI
+/// image, a leftover) must not be audited as if a consumer built it: the
+/// action is a Node action and `runs` never names the file.
+#[test]
+fn node_action_with_unrelated_dockerfile_is_clean() {
+    let dir = common::repo_with_workflow(
+        "ci.yml",
+        "\
+name: local
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: ./.github/actions/mine
+",
+    );
+    let action = dir.path().join(".github/actions/mine");
+    std::fs::create_dir_all(action.join("dist")).unwrap();
+    std::fs::write(
+        action.join("action.yml"),
+        "name: mine\ndescription: node action\nruns:\n  using: node20\n  main: dist/index.js\n",
+    )
+    .unwrap();
+    std::fs::write(action.join("dist/index.js"), "console.log('hi');\n").unwrap();
+    std::fs::write(action.join("Dockerfile"), "FROM alpine\nRUN echo hi\n").unwrap();
+
+    let output = common::pinprick_cmd()
+        .arg("--json")
+        .arg("audit")
+        .arg(dir.path())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(json["findings"].as_array().unwrap().is_empty());
+}
+
+/// The counterpart: when the action really is a container action, the
+/// Dockerfile its `runs.image` names is still scanned.
+#[test]
+fn docker_action_dockerfile_named_by_runs_image_is_scanned() {
+    let dir = common::repo_with_workflow(
+        "ci.yml",
+        "\
+name: local
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: ./.github/actions/mine
+",
+    );
+    let action = dir.path().join(".github/actions/mine");
+    std::fs::create_dir_all(&action).unwrap();
+    std::fs::write(
+        action.join("action.yml"),
+        "name: mine\ndescription: container action\nruns:\n  using: docker\n  image: Dockerfile\n",
+    )
+    .unwrap();
+    std::fs::write(action.join("Dockerfile"), "FROM alpine\nRUN echo hi\n").unwrap();
+
+    let output = common::pinprick_cmd()
+        .arg("--json")
+        .arg("audit")
+        .arg(dir.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let findings = json["findings"].as_array().unwrap();
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0]["category"], "docker_unpinned");
+}
