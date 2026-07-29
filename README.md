@@ -199,7 +199,7 @@ pinprick score  v0.9.0 rubric
 
 ### Configuration
 
-A `.pinprick.toml` at the repo root (or `~/.config/pinprick/config.toml` globally) customizes behavior. All keys are optional:
+A `.pinprick.toml` at the repo root (or `$XDG_CONFIG_HOME/pinprick/config.toml`, default `~/.config/pinprick/config.toml`, globally) customizes behavior. All keys are optional:
 
 ```toml
 # Minimum severity to report: "low" (default), "medium", or "high"
@@ -227,7 +227,7 @@ patterns = []
 
 ### Clean
 
-Remove locally cached audit results (`~/.cache/pinprick/audited/`):
+Remove locally cached audit results (`$XDG_CACHE_HOME/pinprick/audited/`, default `~/.cache/pinprick/audited/`):
 
 ```
 $ pinprick clean

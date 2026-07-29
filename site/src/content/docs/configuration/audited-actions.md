@@ -8,7 +8,7 @@ pinprick maintains a list of GitHub Actions that have been scanned and confirmed
 ## Lookup order
 
 1. **Bundled** — compiled into the binary at build time. Same trust as the binary itself.
-2. **Local cache** — `~/.cache/pinprick/audited/`. Populated automatically when you scan an action and it comes back clean.
+2. **Local cache** — `$XDG_CACHE_HOME/pinprick/audited/` (default `~/.cache/pinprick/audited/`). Populated automatically when you scan an action and it comes back clean.
 3. **Remote** — `https://pinprick.rs/audited-actions/`. Opt-in via `fetch-remote = true` in your [config file](/configuration/config-file).
 4. **GitHub API** — full source fetch and scan as last resort.
 

@@ -32,10 +32,9 @@ pub fn repo_with_config(filename: &str, workflow: &str, config: &str) -> TempDir
 }
 
 /// Build an `assert_cmd::Command` for pinprick with the token stripped, colors
-/// off, and HOME pointed at a unique temp path per invocation. The per-call HOME
-/// isolates the audit cache (`~/.cache/pinprick`) and global config
-/// (`~/.config/pinprick`) so parallel test processes can't race on, or poison,
-/// a shared directory.
+/// off, and HOME pointed at a unique temp path per invocation. Clearing the XDG
+/// variables alongside it pins the audit cache and global config to that HOME,
+/// so parallel test processes can't race on, or poison, a shared directory.
 pub fn pinprick_cmd() -> assert_cmd::Command {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let mut cmd = assert_cmd::Command::cargo_bin("pinprick").unwrap();
@@ -44,6 +43,10 @@ pub fn pinprick_cmd() -> assert_cmd::Command {
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let home = std::env::temp_dir().join(format!("pinprick-test-{}-{n}", std::process::id()));
     cmd.env("HOME", &home);
+    // The developer's own XDG dirs must never leak into (or be touched by) a
+    // test run — fall back to the per-test HOME.
+    cmd.env_remove("XDG_CACHE_HOME");
+    cmd.env_remove("XDG_CONFIG_HOME");
     cmd.arg("--color").arg("never");
     cmd
 }

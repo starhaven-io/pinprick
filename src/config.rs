@@ -77,7 +77,7 @@ pub struct IgnoreConfig {
 }
 
 impl Config {
-    /// Load config from global (~/.config/pinprick/config.toml) and per-repo (.pinprick.toml).
+    /// Load config from the XDG global path and per-repo `.pinprick.toml`.
     /// Per-repo overrides global. Missing files are fine — defaults are used.
     /// With `use_repo_config` false the per-repo file is ignored entirely —
     /// the right mode when scanning a repository you don't control, whose
@@ -203,14 +203,21 @@ enum ConfigLoad {
 }
 
 fn load_global() -> ConfigLoad {
-    let Ok(home) = std::env::var("HOME") else {
-        return ConfigLoad::Absent;
+    // XDG_CONFIG_HOME wins when set to an absolute path; the spec says a
+    // relative value must be ignored.
+    let base = match std::env::var("XDG_CONFIG_HOME") {
+        Ok(dir) if dir.starts_with('/') => std::path::PathBuf::from(dir),
+        _ => {
+            let Ok(home) = std::env::var("HOME") else {
+                return ConfigLoad::Absent;
+            };
+            Path::new(&home).join(".config")
+        }
     };
-    let path = Path::new(&home)
-        .join(".config")
-        .join("pinprick")
-        .join("config.toml");
-    load_file(&path, ParseWarning::Detailed)
+    load_file(
+        &base.join("pinprick").join("config.toml"),
+        ParseWarning::Detailed,
+    )
 }
 
 fn load_local(repo_root: &Path) -> ConfigLoad {
