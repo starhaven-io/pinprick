@@ -156,9 +156,6 @@ pub fn parse_uses_line(line: &str, line_number: usize) -> Option<ActionRef> {
         return None;
     }
 
-    // `docker://image@sha256:…` is a container reference, not a GitHub repo —
-    // parsing it would misread `docker:` as an owner and a digest-pinned image
-    // as an unpinned branch ref.
     if action_path.contains("://") {
         return None;
     }
@@ -257,36 +254,36 @@ pub fn build_pinned_line(line: &str, sha: &str, original_tag: &str) -> Option<St
     Some(format!("{prefix}{action_path}@{sha} # {original_tag}"))
 }
 
-/// Scan workflow YAML text and return all external action references.
-///
-/// Lines inside block scalars are skipped so that shell heredocs, inline docs,
-/// and `with: script: |` snippets can't false-match on literal `- uses:` text.
-pub fn scan_content(content: &str) -> Vec<ActionRef> {
-    let mut refs = Vec::new();
+/// Iterate the scannable lines of workflow YAML as `(1-based line number,
+/// line)`, skipping the bodies of block scalars so that shell heredocs, inline
+/// docs, and `with: script: |` snippets can't false-match on literal
+/// `- uses:` text.
+fn scannable_lines(content: &str) -> impl Iterator<Item = (usize, &str)> {
     let mut block_parent_col: Option<usize> = None;
 
-    for (i, line) in content.lines().enumerate() {
-        let line_num = i + 1;
-
+    content.lines().enumerate().filter_map(move |(i, line)| {
         if let Some(start_col) = block_parent_col {
             let indent = line.chars().take_while(|c| *c == ' ').count();
             if line.trim().is_empty() || indent > start_col {
-                continue;
+                return None;
             }
             block_parent_col = None;
         }
 
         if let Some(caps) = BLOCK_SCALAR_RE.captures(line) {
             block_parent_col = Some(caps.get(1).unwrap().as_str().len());
-            continue;
+            return None;
         }
 
-        if let Some(r) = parse_uses_line(line, line_num) {
-            refs.push(r);
-        }
-    }
+        Some((i + 1, line))
+    })
+}
 
-    refs
+/// Scan workflow YAML text and return all external action references.
+pub fn scan_content(content: &str) -> Vec<ActionRef> {
+    scannable_lines(content)
+        .filter_map(|(line_num, line)| parse_uses_line(line, line_num))
+        .collect()
 }
 
 /// Scan workflow YAML text and return local action references (`uses: ./path`).
@@ -295,31 +292,9 @@ pub fn scan_content(content: &str) -> Vec<ActionRef> {
 /// references another local action from its own `action.yml` is not followed —
 /// such a nested action is scanned only if a workflow also uses it directly.
 pub fn scan_local_actions(content: &str) -> Vec<LocalActionRef> {
-    let mut refs = Vec::new();
-    let mut block_parent_col: Option<usize> = None;
-
-    for (i, line) in content.lines().enumerate() {
-        let line_num = i + 1;
-
-        if let Some(start_col) = block_parent_col {
-            let indent = line.chars().take_while(|c| *c == ' ').count();
-            if line.trim().is_empty() || indent > start_col {
-                continue;
-            }
-            block_parent_col = None;
-        }
-
-        if let Some(caps) = BLOCK_SCALAR_RE.captures(line) {
-            block_parent_col = Some(caps.get(1).unwrap().as_str().len());
-            continue;
-        }
-
-        if let Some(r) = parse_local_uses_line(line, line_num) {
-            refs.push(r);
-        }
-    }
-
-    refs
+    scannable_lines(content)
+        .filter_map(|(line_num, line)| parse_local_uses_line(line, line_num))
+        .collect()
 }
 
 /// Scan a workflow file and return all external action references.
