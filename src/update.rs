@@ -91,19 +91,21 @@ async fn run_with_client(
                 continue;
             }
 
-            let releases = if let Some(cached) = releases_cache.get(&owner_repo) {
+            // Borrow the cached vectors instead of cloning them — release
+            // lists can run to 1,000 entries, and this loop hits the cache
+            // once per action occurrence.
+            let releases: &[Release] = if releases_cache.contains_key(&owner_repo) {
                 if !json {
                     eprintln!(" cached");
                 }
-                cached.clone()
+                &releases_cache[&owner_repo]
             } else {
                 match client.list_releases(&action.owner, &action.repo).await {
                     Ok(r) => {
                         if !json {
                             eprintln!(" done");
                         }
-                        releases_cache.insert(owner_repo.clone(), r.clone());
-                        r
+                        &*releases_cache.entry(owner_repo.clone()).or_insert(r)
                     }
                     Err(_) => {
                         if !json {
@@ -117,20 +119,18 @@ async fn run_with_client(
 
             // Fall back to tags when there's no usable release — some actions
             // tag versions but never cut a GitHub Release.
-            let (latest_tag, release_url) = match pick_latest_release(&releases) {
+            let (latest_tag, release_url) = match pick_latest_release(releases) {
                 Some(r) => (r.tag_name.clone(), r.html_url.clone()),
                 None => {
-                    let tags = match tags_cache.get(&owner_repo) {
-                        Some(cached) => cached.clone(),
-                        None => match client.list_tags(&action.owner, &action.repo).await {
-                            Ok(t) => {
-                                tags_cache.insert(owner_repo.clone(), t.clone());
-                                t
-                            }
+                    let tags: &[String] = if tags_cache.contains_key(&owner_repo) {
+                        &tags_cache[&owner_repo]
+                    } else {
+                        match client.list_tags(&action.owner, &action.repo).await {
+                            Ok(t) => &*tags_cache.entry(owner_repo.clone()).or_insert(t),
                             Err(_) => continue,
-                        },
+                        }
                     };
-                    match pick_latest_tag(&tags) {
+                    match pick_latest_tag(tags) {
                         Some(t) => (t.clone(), None),
                         None => {
                             report.up_to_date += 1;
