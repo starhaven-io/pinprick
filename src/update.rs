@@ -16,7 +16,18 @@ pub async fn run(
 ) -> Result<ExitCode> {
     let token = auth::require_token().await?;
     let client = GitHubClient::new(token);
+    run_with_client(repo_root, apply, json, only, &client).await
+}
 
+/// The command loop behind [`run`], with the GitHub client injected so tests
+/// can point the resolve-and-rewrite path at a mock server.
+async fn run_with_client(
+    repo_root: &Path,
+    apply: bool,
+    json: bool,
+    only: Option<&str>,
+    client: &GitHubClient,
+) -> Result<ExitCode> {
     let files = workflow::find_workflows(repo_root)?;
     let mut report = UpdateReport {
         updates: Vec::new(),
@@ -80,19 +91,21 @@ pub async fn run(
                 continue;
             }
 
-            let releases = if let Some(cached) = releases_cache.get(&owner_repo) {
+            // Borrow the cached vectors instead of cloning them — release
+            // lists can run to 1,000 entries, and this loop hits the cache
+            // once per action occurrence.
+            let releases: &[Release] = if releases_cache.contains_key(&owner_repo) {
                 if !json {
                     eprintln!(" cached");
                 }
-                cached.clone()
+                &releases_cache[&owner_repo]
             } else {
                 match client.list_releases(&action.owner, &action.repo).await {
                     Ok(r) => {
                         if !json {
                             eprintln!(" done");
                         }
-                        releases_cache.insert(owner_repo.clone(), r.clone());
-                        r
+                        &*releases_cache.entry(owner_repo.clone()).or_insert(r)
                     }
                     Err(_) => {
                         if !json {
@@ -106,20 +119,18 @@ pub async fn run(
 
             // Fall back to tags when there's no usable release — some actions
             // tag versions but never cut a GitHub Release.
-            let (latest_tag, release_url) = match pick_latest_release(&releases) {
+            let (latest_tag, release_url) = match pick_latest_release(releases) {
                 Some(r) => (r.tag_name.clone(), r.html_url.clone()),
                 None => {
-                    let tags = match tags_cache.get(&owner_repo) {
-                        Some(cached) => cached.clone(),
-                        None => match client.list_tags(&action.owner, &action.repo).await {
-                            Ok(t) => {
-                                tags_cache.insert(owner_repo.clone(), t.clone());
-                                t
-                            }
+                    let tags: &[String] = if tags_cache.contains_key(&owner_repo) {
+                        &tags_cache[&owner_repo]
+                    } else {
+                        match client.list_tags(&action.owner, &action.repo).await {
+                            Ok(t) => &*tags_cache.entry(owner_repo.clone()).or_insert(t),
                             Err(_) => continue,
-                        },
+                        }
                     };
-                    match pick_latest_tag(&tags) {
+                    match pick_latest_tag(tags) {
                         Some(t) => (t.clone(), None),
                         None => {
                             report.up_to_date += 1;
@@ -499,5 +510,220 @@ mod tests {
         assert_eq!(leading_version_token("1.2.3"), "1.2.3");
         // No leading version → fall back to the whole comment unchanged.
         assert_eq!(leading_version_token("pinned manually"), "pinned manually");
+    }
+
+    mod command {
+        use super::*;
+        use crate::github::GitHubClient;
+        use serde_json::json;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const OLD_SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+        const NEW_SHA: &str = "89abcdef0123456789abcdef0123456789abcdef";
+
+        /// `ExitCode` exposes no accessor; its Debug form is the only stable
+        /// way to compare against an expected status in-process.
+        fn assert_code(code: ExitCode, expected: u8) {
+            assert_eq!(
+                format!("{code:?}"),
+                format!("{:?}", ExitCode::from(expected))
+            );
+        }
+
+        fn repo_with_workflow(content: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+            let dir = tempfile::TempDir::new().unwrap();
+            let workflows = dir.path().join(".github").join("workflows");
+            std::fs::create_dir_all(&workflows).unwrap();
+            let file = workflows.join("ci.yml");
+            std::fs::write(&file, content).unwrap();
+            (dir, file)
+        }
+
+        fn client_for(server: &MockServer) -> GitHubClient {
+            GitHubClient::with_base("test-token".into(), server.uri())
+        }
+
+        async fn mount_release(server: &MockServer, owner_repo: &str, tag: &str) {
+            Mock::given(method("GET"))
+                .and(path(format!("/repos/{owner_repo}/releases")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                    { "tag_name": tag, "draft": false, "prerelease": false,
+                      "html_url": format!("https://example.com/{tag}") }
+                ])))
+                .mount(server)
+                .await;
+        }
+
+        async fn mount_tag_resolution(server: &MockServer, owner_repo: &str, tag: &str, sha: &str) {
+            Mock::given(method("GET"))
+                .and(path(format!("/repos/{owner_repo}/git/ref/tags/{tag}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "object": { "sha": sha, "type": "commit" }
+                })))
+                .mount(server)
+                .await;
+        }
+
+        #[tokio::test]
+        async fn newer_release_is_applied_to_the_workflow() {
+            let server = MockServer::start().await;
+            mount_release(&server, "actions/checkout", "v1.1.0").await;
+            mount_tag_resolution(&server, "actions/checkout", "v1.1.0", NEW_SHA).await;
+
+            let (dir, file) = repo_with_workflow(&format!(
+                "jobs:\n  test:\n    steps:\n      - uses: actions/checkout@{OLD_SHA} # v1.0.0\n"
+            ));
+
+            let code = run_with_client(dir.path(), true, true, None, &client_for(&server))
+                .await
+                .unwrap();
+
+            assert_code(code, 0);
+            assert_eq!(
+                std::fs::read_to_string(&file).unwrap(),
+                format!(
+                    "jobs:\n  test:\n    steps:\n      - uses: actions/checkout@{NEW_SHA} # v1.1.0\n"
+                )
+            );
+        }
+
+        #[tokio::test]
+        async fn dry_run_reports_update_without_rewriting_and_exits_one() {
+            let server = MockServer::start().await;
+            mount_release(&server, "actions/checkout", "v1.1.0").await;
+            mount_tag_resolution(&server, "actions/checkout", "v1.1.0", NEW_SHA).await;
+
+            let original = format!(
+                "jobs:\n  test:\n    steps:\n      - uses: actions/checkout@{OLD_SHA} # v1.0.0\n"
+            );
+            let (dir, file) = repo_with_workflow(&original);
+
+            let code = run_with_client(dir.path(), false, true, None, &client_for(&server))
+                .await
+                .unwrap();
+
+            assert_code(code, 1);
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), original);
+        }
+
+        #[tokio::test]
+        async fn falls_back_to_tags_when_repo_has_no_releases() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/repos/o/r/releases"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/repos/o/r/tags"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                    { "name": "v2.0.0", "commit": { "sha": "unrelated" } }
+                ])))
+                .mount(&server)
+                .await;
+            mount_tag_resolution(&server, "o/r", "v2.0.0", NEW_SHA).await;
+
+            let (dir, file) = repo_with_workflow(&format!(
+                "jobs:\n  test:\n    steps:\n      - uses: o/r@{OLD_SHA} # v1.0.0\n"
+            ));
+
+            let code = run_with_client(dir.path(), true, true, None, &client_for(&server))
+                .await
+                .unwrap();
+
+            assert_code(code, 0);
+            assert_eq!(
+                std::fs::read_to_string(&file).unwrap(),
+                format!("jobs:\n  test:\n    steps:\n      - uses: o/r@{NEW_SHA} # v2.0.0\n")
+            );
+        }
+
+        #[tokio::test]
+        async fn newer_tag_name_for_the_same_commit_is_not_an_update() {
+            // A "newer" tag that resolves to the already-pinned commit is just
+            // a different name for the same content — up to date, exit 0.
+            let server = MockServer::start().await;
+            mount_release(&server, "o/r", "v1.1.0").await;
+            mount_tag_resolution(&server, "o/r", "v1.1.0", OLD_SHA).await;
+
+            let original =
+                format!("jobs:\n  test:\n    steps:\n      - uses: o/r@{OLD_SHA} # v1.0.0\n");
+            let (dir, file) = repo_with_workflow(&original);
+
+            let code = run_with_client(dir.path(), false, true, None, &client_for(&server))
+                .await
+                .unwrap();
+
+            assert_code(code, 0);
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), original);
+        }
+
+        #[tokio::test]
+        async fn only_filter_skips_non_matching_actions_entirely() {
+            let server = MockServer::start().await;
+            mount_release(&server, "actions/checkout", "v1.1.0").await;
+            mount_tag_resolution(&server, "actions/checkout", "v1.1.0", NEW_SHA).await;
+
+            let (dir, file) = repo_with_workflow(&format!(
+                "jobs:\n  test:\n    steps:\n      - uses: actions/checkout@{OLD_SHA} # v1.0.0\n      - uses: other/action@{OLD_SHA} # v0.1.0\n"
+            ));
+
+            let code = run_with_client(
+                dir.path(),
+                true,
+                true,
+                Some("checkout"),
+                &client_for(&server),
+            )
+            .await
+            .unwrap();
+
+            assert_code(code, 0);
+            // The matching action is updated; the filtered one is untouched.
+            let rewritten = std::fs::read_to_string(&file).unwrap();
+            assert!(rewritten.contains(&format!("actions/checkout@{NEW_SHA} # v1.1.0")));
+            assert!(rewritten.contains(&format!("other/action@{OLD_SHA} # v0.1.0")));
+            // And no request was ever made for the filtered repo.
+            let requests = server.received_requests().await.unwrap();
+            assert!(
+                requests
+                    .iter()
+                    .all(|r| !r.url.path().starts_with("/repos/other/action")),
+                "filtered action must not be queried"
+            );
+        }
+
+        #[tokio::test]
+        async fn bare_sha_pin_is_resolved_via_tag_lookup() {
+            // No `# tag` comment: the current version comes from the tags
+            // endpoint (which tag points at the pinned SHA?), then the release
+            // comparison proceeds as usual.
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/repos/o/r/tags"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                    { "name": "v1.0.0", "commit": { "sha": OLD_SHA } },
+                    { "name": "v1.1.0", "commit": { "sha": NEW_SHA } }
+                ])))
+                .mount(&server)
+                .await;
+            mount_release(&server, "o/r", "v1.1.0").await;
+            mount_tag_resolution(&server, "o/r", "v1.1.0", NEW_SHA).await;
+
+            let (dir, file) = repo_with_workflow(&format!(
+                "jobs:\n  test:\n    steps:\n      - uses: o/r@{OLD_SHA}\n"
+            ));
+
+            let code = run_with_client(dir.path(), true, true, None, &client_for(&server))
+                .await
+                .unwrap();
+
+            assert_code(code, 0);
+            assert_eq!(
+                std::fs::read_to_string(&file).unwrap(),
+                format!("jobs:\n  test:\n    steps:\n      - uses: o/r@{NEW_SHA} # v1.1.0\n")
+            );
+        }
     }
 }
