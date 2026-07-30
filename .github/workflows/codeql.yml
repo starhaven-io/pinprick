@@ -19,7 +19,7 @@ jobs:
     permissions:
       contents: read
       security-events: write # required to upload SARIF results
-    uses: starhaven-io/.github/.github/workflows/reusable-codeql.yml@7917b6404c4b6e9f2bffc8aa4f6b508d06edb897 # v2026.07.29.1
+    uses: starhaven-io/.github/.github/workflows/reusable-codeql.yml@2addbf69b694a7efd3b673ac0c878c988275b71f # v2026.07.29.2
     with:
       languages: '["actions"]'
       runner: "ubuntu-slim"
