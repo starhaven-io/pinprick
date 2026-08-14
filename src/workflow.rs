@@ -1015,6 +1015,7 @@ jobs:
         assert!(parse_uses_line("      - run: echo hello", 1).is_none());
         assert!(parse_uses_line("name: CI", 1).is_none());
         assert!(parse_uses_line("", 1).is_none());
+        assert!(parse_uses_line("      - uses: checkout@v4", 1).is_none());
     }
 
     #[test]
@@ -1428,6 +1429,22 @@ jobs:
     }
 
     #[test]
+    fn find_workflows_skips_forge_root_without_workflows_directory() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(dir.path().join(".github")).unwrap();
+        let workflows = dir.path().join(".gitea/workflows");
+        std::fs::create_dir_all(&workflows).unwrap();
+        std::fs::write(workflows.join("ci.yml"), "").unwrap();
+
+        let files = find_workflows(dir.path()).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(
+            display_path(files[0].path(), dir.path()),
+            ".gitea/workflows/ci.yml"
+        );
+    }
+
+    #[test]
     fn find_workflows_error_lists_all_forge_roots() {
         // With no workflow directory anywhere, the error names every root tried
         // so the user knows a Forgejo/Gitea layout is also supported.
@@ -1465,6 +1482,57 @@ jobs:
         let err = read_workflow(&file).unwrap_err();
         assert!(is_unsafe_workflow_path(&err));
         assert!(err.to_string().contains("symlinked workflow file"));
+    }
+
+    #[test]
+    fn read_workflow_reports_file_removed_after_discovery() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = write_temp_workflow(&dir, "ci.yml", "name: safe\n");
+        std::fs::remove_file(file.path()).unwrap();
+
+        let err = read_workflow(&file).unwrap_err();
+        assert!(!is_unsafe_workflow_path(&err));
+        assert!(err.to_string().contains("reading"));
+    }
+
+    #[test]
+    fn child_path_helpers_reject_escaping_and_missing_paths() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        assert!(open_child_dir_path(dir.path(), Path::new("../outside")).is_err());
+        assert!(open_child_file_path(dir.path(), Path::new("../outside")).is_err());
+        assert!(
+            open_child_dir_path(dir.path(), Path::new("missing/child"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            open_child_file_path(dir.path(), Path::new("missing/child"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            open_child_file_path(dir.path(), Path::new(""))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn child_path_helpers_reject_non_utf8_and_symlinked_file() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let invalid = PathBuf::from(std::ffi::OsString::from_vec(vec![0xff]));
+        assert!(open_child_dir_path(dir.path(), &invalid).is_err());
+        assert!(open_child_file_path(dir.path(), &invalid).is_err());
+
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("linked.yml")).unwrap();
+        let err = open_child_file_path(dir.path(), Path::new("linked.yml")).unwrap_err();
+        assert!(is_unsafe_workflow_path(&err));
+        assert!(err.to_string().contains("symlinked file"));
     }
 
     // ── rewrite_actions ────────────────────────────────────────────────
@@ -1527,6 +1595,16 @@ jobs:
         let err =
             rewrite_actions(&file, &[(99, "old".to_string(), "nope".to_string())]).unwrap_err();
         assert!(err.to_string().contains("line 99 no longer exists"));
+        assert_eq!(std::fs::read_to_string(file.path()).unwrap(), "line1\n");
+    }
+
+    #[test]
+    fn rewrite_rejects_zero_line_number() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = write_temp_workflow(&dir, "test.yml", "line1\n");
+        let err =
+            rewrite_actions(&file, &[(0, "line1".to_string(), "nope".to_string())]).unwrap_err();
+        assert!(err.to_string().contains("invalid line number 0"));
         assert_eq!(std::fs::read_to_string(file.path()).unwrap(), "line1\n");
     }
 

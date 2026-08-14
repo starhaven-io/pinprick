@@ -595,11 +595,11 @@ mod tests {
             mount_tag_resolution(&server, "actions/checkout", "v1.1.0", NEW_SHA).await;
 
             let original = format!(
-                "jobs:\n  test:\n    steps:\n      - uses: actions/checkout@{OLD_SHA} # v1.0.0\n"
+                "jobs:\n  test:\n    steps:\n      - uses: actions/checkout@{OLD_SHA} # v1.0.0\n      - uses: actions/checkout@{OLD_SHA} # v1.0.0\n"
             );
             let (dir, file) = repo_with_workflow(&original);
 
-            let code = run_with_client(dir.path(), false, true, None, &client_for(&server))
+            let code = run_with_client(dir.path(), false, false, None, &client_for(&server))
                 .await
                 .unwrap();
 
@@ -625,17 +625,19 @@ mod tests {
             mount_tag_resolution(&server, "o/r", "v2.0.0", NEW_SHA).await;
 
             let (dir, file) = repo_with_workflow(&format!(
-                "jobs:\n  test:\n    steps:\n      - uses: o/r@{OLD_SHA} # v1.0.0\n"
+                "jobs:\n  test:\n    steps:\n      - uses: o/r@{OLD_SHA} # v1.0.0\n      - uses: o/r@{OLD_SHA} # v1.0.0\n"
             ));
 
-            let code = run_with_client(dir.path(), true, true, None, &client_for(&server))
+            let code = run_with_client(dir.path(), true, false, None, &client_for(&server))
                 .await
                 .unwrap();
 
             assert_code(code, 0);
             assert_eq!(
                 std::fs::read_to_string(&file).unwrap(),
-                format!("jobs:\n  test:\n    steps:\n      - uses: o/r@{NEW_SHA} # v2.0.0\n")
+                format!(
+                    "jobs:\n  test:\n    steps:\n      - uses: o/r@{NEW_SHA} # v2.0.0\n      - uses: o/r@{NEW_SHA} # v2.0.0\n"
+                )
             );
         }
 

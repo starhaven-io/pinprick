@@ -268,10 +268,10 @@ mod tests {
             .mount(&server)
             .await;
 
-        let original = "jobs:\n  test:\n    steps:\n      - uses: actions/checkout@v4\n";
+        let original = "jobs:\n  test:\n    steps:\n      - uses: actions/checkout@v4\n      - uses: actions/checkout@v4\n";
         let (dir, file) = repo_with_workflow(original);
 
-        let code = run_with_client(dir.path(), true, false, &client_for(&server))
+        let code = run_with_client(dir.path(), false, false, &client_for(&server))
             .await
             .unwrap();
 
@@ -330,7 +330,7 @@ mod tests {
         let original = "jobs:\n  test:\n    steps:\n      - uses: o/r@v9\n";
         let (dir, file) = repo_with_workflow(original);
 
-        let code = run_with_client(dir.path(), true, false, &client_for(&server))
+        let code = run_with_client(dir.path(), false, false, &client_for(&server))
             .await
             .unwrap();
 

@@ -1083,26 +1083,61 @@ mod audit_summary_tests {
         assert!(out.contains("# v1.2.3\u{fffd}rewrite"));
         assert!(out.contains("skip\u{fffd}action"));
         assert!(out.contains("branch\u{fffd}[31m ref"));
+        assert!(out.contains("(1 skipped)"));
         assert!(!out.contains('\u{7}'));
         assert!(!out.contains('\r'));
         assert!(!out.contains('\u{7f}'));
     }
 
     #[test]
+    fn pin_human_output_reports_applied_summary() {
+        let report = PinReport {
+            pinned: vec![PinResult {
+                file: ".github/workflows/ci.yml".into(),
+                action: "owner/action".into(),
+                old_ref: "v1".into(),
+                sha: "0123456789abcdef0123456789abcdef01234567".into(),
+                tag: "v1".into(),
+                line: 1,
+            }],
+            skipped: vec![],
+            applied: true,
+        };
+        let mut buf = Vec::new();
+        report.write_human(&mut buf).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+
+        assert!(out.contains("Pinned 1 action across 1 file"));
+        assert!(!out.contains("Would pin"));
+    }
+
+    #[test]
     fn update_human_output_sanitizes_untrusted_fields() {
         let report = UpdateReport {
-            updates: vec![UpdateResult {
-                file: ".github/workflows/ci.yml".into(),
-                action: "evil\u{1b}[2J/action".into(),
-                current_tag: "v1\u{7}".into(),
-                current_sha: "0123456789abcdef0123456789abcdef01234567".into(),
-                latest_tag: "v2\rrewrite".into(),
-                latest_sha: "abcdef0123456789abcdef0123456789abcdef01".into(),
-                line: 1,
-                release_url: Some("https://example.com/release\u{7f}".into()),
-            }],
+            updates: vec![
+                UpdateResult {
+                    file: ".github/workflows/ci.yml".into(),
+                    action: "evil\u{1b}[2J/action".into(),
+                    current_tag: "v1\u{7}".into(),
+                    current_sha: "0123456789abcdef0123456789abcdef01234567".into(),
+                    latest_tag: "v2\rrewrite".into(),
+                    latest_sha: "abcdef0123456789abcdef0123456789abcdef01".into(),
+                    line: 1,
+                    release_url: Some("https://example.com/release\u{7f}".into()),
+                },
+                UpdateResult {
+                    file: ".github/workflows/other.yml".into(),
+                    action: "other/action".into(),
+                    current_tag: "v1".into(),
+                    current_sha: "0123456789abcdef0123456789abcdef01234567".into(),
+                    latest_tag: "v2".into(),
+                    latest_sha: "abcdef0123456789abcdef0123456789abcdef01".into(),
+                    line: 2,
+                    release_url: None,
+                },
+            ],
             up_to_date: 0,
-            applied: false,
+            applied: true,
         };
         let mut buf = Vec::new();
         report.write_human(&mut buf).unwrap();
@@ -1112,9 +1147,49 @@ mod audit_summary_tests {
         assert!(out.contains("v1\u{fffd}"));
         assert!(out.contains("v2\u{fffd}rewrite"));
         assert!(out.contains("https://example.com/release\u{fffd}"));
+        assert!(out.contains("2 updates applied."));
         assert!(!out.contains('\u{7}'));
         assert!(!out.contains('\r'));
         assert!(!out.contains('\u{7f}'));
+    }
+
+    #[test]
+    fn update_human_output_reports_empty_summary() {
+        let empty = UpdateReport {
+            updates: vec![],
+            up_to_date: 1,
+            applied: false,
+        };
+        let mut buf = Vec::new();
+        empty.write_human(&mut buf).unwrap();
+        assert_eq!(
+            String::from_utf8(buf).unwrap(),
+            "All pinned actions are up to date.\n"
+        );
+    }
+
+    #[test]
+    fn update_human_output_reports_dry_run_summary() {
+        let dry_run = UpdateReport {
+            updates: vec![UpdateResult {
+                file: ".github/workflows/ci.yml".into(),
+                action: "owner/action".into(),
+                current_tag: "v1".into(),
+                current_sha: "0123456789abcdef0123456789abcdef01234567".into(),
+                latest_tag: "v2".into(),
+                latest_sha: "abcdef0123456789abcdef0123456789abcdef01".into(),
+                line: 1,
+                release_url: None,
+            }],
+            up_to_date: 0,
+            applied: false,
+        };
+        let mut buf = Vec::new();
+        dry_run.write_human(&mut buf).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+
+        assert!(out.contains("1 update available."));
+        assert!(out.contains("--write"));
     }
 
     #[test]

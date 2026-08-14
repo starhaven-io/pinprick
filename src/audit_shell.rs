@@ -831,4 +831,91 @@ mod tests {
         assert!(joined[0].1.contains("curl"));
         assert!(joined[0].1.contains("| sh"));
     }
+
+    #[test]
+    fn join_continuations_keeps_dangling_continuation() {
+        assert_eq!(
+            join_continuations("echo unfinished \\"),
+            vec![(0, "echo unfinished ".into())]
+        );
+    }
+
+    #[test]
+    fn shell_split_handles_escaped_controls_and_or_operator() {
+        assert_eq!(
+            split_shell_control(r#"printf one\;two || printf 'three;four'"#),
+            vec![r#"printf one\;two"#, "printf 'three;four'"]
+        );
+    }
+
+    #[test]
+    fn shell_words_handles_escaped_whitespace_and_append_redirect() {
+        assert_eq!(
+            shell_words(r#"curl -o tool\ file https://example.com/tool >> download.log"#),
+            vec![
+                "curl",
+                "-o",
+                "tool file",
+                "https://example.com/tool",
+                ">>",
+                "download.log",
+            ]
+        );
+    }
+
+    #[test]
+    fn docker_image_extraction_handles_cli_prefixes_and_options() {
+        for (line, expected) in [
+            ("docker image pull alpine", vec!["alpine"]),
+            (
+                "env DOCKER_HOST=local docker container run --platform=linux alpine",
+                vec!["alpine"],
+            ),
+            ("docker run -e MODE=test alpine", vec!["alpine"]),
+            ("docker run -- alpine", vec!["alpine"]),
+            ("docker pull --platform", vec![]),
+        ] {
+            assert_eq!(docker_unpinned_images(line), expected, "line: {line}");
+        }
+    }
+
+    #[test]
+    fn fetch_output_targets_handles_option_and_redirect_forms() {
+        for (line, expected) in [
+            ("curl --output=tool https://example.com/tool", vec!["tool"]),
+            ("curl -sLo tool https://example.com/tool", vec!["tool"]),
+            (
+                "curl --compressed -otool https://example.com/tool",
+                vec!["tool"],
+            ),
+            (
+                "wget --output-document=tool https://example.com/tool",
+                vec!["tool"],
+            ),
+            ("wget -Otool https://example.com/tool", vec!["tool"]),
+            ("curl https://example.com/tool >> tool", vec!["tool"]),
+        ] {
+            assert_eq!(fetch_output_targets(line), expected, "line: {line}");
+        }
+    }
+
+    #[test]
+    fn git_clone_parses_equals_flags_and_attached_checkout_directory() {
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        let script = format!(
+            "git clone --depth=1 --quiet https://example.com/o/r.git\ngit -C././r checkout {sha}\n"
+        );
+        let logical = join_continuations(&script);
+
+        assert!(git_clone_has_bound_sha_checkout(&logical, 0));
+    }
+
+    #[test]
+    fn git_command_without_checkout_does_not_bind_clone() {
+        let logical = join_continuations(
+            "git clone --depth=1 --quiet https://example.com/o/r.git\ngit -C r status\n",
+        );
+
+        assert!(!git_clone_has_bound_sha_checkout(&logical, 0));
+    }
 }
