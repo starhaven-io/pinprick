@@ -513,6 +513,14 @@ trusted-hosts = ["artifacts.example.com", "releases.example.org"]
         assert!(!high.meets_severity("medium"));
         assert!(!high.meets_severity("low"));
 
+        let medium = Config {
+            severity: SeverityFilter::Medium,
+            ..Config::default()
+        };
+        assert_eq!(medium.severity_threshold(), 1);
+        assert!(medium.meets_severity("medium"));
+        assert!(!medium.meets_severity("low"));
+
         let low = Config::default();
         assert!(low.meets_severity("low"));
         assert!(low.meets_severity("high"));
@@ -568,6 +576,21 @@ trusted-hosts = ["artifacts.example.com", "releases.example.org"]
         };
         assert_eq!(cfg.severity, SeverityFilter::High);
         assert!(cfg.fetch_remote);
+    }
+
+    #[test]
+    fn load_repo_file_treats_missing_root_and_unreadable_file_as_absent() {
+        let dir = tempfile::TempDir::new().unwrap();
+        assert!(matches!(
+            load_repo_file(&dir.path().join("missing"), ".pinprick.toml"),
+            ConfigLoad::Absent
+        ));
+
+        std::fs::create_dir(dir.path().join(".pinprick.toml")).unwrap();
+        assert!(matches!(
+            load_repo_file(dir.path(), ".pinprick.toml"),
+            ConfigLoad::Absent
+        ));
     }
 
     #[test]

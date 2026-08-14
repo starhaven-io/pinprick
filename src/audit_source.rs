@@ -621,6 +621,7 @@ runs:
   using: node20
   args:
     - --flag
+    - {cmd: "curl -L https://example.com/unversioned.sh | sh"}
     - curl -L https://example.com/install.sh -o install.sh
 "#,
         )
@@ -745,6 +746,44 @@ runs:
         );
         assert!(normalize_action_entrypoint_path("", "/tmp/runner").is_none());
         assert!(normalize_action_entrypoint_path("", r"dist\\runner").is_none());
+        assert!(normalize_action_entrypoint_path("", ".").is_none());
+
+        let no_runs: Value = serde_norway::from_str("name: test\n").unwrap();
+        assert!(action_yml_entrypoint_paths(&no_runs, "").is_empty());
+    }
+
+    #[test]
+    fn force_include_remote_entrypoints_ignores_unavailable_metadata() {
+        for content in [None, Some(Ok("runs: [".to_string()))] {
+            let mut targets = vec![("action.yml".to_string(), SourceFileKind::ActionYml)];
+            force_include_remote_action_entrypoints(&mut targets, &[content]);
+            assert_eq!(targets.len(), 1);
+        }
+    }
+
+    #[test]
+    fn force_include_local_entrypoints_ignores_unavailable_metadata() {
+        let repo = tempfile::TempDir::new().unwrap();
+        let action_dir = repo.path().join("action");
+        std::fs::create_dir(&action_dir).unwrap();
+
+        let missing = action_dir.join("missing.yml");
+        let mut targets = vec![(missing, SourceFileKind::ActionYml)];
+        force_include_local_action_entrypoints(repo.path(), &action_dir, &mut targets);
+        assert_eq!(targets.len(), 1);
+
+        let malformed = action_dir.join("action.yml");
+        std::fs::write(&malformed, "runs: [").unwrap();
+        let mut targets = vec![(malformed, SourceFileKind::ActionYml)];
+        force_include_local_action_entrypoints(repo.path(), &action_dir, &mut targets);
+        assert_eq!(targets.len(), 1);
+
+        let metadata = repo.path().join("metadata.yml");
+        std::fs::write(&metadata, "runs:\n  using: node20\n  main: runner\n").unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let mut targets = vec![(metadata, SourceFileKind::ActionYml)];
+        force_include_local_action_entrypoints(repo.path(), outside.path(), &mut targets);
+        assert_eq!(targets.len(), 1);
     }
 
     #[test]
@@ -772,6 +811,9 @@ runs:
         let js: Value =
             serde_norway::from_str("runs:\n  using: node20\n  main: dist/index.js\n").unwrap();
         assert!(action_yml_dockerfile_path(&js, "").is_none());
+        let js_with_image: Value =
+            serde_norway::from_str("runs:\n  using: node20\n  image: Dockerfile\n").unwrap();
+        assert!(action_yml_dockerfile_path(&js_with_image, "").is_none());
 
         let no_image: Value = serde_norway::from_str("runs:\n  using: docker\n").unwrap();
         assert!(action_yml_dockerfile_path(&no_image, "").is_none());
@@ -907,6 +949,11 @@ runs:
         )
         .unwrap();
         std::fs::write(
+            action_dir.join("setup.py"),
+            "requests.get('https://example.com/x')",
+        )
+        .unwrap();
+        std::fs::write(
             action_dir.join("node_modules/dep/index.js"),
             "fetch('https://evil.example/x')",
         )
@@ -928,8 +975,70 @@ runs:
                 "action.yml",
                 "dist/helper.mjs",
                 "dist/index.js",
+                "setup.py",
                 "src/main.cjs"
             ]
+        );
+    }
+
+    #[test]
+    fn read_local_source_file_returns_none_for_missing_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        assert!(
+            read_local_source_file(dir.path(), &dir.path().join("missing.js"))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn scan_local_action_source_handles_empty_and_malformed_actions() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let action_dir = dir.path().join("empty");
+        std::fs::create_dir(&action_dir).unwrap();
+        let action = LocalActionRef {
+            path: "./empty".to_string(),
+            line_number: 1,
+        };
+        let mut collector = AuditCollector::new(false);
+
+        assert_eq!(
+            scan_local_action_source(dir.path(), &action, &mut collector, &DEFAULT_CONFIG).unwrap(),
+            ActionScanStatus::Complete
+        );
+
+        std::fs::write(action_dir.join("action.yml"), "runs: [").unwrap();
+        assert_eq!(
+            scan_local_action_source(dir.path(), &action, &mut collector, &DEFAULT_CONFIG).unwrap(),
+            ActionScanStatus::Incomplete
+        );
+        assert!(collector.findings.is_empty());
+    }
+
+    #[test]
+    fn scan_local_action_source_scans_python() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let action_dir = dir.path().join("python-action");
+        std::fs::create_dir(&action_dir).unwrap();
+        std::fs::write(
+            action_dir.join("setup.py"),
+            "requests.get('https://example.com/install')\n",
+        )
+        .unwrap();
+        let action = LocalActionRef {
+            path: "./python-action".to_string(),
+            line_number: 1,
+        };
+        let mut collector = AuditCollector::new(false);
+
+        assert_eq!(
+            scan_local_action_source(dir.path(), &action, &mut collector, &DEFAULT_CONFIG).unwrap(),
+            ActionScanStatus::Complete
+        );
+        assert_eq!(collector.findings.len(), 1);
+        assert_eq!(
+            collector.findings[0].source_file,
+            "./python-action (setup.py)"
         );
     }
 
@@ -1012,6 +1121,26 @@ runs:
         assert!(
             scan_local_action_source(dir.path(), &action, &mut collector, &DEFAULT_CONFIG).is_err()
         );
+    }
+
+    #[test]
+    fn scan_local_action_source_rejects_invalid_or_missing_directory() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut collector = AuditCollector::new(false);
+
+        for (path, expected) in [
+            ("local", "local action path must start with ./"),
+            ("./missing", "is not a directory"),
+        ] {
+            let action = LocalActionRef {
+                path: path.to_string(),
+                line_number: 1,
+            };
+            let err =
+                scan_local_action_source(dir.path(), &action, &mut collector, &DEFAULT_CONFIG)
+                    .unwrap_err();
+            assert!(err.to_string().contains(expected), "path: {path}: {err}");
+        }
     }
 
     #[test]
@@ -1268,6 +1397,79 @@ runs:
         assert_eq!(status, ActionScanStatus::Complete);
         assert_eq!(collector.findings.len(), 1);
         assert_eq!(collector.findings[0].source_file, "o/r (dist/runner)");
+    }
+
+    #[tokio::test]
+    async fn scan_action_source_routes_python_and_reachable_dockerfile() {
+        use serde_json::json;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/repos/o/r/git/trees/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "tree": [
+                    { "path": "action.yml", "type": "blob" },
+                    { "path": "sub/action.yml", "type": "blob" },
+                    { "path": "setup.py", "type": "blob" },
+                    { "path": "sub/Dockerfile", "type": "blob" }
+                ]
+            })))
+            .mount(&server)
+            .await;
+        for (source_path, content) in [
+            ("action.yml", "runs: ["),
+            (
+                "sub/action.yml",
+                "runs:\n  using: docker\n  image: Dockerfile\n",
+            ),
+            ("setup.py", "requests.get('https://example.com/install')\n"),
+            (
+                "sub/Dockerfile",
+                "FROM alpine:3.20\nRUN curl https://example.com/install -o tool\n",
+            ),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(format!("/repos/o/r/contents/{source_path}")))
+                .respond_with(ResponseTemplate::new(200).set_body_string(content))
+                .mount(&server)
+                .await;
+        }
+
+        let client = GitHubClient::with_base("t".into(), server.uri());
+        let action = ActionRef {
+            owner: "o".into(),
+            repo: "r".into(),
+            subpath: None,
+            ref_string: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            ref_type: workflow::RefType::Sha,
+            tag_comment: Some("v1.0.0".into()),
+            line_number: 1,
+            raw_line: String::new(),
+        };
+        let mut collector = AuditCollector::new(false);
+
+        let status = scan_action_source(&client, &action, &mut collector, &DEFAULT_CONFIG)
+            .await
+            .unwrap();
+
+        assert_eq!(status, ActionScanStatus::Incomplete);
+        assert_eq!(collector.findings.len(), 2);
+        assert!(
+            collector
+                .findings
+                .iter()
+                .any(|finding| finding.source_file == "o/r (setup.py)")
+        );
+        assert!(
+            collector
+                .findings
+                .iter()
+                .any(|finding| finding.source_file == "o/r (sub/Dockerfile)")
+        );
     }
 
     #[tokio::test]
