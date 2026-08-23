@@ -255,7 +255,7 @@ jobs:
 
       - name: Install cargo-llvm-cov
         if: matrix.check == 'coverage'
-        run: cargo install cargo-llvm-cov --locked --version 0.8.7
+        run: cargo install cargo-llvm-cov --locked --version 0.9.0
 
       - name: Run tests with coverage
         if: matrix.check == 'coverage'
