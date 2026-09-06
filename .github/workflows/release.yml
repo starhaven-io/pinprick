@@ -240,8 +240,11 @@ jobs:
     needs: build
     runs-on: ubuntu-slim
     timeout-minutes: 60
+    environment:
+      name: release
+      deployment: false
     permissions:
-      contents: write # required to create tags and GitHub releases
+      contents: read # required to check out the release source
     outputs:
       version: ${{ steps.version.outputs.version }}
       tag: ${{ steps.version.outputs.tag }}
@@ -261,9 +264,19 @@ jobs:
           echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
           echo "tag=v${VERSION}" >> "${GITHUB_OUTPUT}"
 
+      - name: Mint release token
+        id: release-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.APP_CLIENT_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+
       - name: Create tag
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ steps.release-token.outputs.token }}
           REPOSITORY: ${{ github.repository }}
           COMMIT_SHA: ${{ github.sha }}
           TAG: ${{ steps.version.outputs.tag }}
@@ -279,7 +292,7 @@ jobs:
 
       - name: Create release with generated notes
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ steps.release-token.outputs.token }}
           REPOSITORY: ${{ github.repository }}
           TAG: ${{ steps.version.outputs.tag }}
         run: |
@@ -295,7 +308,7 @@ jobs:
 
       - name: Format release notes
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ steps.release-token.outputs.token }}
           REPOSITORY: ${{ github.repository }}
           TAG: ${{ steps.version.outputs.tag }}
         run: |
