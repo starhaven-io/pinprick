@@ -158,7 +158,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - run: |
           curl -L \"https://github.com/owner/repo/releases/download/tool\" -o tool
-          sha256sum --check tool.sha256
+          printf '%s  %s\\n' aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa tool | sha256sum --check -
 ";
 
 /// Curl with unversioned URL hitting a trusted host.

@@ -1,3 +1,4 @@
+use crate::output::sanitize_for_terminal;
 use minisign_verify::{PublicKey, Signature};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
@@ -140,11 +141,16 @@ impl AuditedActions {
         sha: &str,
     ) -> Option<AuditSource> {
         let keys = action_keys(owner, repo, subpath)?;
+        if !is_full_sha(sha) {
+            return None;
+        }
+        let sha = sha.to_ascii_lowercase();
 
-        if keys
-            .iter()
-            .any(|key| self.bundled.get(key).is_some_and(|shas| shas.contains(sha)))
-        {
+        if keys.iter().any(|key| {
+            self.bundled
+                .get(key)
+                .is_some_and(|shas| shas.contains(&sha))
+        }) {
             return Some(AuditSource::Bundled);
         }
 
@@ -153,7 +159,7 @@ impl AuditedActions {
                 let shas = self.load_local_cache(owner, repo, key);
                 self.local.insert(key.clone(), shas);
             }
-            if self.local.get(key).is_some_and(|shas| shas.contains(sha)) {
+            if self.local.get(key).is_some_and(|shas| shas.contains(&sha)) {
                 return Some(AuditSource::LocalCache);
             }
         }
@@ -164,7 +170,7 @@ impl AuditedActions {
                     let shas = self.fetch_remote_list(key).await.unwrap_or_default();
                     self.remote.insert(key.clone(), shas);
                 }
-                if self.remote.get(key).is_some_and(|shas| shas.contains(sha)) {
+                if self.remote.get(key).is_some_and(|shas| shas.contains(&sha)) {
                     return Some(AuditSource::Remote);
                 }
             }
@@ -182,6 +188,9 @@ impl AuditedActions {
         sha: &str,
         tag: &str,
     ) {
+        if !is_full_sha(sha) {
+            return;
+        }
         let Some(cache_dir) = &self.cache_dir else {
             return;
         };
@@ -245,6 +254,7 @@ impl AuditedActions {
     async fn fetch_remote_list(&self, action_key: &str) -> Option<HashSet<String>> {
         // No public key in this build → the remote layer stays dark.
         let key = self.catalog_key.as_ref()?;
+        let safe_action_key = sanitize_for_terminal(action_key);
 
         let url = format!("{}/{action_key}.json", self.remote_url);
         let bytes = match self.fetch_url(&url).await {
@@ -256,7 +266,7 @@ impl AuditedActions {
             // degrading coverage for the rest of the run.
             Err(()) => {
                 eprintln!(
-                    "warning: could not fetch remote catalog for {action_key} — treating it as unaudited for this run"
+                    "warning: could not fetch remote catalog for {safe_action_key} — treating it as unaudited for this run"
                 );
                 return None;
             }
@@ -271,13 +281,13 @@ impl AuditedActions {
             Ok(Some(b)) => b,
             Ok(None) => {
                 eprintln!(
-                    "warning: remote catalog for {action_key} has no signature — ignoring it"
+                    "warning: remote catalog for {safe_action_key} has no signature — ignoring it"
                 );
                 return None;
             }
             Err(()) => {
                 eprintln!(
-                    "warning: could not fetch the signature for {action_key}'s remote catalog — ignoring it"
+                    "warning: could not fetch the signature for {safe_action_key}'s remote catalog — ignoring it"
                 );
                 return None;
             }
@@ -285,21 +295,30 @@ impl AuditedActions {
         let sig_text = String::from_utf8_lossy(&sig_bytes);
         let Some(trusted_comment) = verify_catalog_signature(key, &bytes, &sig_text) else {
             eprintln!(
-                "warning: remote catalog for {action_key} failed signature verification — ignoring it"
+                "warning: remote catalog for {safe_action_key} failed signature verification — ignoring it"
             );
             return None;
         };
 
-        // Anti-replay: minisign's default trusted comment carries the signing
-        // time (`timestamp:<epoch>`), and the verified global signature covers
-        // it. A CDN (or a MITM on a downgraded path) could otherwise serve a
-        // validly signed but superseded catalog forever — keeping an entry
-        // vouched-for after its audit was found wrong and it was removed.
-        // A missing timestamp cannot satisfy the replay bound. Accepting it
-        // would turn a valid signature into an indefinitely reusable verdict.
+        let Some(signed_action) = trusted_comment_action(&trusted_comment) else {
+            eprintln!(
+                "warning: remote catalog for {safe_action_key} has no signed action identity — ignoring it"
+            );
+            return None;
+        };
+        if signed_action != action_key {
+            eprintln!(
+                "warning: remote catalog for {safe_action_key} was signed for {} — ignoring it",
+                sanitize_for_terminal(signed_action)
+            );
+            return None;
+        }
+
+        // Anti-replay: the authenticated trusted comment carries the signing
+        // time. A missing timestamp cannot satisfy the replay bound.
         let Some(signed_at) = trusted_comment_timestamp(&trusted_comment) else {
             eprintln!(
-                "warning: remote catalog for {action_key} has no signed timestamp — ignoring it"
+                "warning: remote catalog for {safe_action_key} has no signed timestamp — ignoring it"
             );
             return None;
         };
@@ -311,14 +330,14 @@ impl AuditedActions {
             CatalogFreshness::Fresh => {}
             CatalogFreshness::Stale => {
                 eprintln!(
-                    "warning: remote catalog for {action_key} was signed more than {} days ago — ignoring it (possible replay of a superseded catalog)",
+                    "warning: remote catalog for {safe_action_key} was signed more than {} days ago — ignoring it (possible replay of a superseded catalog)",
                     MAX_REMOTE_CATALOG_AGE.as_secs() / 86_400
                 );
                 return None;
             }
             CatalogFreshness::FutureDated => {
                 eprintln!(
-                    "warning: remote catalog for {action_key} claims to be signed more than {} minutes in the future — ignoring it (check the signing system's clock; if your own clock is correct this may indicate a compromised or faulty signer)",
+                    "warning: remote catalog for {safe_action_key} claims to be signed more than {} minutes in the future — ignoring it (check the signing system's clock; if your own clock is correct this may indicate a compromised or faulty signer)",
                     MAX_CLOCK_SKEW.as_secs() / 60
                 );
                 return None;
@@ -388,6 +407,13 @@ fn trusted_comment_timestamp(comment: &str) -> Option<u64> {
         .and_then(|value| value.parse().ok())
 }
 
+fn trusted_comment_action(comment: &str) -> Option<&str> {
+    comment
+        .split(['\t', ' '])
+        .find_map(|token| token.strip_prefix("action:"))
+        .filter(|value| !value.is_empty())
+}
+
 fn load_bundled() -> HashMap<String, HashSet<String>> {
     let map: HashMap<String, Vec<String>> = serde_json::from_str(BUNDLED_JSON).unwrap_or_default();
     map.into_iter()
@@ -397,7 +423,10 @@ fn load_bundled() -> HashMap<String, HashSet<String>> {
 
 fn parse_entries(json: &str) -> HashSet<String> {
     let entries: Vec<AuditedEntry> = serde_json::from_str(json).unwrap_or_default();
-    entries.into_iter().map(|e| e.sha).collect()
+    entries
+        .into_iter()
+        .filter_map(|entry| is_full_sha(&entry.sha).then(|| entry.sha.to_ascii_lowercase()))
+        .collect()
 }
 
 fn parse_local_cache_entries(json: &str, key: &str) -> HashSet<String> {
@@ -406,8 +435,12 @@ fn parse_local_cache_entries(json: &str, key: &str) -> HashSet<String> {
         .into_iter()
         .filter(|e| e.pinprick_version.as_deref() == Some(LOCAL_CACHE_PINPRICK_VERSION))
         .filter(|e| e.action.as_deref() == Some(key))
-        .map(|e| e.sha)
+        .filter_map(|entry| is_full_sha(&entry.sha).then(|| entry.sha.to_ascii_lowercase()))
         .collect()
+}
+
+fn is_full_sha(value: &str) -> bool {
+    value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 /// Serialize cache entries to their on-disk JSON form. Going through serde
@@ -450,15 +483,8 @@ fn action_key(owner: &str, repo: &str, subpath: Option<&str>) -> Option<String> 
     }
 }
 
-/// A repository-level clean verdict covers every action at that commit, while
-/// a subpath verdict covers only that subpath. Keep the fallback one-way so a
-/// clean sibling action can never suppress scanning another sibling.
 fn action_keys(owner: &str, repo: &str, subpath: Option<&str>) -> Option<Vec<String>> {
-    let exact = action_key(owner, repo, subpath)?;
-    match subpath {
-        Some(_) => Some(vec![action_key(owner, repo, None)?, exact]),
-        None => Some(vec![exact]),
-    }
+    Some(vec![action_key(owner, repo, subpath)?])
 }
 
 fn is_safe_subpath(path: &str) -> bool {
@@ -466,12 +492,20 @@ fn is_safe_subpath(path: &str) -> bool {
 }
 
 fn is_safe_segment(s: &str) -> bool {
-    !s.is_empty() && s != "." && s != ".." && !s.contains(['/', '\\'])
+    !s.is_empty()
+        && s != "."
+        && s != ".."
+        && s.bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const SHA_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const SHA_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const SHA_C: &str = "abc123abc123abc123abc123abc123abc123abcd";
 
     #[test]
     fn safe_segments_accepted() {
@@ -499,13 +533,14 @@ mod tests {
         }
         assert_eq!(action_key("owner/name", "repo", Some("a")), None);
         assert_eq!(action_key("owner", "repo/name", Some("a")), None);
+        assert_eq!(action_key("owner\u{1b}[31m", "repo", None), None);
     }
 
     #[test]
-    fn subpath_lookup_uses_parent_then_exact_identity() {
+    fn subpath_lookup_uses_exact_identity_only() {
         assert_eq!(
             action_keys("owner", "repo", Some("a/b")),
-            Some(vec!["owner/repo".to_string(), "owner/repo/a/b".to_string()])
+            Some(vec!["owner/repo/a/b".to_string()])
         );
         assert_eq!(
             action_keys("owner", "repo", None),
@@ -515,16 +550,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn parent_bundled_verdict_covers_subpath() {
+    async fn parent_bundled_verdict_does_not_cover_subpath() {
         let mut aa = AuditedActions::new(false);
         aa.bundled.clear();
         aa.bundled
-            .insert("owner/repo".to_string(), HashSet::from(["aaa".to_string()]));
+            .insert("owner/repo".to_string(), HashSet::from([SHA_A.to_string()]));
         aa.cache_dir = None;
 
         assert_eq!(
-            aa.check("owner", "repo", Some("restore"), "aaa").await,
-            Some(AuditSource::Bundled)
+            aa.check("owner", "repo", Some("restore"), SHA_A).await,
+            None
         );
     }
 
@@ -534,27 +569,27 @@ mod tests {
         aa.bundled.clear();
         aa.bundled.insert(
             "owner/repo/save".to_string(),
-            HashSet::from(["aaa".to_string()]),
+            HashSet::from([SHA_A.to_string()]),
         );
         aa.cache_dir = None;
 
         assert_eq!(
-            aa.check("owner", "repo", Some("restore"), "aaa").await,
+            aa.check("owner", "repo", Some("restore"), SHA_A).await,
             None
         );
     }
 
     #[tokio::test]
-    async fn parent_local_cache_verdict_covers_subpath() {
+    async fn parent_local_cache_verdict_does_not_cover_subpath() {
         let dir = tempfile::TempDir::new().unwrap();
         let mut aa = AuditedActions::new(false);
         aa.bundled.clear();
         aa.cache_dir = Some(dir.path().to_path_buf());
-        aa.cache_clean("owner", "repo", None, "aaa", "v1");
+        aa.cache_clean("owner", "repo", None, SHA_A, "v1");
 
         assert_eq!(
-            aa.check("owner", "repo", Some("restore"), "aaa").await,
-            Some(AuditSource::LocalCache)
+            aa.check("owner", "repo", Some("restore"), SHA_A).await,
+            None
         );
     }
 
@@ -575,14 +610,14 @@ mod tests {
     #[test]
     fn render_entries_round_trips() {
         let entries = vec![
-            serde_json::json!({ "sha": "aaa", "tag": "v1" }),
-            serde_json::json!({ "sha": "bbb", "tag": "v2" }),
+            serde_json::json!({ "sha": SHA_A, "tag": "v1" }),
+            serde_json::json!({ "sha": SHA_B, "tag": "v2" }),
         ];
         let rendered = render_entries(&entries).unwrap();
         assert!(rendered.ends_with('\n'));
         let shas = parse_entries(&rendered);
-        assert!(shas.contains("aaa"));
-        assert!(shas.contains("bbb"));
+        assert!(shas.contains(SHA_A));
+        assert!(shas.contains(SHA_B));
     }
 
     #[test]
@@ -590,49 +625,56 @@ mod tests {
         // A tag with quotes and a backslash would corrupt hand-formatted JSON.
         // serde escapes it, so the file stays valid and round-trips.
         let entries = vec![serde_json::json!({
-            "sha": "abc123",
+            "sha": SHA_C,
             "tag": r#"v1 "stable" \ release"#,
         })];
         let rendered = render_entries(&entries).unwrap();
         let parsed: Vec<serde_json::Value> =
             serde_json::from_str(&rendered).expect("rendered cache must be valid JSON");
-        assert_eq!(parsed[0]["sha"], "abc123");
+        assert_eq!(parsed[0]["sha"], SHA_C);
         assert_eq!(parsed[0]["tag"], r#"v1 "stable" \ release"#);
         // The reader still recovers the sha.
-        assert!(parse_entries(&rendered).contains("abc123"));
+        assert!(parse_entries(&rendered).contains(SHA_C));
     }
 
     #[test]
     fn local_cache_ignores_unversioned_legacy_entries() {
+        let rendered = format!(r#"[{{ "sha": "{SHA_A}", "tag": "v1" }}]"#);
+        assert!(parse_entries(&rendered).contains(SHA_A));
+        assert!(!parse_local_cache_entries(&rendered, "owner/repo").contains(SHA_A));
+    }
+
+    #[test]
+    fn catalog_reader_rejects_abbreviated_or_non_hex_shas() {
         let rendered = r#"[
-  { "sha": "aaa", "tag": "v1" }
-]"#;
-        assert!(parse_entries(rendered).contains("aaa"));
-        assert!(!parse_local_cache_entries(rendered, "owner/repo").contains("aaa"));
+            { "sha": "abc123", "tag": "v1" },
+            { "sha": "gggggggggggggggggggggggggggggggggggggggg", "tag": "v2" }
+        ]"#;
+        assert!(parse_entries(rendered).is_empty());
     }
 
     #[test]
     fn local_cache_ignores_owner_repo_only_entries() {
         let rendered = serde_json::to_string(&vec![serde_json::json!({
-            "sha": "aaa",
+            "sha": SHA_A,
             "tag": "v1",
             "pinprick_version": LOCAL_CACHE_PINPRICK_VERSION
         })])
         .unwrap();
-        assert!(!parse_local_cache_entries(&rendered, "owner/repo").contains("aaa"));
+        assert!(!parse_local_cache_entries(&rendered, "owner/repo").contains(SHA_A));
     }
 
     #[test]
     fn local_cache_accepts_current_version_entries() {
         let rendered = serde_json::to_string(&vec![serde_json::json!({
             "action": "owner/repo",
-            "sha": "aaa",
+            "sha": SHA_A,
             "tag": "v1",
             "pinprick_version": LOCAL_CACHE_PINPRICK_VERSION
         })])
         .unwrap();
-        assert!(parse_local_cache_entries(&rendered, "owner/repo").contains("aaa"));
-        assert!(!parse_local_cache_entries(&rendered, "owner/repo/subdir").contains("aaa"));
+        assert!(parse_local_cache_entries(&rendered, "owner/repo").contains(SHA_A));
+        assert!(!parse_local_cache_entries(&rendered, "owner/repo/subdir").contains(SHA_A));
     }
 
     #[test]
@@ -641,21 +683,21 @@ mod tests {
         let mut aa = AuditedActions::new(false);
         aa.cache_dir = Some(dir.path().to_path_buf());
 
-        aa.cache_clean("owner", "repo", Some("a"), "aaa", "v1");
+        aa.cache_clean("owner", "repo", Some("a"), SHA_A, "v1");
 
         assert!(
             aa.load_local_cache("owner", "repo", "owner/repo/a")
-                .contains("aaa")
+                .contains(SHA_A)
         );
         assert!(
             !aa.load_local_cache("owner", "repo", "owner/repo/b")
-                .contains("aaa")
+                .contains(SHA_A)
         );
 
-        aa.cache_clean("owner", "repo", Some("b"), "aaa", "v1");
+        aa.cache_clean("owner", "repo", Some("b"), SHA_A, "v1");
         assert!(
             aa.load_local_cache("owner", "repo", "owner/repo/b")
-                .contains("aaa")
+                .contains(SHA_A)
         );
 
         let path = cache_path(dir.path(), "owner", "repo").unwrap();
@@ -676,19 +718,19 @@ mod tests {
 
         let path = cache_path(dir.path(), "owner", "repo").unwrap();
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, r#"[{ "sha": "aaa", "tag": "v1" }]"#).unwrap();
+        std::fs::write(&path, format!(r#"[{{ "sha": "{SHA_A}", "tag": "v1" }}]"#)).unwrap();
         // Pre-state: the legacy entry is invisible to the reader.
         assert!(
             !aa.load_local_cache("owner", "repo", "owner/repo")
-                .contains("aaa")
+                .contains(SHA_A)
         );
 
-        aa.cache_clean("owner", "repo", None, "aaa", "v1");
+        aa.cache_clean("owner", "repo", None, SHA_A, "v1");
 
         // The SHA is now cached under the current version…
         assert!(
             aa.load_local_cache("owner", "repo", "owner/repo")
-                .contains("aaa")
+                .contains(SHA_A)
         );
         // …and the stale legacy entry was pruned rather than duplicated.
         let on_disk: Vec<serde_json::Value> =
@@ -730,13 +772,14 @@ mod tests {
 
         /// Ephemeral signing identity for tests: the verification key (as
         /// parsed from a real `.pub` rendering) and a signer closure.
-        fn test_identity() -> (PublicKey, impl Fn(&[u8]) -> String) {
+        fn test_identity() -> (PublicKey, impl Fn(&[u8], &str) -> String) {
             let minisign::KeyPair { pk, sk } =
                 minisign::KeyPair::generate_unencrypted_keypair().unwrap();
             let verify_key = parse_catalog_key(&pk.to_box().unwrap().to_string())
                 .expect("generated public key must parse");
-            let signer = move |data: &[u8]| {
-                minisign::sign(None, &sk, std::io::Cursor::new(data), None, None)
+            let signer = move |data: &[u8], action_key: &str| {
+                let trusted = format!("timestamp:{}\taction:{action_key}", now_epoch());
+                minisign::sign(None, &sk, std::io::Cursor::new(data), Some(&trusted), None)
                     .unwrap()
                     .to_string()
             };
@@ -833,17 +876,27 @@ mod tests {
             assert_eq!(trusted_comment_timestamp(""), None);
         }
 
+        #[test]
+        fn trusted_comment_action_requires_a_nonempty_token() {
+            assert_eq!(
+                trusted_comment_action("timestamp:1700000000\taction:actions/checkout"),
+                Some("actions/checkout")
+            );
+            assert_eq!(trusted_comment_action("timestamp:1700000000"), None);
+            assert_eq!(trusted_comment_action("action:"), None);
+        }
+
         #[tokio::test]
         async fn fetch_remote_list_stale_signature_is_rejected() {
             // A validly signed catalog whose signed timestamp is past the
             // freshness window must be ignored — that is the replay defense:
             // an old signature stays valid forever, but not fresh forever.
             let (key, sign) = test_identity_with_trusted_comment();
-            let body = serde_json::to_string(&json!([{ "sha": "aaa", "tag": "v1" }])).unwrap();
+            let body = serde_json::to_string(&json!([{ "sha": SHA_A, "tag": "v1" }])).unwrap();
             let stale = now_epoch() - MAX_REMOTE_CATALOG_AGE.as_secs() - 86_400;
             let sig = sign(
                 body.as_bytes(),
-                &format!("timestamp:{stale}\tfile:replayed.json\thashed"),
+                &format!("timestamp:{stale}\taction:actions/replayed"),
             );
 
             let server = MockServer::start().await;
@@ -859,14 +912,17 @@ mod tests {
         async fn fetch_remote_list_fresh_and_within_skew_timestamps_are_accepted() {
             // Fresh: inside the window. Slightly future: NTP drift, not replay.
             let (key, sign) = test_identity_with_trusted_comment();
-            let body = serde_json::to_string(&json!([{ "sha": "aaa", "tag": "v1" }])).unwrap();
+            let body = serde_json::to_string(&json!([{ "sha": SHA_A, "tag": "v1" }])).unwrap();
 
             let server = MockServer::start().await;
             for (action_key, timestamp) in [
                 ("actions/fresh", now_epoch() - 60),
                 ("actions/skewed", now_epoch() + MAX_CLOCK_SKEW.as_secs() / 2),
             ] {
-                let sig = sign(body.as_bytes(), &format!("timestamp:{timestamp}"));
+                let sig = sign(
+                    body.as_bytes(),
+                    &format!("timestamp:{timestamp}\taction:{action_key}"),
+                );
                 mount_signed(&server, action_key, &body, &sig).await;
             }
 
@@ -877,13 +933,13 @@ mod tests {
                 aa.fetch_remote_list("actions/fresh")
                     .await
                     .unwrap()
-                    .contains("aaa")
+                    .contains(SHA_A)
             );
             assert!(
                 aa.fetch_remote_list("actions/skewed")
                     .await
                     .unwrap()
-                    .contains("aaa")
+                    .contains(SHA_A)
             );
         }
 
@@ -895,11 +951,11 @@ mod tests {
             // fault (or a compromised signer) would grant a CDN an extended
             // replay horizon for a later-revoked entry.
             let (key, sign) = test_identity_with_trusted_comment();
-            let body = serde_json::to_string(&json!([{ "sha": "aaa", "tag": "v1" }])).unwrap();
+            let body = serde_json::to_string(&json!([{ "sha": SHA_A, "tag": "v1" }])).unwrap();
             let future = now_epoch() + MAX_CLOCK_SKEW.as_secs() + 3_600;
             let sig = sign(
                 body.as_bytes(),
-                &format!("timestamp:{future}\tfile:fromthefuture.json\thashed"),
+                &format!("timestamp:{future}\taction:actions/fromthefuture"),
             );
 
             let server = MockServer::start().await;
@@ -918,7 +974,7 @@ mod tests {
         #[tokio::test]
         async fn fetch_remote_list_signature_without_timestamp_is_rejected() {
             let (key, sign) = test_identity_with_trusted_comment();
-            let body = serde_json::to_string(&json!([{ "sha": "aaa", "tag": "v1" }])).unwrap();
+            let body = serde_json::to_string(&json!([{ "sha": SHA_A, "tag": "v1" }])).unwrap();
             let sig = sign(body.as_bytes(), "no clock here");
 
             let server = MockServer::start().await;
@@ -934,20 +990,41 @@ mod tests {
         async fn fetch_remote_list_parses_signed_entries() {
             let (key, sign) = test_identity();
             let body = serde_json::to_string(&json!([
-                { "sha": "aaa", "tag": "v1" },
-                { "sha": "bbb", "tag": "v2" }
+                { "sha": SHA_A, "tag": "v1" },
+                { "sha": SHA_B, "tag": "v2" }
             ]))
             .unwrap();
 
             let server = MockServer::start().await;
-            mount_signed(&server, "actions/checkout", &body, &sign(body.as_bytes())).await;
+            mount_signed(
+                &server,
+                "actions/checkout",
+                &body,
+                &sign(body.as_bytes(), "actions/checkout"),
+            )
+            .await;
 
             let mut aa = AuditedActions::new(true);
             aa.catalog_key = Some(key);
             aa.remote_url = server.uri();
             let shas = aa.fetch_remote_list("actions/checkout").await.unwrap();
-            assert!(shas.contains("aaa"));
-            assert!(shas.contains("bbb"));
+            assert!(shas.contains(SHA_A));
+            assert!(shas.contains(SHA_B));
+        }
+
+        #[tokio::test]
+        async fn fetch_remote_list_rejects_signature_relocated_to_another_action() {
+            let (key, sign) = test_identity();
+            let body = serde_json::to_string(&json!([{ "sha": SHA_A, "tag": "v1" }])).unwrap();
+            let sig = sign(body.as_bytes(), "actions/source");
+
+            let server = MockServer::start().await;
+            mount_signed(&server, "actions/destination", &body, &sig).await;
+
+            let mut aa = AuditedActions::new(true);
+            aa.catalog_key = Some(key);
+            aa.remote_url = server.uri();
+            assert!(aa.fetch_remote_list("actions/destination").await.is_none());
         }
 
         #[tokio::test]
@@ -1012,7 +1089,7 @@ mod tests {
         #[tokio::test]
         async fn fetch_remote_list_missing_signature_is_none() {
             let (key, _) = test_identity();
-            let body = serde_json::to_string(&json!([{ "sha": "aaa", "tag": "v1" }])).unwrap();
+            let body = serde_json::to_string(&json!([{ "sha": SHA_A, "tag": "v1" }])).unwrap();
 
             let server = MockServer::start().await;
             Mock::given(method("GET"))
@@ -1032,7 +1109,7 @@ mod tests {
         async fn fetch_remote_list_tampered_body_is_none() {
             let (key, sign) = test_identity();
             let signed_body =
-                serde_json::to_string(&json!([{ "sha": "aaa", "tag": "v1" }])).unwrap();
+                serde_json::to_string(&json!([{ "sha": SHA_A, "tag": "v1" }])).unwrap();
             let tampered_body =
                 serde_json::to_string(&json!([{ "sha": "evil", "tag": "v1" }])).unwrap();
 
@@ -1043,7 +1120,7 @@ mod tests {
                 &server,
                 "actions/tampered",
                 &tampered_body,
-                &sign(signed_body.as_bytes()),
+                &sign(signed_body.as_bytes(), "actions/tampered"),
             )
             .await;
 
@@ -1057,10 +1134,16 @@ mod tests {
         async fn fetch_remote_list_wrong_key_is_none() {
             let (_, sign) = test_identity();
             let (other_key, _) = test_identity();
-            let body = serde_json::to_string(&json!([{ "sha": "aaa", "tag": "v1" }])).unwrap();
+            let body = serde_json::to_string(&json!([{ "sha": SHA_A, "tag": "v1" }])).unwrap();
 
             let server = MockServer::start().await;
-            mount_signed(&server, "actions/wrongkey", &body, &sign(body.as_bytes())).await;
+            mount_signed(
+                &server,
+                "actions/wrongkey",
+                &body,
+                &sign(body.as_bytes(), "actions/wrongkey"),
+            )
+            .await;
 
             let mut aa = AuditedActions::new(true);
             aa.catalog_key = Some(other_key);
@@ -1073,10 +1156,16 @@ mod tests {
             // Even with a perfectly signed catalog available, a build without
             // a public key must not honor remote entries.
             let (_, sign) = test_identity();
-            let body = serde_json::to_string(&json!([{ "sha": "aaa", "tag": "v1" }])).unwrap();
+            let body = serde_json::to_string(&json!([{ "sha": SHA_A, "tag": "v1" }])).unwrap();
 
             let server = MockServer::start().await;
-            mount_signed(&server, "actions/keyless", &body, &sign(body.as_bytes())).await;
+            mount_signed(
+                &server,
+                "actions/keyless",
+                &body,
+                &sign(body.as_bytes(), "actions/keyless"),
+            )
+            .await;
 
             let mut aa = AuditedActions::new(true);
             aa.catalog_key = None;
@@ -1087,10 +1176,17 @@ mod tests {
         #[tokio::test]
         async fn check_falls_through_to_remote_layer() {
             let (key, sign) = test_identity();
-            let body = serde_json::to_string(&json!([{ "sha": "feedface", "tag": "v3" }])).unwrap();
+            let sha = "feedfacefeedfacefeedfacefeedfacefeedface";
+            let body = serde_json::to_string(&json!([{ "sha": sha, "tag": "v3" }])).unwrap();
 
             let server = MockServer::start().await;
-            mount_signed(&server, "some/action", &body, &sign(body.as_bytes())).await;
+            mount_signed(
+                &server,
+                "some/action",
+                &body,
+                &sign(body.as_bytes(), "some/action"),
+            )
+            .await;
 
             let mut aa = AuditedActions::new(true);
             aa.catalog_key = Some(key);
@@ -1098,7 +1194,7 @@ mod tests {
             aa.cache_dir = None; // don't consult the real user cache during the test
             // Not bundled, no local cache hit → resolved by the remote layer.
             assert_eq!(
-                aa.check("some", "action", None, "feedface").await,
+                aa.check("some", "action", None, sha).await,
                 Some(AuditSource::Remote)
             );
             // A SHA the remote list doesn't contain stays unaudited.
@@ -1108,33 +1204,44 @@ mod tests {
         #[tokio::test]
         async fn check_uses_subpath_remote_identity() {
             let (key, sign) = test_identity();
-            let body = serde_json::to_string(&json!([{ "sha": "feedface", "tag": "v3" }])).unwrap();
+            let sha = "feedfacefeedfacefeedfacefeedfacefeedface";
+            let body = serde_json::to_string(&json!([{ "sha": sha, "tag": "v3" }])).unwrap();
 
             let server = MockServer::start().await;
-            mount_signed(&server, "some/action/a", &body, &sign(body.as_bytes())).await;
+            mount_signed(
+                &server,
+                "some/action/a",
+                &body,
+                &sign(body.as_bytes(), "some/action/a"),
+            )
+            .await;
 
             let mut aa = AuditedActions::new(true);
             aa.catalog_key = Some(key);
             aa.remote_url = server.uri();
             aa.cache_dir = None;
 
+            assert_eq!(aa.check("some", "action", Some("b"), sha).await, None);
             assert_eq!(
-                aa.check("some", "action", Some("b"), "feedface").await,
-                None
-            );
-            assert_eq!(
-                aa.check("some", "action", Some("a"), "feedface").await,
+                aa.check("some", "action", Some("a"), sha).await,
                 Some(AuditSource::Remote)
             );
         }
 
         #[tokio::test]
-        async fn parent_remote_verdict_covers_subpath() {
+        async fn parent_remote_verdict_does_not_cover_subpath() {
             let (key, sign) = test_identity();
-            let body = serde_json::to_string(&json!([{ "sha": "feedface", "tag": "v3" }])).unwrap();
+            let sha = "feedfacefeedfacefeedfacefeedfacefeedface";
+            let body = serde_json::to_string(&json!([{ "sha": sha, "tag": "v3" }])).unwrap();
 
             let server = MockServer::start().await;
-            mount_signed(&server, "some/action", &body, &sign(body.as_bytes())).await;
+            mount_signed(
+                &server,
+                "some/action",
+                &body,
+                &sign(body.as_bytes(), "some/action"),
+            )
+            .await;
 
             let mut aa = AuditedActions::new(true);
             aa.bundled.clear();
@@ -1142,10 +1249,7 @@ mod tests {
             aa.remote_url = server.uri();
             aa.cache_dir = None;
 
-            assert_eq!(
-                aa.check("some", "action", Some("sub"), "feedface").await,
-                Some(AuditSource::Remote)
-            );
+            assert_eq!(aa.check("some", "action", Some("sub"), sha).await, None);
         }
     }
 }

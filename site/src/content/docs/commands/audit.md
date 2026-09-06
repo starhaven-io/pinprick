@@ -14,16 +14,16 @@ pinprick audit /path/to/repo
 
 ## What it scans
 
-- Shell commands in workflow `run:` blocks and composite `action.yml` steps
-- JavaScript and TypeScript files (`.js`, `.ts`) inside each action's source tree, including minified bundles
-- Python files (`.py`) inside each action's source tree
-- `Dockerfile` and `*.dockerfile` files inside each action's source tree
+- Shell commands in workflow `run:` blocks and composite `action.yml` steps, plus statically referenced non-vendored `.sh`, `.bash`, `.zsh`, and `.ps1` helpers
+- JavaScript and TypeScript entrypoints declared by action metadata, plus statically referenced helpers, including minified bundles
+- Python helpers statically referenced by composite action steps
+- Dockerfiles named by a reachable container action's `runs.image` field. Unreferenced example and test Dockerfiles are not executed by consumers and are not scanned
 
 For the full list of every rule, including examples and severity, see the [Detections reference](/reference/detections).
 
 ## Audited actions list
 
-pinprick skips actions whose `owner/repo@sha` is already known to be clean. The check consults three sources, in order, and reports which one answered:
+pinprick skips exact action identities whose `owner/repo[/subpath]@sha` is already known to be clean. The check consults three sources, in order, and reports which one answered:
 
 - `bundled` — ships with the pinprick binary from `audited-actions/` in the repo
 - `local cache` — written to `$XDG_CACHE_HOME/pinprick/audited/` (default `~/.cache/pinprick/audited/`) after a successful live scan on this machine
@@ -33,7 +33,11 @@ See [Audited Actions](/configuration/audited-actions) for details on how the lis
 
 ## Without a token
 
-When no GitHub token is available, audit scans workflow `run:` blocks and local actions referenced with `uses: ./...`. Remote action source code is not fetched. This still catches the most common patterns in repository-owned workflow code, but misses JavaScript, Python, and Docker patterns inside remote actions.
+When no GitHub token is available, audit scans workflow `run:` blocks and local actions referenced with `uses: ./...` or `uses: $/...`. Remote action source code is not fetched. External actions already covered by a valid bundled, local, or remote audited-actions verdict remain covered; any other external action makes the result incomplete and exits 2 rather than claiming the repository is clean.
+
+`$/path` binds a same-repository action to the exact workflow commit on GitHub Actions runner 2.336.0 or newer. `./path` resolves from the runner workspace. Pinprick statically scans both forms relative to the repository path supplied on the command line.
+
+Missing entrypoints, symlinked source, truncated trees that omit the selected action metadata, resource limits, unsupported `uses:` targets, and nested action or reusable-workflow references that cannot be followed all make the scan incomplete. Human, JSON, and SARIF modes share this verdict.
 
 ## Output formats
 

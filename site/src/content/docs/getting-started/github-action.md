@@ -117,11 +117,11 @@ The action passes the workflow's `GITHUB_TOKEN` to pinprick so it can fetch and 
 
 ## Exit behavior
 
-| Code | Meaning          | Action behavior                                                |
-| ---- | ---------------- | -------------------------------------------------------------- |
-| `0`  | Clean            | Succeeds.                                                      |
-| `1`  | Findings present | Succeeds by default; fails only with `fail-on-findings: true`. |
-| `2+` | Error            | Fails.                                                         |
+| Code | Meaning                      | Action behavior                                                |
+| ---- | ---------------------------- | -------------------------------------------------------------- |
+| `0`  | Clean                        | Succeeds.                                                      |
+| `1`  | Findings present             | Succeeds by default; fails only with `fail-on-findings: true`. |
+| `2+` | Error or incomplete coverage | Fails; no clean verdict was produced.                          |
 
 In Advanced Security mode, SARIF upload happens before optional `fail-on-findings` failure so findings are still available in code scanning.
 

@@ -63,4 +63,4 @@ It looks for a token in this order:
 2. `GH_TOKEN` environment variable
 3. `gh auth token` CLI fallback
 
-The `pin` and `update` commands require a token. The `audit` command works without one but with reduced coverage — only local `run:` blocks are scanned.
+The `pin` and `update` commands require a token. The `audit` command can still scan workflow `run:` blocks and local `./` or `$/` actions without one. External actions without an audited-actions catalog verdict make token-less coverage incomplete and exit 2.

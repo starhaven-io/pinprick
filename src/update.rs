@@ -5,7 +5,7 @@ use std::process::ExitCode;
 
 use crate::auth;
 use crate::github::{GitHubClient, Release};
-use crate::output::{UpdateReport, UpdateResult};
+use crate::output::{UpdateFailure, UpdateReport, UpdateResult, sanitize_for_terminal};
 use crate::workflow::{self, RefType};
 
 pub async fn run(
@@ -31,23 +31,35 @@ async fn run_with_client(
     let files = workflow::find_workflows(repo_root)?;
     let mut report = UpdateReport {
         updates: Vec::new(),
+        failures: Vec::new(),
+        skipped: Vec::new(),
         up_to_date: 0,
-        applied: apply,
+        applied: false,
     };
 
     let mut releases_cache: HashMap<String, Vec<Release>> = HashMap::new();
-    let mut releases_failed: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut tags_cache: HashMap<String, Vec<String>> = HashMap::new();
     let mut tag_sha_cache: HashMap<String, String> = HashMap::new();
+    let mut pending_edits: Vec<(workflow::WorkflowFile, Vec<workflow::ActionEdit>)> = Vec::new();
 
     for file in &files {
         let display_name = workflow::display_path(file.path(), repo_root);
         if !json {
-            eprintln!("Scanning {display_name}...");
+            eprintln!("Scanning {}...", sanitize_for_terminal(&display_name));
         }
 
-        let actions = workflow::scan_workflow(file)?;
-        let mut replacements: Vec<(usize, String, String)> = Vec::new();
+        let content = workflow::read_workflow(file)?;
+        for unsupported in workflow::scan_unsupported_uses(&content) {
+            report.failures.push(UpdateFailure {
+                file: display_name.clone(),
+                action: unsupported.value,
+                stage: "workflow parsing".to_string(),
+                error: "unsupported uses representation; update refused".to_string(),
+                line: unsupported.line_number,
+            });
+        }
+        let actions = workflow::scan_content(&content);
+        let mut edits = Vec::new();
 
         for action in &actions {
             if action.ref_type != RefType::Sha {
@@ -69,28 +81,45 @@ async fn run_with_client(
                 .filter(|t| is_version_like(t));
             let current_tag = match comment_tag {
                 Some(t) => t,
-                None => match client
-                    .sha_to_tag(&action.owner, &action.repo, &action.ref_string)
-                    .await
-                {
-                    Ok(Some(tag)) => leading_version_token(&tag),
-                    // Unknown SHA or fetch failure — nothing to compare against.
-                    _ => continue,
-                },
+                None => {
+                    match client
+                        .sha_to_tag(&action.owner, &action.repo, &action.ref_string)
+                        .await
+                    {
+                        Ok(Some(tag)) => leading_version_token(&tag),
+                        Ok(None) => {
+                            report.skipped.push(update_failure(
+                                file,
+                                repo_root,
+                                action,
+                                "current version lookup",
+                                "no version tag points at the pinned SHA",
+                            ));
+                            continue;
+                        }
+                        Err(error) => {
+                            report.failures.push(update_failure(
+                                file,
+                                repo_root,
+                                action,
+                                "current version lookup",
+                                error,
+                            ));
+                            continue;
+                        }
+                    }
+                }
             };
 
             if !json {
-                eprint!("  Checking {}@{}...", action.full_name(), current_tag);
+                eprint!(
+                    "  Checking {}@{}...",
+                    sanitize_for_terminal(&action.full_name()),
+                    sanitize_for_terminal(&current_tag)
+                );
             }
 
             let owner_repo = action.owner_repo();
-            if releases_failed.contains(&owner_repo) {
-                if !json {
-                    eprintln!(" skipped");
-                }
-                continue;
-            }
-
             // Borrow the cached vectors instead of cloning them — release
             // lists can run to 1,000 entries, and this loop hits the cache
             // once per action occurrence.
@@ -107,11 +136,17 @@ async fn run_with_client(
                         }
                         &*releases_cache.entry(owner_repo.clone()).or_insert(r)
                     }
-                    Err(_) => {
+                    Err(error) => {
                         if !json {
                             eprintln!(" failed");
                         }
-                        releases_failed.insert(owner_repo);
+                        report.failures.push(update_failure(
+                            file,
+                            repo_root,
+                            action,
+                            "release lookup",
+                            error,
+                        ));
                         continue;
                     }
                 }
@@ -127,7 +162,16 @@ async fn run_with_client(
                     } else {
                         match client.list_tags(&action.owner, &action.repo).await {
                             Ok(t) => &*tags_cache.entry(owner_repo.clone()).or_insert(t),
-                            Err(_) => continue,
+                            Err(error) => {
+                                report.failures.push(update_failure(
+                                    file,
+                                    repo_root,
+                                    action,
+                                    "tag lookup",
+                                    error,
+                                ));
+                                continue;
+                            }
                         }
                     };
                     match pick_latest_tag(tags) {
@@ -162,7 +206,16 @@ async fn run_with_client(
                         tag_sha_cache.insert(tag_key, sha.clone());
                         sha
                     }
-                    Err(_) => continue,
+                    Err(error) => {
+                        report.failures.push(update_failure(
+                            file,
+                            repo_root,
+                            action,
+                            "new version resolution",
+                            error,
+                        ));
+                        continue;
+                    }
                 }
             };
 
@@ -185,17 +238,21 @@ async fn run_with_client(
                 release_url,
             });
 
-            if apply
-                && let Some(new_line) =
-                    workflow::build_pinned_line(&action.raw_line, &new_sha, &latest_tag)
-            {
-                replacements.push((action.line_number, action.raw_line.clone(), new_line));
+            if apply {
+                edits.push(workflow::action_edit(action, &new_sha, &latest_tag));
             }
         }
 
-        if apply && !replacements.is_empty() {
-            workflow::rewrite_actions(file, &replacements)?;
+        if !edits.is_empty() {
+            pending_edits.push((file.clone(), edits));
         }
+    }
+
+    if apply && report.failures.is_empty() {
+        for (file, edits) in &pending_edits {
+            workflow::rewrite_actions(file, &workflow::render_action_edits(edits)?)?;
+        }
+        report.applied = true;
     }
 
     let has_updates = !report.updates.is_empty();
@@ -206,10 +263,28 @@ async fn run_with_client(
         report.print_human();
     }
 
-    if has_updates && !apply {
+    if !report.failures.is_empty() || !report.skipped.is_empty() {
+        Ok(ExitCode::from(2))
+    } else if has_updates && !apply {
         Ok(ExitCode::from(1))
     } else {
         Ok(ExitCode::SUCCESS)
+    }
+}
+
+fn update_failure(
+    file: &workflow::WorkflowFile,
+    repo_root: &Path,
+    action: &workflow::ActionRef,
+    stage: &str,
+    error: impl std::fmt::Display,
+) -> UpdateFailure {
+    UpdateFailure {
+        file: workflow::display_path(file.path(), repo_root),
+        action: format!("{}@{}", action.full_name(), action.ref_string),
+        stage: stage.to_string(),
+        error: error.to_string(),
+        line: action.line_number,
     }
 }
 
@@ -726,6 +801,77 @@ mod tests {
                 std::fs::read_to_string(&file).unwrap(),
                 format!("jobs:\n  test:\n    steps:\n      - uses: o/r@{NEW_SHA} # v1.1.0\n")
             );
+        }
+
+        #[tokio::test]
+        async fn write_is_atomic_across_lookup_failures() {
+            let server = MockServer::start().await;
+            mount_release(&server, "good/action", "v1.1.0").await;
+            mount_tag_resolution(&server, "good/action", "v1.1.0", NEW_SHA).await;
+            Mock::given(method("GET"))
+                .and(path("/repos/bad/action/releases"))
+                .respond_with(ResponseTemplate::new(500).set_body_string("unavailable"))
+                .mount(&server)
+                .await;
+
+            let original = format!(
+                "jobs:\n  test:\n    steps:\n      - uses: good/action@{OLD_SHA} # v1.0.0\n      - uses: bad/action@{OLD_SHA} # v1.0.0\n"
+            );
+            let (dir, file) = repo_with_workflow(&original);
+
+            let code = run_with_client(dir.path(), true, true, None, &client_for(&server))
+                .await
+                .unwrap();
+
+            assert_code(code, 2);
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), original);
+        }
+
+        #[tokio::test]
+        async fn untaggable_sha_does_not_block_verified_updates() {
+            let server = MockServer::start().await;
+            mount_release(&server, "good/action", "v1.1.0").await;
+            mount_tag_resolution(&server, "good/action", "v1.1.0", NEW_SHA).await;
+            Mock::given(method("GET"))
+                .and(path("/repos/untagged/action/tags"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+                .mount(&server)
+                .await;
+
+            let original = format!(
+                "jobs:\n  test:\n    steps:\n      - uses: good/action@{OLD_SHA} # v1.0.0\n      - uses: untagged/action@{OLD_SHA}\n"
+            );
+            let (dir, file) = repo_with_workflow(&original);
+
+            let code = run_with_client(dir.path(), true, true, None, &client_for(&server))
+                .await
+                .unwrap();
+
+            assert_code(code, 2);
+            assert_eq!(
+                std::fs::read_to_string(&file).unwrap(),
+                format!(
+                    "jobs:\n  test:\n    steps:\n      - uses: good/action@{NEW_SHA} # v1.1.0\n      - uses: untagged/action@{OLD_SHA}\n"
+                )
+            );
+        }
+
+        #[tokio::test]
+        async fn unsupported_uses_blocks_all_writes() {
+            let server = MockServer::start().await;
+            mount_release(&server, "o/r", "v2.0.0").await;
+            mount_tag_resolution(&server, "o/r", "v2.0.0", NEW_SHA).await;
+            let original = format!(
+                "jobs:\n  test:\n    steps:\n      - uses: o/r@{OLD_SHA} # v1.0.0\n      - with: {{ uses: owner/not-an-action@v1 }}\n"
+            );
+            let (dir, file) = repo_with_workflow(&original);
+
+            let code = run_with_client(dir.path(), true, true, None, &client_for(&server))
+                .await
+                .unwrap();
+
+            assert_code(code, 2);
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), original);
         }
     }
 }

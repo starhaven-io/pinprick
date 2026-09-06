@@ -21,6 +21,9 @@ pub struct ActionRef {
     pub tag_comment: Option<String>,
     pub line_number: usize,
     pub raw_line: String,
+    pub(crate) value_start: usize,
+    pub(crate) value_end: usize,
+    pub(crate) block_style: bool,
 }
 
 impl ActionRef {
@@ -44,19 +47,12 @@ pub enum RefType {
     Tag,
 }
 
-static USES_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^(\s*-?\s*uses:\s*)([^\s@]+)@(\S+?)(\s*#\s*(.+?))?\s*$").unwrap()
+static USES_KEY_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?x)(?: ^\s*-?\s* | [\{\[,]\s* ) (?: uses | "uses" | 'uses' ) \s*:\s*"#).unwrap()
 });
 
-static LOCAL_USES_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"^\s*-?\s*uses:\s*(?:"([^"]+)"|'([^']+)'|([^#\s]+))\s*(?:#.*)?$"#).unwrap()
-});
-
-static DOCKER_USES_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r#"^\s*-?\s*uses:\s*(?:"docker://([^"]+)"|'docker://([^']+)'|docker://([^#\s]+))\s*(?:#.*)?$"#,
-    )
-    .unwrap()
+static ESCAPED_YAML_KEY_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?x)(?: ^\s*-?\s* | [\{\[,]\s* ) (?P<key> "(?:[^"\\]|\\.)*" ) \s*:\s*"#).unwrap()
 });
 
 // YAML block scalar openers (`run: |`, `script: >`, etc.), including
@@ -79,6 +75,12 @@ pub struct LocalActionRef {
     pub line_number: usize,
 }
 
+#[derive(Debug, Clone)]
+pub struct UnsupportedUsesRef {
+    pub value: String,
+    pub line_number: usize,
+}
+
 /// A container action reference: `uses: docker://image[:tag][@sha256:digest]`.
 #[derive(Debug, Clone)]
 pub struct DockerRef {
@@ -88,6 +90,25 @@ pub struct DockerRef {
     pub pin: DockerPin,
     pub line_number: usize,
     pub raw_line: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ActionEdit {
+    line_number: usize,
+    expected_line: String,
+    value_start: usize,
+    value_end: usize,
+    replacement: String,
+    tag: String,
+    block_style: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct UsesValue<'a> {
+    value: &'a str,
+    start: usize,
+    end: usize,
+    block_style: bool,
 }
 
 impl DockerRef {
@@ -111,26 +132,22 @@ pub enum DockerPin {
 
 /// Parse a single line into a container action reference
 /// (`uses: docker://…`), if any.
+#[cfg(test)]
 pub fn parse_docker_uses_line(line: &str, line_number: usize) -> Option<DockerRef> {
-    let caps = DOCKER_USES_RE.captures(line)?;
-    let image = caps
-        .get(1)
-        .or_else(|| caps.get(2))
-        .or_else(|| caps.get(3))?
-        .as_str();
-    if image.is_empty() {
-        return None;
-    }
-
-    Some(DockerRef {
-        image: image.to_string(),
-        pin: classify_docker_image(image),
-        line_number,
-        raw_line: line.to_string(),
+    uses_values_on_line(line).into_iter().find_map(|value| {
+        value
+            .value
+            .strip_prefix("docker://")
+            .map(|image| DockerRef {
+                image: image.to_string(),
+                pin: classify_docker_image(image),
+                line_number,
+                raw_line: line.to_string(),
+            })
     })
 }
 
-fn classify_docker_image(image: &str) -> DockerPin {
+pub(crate) fn classify_docker_image(image: &str) -> DockerPin {
     // `image@sha256:<hex>` — only a well-formed digest counts as pinned; a
     // malformed one would not resolve, and must not read as pinned.
     if let Some((_, digest)) = image.split_once('@') {
@@ -215,32 +232,36 @@ impl WorkflowFile {
 }
 
 /// Parse a single line into an ActionRef, if it's a `uses:` line with an external action.
+#[cfg(test)]
 pub fn parse_uses_line(line: &str, line_number: usize) -> Option<ActionRef> {
-    let caps = USES_RE.captures(line)?;
+    uses_values_on_line(line)
+        .into_iter()
+        .find_map(|value| parse_external_uses_value(line, line_number, value))
+}
 
-    let mut action_path = caps.get(2)?.as_str();
-    let mut ref_string = caps.get(3)?.as_str().to_string();
-    let tag_comment = caps.get(5).map(|m| m.as_str().trim().to_string());
-
-    // Strip a matched surrounding quote pair: `uses: "owner/repo@v4"` puts the
-    // quotes on the path and ref, which would break classification.
-    for q in ['"', '\''] {
-        if action_path.starts_with(q) && ref_string.ends_with(q) {
-            action_path = &action_path[1..];
-            ref_string.pop();
-            break;
-        }
-    }
-
-    if action_path.starts_with('.') {
+/// Parse an already-decoded YAML `uses` value. This is used when following
+/// composite-action dependencies from parsed action metadata.
+pub(crate) fn parse_external_action_reference(reference: &str) -> Option<ActionRef> {
+    if reference.is_empty() || reference.chars().any(char::is_whitespace) {
         return None;
     }
+    let line = format!("uses: {reference}");
+    let value = UsesValue {
+        value: reference,
+        start: "uses: ".len(),
+        end: line.len(),
+        block_style: true,
+    };
+    parse_external_uses_value(&line, 0, value)
+}
 
-    // `docker://image@sha256:…` is a container reference, not a GitHub repo —
-    // parsing it here would misread `docker:` as an owner and a digest-pinned
-    // image as an unpinned branch ref. Container refs are handled by
-    // `parse_docker_uses_line` instead.
-    if action_path.contains("://") {
+fn parse_external_uses_value(
+    line: &str,
+    line_number: usize,
+    value: UsesValue<'_>,
+) -> Option<ActionRef> {
+    let (action_path, ref_string) = value.value.rsplit_once('@')?;
+    if action_path.starts_with('.') || action_path.starts_with('$') || action_path.contains("://") {
         return None;
     }
 
@@ -257,41 +278,50 @@ pub fn parse_uses_line(line: &str, line_number: usize) -> Option<ActionRef> {
         None
     };
 
-    let ref_type = classify_ref(&ref_string);
+    let ref_type = classify_ref(ref_string);
+    let tag_comment = if value.block_style {
+        find_yaml_comment(line)
+            .filter(|position| *position >= value.end)
+            .map(|position| line[position + 1..].trim().to_string())
+            .filter(|comment| !comment.is_empty())
+    } else {
+        None
+    };
 
     Some(ActionRef {
         owner,
         repo,
         subpath,
-        ref_string,
+        ref_string: ref_string.to_string(),
         ref_type,
         tag_comment,
         line_number,
         raw_line: line.to_string(),
+        value_start: value.start,
+        value_end: value.end,
+        block_style: value.block_style,
     })
 }
 
 /// Parse a single line into a local action reference (`uses: ./path`), if any.
+#[cfg(test)]
 pub fn parse_local_uses_line(line: &str, line_number: usize) -> Option<LocalActionRef> {
-    let caps = LOCAL_USES_RE.captures(line)?;
-    let path = caps
-        .get(1)
-        .or_else(|| caps.get(2))
-        .or_else(|| caps.get(3))?
-        .as_str();
-
-    if !path.starts_with("./") || !is_safe_local_action_path(path) {
-        return None;
-    }
-
-    Some(LocalActionRef {
-        path: path.to_string(),
-        line_number,
+    uses_values_on_line(line).into_iter().find_map(|value| {
+        let self_repository = value.value.starts_with("$/");
+        if !(self_repository || value.value.starts_with("./"))
+            || !is_safe_local_action_path(value.value)
+        {
+            return None;
+        }
+        Some(LocalActionRef {
+            path: value.value.to_string(),
+            line_number,
+        })
     })
 }
 
 fn is_safe_local_action_path(path: &str) -> bool {
-    let Some(rel) = path.strip_prefix("./") else {
+    let Some(rel) = path.strip_prefix("./").or_else(|| path.strip_prefix("$/")) else {
         return false;
     };
     !rel.is_empty()
@@ -306,36 +336,205 @@ fn classify_ref(r: &str) -> RefType {
     }
 
     let version_part = r.strip_prefix('v').unwrap_or(r);
-    if !version_part.is_empty() && version_part.chars().all(|c| c.is_ascii_digit() || c == '.') {
-        return if version_part.contains('.') {
-            RefType::Tag
-        } else {
-            RefType::SlidingTag
-        };
+    if !version_part.is_empty() && version_part.chars().all(|c| c.is_ascii_digit()) {
+        return RefType::SlidingTag;
+    }
+    if version_part.contains('.')
+        && version_part
+            .split('.')
+            .all(|component| !component.is_empty() && component.chars().all(|c| c.is_ascii_digit()))
+    {
+        return RefType::Tag;
+    }
+    if semver::Version::parse(version_part).is_ok()
+        || (version_part.chars().filter(|c| *c == '.').count() == 1
+            && semver::Version::parse(&format!("{version_part}.0")).is_ok())
+    {
+        return RefType::Tag;
     }
 
     RefType::Branch
 }
 
 /// Build a replacement line: same prefix, new SHA, tag as comment.
+#[cfg(test)]
 pub fn build_pinned_line(line: &str, sha: &str, original_tag: &str) -> Option<String> {
-    let caps = USES_RE.captures(line)?;
-    let prefix = caps.get(1)?.as_str();
-    let action_path = caps.get(2)?.as_str();
-    let ref_str = caps.get(3)?.as_str();
+    let action = parse_uses_line(line, 1)?;
+    let edit = action_edit(&action, sha, original_tag);
+    render_action_edits(&[edit])
+        .ok()?
+        .pop()
+        .map(|(_, _, line)| line)
+}
 
-    // Keep a surrounding quote pair so `uses: "owner/repo@v4"` stays valid; the
-    // comment goes after the closing quote.
-    if let Some(q) = action_path
-        .chars()
-        .next()
-        .filter(|c| *c == '"' || *c == '\'')
-        && ref_str.ends_with(q)
-    {
-        let inner = &action_path[1..];
-        return Some(format!("{prefix}{q}{inner}@{sha}{q} # {original_tag}"));
+pub fn action_edit(action: &ActionRef, sha: &str, tag: &str) -> ActionEdit {
+    ActionEdit {
+        line_number: action.line_number,
+        expected_line: action.raw_line.clone(),
+        value_start: action.value_start,
+        value_end: action.value_end,
+        replacement: format!("{}@{sha}", action.full_name()),
+        tag: tag.to_string(),
+        block_style: action.block_style,
     }
-    Some(format!("{prefix}{action_path}@{sha} # {original_tag}"))
+}
+
+pub fn render_action_edits(edits: &[ActionEdit]) -> Result<Vec<(usize, String, String)>> {
+    let mut by_line: std::collections::BTreeMap<usize, Vec<&ActionEdit>> =
+        std::collections::BTreeMap::new();
+    for edit in edits {
+        by_line.entry(edit.line_number).or_default().push(edit);
+    }
+
+    let mut replacements = Vec::with_capacity(by_line.len());
+    for (line_number, mut line_edits) in by_line {
+        let expected = &line_edits[0].expected_line;
+        if line_edits
+            .iter()
+            .any(|edit| edit.expected_line != *expected)
+        {
+            anyhow::bail!("conflicting source lines for workflow line {line_number}");
+        }
+        line_edits.sort_by_key(|edit| std::cmp::Reverse(edit.value_start));
+        let mut output = expected.clone();
+        for edit in &line_edits {
+            if edit.value_start > edit.value_end
+                || edit.value_end > expected.len()
+                || !expected.is_char_boundary(edit.value_start)
+                || !expected.is_char_boundary(edit.value_end)
+            {
+                anyhow::bail!("invalid action span for workflow line {line_number}");
+            }
+            output.replace_range(edit.value_start..edit.value_end, &edit.replacement);
+        }
+
+        if line_edits.len() == 1 && line_edits[0].block_style {
+            if let Some(comment) = find_yaml_comment(&output) {
+                output.truncate(comment);
+            }
+            let trimmed = output.trim_end().len();
+            output.truncate(trimmed);
+            output.push_str(" # ");
+            output.push_str(&line_edits[0].tag);
+        }
+        replacements.push((line_number, expected.clone(), output));
+    }
+    Ok(replacements)
+}
+
+fn candidate_uses_values_on_line(line: &str) -> Vec<UsesValue<'_>> {
+    let searchable_end = find_yaml_comment(line).unwrap_or(line.len());
+    let searchable = &line[..searchable_end];
+    let mut values = Vec::new();
+    for key in USES_KEY_RE.find_iter(searchable) {
+        if is_inside_yaml_quotes(searchable, key.start()) {
+            continue;
+        }
+        let mut start = key.end();
+        let bytes = searchable.as_bytes();
+        let quote = bytes
+            .get(start)
+            .copied()
+            .filter(|byte| matches!(byte, b'\'' | b'"'));
+        if quote.is_some() {
+            start += 1;
+        }
+        let mut end = start;
+        while end < searchable.len() {
+            let byte = bytes[end];
+            if quote.is_some_and(|quote| byte == quote) {
+                break;
+            }
+            if quote.is_none() && (byte.is_ascii_whitespace() || matches!(byte, b',' | b'}' | b']'))
+            {
+                break;
+            }
+            if byte == b'\\' && quote == Some(b'"') && end + 1 < searchable.len() {
+                end += 2;
+            } else {
+                end += 1;
+            }
+        }
+        values.push(UsesValue {
+            value: &searchable[start..end],
+            start,
+            end,
+            block_style: key.start() == 0,
+        });
+    }
+    values
+}
+
+fn uses_values_on_line(line: &str) -> Vec<UsesValue<'_>> {
+    candidate_uses_values_on_line(line)
+        .into_iter()
+        .filter(|value| value.block_style)
+        .collect()
+}
+
+fn has_escaped_uses_key(line: &str) -> bool {
+    let searchable_end = find_yaml_comment(line).unwrap_or(line.len());
+    let searchable = &line[..searchable_end];
+    ESCAPED_YAML_KEY_RE
+        .captures_iter(searchable)
+        .any(|capture| {
+            let whole = capture.get(0).unwrap();
+            let key = capture.name("key").unwrap().as_str();
+            !is_inside_yaml_quotes(searchable, whole.start())
+                && key != "\"uses\""
+                && serde_norway::from_str::<String>(key).is_ok_and(|decoded| decoded == "uses")
+        })
+}
+
+fn find_yaml_comment(line: &str) -> Option<usize> {
+    let mut quote = None;
+    let mut escaped = false;
+    for (index, character) in line.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if character == '\\' && quote == Some('"') {
+            escaped = true;
+            continue;
+        }
+        if matches!(character, '\'' | '"') {
+            if quote == Some(character) {
+                quote = None;
+            } else if quote.is_none() {
+                quote = Some(character);
+            }
+            continue;
+        }
+        if character == '#'
+            && quote.is_none()
+            && (index == 0 || line[..index].ends_with(char::is_whitespace))
+        {
+            return Some(index);
+        }
+    }
+    None
+}
+
+fn is_inside_yaml_quotes(line: &str, position: usize) -> bool {
+    let mut quote = None;
+    let mut escaped = false;
+    for character in line[..position].chars() {
+        if escaped {
+            escaped = false;
+        } else if character == '\\' && quote == Some('"') {
+            escaped = true;
+        } else if matches!(character, '\'' | '"') {
+            quote = if quote == Some(character) {
+                None
+            } else if quote.is_none() {
+                Some(character)
+            } else {
+                quote
+            };
+        }
+    }
+    quote.is_some()
 }
 
 /// Iterate the scannable lines of workflow YAML as `(1-based line number,
@@ -356,7 +555,8 @@ fn scannable_lines(content: &str) -> impl Iterator<Item = (usize, &str)> {
 
         if let Some(caps) = BLOCK_SCALAR_RE.captures(line) {
             block_parent_col = Some(caps.get(1).unwrap().as_str().len());
-            return None;
+            return (!candidate_uses_values_on_line(line).is_empty() || has_escaped_uses_key(line))
+                .then_some((i + 1, line));
         }
 
         Some((i + 1, line))
@@ -366,7 +566,11 @@ fn scannable_lines(content: &str) -> impl Iterator<Item = (usize, &str)> {
 /// Scan workflow YAML text and return all external action references.
 pub fn scan_content(content: &str) -> Vec<ActionRef> {
     scannable_lines(content)
-        .filter_map(|(line_num, line)| parse_uses_line(line, line_num))
+        .flat_map(|(line_num, line)| {
+            uses_values_on_line(line)
+                .into_iter()
+                .filter_map(move |value| parse_external_uses_value(line, line_num, value))
+        })
         .collect()
 }
 
@@ -377,7 +581,19 @@ pub fn scan_content(content: &str) -> Vec<ActionRef> {
 /// such a nested action is scanned only if a workflow also uses it directly.
 pub fn scan_local_actions(content: &str) -> Vec<LocalActionRef> {
     scannable_lines(content)
-        .filter_map(|(line_num, line)| parse_local_uses_line(line, line_num))
+        .flat_map(|(line_num, line)| {
+            uses_values_on_line(line)
+                .into_iter()
+                .filter_map(move |value| {
+                    let self_repository = value.value.starts_with("$/");
+                    (self_repository || value.value.starts_with("./"))
+                        .then(|| LocalActionRef {
+                            path: value.value.to_string(),
+                            line_number: line_num,
+                        })
+                        .filter(|action| is_safe_local_action_path(&action.path))
+                })
+        })
         .collect()
 }
 
@@ -385,14 +601,66 @@ pub fn scan_local_actions(content: &str) -> Vec<LocalActionRef> {
 /// (`uses: docker://…`).
 pub fn scan_docker_refs(content: &str) -> Vec<DockerRef> {
     scannable_lines(content)
-        .filter_map(|(line_num, line)| parse_docker_uses_line(line, line_num))
+        .flat_map(|(line_num, line)| {
+            uses_values_on_line(line)
+                .into_iter()
+                .filter_map(move |value| {
+                    value
+                        .value
+                        .strip_prefix("docker://")
+                        .map(|image| DockerRef {
+                            image: image.to_string(),
+                            pin: classify_docker_image(image),
+                            line_number: line_num,
+                            raw_line: line.to_string(),
+                        })
+                })
+        })
         .collect()
 }
 
-/// Scan a workflow file and return all external action references.
-pub fn scan_workflow(file: &WorkflowFile) -> Result<Vec<ActionRef>> {
-    let content = read_workflow(file)?;
-    Ok(scan_content(&content))
+pub fn scan_unsupported_uses(content: &str) -> Vec<UnsupportedUsesRef> {
+    let mut unsupported: Vec<UnsupportedUsesRef> = scannable_lines(content)
+        .flat_map(|(line_number, line)| {
+            candidate_uses_values_on_line(line)
+                .into_iter()
+                .filter_map(move |value| {
+                    let recognized = value.block_style
+                        && (parse_external_uses_value(line, line_number, value).is_some()
+                            || ((value.value.starts_with("./") || value.value.starts_with("$/"))
+                                && is_safe_local_action_path(value.value))
+                            || value.value.starts_with("docker://"));
+                    (!recognized).then(|| UnsupportedUsesRef {
+                        value: if !value.block_style {
+                            "<flow-style uses>".to_string()
+                        } else if value.value.is_empty()
+                            || value.value.starts_with('|')
+                            || value.value.starts_with('>')
+                        {
+                            "<empty or multiline>".to_string()
+                        } else {
+                            value.value.to_string()
+                        },
+                        line_number,
+                    })
+                })
+        })
+        .collect();
+    unsupported.extend(
+        scannable_lines(content)
+            .filter(|(_, line)| has_escaped_uses_key(line))
+            .map(|(line_number, _)| UnsupportedUsesRef {
+                value: "<escaped uses key>".to_string(),
+                line_number,
+            }),
+    );
+    unsupported.sort_by_key(|entry| entry.line_number);
+    unsupported
+}
+
+#[cfg(test)]
+fn scan_workflow(file: &WorkflowFile) -> Result<Vec<ActionRef>> {
+    Ok(scan_content(&read_workflow(file)?))
 }
 
 pub fn read_workflow(file: &WorkflowFile) -> Result<String> {
@@ -889,6 +1157,33 @@ mod tests {
     }
 
     #[test]
+    fn flow_style_uses_fail_closed_instead_of_rewriting_untyped_mappings() {
+        let line = "steps: [{ uses: owner/one@v1.0.0 }, { uses: owner/two@v2.0.0 }]";
+        let actions = scan_content(line);
+        assert!(actions.is_empty());
+        let unsupported = scan_unsupported_uses(line);
+        assert_eq!(unsupported.len(), 2);
+        assert!(
+            unsupported
+                .iter()
+                .all(|entry| entry.value == "<flow-style uses>")
+        );
+    }
+
+    #[test]
+    fn flow_style_input_named_uses_is_not_treated_as_an_action() {
+        let sha1 = "1111111111111111111111111111111111111111";
+        let sha2 = "2222222222222222222222222222222222222222";
+        let line = format!(
+            "steps: [{{ uses: owner/one@{sha1} }}, {{ uses: owner/two@{sha2} }}] # unrelated"
+        );
+        let actions = scan_content(&line);
+        assert!(actions.is_empty());
+        assert_eq!(scan_unsupported_uses(&line).len(), 2);
+        assert!(scan_content("steps:\n  - with: { uses: owner/not-an-action@v1 }").is_empty());
+    }
+
+    #[test]
     fn parse_numeric_sliding_tag() {
         let r = parse_uses_line("      - uses: some/action@4", 1).unwrap();
         assert_eq!(r.ref_type, RefType::SlidingTag);
@@ -898,6 +1193,14 @@ mod tests {
     fn parse_numeric_exact_tag() {
         let r = parse_uses_line("      - uses: some/action@4.1", 1).unwrap();
         assert_eq!(r.ref_type, RefType::Tag);
+    }
+
+    #[test]
+    fn parse_calver_and_four_component_exact_tags() {
+        for tag in ["v2024.01.05", "v1.2.3.4"] {
+            let r = parse_uses_line(&format!("      - uses: some/action@{tag}"), 1).unwrap();
+            assert_eq!(r.ref_type, RefType::Tag, "{tag}");
+        }
     }
 
     #[test]
@@ -998,6 +1301,13 @@ jobs:
     }
 
     #[test]
+    fn scan_local_actions_accepts_self_repository_syntax() {
+        let actions = scan_local_actions("steps:\n  - uses: $/.github/actions/my-action\n");
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].path, "$/.github/actions/my-action");
+    }
+
+    #[test]
     fn parse_quoted_local_action_with_comment() {
         let r = parse_local_uses_line("      - uses: \"./.github/actions/my-action\" # local", 7)
             .unwrap();
@@ -1008,6 +1318,45 @@ jobs:
     fn local_action_rejects_parent_escape() {
         assert!(parse_local_uses_line("      - uses: ../actions/my-action", 1).is_none());
         assert!(parse_local_uses_line("      - uses: ./../actions/my-action", 1).is_none());
+    }
+
+    #[test]
+    fn unsafe_local_actions_are_reported_as_unsupported() {
+        let unsupported = scan_unsupported_uses(
+            "steps:\n  - uses: ./../actions/one\n  - uses: $/.github/../actions/two\n",
+        );
+        assert_eq!(unsupported.len(), 2);
+        assert_eq!(unsupported[0].value, "./../actions/one");
+        assert_eq!(unsupported[1].value, "$/.github/../actions/two");
+    }
+
+    #[test]
+    fn malformed_or_multiline_uses_are_reported_as_unsupported() {
+        for yaml in [
+            "steps:\n  - uses:\n      actions/checkout@v4\n",
+            "steps:\n  - uses: >-\n      actions/checkout@v4\n",
+            "steps:\n  - uses: |\n      actions/checkout@v4\n",
+        ] {
+            let unsupported = scan_unsupported_uses(yaml);
+            assert_eq!(unsupported.len(), 1, "{yaml}");
+            assert_eq!(unsupported[0].value, "<empty or multiline>");
+        }
+    }
+
+    #[test]
+    fn quoted_uses_key_is_scanned() {
+        let refs = scan_content("steps:\n  - \"uses\": actions/checkout@v4\n");
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].full_name(), "actions/checkout");
+    }
+
+    #[test]
+    fn escaped_uses_key_is_reported_as_unsupported() {
+        let yaml = "steps:\n  - \"u\\u0073es\": actions/checkout@v4\n";
+        assert!(scan_content(yaml).is_empty());
+        let unsupported = scan_unsupported_uses(yaml);
+        assert_eq!(unsupported.len(), 1);
+        assert_eq!(unsupported[0].value, "<escaped uses key>");
     }
 
     #[test]
@@ -1284,8 +1633,8 @@ jobs:
     }
 
     #[test]
-    fn classify_prerelease_tag_is_branch() {
-        assert!(matches!(classify_ref("v1.2.3-alpha"), RefType::Branch));
+    fn classify_prerelease_tag_is_exact_tag() {
+        assert!(matches!(classify_ref("v1.2.3-alpha"), RefType::Tag));
     }
 
     #[test]

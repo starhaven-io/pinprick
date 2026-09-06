@@ -71,7 +71,7 @@ jobs:
           CHANGED=$(git diff --name-only "${BASE_SHA}...HEAD")
 
           # Rust or build workflow changes: lint + test + MSRV
-          if echo "${CHANGED}" | grep -qE '\.rs$|^Cargo\.(toml|lock)$|^rust-toolchain\.toml$|^clippy\.toml$|^rustfmt\.toml$|^\.github/workflows/(ci|cargo-deny|release)\.yml$'; then
+          if echo "${CHANGED}" | grep -qE '\.rs$|^Cargo\.(toml|lock)$|^build\.rs$|^deny\.toml$|^justfile$|^rust-toolchain\.toml$|^clippy\.toml$|^rustfmt\.toml$|^\.config/|^\.githooks/|^scripts/|^\.github/workflows/(ci|cargo-deny|release)\.yml$'; then
             add_check '{"name":"Lint","check":"lint","runner":"ubuntu-24.04"}'
             add_check '{"name":"Test (Linux)","check":"test","runner":"ubuntu-24.04"}'
             add_check '{"name":"Test (Linux ARM)","check":"test","runner":"ubuntu-24.04-arm"}'
@@ -99,13 +99,25 @@ jobs:
           fi
 
           # Site or audited-actions changes: format check + build
-          if echo "${CHANGED}" | grep -qE '^site/|^audited-actions/'; then
+          if echo "${CHANGED}" | grep -qE '^site/|^audited-actions/|^catalog-minisign\.pub$|^Cargo\.toml$|^\.github/workflows/deploy-site\.yml$'; then
             add_check '{"name":"Site","check":"site","runner":"ubuntu-slim"}'
           fi
 
           # Workflow changes: Actions security audit
           if echo "${CHANGED}" | grep -qE '^\.github/workflows/'; then
             RUN_ZIZMOR=true
+          fi
+
+          # Fail safe for unclassified project inputs. Documentation-only
+          # changes may skip the expensive matrix; every other unknown path
+          # gets the full Rust gate instead of silently receiving no tests.
+          if [[ "${MATRIX}" == "[]" ]] && echo "${CHANGED}" | grep -qvE '(^|/)(README|CHANGELOG|CONTRIBUTING|SECURITY)(\.[^/]*)?$|^docs/|\.md$|^LICENSE$'; then
+            add_check '{"name":"Lint","check":"lint","runner":"ubuntu-24.04"}'
+            add_check '{"name":"Test (Linux)","check":"test","runner":"ubuntu-24.04"}'
+            add_check '{"name":"Test (Linux ARM)","check":"test","runner":"ubuntu-24.04-arm"}'
+            add_check '{"name":"Test (macOS)","check":"test","runner":"macos-26"}'
+            add_check '{"name":"Coverage","check":"coverage","runner":"ubuntu-24.04","environment":"codecov"}'
+            add_check '{"name":"MSRV","check":"msrv","runner":"ubuntu-24.04"}'
           fi
 
           echo "matrix=${MATRIX}" >> "${GITHUB_OUTPUT}"
@@ -261,22 +273,28 @@ jobs:
         if: matrix.check == 'coverage'
         run: cargo llvm-cov nextest --profile ci --lcov --output-path lcov.info
 
+      - name: Install verified Codecov CLI
+        if: ${{ !cancelled() && matrix.check == 'coverage' }}
+        run: |
+          curl --fail --location --show-error --silent \
+            --output "${RUNNER_TEMP}/codecov" \
+            "https://cli.codecov.io/v11.3.1/linux/codecov"
+          echo "ca1d64196d2d34771084afe76ea657d581bf628e31d993ff8e52ea09cc88a56d  ${RUNNER_TEMP}/codecov" | sha256sum --check --strict
+          chmod 0755 "${RUNNER_TEMP}/codecov"
+
       - name: Upload coverage to Codecov
         if: ${{ !cancelled() && matrix.check == 'coverage' }}
-        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          files: lcov.info
-          fail_ci_if_error: false
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+        run: |
+          "${RUNNER_TEMP}/codecov" upload-process --disable-search --file lcov.info
 
       - name: Upload test results to Codecov
         if: ${{ !cancelled() && matrix.check == 'coverage' }}
-        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          files: target/nextest/ci/junit.xml
-          fail_ci_if_error: false
-          report_type: test_results
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+        run: |
+          "${RUNNER_TEMP}/codecov" upload-process --disable-search --file target/nextest/ci/junit.xml --report-type test_results
 
       - name: Save coverage tools cache
         if: matrix.check == 'coverage' && github.event_name == 'push' && steps.cov-tools-cache.outputs.cache-hit != 'true'
@@ -328,14 +346,14 @@ jobs:
         if: matrix.check == 'verify-audited'
         run: |
           FAILED=0
-          for JSON_FILE in audited-actions/*/*.json; do
+          while IFS= read -r -d '' JSON_FILE; do
             SORTED=$(jq 'sort_by([(.tag | ltrimstr("v") | split(".") | map(tonumber? // 0)), .tag]) | reverse' "${JSON_FILE}")
             ACTUAL=$(jq '.' "${JSON_FILE}")
             if [[ "${SORTED}" != "${ACTUAL}" ]]; then
               echo "::error::${JSON_FILE} is not sorted by version"
               FAILED=1
             fi
-          done
+          done < <(find audited-actions -type f -name '*.json' -print0)
           exit "${FAILED}"
 
       - name: Build pinprick
@@ -352,7 +370,7 @@ jobs:
         run: |
           FAILED=0
           if [[ "${VERIFY_CHANGED}" == "true" ]]; then
-            readarray -t CATALOG_FILES < <(git diff --name-only --diff-filter=d "${BASE_SHA}...HEAD" -- 'audited-actions/*/*.json')
+            readarray -t CATALOG_FILES < <(git diff --name-only --diff-filter=d "${BASE_SHA}...HEAD" -- audited-actions/ | grep -E '\.json$' || true)
             if [[ ${#CATALOG_FILES[@]} -gt 0 ]]; then
               scripts/verify-audited-actions.sh target/release/pinprick files "${CATALOG_FILES[@]}" || FAILED=1
             fi
@@ -373,7 +391,7 @@ jobs:
 
   conclusion:
     name: conclusion
-    needs: [commits, check, zizmor]
+    needs: [generate-matrix, commits, check, zizmor]
     runs-on: ubuntu-slim
     timeout-minutes: 15
     if: always()
@@ -383,7 +401,24 @@ jobs:
           COMMITS_RESULT: ${{ needs.commits.result }}
           CHECK_RESULT: ${{ needs.check.result }}
           ZIZMOR_RESULT: ${{ needs.zizmor.result }}
+          MATRIX: ${{ needs.generate-matrix.outputs.matrix }}
+          RUN_ZIZMOR: ${{ needs.generate-matrix.outputs.run_zizmor }}
+          EVENT_NAME: ${{ github.event_name }}
+          MATRIX_RESULT: ${{ needs.generate-matrix.result }}
         run: |
-          test "${COMMITS_RESULT}" = "success" || test "${COMMITS_RESULT}" = "skipped"
-          test "${CHECK_RESULT}" = "success" || test "${CHECK_RESULT}" = "skipped"
-          [[ "${ZIZMOR_RESULT}" == "success" || "${ZIZMOR_RESULT}" == "skipped" ]]
+          test "${MATRIX_RESULT}" = "success"
+          if [[ "${EVENT_NAME}" == "pull_request" ]]; then
+            test "${COMMITS_RESULT}" = "success"
+          else
+            test "${COMMITS_RESULT}" = "skipped"
+          fi
+          if [[ "${MATRIX}" == "[]" ]]; then
+            test "${CHECK_RESULT}" = "skipped"
+          else
+            test "${CHECK_RESULT}" = "success"
+          fi
+          if [[ "${RUN_ZIZMOR}" == "true" ]]; then
+            test "${ZIZMOR_RESULT}" = "success"
+          else
+            test "${ZIZMOR_RESULT}" = "skipped"
+          fi

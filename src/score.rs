@@ -22,7 +22,7 @@ use crate::github::{AdvisoryVulnerability, GitHubClient, GitHubError, SecurityAd
 use crate::output::AuditFinding;
 use crate::workflow::{self, ActionRef, RefType};
 
-pub const RUBRIC_VERSION: &str = "0.10.0";
+pub const RUBRIC_VERSION: &str = "0.11.0";
 
 // ── Rule catalog ────────────────────────────────────────────────────────────
 
@@ -270,10 +270,32 @@ pub fn score_repo(repo_root: &Path, config: &Config) -> Result<(ScoreReport, Con
     let mut workflow_findings: BTreeMap<(RuleId, String), Vec<Occurrence>> = BTreeMap::new();
     let mut runtime_findings: Vec<Finding> = Vec::new();
     let mut unique_actions: std::collections::BTreeSet<String> = Default::default();
+    let mut local_actions: BTreeMap<String, (workflow::LocalActionRef, Vec<Occurrence>)> =
+        BTreeMap::new();
+    let mut coverage_notes = Vec::new();
 
     for file in &files {
         let display = workflow::display_path(file.path(), repo_root);
         let content = workflow::read_workflow(file)?;
+
+        for unsupported in workflow::scan_unsupported_uses(&content) {
+            coverage_notes.push(format!(
+                "{display}:{}: unsupported uses target `{}`",
+                unsupported.line_number, unsupported.value
+            ));
+        }
+
+        for action in workflow::scan_local_actions(&content) {
+            unique_actions.insert(action.path.clone());
+            local_actions
+                .entry(action.path.clone())
+                .or_insert_with(|| (action.clone(), Vec::new()))
+                .1
+                .push(Occurrence {
+                    workflow: display.clone(),
+                    line: action.line_number,
+                });
+        }
 
         // Action-level pinning findings.
         for a in workflow::scan_content(&content) {
@@ -321,21 +343,28 @@ pub fn score_repo(repo_root: &Path, config: &Config) -> Result<(ScoreReport, Con
                         line: 0, // workflow-level finding has no specific line
                     });
             }
+        } else {
+            coverage_notes.push(format!("{display}: workflow YAML could not be parsed"));
         }
 
         // Runtime findings (runtime.*) — reuse the audit pipeline's shell
         // scanner on each `run:` block.
-        if let Ok(run_blocks) = audit::extract_run_blocks(file.path(), &content) {
+        if let Ok(jobs) = audit::extract_job_run_blocks(file.path(), &content) {
             let mut collector = AuditCollector::new(false);
-            for (line_offset, run_content) in &run_blocks {
-                audit::scan_shell_content(
-                    run_content,
-                    &display,
-                    *line_offset,
-                    "",
-                    &mut collector,
-                    config,
-                );
+            for run_blocks in jobs {
+                let mut shell_state = audit::ShellScanState::default();
+                for block in &run_blocks {
+                    audit::scan_shell_content_with_state_at(
+                        &block.content,
+                        &display,
+                        block.line,
+                        "",
+                        &mut collector,
+                        config,
+                        block.working_directory.as_deref(),
+                        &mut shell_state,
+                    );
+                }
             }
             impact.trusted_host_fetches += collector.trusted_host_allowed;
             impact.extra_data_format_fetches += collector.extra_data_format_allowed;
@@ -361,6 +390,50 @@ pub fn score_repo(repo_root: &Path, config: &Config) -> Result<(ScoreReport, Con
                     details: None,
                 });
             }
+        } else {
+            coverage_notes.push(format!("{display}: run blocks could not be extracted"));
+        }
+    }
+
+    for (action_ref, (action, mut occurrences)) in local_actions {
+        occurrences.sort_by(|a, b| a.workflow.cmp(&b.workflow).then(a.line.cmp(&b.line)));
+        let mut collector = AuditCollector::new(false);
+        match audit_source::scan_local_action_source_graph(
+            repo_root,
+            &action,
+            &mut collector,
+            config,
+        ) {
+            Ok((ActionScanStatus::Complete, _)) => {}
+            Ok((ActionScanStatus::Incomplete, _)) => coverage_notes.push(format!(
+                "local action source scan incomplete for {action_ref}"
+            )),
+            Err(error) => coverage_notes.push(format!(
+                "local action source scan failed for {action_ref}: {error}"
+            )),
+        }
+        impact.trusted_host_fetches += collector.trusted_host_allowed;
+        impact.extra_data_format_fetches += collector.extra_data_format_allowed;
+        for finding in collector.findings {
+            if config.is_pattern_ignored(&finding.description) {
+                impact.findings_suppressed += 1;
+                continue;
+            }
+            let rule = runtime_rule_for(&finding);
+            let location = match finding.line {
+                Some(line) => format!("{}:{line}", finding.source_file),
+                None => finding.source_file.clone(),
+            };
+            runtime_findings.push(Finding {
+                id: rule.id(),
+                category: rule.category(),
+                severity: rule.severity(),
+                points: rule.points(),
+                action_ref: Some(action_ref.clone()),
+                occurrences: occurrences.clone(),
+                remediation: rule.remediation(),
+                details: Some(format!("{location} — {}", finding.description)),
+            });
         }
     }
 
@@ -411,8 +484,8 @@ pub fn score_repo(repo_root: &Path, config: &Config) -> Result<(ScoreReport, Con
             unique_actions: unique_actions.len(),
         },
         findings,
-        coverage_complete: true,
-        coverage_notes: Vec::new(),
+        coverage_complete: coverage_notes.is_empty(),
+        coverage_notes,
     };
     recompute_score(&mut report);
     Ok((report, impact))
@@ -457,7 +530,9 @@ fn is_hard_github_error(e: &anyhow::Error) -> bool {
 /// couldn't complete — the score still emits but is incomplete.
 fn warn_enrichment_incomplete(rule: &str, e: &anyhow::Error) {
     eprintln!(
-        "warning: {rule} could not be evaluated ({e}); score reflects only the rules that ran"
+        "warning: {} could not be evaluated ({}); score reflects only the rules that ran",
+        crate::output::sanitize_for_terminal(rule),
+        crate::output::sanitize_for_terminal(&e.to_string())
     );
 }
 
@@ -641,29 +716,46 @@ async fn enrich_with_source_advisory(
         }
     }
 
-    // Pull advisories once per (owner, repo) that has at least one resolved pin.
+    // Query the global GitHub Advisory Database for every exact Actions package
+    // version. This includes reviewed advisories that were not published in
+    // the action repository itself.
     let mut advisories: BTreeMap<(String, String), Vec<SecurityAdvisory>> = BTreeMap::new();
-    for (owner, repo, _) in action_resolved.values() {
+    let mut queried: std::collections::BTreeSet<(String, String)> =
+        std::collections::BTreeSet::new();
+    for (action_ref, (owner, repo, tag)) in &action_resolved {
+        let package = action_ref
+            .rsplit_once('@')
+            .map(|(package, _)| package)
+            .unwrap_or(action_ref);
         let key = (owner.clone(), repo.clone());
-        if advisories.contains_key(&key) {
-            continue;
+        for candidate in action_advisory_packages(package, owner, repo) {
+            if !queried.insert((candidate.to_string(), tag.clone())) {
+                continue;
+            }
+            let advs = match client.list_action_advisories(candidate, tag).await {
+                Ok(advs) => advs,
+                Err(e) if is_hard_github_error(&e) => {
+                    warn_enrichment_incomplete("source.advisory", &e);
+                    report.mark_coverage_incomplete(format!(
+                        "source.advisory evaluation stopped: {e}"
+                    ));
+                    return Ok(());
+                }
+                Err(e) => {
+                    warn_enrichment_incomplete("source.advisory", &e);
+                    report.mark_coverage_incomplete(format!(
+                        "source.advisory unavailable for {candidate}: {e}"
+                    ));
+                    Vec::new()
+                }
+            };
+            let existing = advisories.entry(key.clone()).or_default();
+            for advisory in advs {
+                if !existing.iter().any(|item| item.ghsa_id == advisory.ghsa_id) {
+                    existing.push(advisory);
+                }
+            }
         }
-        let advs = match client.list_security_advisories(owner, repo).await {
-            Ok(advs) => advs,
-            Err(e) if is_hard_github_error(&e) => {
-                warn_enrichment_incomplete("source.advisory", &e);
-                report.mark_coverage_incomplete(format!("source.advisory evaluation stopped: {e}"));
-                return Ok(());
-            }
-            Err(e) => {
-                warn_enrichment_incomplete("source.advisory", &e);
-                report.mark_coverage_incomplete(format!(
-                    "source.advisory unavailable for {owner}/{repo}: {e}"
-                ));
-                Vec::new()
-            }
-        };
-        advisories.insert(key, advs);
     }
 
     let new_findings = advisory_findings(&action_resolved, &advisories, &occurrences);
@@ -702,6 +794,39 @@ async fn enrich_with_remote_runtime(
                     line: action.line_number,
                 });
             actions.entry(action_ref).or_insert(action);
+        }
+        for local in workflow::scan_local_actions(&content) {
+            let mut collector = AuditCollector::new(false);
+            match audit_source::scan_local_action_source_graph(
+                repo_root,
+                &local,
+                &mut collector,
+                config,
+            ) {
+                Ok((status, nested)) => {
+                    if status == ActionScanStatus::Incomplete {
+                        report.mark_coverage_incomplete(format!(
+                            "local action source scan incomplete for {}",
+                            local.path
+                        ));
+                    }
+                    for action in nested {
+                        let action_ref = format!("{}@{}", action.full_name(), action.ref_string);
+                        occurrences
+                            .entry(action_ref.clone())
+                            .or_default()
+                            .push(Occurrence {
+                                workflow: display.clone(),
+                                line: local.line_number,
+                            });
+                        actions.entry(action_ref).or_insert(action);
+                    }
+                }
+                Err(error) => report.mark_coverage_incomplete(format!(
+                    "local action source scan failed for {}: {error}",
+                    local.path
+                )),
+            }
         }
     }
 
@@ -743,8 +868,9 @@ async fn enrich_with_remote_runtime(
             }
             Err(e) => {
                 eprintln!(
-                    "warning: could not scan {} for runtime scoring: {e}",
-                    action.full_name()
+                    "warning: could not scan {} for runtime scoring: {}",
+                    crate::output::sanitize_for_terminal(&action.full_name()),
+                    crate::output::sanitize_for_terminal(&e.to_string())
                 );
                 report.mark_coverage_incomplete(format!(
                     "remote source scan failed for {action_ref}: {e}"
@@ -798,12 +924,16 @@ fn advisory_findings(
     let rule = RuleId::SourceAdvisory;
     let mut out = Vec::new();
     for (action_ref, (owner, repo, tag)) in action_resolved {
+        let package = action_ref
+            .rsplit_once('@')
+            .map(|(package, _)| package)
+            .unwrap_or(action_ref);
         let Some(repo_advs) = advisories.get(&(owner.clone(), repo.clone())) else {
             continue;
         };
         for adv in repo_advs {
             let Some((matched_range, patched)) = adv.vulnerabilities.iter().find_map(|v| {
-                if !vuln_is_for_action(v, owner, repo) {
+                if !vuln_is_for_action(v, &action_advisory_packages(package, owner, repo)) {
                     return None;
                 }
                 let range = v.vulnerable_version_range.as_deref()?;
@@ -867,60 +997,94 @@ fn format_advisory_details(
 /// Returns `None` if either string can't be parsed as semver — callers
 /// treat that as "no match" rather than aborting the scan.
 fn version_in_range(version: &str, range: &str) -> Option<bool> {
-    let v = strip_v_prefix(version);
-    let mut ver = semver::Version::parse(v).ok()?;
-    // semver's VersionReq won't match a pre-release (`2.0.0-rc1`) unless the
-    // comparator names one, so match on the numeric version only.
-    ver.pre = semver::Prerelease::EMPTY;
-    ver.build = semver::BuildMetadata::EMPTY;
-
-    // GitHub uses `or` (union) and `and`/comma (intersection); semver has no
-    // `or`, so match if any `or`-clause holds. None only if nothing parses.
-    let mut parsed_any = false;
-    for clause in range.split(" or ") {
-        let clause = clause
-            .trim()
-            .trim_end_matches(',')
-            .trim()
-            .replace(" and ", ", ");
-        let r = normalize_range_string(&clause);
-        // A bare version (`1.2.3`) means exact, not semver's caret default.
-        let r = if r.trim_start().starts_with(|c: char| c.is_ascii_digit()) {
-            format!("={}", r.trim())
-        } else {
-            r
-        };
-        if let Ok(req) = semver::VersionReq::parse(&r) {
-            parsed_any = true;
-            if req.matches(&ver) {
+    let version = semver::Version::parse(strip_v_prefix(version)).ok()?;
+    let normalized = range.replace("||", " or ");
+    let mut parsed_clause = false;
+    for union in normalized.split(" or ") {
+        let intersection = union.replace(" and ", ",");
+        let mut matched = true;
+        let mut comparators = 0usize;
+        for raw in intersection
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let (operator, literal) = [">=", "<=", "==", ">", "<", "="]
+                .into_iter()
+                .find_map(|operator| {
+                    raw.strip_prefix(operator)
+                        .map(|rest| (operator, rest.trim()))
+                })
+                .unwrap_or(("=", raw));
+            let candidate = parse_advisory_version(literal)?;
+            comparators += 1;
+            matched &= match operator {
+                ">=" => version >= candidate,
+                "<=" => version <= candidate,
+                ">" => version > candidate,
+                "<" => version < candidate,
+                "=" | "==" => version == candidate,
+                _ => false,
+            };
+        }
+        if comparators > 0 {
+            parsed_clause = true;
+            if matched {
                 return Some(true);
             }
         }
     }
-    parsed_any.then_some(false)
+    parsed_clause.then_some(false)
+}
+
+/// GitHub advisory ranges use SemVer-like partials such as `< 3` in addition
+/// to full versions. A missing minor or patch component denotes zero for
+/// comparator purposes (`3` is the `3.0.0` boundary).
+fn parse_advisory_version(value: &str) -> Option<semver::Version> {
+    let value = strip_v_prefix(value.trim());
+    let suffix_start = value.find(['-', '+']).unwrap_or(value.len());
+    let (core, suffix) = value.split_at(suffix_start);
+    let mut components: Vec<&str> = core.split('.').collect();
+    if components.is_empty()
+        || components.len() > 3
+        || components
+            .iter()
+            .any(|component| component.is_empty() || !component.bytes().all(|b| b.is_ascii_digit()))
+    {
+        return None;
+    }
+    while components.len() < 3 {
+        components.push("0");
+    }
+    semver::Version::parse(&format!("{}{suffix}", components.join("."))).ok()
 }
 
 /// True if this vulnerability entry is for the action being scored. An advisory
 /// can list several packages (an action *and* a CLI); matching against another
 /// package's range is a false positive. Actions packages are named `owner/repo`.
-fn vuln_is_for_action(v: &AdvisoryVulnerability, owner: &str, repo: &str) -> bool {
+fn action_advisory_packages<'a>(package: &'a str, owner: &str, repo: &str) -> Vec<&'a str> {
+    let parent_len = owner.len() + repo.len() + 1;
+    if package.len() > parent_len && package.as_bytes().get(parent_len) == Some(&b'/') {
+        vec![package, &package[..parent_len]]
+    } else {
+        vec![package]
+    }
+}
+
+fn vuln_is_for_action(v: &AdvisoryVulnerability, packages: &[&str]) -> bool {
     v.package
         .as_ref()
         .and_then(|p| p.name.as_deref())
-        .is_some_and(|name| name.eq_ignore_ascii_case(&format!("{owner}/{repo}")))
+        .map(|name| name.strip_prefix("https://github.com/").unwrap_or(name))
+        .is_some_and(|name| {
+            packages
+                .iter()
+                .any(|package| name.eq_ignore_ascii_case(package))
+        })
 }
 
 fn strip_v_prefix(s: &str) -> &str {
     s.strip_prefix('v').unwrap_or(s)
-}
-
-/// Strip the `v` prefix from any version literal inside a semver range
-/// string. GitHub advisories return ranges like `< v40.2.3` or
-/// `>= v1.0.0, < v2.0.0`; the `semver` crate doesn't accept the prefix.
-fn normalize_range_string(s: &str) -> String {
-    static V_PREFIX_RE: std::sync::LazyLock<regex::Regex> =
-        std::sync::LazyLock::new(|| regex::Regex::new(r"(^|[\s,<>=!^~])v(\d)").unwrap());
-    V_PREFIX_RE.replace_all(s, "$1$2").to_string()
 }
 
 /// Map an audit finding to the runtime.* rule it corresponds to. Pipe-to-shell
@@ -1005,11 +1169,24 @@ fn trigger_present(on: &Value, name: &str) -> bool {
     }
 }
 
-fn has_remote_actions(repo_root: &Path) -> Result<bool> {
+fn has_remote_actions(repo_root: &Path, config: &Config) -> Result<bool> {
     for file in workflow::find_workflows(repo_root)? {
         let content = workflow::read_workflow(&file)?;
         if !workflow::scan_content(&content).is_empty() {
             return Ok(true);
+        }
+        for local in workflow::scan_local_actions(&content) {
+            let mut collector = AuditCollector::new(false);
+            match audit_source::scan_local_action_source_graph(
+                repo_root,
+                &local,
+                &mut collector,
+                config,
+            ) {
+                Ok((_, nested)) if !nested.is_empty() => return Ok(true),
+                Err(_) => return Ok(true),
+                _ => {}
+            }
         }
     }
     Ok(false)
@@ -1034,7 +1211,7 @@ pub async fn run(
         enrich_with_source_archived(&mut report, repo_root, &client).await?;
         enrich_with_source_advisory(&mut report, repo_root, &client).await?;
         enrich_with_remote_runtime(&mut report, repo_root, &client, &config, &mut impact).await?;
-    } else if has_remote_actions(repo_root)? {
+    } else if has_remote_actions(repo_root, &config)? {
         report.mark_coverage_incomplete(
             "GitHub token unavailable; remote action source and token-gated source rules were not evaluated",
         );
@@ -1892,19 +2069,6 @@ jobs:
     }
 
     #[test]
-    fn normalize_range_string_strips_v_prefix_only_on_version_literals() {
-        assert_eq!(normalize_range_string("< v40.2.3"), "< 40.2.3");
-        assert_eq!(
-            normalize_range_string(">= v1.0.0, < v2.0.0"),
-            ">= 1.0.0, < 2.0.0"
-        );
-        // Leading `v` at start of string also stripped.
-        assert_eq!(normalize_range_string("v1.2.3"), "1.2.3");
-        // No-op on already-clean ranges.
-        assert_eq!(normalize_range_string("<= 45.0.7"), "<= 45.0.7");
-    }
-
-    #[test]
     fn advisory_findings_emits_per_match_with_details() {
         let mut action_resolved = BTreeMap::new();
         action_resolved.insert(
@@ -2067,6 +2231,55 @@ jobs:
             findings.is_empty(),
             "a patched v4 action must not match a v2-era advisory or a co-listed package"
         );
+    }
+
+    #[test]
+    fn advisory_findings_matches_exact_subpath_package() {
+        let mut action_resolved = BTreeMap::new();
+        action_resolved.insert(
+            "owner/repo/.github/actions/build@SHA".to_string(),
+            (
+                "owner".to_string(),
+                "repo".to_string(),
+                "v1.0.0".to_string(),
+            ),
+        );
+        let advisory = SecurityAdvisory {
+            ghsa_id: "GHSA-subpath".to_string(),
+            html_url: "https://github.com/advisories/GHSA-subpath".to_string(),
+            severity: "high".to_string(),
+            summary: "subpath action issue".to_string(),
+            vulnerabilities: vec![crate::github::AdvisoryVulnerability {
+                package: Some(crate::github::AdvisoryPackage {
+                    name: Some("https://github.com/owner/repo/.github/actions/build".to_string()),
+                }),
+                vulnerable_version_range: Some("< 1.1.0".to_string()),
+                patched_versions: Some("1.1.0".to_string()),
+            }],
+        };
+        let advisories =
+            BTreeMap::from([(("owner".to_string(), "repo".to_string()), vec![advisory])]);
+
+        let findings = advisory_findings(&action_resolved, &advisories, &BTreeMap::new());
+        assert_eq!(findings.len(), 1);
+    }
+
+    #[test]
+    fn advisory_findings_matches_parent_package_for_subpath_action() {
+        let action_resolved = BTreeMap::from([(
+            "owner/repo/.github/actions/build@SHA".to_string(),
+            (
+                "owner".to_string(),
+                "repo".to_string(),
+                "v1.0.0".to_string(),
+            ),
+        )]);
+        let advisory = make_adv("GHSA-parent", "high", "< 1.1.0", None, "parent issue");
+        let advisories =
+            BTreeMap::from([(("owner".to_string(), "repo".to_string()), vec![advisory])]);
+
+        let findings = advisory_findings(&action_resolved, &advisories, &BTreeMap::new());
+        assert_eq!(findings.len(), 1);
     }
 
     #[test]
@@ -2592,7 +2805,7 @@ jobs:
                 .await;
             // ...which falls inside this advisory's vulnerable range.
             Mock::given(method("GET"))
-                .and(path("/repos/o/r/security-advisories"))
+                .and(path("/advisories"))
                 .respond_with(ResponseTemplate::new(200).set_body_json(json!([
                     {
                         "ghsa_id": "GHSA-test",
@@ -2659,7 +2872,7 @@ jobs:
             // Advisory range covers v1.0.0 but is for a *co-listed* package, not
             // the action — the #216 false-match guard must keep this silent.
             Mock::given(method("GET"))
-                .and(path("/repos/o/r/security-advisories"))
+                .and(path("/advisories"))
                 .respond_with(ResponseTemplate::new(200).set_body_json(json!([
                     {
                         "ghsa_id": "GHSA-other",
@@ -2682,6 +2895,7 @@ jobs:
             enrich_with_source_advisory(&mut report, dir.path(), &client)
                 .await
                 .unwrap();
+            assert!(report.coverage_complete);
             assert!(!report.findings.iter().any(|f| f.id == "source.advisory"));
         }
 
@@ -2736,6 +2950,62 @@ jobs:
             assert!(details.contains("action.yml"), "details: {details}");
             assert!(details.contains("piped to shell"), "details: {details}");
             assert_eq!(report.score, 80);
+            assert!(report.coverage_complete);
+        }
+
+        #[tokio::test]
+        async fn local_composite_remote_children_are_enriched() {
+            const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path(format!("/repos/scoretest/child/git/trees/{SHA}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "tree": [{ "path": "action.yml", "type": "blob" }]
+                })))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/repos/scoretest/child/contents/action.yml"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(
+                    "name: child\nruns:\n  using: composite\n  steps:\n    - run: curl -fsSL https://example.com/install.sh | bash\n      shell: bash\n",
+                ))
+                .mount(&server)
+                .await;
+
+            let dir = tempfile::TempDir::new().unwrap();
+            let workflows = dir.path().join(".github/workflows");
+            let local = dir.path().join(".github/actions/local");
+            std::fs::create_dir_all(&workflows).unwrap();
+            std::fs::create_dir_all(&local).unwrap();
+            std::fs::write(
+                workflows.join("ci.yml"),
+                "jobs:\n  test:\n    steps:\n      - uses: ./.github/actions/local\n",
+            )
+            .unwrap();
+            std::fs::write(
+                local.join("action.yml"),
+                format!("runs:\n  using: composite\n  steps:\n    - uses: scoretest/child@{SHA}\n"),
+            )
+            .unwrap();
+
+            let config = Config::default();
+            let (mut report, mut impact) = score_repo(dir.path(), &config).unwrap();
+            assert!(has_remote_actions(dir.path(), &config).unwrap());
+            let client = GitHubClient::with_base("t".into(), server.uri());
+            enrich_with_remote_runtime(&mut report, dir.path(), &client, &config, &mut impact)
+                .await
+                .unwrap();
+
+            let finding = report
+                .findings
+                .iter()
+                .find(|finding| finding.id == "runtime.pipe_to_shell")
+                .unwrap();
+            assert_eq!(
+                finding.action_ref.as_deref(),
+                Some(&*format!("scoretest/child@{SHA}"))
+            );
+            assert_eq!(finding.occurrences[0].line, 4);
             assert!(report.coverage_complete);
         }
 
