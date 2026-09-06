@@ -10,7 +10,7 @@
     "build": "astro build",
     "preview": "astro preview",
     "astro": "astro",
-    "deploy": "wrangler deploy --config dist/client/wrangler.json",
+    "deploy": "wrangler deploy --config wrangler.jsonc",
     "deploy:dry": "npm run deploy -- --dry-run",
     "format": "prettier --write .",
     "format:check": "prettier --check ."

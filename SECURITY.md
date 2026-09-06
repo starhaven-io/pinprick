@@ -48,11 +48,12 @@ with different trust anchors:
 
 The catalog signing key (`CATALOG_SIGNING_KEY`) must be stored as a
 passwordless minisign secret key in the GitHub `cloudflare` environment.
-Only `deploy-site.yml` reads it, on pushes to `main` that touch `site/**`,
-`audited-actions/**`, `catalog-minisign.pub`, or `Cargo.toml`. The workflow
-writes a temporary runner copy and removes it on step exit; maintainers must
-not retain additional copies. A compromise of that workflow or environment
-is a catalog compromise. Signing the catalog offline
+Only `deploy-site.yml` reads it. Every build job is explicitly restricted to
+`main`, including manual dispatches, and a weekly default-branch schedule
+refreshes signatures before their 30-day expiry. Relevant pushes to `main`
+also deploy immediately. The workflow writes a temporary runner copy and
+removes it on step exit; maintainers must not retain additional copies. A
+compromise of that workflow or environment is a catalog compromise. Signing the catalog offline
 (committing `.minisig` files next to each JSON and serving them verbatim)
 would take the key out of CI at the cost of maintainer friction on every
 catalog change; that trade-off remains under consideration.

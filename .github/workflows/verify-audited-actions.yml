@@ -115,8 +115,8 @@ jobs:
           } > issue-body.md
           EXISTING=$(gh issue list --state open --limit 50 \
             --search "in:title catalog re-verification is failing" \
-            --json number,title \
-            --jq ".[] | select(.title == \"${TITLE}\") | .number" | head -1)
+            --json number,title,author \
+            --jq ".[] | select(.title == \"${TITLE}\" and .author.login == \"app/github-actions\") | .number" | head -1)
           if [[ -n "${EXISTING}" ]]; then
             gh issue edit "${EXISTING}" --body-file issue-body.md
             gh issue comment "${EXISTING}" --body-file issue-body.md
@@ -137,8 +137,8 @@ jobs:
           TITLE="audited-actions catalog re-verification is failing"
           for N in $(gh issue list --state open --limit 50 \
             --search "in:title catalog re-verification is failing" \
-            --json number,title \
-            --jq ".[] | select(.title == \"${TITLE}\") | .number"); do
+            --json number,title,author \
+            --jq ".[] | select(.title == \"${TITLE}\" and .author.login == \"app/github-actions\") | .number"); do
             if [[ "${VERIFY_MODE}" == "all" ]]; then
               gh issue comment "${N}" --body "A full catalog re-verification passed as of ${RUN_URL}. Closing."
               gh issue close "${N}"

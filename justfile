@@ -46,16 +46,24 @@ typos:
 # Audited Actions
 
 # Add a new audited action by resolving its latest release and verifying it is clean
-add-action owner_repo:
+add-action action_key:
     #!/usr/bin/env bash
     set -euo pipefail
-    OWNER_REPO="$1"
-    if [[ ! "$OWNER_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ || "$OWNER_REPO" == *..* ]]; then
-        echo "error: expected OWNER/REPO, got '$OWNER_REPO'" >&2
+    ACTION_KEY="$1"
+    if [[ ! "${ACTION_KEY}" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)*$ ]]; then
+        echo "error: expected OWNER/REPO[/SUBPATH], got '${ACTION_KEY}'" >&2
         exit 2
     fi
-    OWNER="${OWNER_REPO%/*}"
-    REPO="${OWNER_REPO#*/}"
+    IFS='/' read -r -a PARTS <<< "${ACTION_KEY}"
+    for PART in "${PARTS[@]}"; do
+        if [[ "${PART}" == "." || "${PART}" == ".." ]]; then
+            echo "error: action path cannot contain '${PART}'" >&2
+            exit 2
+        fi
+    done
+    OWNER="${PARTS[0]}"
+    REPO="${PARTS[1]}"
+    OWNER_REPO="${OWNER}/${REPO}"
 
     echo "--- ${OWNER_REPO} ---"
 
@@ -83,12 +91,12 @@ add-action owner_repo:
       test:
         runs-on: ubuntu-latest
         steps:
-          - uses: ${OWNER}/${REPO}@${LATEST_SHA} # ${LATEST}
+          - uses: ${ACTION_KEY}@${LATEST_SHA} # ${LATEST}
     YAML
 
     cargo run --locked --release --quiet -- --json audit "$TMPDIR"
 
-    FILE="audited-actions/${OWNER}/${REPO}.json"
+    FILE="audited-actions/${ACTION_KEY}.json"
     mkdir -p "$(dirname "$FILE")"
     [[ -f "$FILE" ]] || echo "[]" > "$FILE"
     jq -r --arg sha "$LATEST_SHA" --arg tag "$LATEST" '

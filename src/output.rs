@@ -10,7 +10,14 @@ use crate::audit_patterns::{Category, FindingKind, Pattern, Severity, category_s
 pub(crate) fn sanitize_for_terminal(s: &str) -> String {
     s.chars()
         .map(|c| {
-            if c == '\t' || !c.is_control() {
+            let directional_control = matches!(
+                c,
+                '\u{200e}'
+                    | '\u{200f}'
+                    | '\u{202a}'..='\u{202e}'
+                    | '\u{2066}'..='\u{2069}'
+            );
+            if (c == '\t' || !c.is_control()) && !directional_control {
                 c
             } else {
                 '\u{fffd}'
@@ -141,8 +148,19 @@ pub struct UpdateResult {
 }
 
 #[derive(Serialize)]
+pub struct UpdateFailure {
+    pub file: String,
+    pub action: String,
+    pub stage: String,
+    pub error: String,
+    pub line: usize,
+}
+
+#[derive(Serialize)]
 pub struct UpdateReport {
     pub updates: Vec<UpdateResult>,
+    pub failures: Vec<UpdateFailure>,
+    pub skipped: Vec<UpdateFailure>,
     pub up_to_date: usize,
     pub applied: bool,
 }
@@ -154,7 +172,7 @@ impl UpdateReport {
     }
 
     fn write_human(&self, w: &mut impl Write) -> io::Result<()> {
-        if self.updates.is_empty() {
+        if self.updates.is_empty() && self.failures.is_empty() && self.skipped.is_empty() {
             writeln!(w, "All pinned actions are up to date.")?;
             return Ok(());
         }
@@ -184,21 +202,85 @@ impl UpdateReport {
             }
         }
 
+        for failure in &self.failures {
+            if failure.file != current_file {
+                if !current_file.is_empty() {
+                    writeln!(w)?;
+                }
+                writeln!(w, "{}", sanitize_for_terminal(&failure.file).bold())?;
+                current_file.clone_from(&failure.file);
+            }
+            writeln!(
+                w,
+                "  {} {}",
+                format!("! {}", sanitize_for_terminal(&failure.action)).red(),
+                format!(
+                    "-- {} failed: {}",
+                    sanitize_for_terminal(&failure.stage),
+                    sanitize_for_terminal(&failure.error)
+                )
+                .dimmed()
+            )?;
+        }
+
+        for skipped in &self.skipped {
+            if skipped.file != current_file {
+                if !current_file.is_empty() {
+                    writeln!(w)?;
+                }
+                writeln!(w, "{}", sanitize_for_terminal(&skipped.file).bold())?;
+                current_file.clone_from(&skipped.file);
+            }
+            writeln!(
+                w,
+                "  {} {}",
+                format!("? {}", sanitize_for_terminal(&skipped.action)).yellow(),
+                format!(
+                    "-- {} skipped: {}",
+                    sanitize_for_terminal(&skipped.stage),
+                    sanitize_for_terminal(&skipped.error)
+                )
+                .dimmed()
+            )?;
+        }
+
         writeln!(w)?;
-        if self.applied {
+        if !self.failures.is_empty() {
+            writeln!(
+                w,
+                "Coverage incomplete: {} action check{} failed; no files were changed.",
+                self.failures.len(),
+                if self.failures.len() == 1 { "" } else { "s" }
+            )?;
+        } else if self.applied {
             writeln!(
                 w,
                 "{} update{} applied.",
                 self.updates.len(),
                 if self.updates.len() == 1 { "" } else { "s" }
             )?;
-        } else {
+        } else if !self.updates.is_empty() {
             writeln!(
                 w,
                 "{} update{} available. Run with {} to apply.",
                 self.updates.len(),
                 if self.updates.len() == 1 { "" } else { "s" },
                 "--write".bold()
+            )?;
+        } else {
+            writeln!(w, "No updates found in the completed checks.")?;
+        }
+        if !self.skipped.is_empty() {
+            writeln!(
+                w,
+                "Coverage incomplete: {} action{} had no version tag and {} skipped.",
+                self.skipped.len(),
+                if self.skipped.len() == 1 { "" } else { "s" },
+                if self.skipped.len() == 1 {
+                    "was"
+                } else {
+                    "were"
+                }
             )?;
         }
         Ok(())
@@ -378,6 +460,12 @@ pub struct AuditReport {
     /// silence as cleanliness.
     #[serde(default)]
     pub external_actions_skipped: usize,
+    /// Whether every discovered workflow and reachable action source was
+    /// inspected far enough to support a clean verdict.
+    pub coverage_complete: bool,
+    /// Concrete reasons a clean verdict is unavailable.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub coverage_failures: Vec<String>,
 }
 
 impl AuditReport {
@@ -428,8 +516,10 @@ impl AuditReport {
             }
         }
 
-        if self.findings.is_empty() {
+        if self.findings.is_empty() && self.coverage_complete {
             println!("No runtime fetch risks found.");
+        } else if self.findings.is_empty() {
+            println!("No runtime fetch risks found in the completed portion of the scan.");
         } else {
             let high = self
                 .findings
@@ -463,6 +553,16 @@ impl AuditReport {
                 self.allowed.len(),
                 if self.allowed.len() == 1 { "" } else { "es" }
             );
+        }
+
+        if !self.coverage_complete {
+            println!(
+                "{}",
+                "Coverage incomplete; no clean verdict was produced.".yellow()
+            );
+            for failure in &self.coverage_failures {
+                println!("  - {}", sanitize_for_terminal(failure));
+            }
         }
 
         if !self.had_token {
@@ -656,6 +756,10 @@ impl AuditReport {
                     },
                 },
                 results,
+                properties: SarifProperties {
+                    coverage_complete: self.coverage_complete,
+                    coverage_failures: self.coverage_failures.clone(),
+                },
             }],
         }
     }
@@ -735,6 +839,15 @@ struct SarifDocument {
 struct SarifRun {
     tool: SarifTool,
     results: Vec<SarifResult>,
+    properties: SarifProperties,
+}
+
+#[derive(Serialize)]
+struct SarifProperties {
+    #[serde(rename = "pinprickCoverageComplete")]
+    coverage_complete: bool,
+    #[serde(rename = "pinprickCoverageFailures")]
+    coverage_failures: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -842,6 +955,8 @@ mod sarif_tests {
             scanned_unpinned_sliding: 0,
             ignored: 0,
             external_actions_skipped: 0,
+            coverage_complete: true,
+            coverage_failures: vec![],
         }
     }
 
@@ -873,6 +988,23 @@ mod sarif_tests {
         assert_eq!(driver["name"], "pinprick");
         assert_eq!(driver["version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(driver["informationUri"], "https://pinprick.rs");
+        assert_eq!(v["runs"][0]["properties"]["pinprickCoverageComplete"], true);
+    }
+
+    #[test]
+    fn sarif_exposes_incomplete_coverage() {
+        let mut report = report(vec![]);
+        report.coverage_complete = false;
+        report.coverage_failures = vec!["source fetch failed".to_string()];
+        let json = serde_json::to_value(report.build_sarif()).unwrap();
+        assert_eq!(
+            json["runs"][0]["properties"]["pinprickCoverageComplete"],
+            false
+        );
+        assert_eq!(
+            json["runs"][0]["properties"]["pinprickCoverageFailures"][0],
+            "source fetch failed"
+        );
     }
 
     #[test]
@@ -1015,6 +1147,8 @@ mod audit_summary_tests {
             scanned_unpinned_sliding: 0,
             ignored: 0,
             external_actions_skipped: 0,
+            coverage_complete: true,
+            coverage_failures: vec![],
         }
     }
 
@@ -1052,6 +1186,10 @@ mod audit_summary_tests {
         assert_eq!(
             sanitize_for_terminal("x\ry\nz\u{7}\u{7f}"),
             "x\u{fffd}y\u{fffd}z\u{fffd}\u{fffd}"
+        );
+        assert_eq!(
+            sanitize_for_terminal("safe\u{202e}gpj.exe\u{2066}"),
+            "safe\u{fffd}gpj.exe\u{fffd}"
         );
     }
 
@@ -1136,6 +1274,8 @@ mod audit_summary_tests {
                     release_url: None,
                 },
             ],
+            failures: Vec::new(),
+            skipped: Vec::new(),
             up_to_date: 0,
             applied: true,
         };
@@ -1157,6 +1297,8 @@ mod audit_summary_tests {
     fn update_human_output_reports_empty_summary() {
         let empty = UpdateReport {
             updates: vec![],
+            failures: Vec::new(),
+            skipped: Vec::new(),
             up_to_date: 1,
             applied: false,
         };
@@ -1181,6 +1323,8 @@ mod audit_summary_tests {
                 line: 1,
                 release_url: None,
             }],
+            failures: Vec::new(),
+            skipped: Vec::new(),
             up_to_date: 0,
             applied: false,
         };

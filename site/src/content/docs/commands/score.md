@@ -17,11 +17,11 @@ pinprick score --badge > badge.json
 
 ## Behavior
 
-- Scans `.github/workflows/*.yml` and emits findings across four categories: `pin.*`, `workflow.*`, `source.*`, `runtime.*`
+- Scans `.yml` and `.yaml` workflows under `.github/workflows/`, `.forgejo/workflows/`, and `.gitea/workflows/`, plus reachable local and remote action source, and emits findings across four categories: `pin.*`, `workflow.*`, `source.*`, `runtime.*`
 - Each finding has a fixed point deduction; the score is `max(0, 100 - sum(points))`
-- Exits 1 when any finding deducts points
+- Exits 1 when any finding deducts points. Coverage is reported independently in every output format
 - Runs its workflow-owned rules offline. With a GitHub token, it also evaluates `source.archived`, `source.advisory`, and runtime findings in fetched remote action source
-- Marks report coverage incomplete when token-gated checks do not run, remote source cannot be fetched completely, or configuration suppresses coverage
+- Marks report coverage incomplete when token-gated checks do not run, reachable source cannot be inspected completely, or configuration suppresses coverage
 
 ## Output formats
 
@@ -64,18 +64,18 @@ Container-action findings identify `docker://` references that use a tag instead
 
 ```
 $ pinprick score
-pinprick score  v0.10.0 rubric
+pinprick score  v0.11.0 rubric
 
   Grade:  A   (95 / 100)
 
   Findings (1 unique, 1 occurrences):
     medium  -5    pin.sliding                       actions/checkout@v4
 
-  3 workflows scanned, 8 unique actions.
+  3 workflows scanned, 8 unique action references (including local paths).
 
   Run with --json for the full report.
 ```
 
 ## Versioning
 
-The rubric is independently versioned from the pinprick binary (currently `v0.10.0`). Every scan records the rubric version so historical scores remain interpretable as the rubric evolves. Re-scoring against a newer rubric is always explicit — pinprick never silently re-grades a past scan.
+The rubric is independently versioned from the pinprick binary (currently `v0.11.0`). Every scan records the rubric version so historical scores remain interpretable as the rubric evolves. Re-scoring against a newer rubric is always explicit — pinprick never silently re-grades a past scan.

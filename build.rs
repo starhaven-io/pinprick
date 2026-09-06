@@ -8,9 +8,8 @@ fn main() {
     let dir = Path::new("audited-actions");
     let mut data: HashMap<String, Vec<String>> = HashMap::new();
 
-    if dir.is_dir() {
-        walk_dir(dir, dir, &mut data);
-    }
+    assert!(dir.is_dir(), "audited-actions directory is missing");
+    walk_dir(dir, dir, &mut data).unwrap_or_else(|error| panic!("{error}"));
 
     let json = serde_json::to_string(&data).unwrap();
     let out_dir = std::env::var("OUT_DIR").unwrap();
@@ -18,33 +17,44 @@ fn main() {
     fs::write(dest, json).unwrap();
 }
 
-fn walk_dir(base: &Path, dir: &Path, data: &mut HashMap<String, Vec<String>>) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
+fn walk_dir(
+    base: &Path,
+    dir: &Path,
+    data: &mut HashMap<String, Vec<String>>,
+) -> Result<(), String> {
+    let entries =
+        fs::read_dir(dir).map_err(|error| format!("could not read {}: {error}", dir.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("could not read {}: {error}", dir.display()))?;
         let path = entry.path();
         if path.is_dir() {
-            walk_dir(base, &path, data);
+            walk_dir(base, &path, data)?;
         } else if path.extension().is_some_and(|e| e == "json")
             && let Some(key) = path_to_key(base, &path)
-            && let Ok(content) = fs::read_to_string(&path)
         {
-            match serde_json::from_str::<Vec<Entry>>(&content) {
-                Ok(entries) => {
-                    let shas: Vec<String> = entries.into_iter().map(|e| e.sha).collect();
-                    data.insert(key, shas);
+            let content = fs::read_to_string(&path)
+                .map_err(|error| format!("could not read {}: {error}", path.display()))?;
+            let entries = serde_json::from_str::<Vec<Entry>>(&content)
+                .map_err(|error| format!("{} contains invalid JSON: {error}", path.display()))?;
+            let mut shas = Vec::with_capacity(entries.len());
+            for entry in entries {
+                if !is_full_sha(&entry.sha) {
+                    return Err(format!(
+                        "{} contains non-canonical SHA `{}`",
+                        path.display(),
+                        entry.sha
+                    ));
                 }
-                // A malformed file would otherwise be silently dropped from the
-                // bundle; surface it so a bad edit is caught at build time.
-                Err(e) => {
-                    println!(
-                        "cargo:warning=audited-actions/{key}.json: skipped, invalid JSON ({e})"
-                    );
-                }
+                shas.push(entry.sha.to_ascii_lowercase());
             }
+            data.insert(key, shas);
         }
     }
+    Ok(())
+}
+
+fn is_full_sha(value: &str) -> bool {
+    value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 /// Convert `audited-actions/actions/checkout.json` → `actions/checkout`

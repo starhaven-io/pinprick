@@ -2,13 +2,15 @@ name: Deploy Site
 
 on:
   push:
-    branches:
-      - main
+    branches: [main]
     paths:
       - "site/**"
       - "audited-actions/**"
       - "catalog-minisign.pub"
       - "Cargo.toml"
+      - ".github/workflows/deploy-site.yml"
+  schedule:
+    - cron: "17 6 * * 1"
   workflow_dispatch:
 
 defaults:
@@ -22,76 +24,127 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  deploy:
-    name: Deploy
+  build:
+    name: Build untrusted site inputs
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-slim
-    timeout-minutes: 60
+    timeout-minutes: 30
     permissions:
-      contents: read # required to checkout repository
-    environment: cloudflare
+      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 26
           package-manager-cache: false
-
       - name: Check npm install-script policy
         run: node scripts/check-npm-install-policy.mjs site
-
       - name: Install dependencies
         working-directory: site
-        # Fail if an unreviewed dependency install script is introduced.
         run: npm ci --strict-allow-scripts
-
       - name: Build site
         working-directory: site
         run: npm run build
+      - name: Remove generated deployment configuration
+        run: rm -f site/dist/client/wrangler.json
+      - name: Upload unsigned site
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: unsigned-site
+          path: site/dist
+          if-no-files-found: error
+          retention-days: 1
 
-      # Sign the built audited-actions catalog files so the pinprick binary
-      # can verify them against its embedded public key (fail-closed: an
-      # unsigned or tampered catalog is ignored by clients). Signing the dist
-      # output covers exactly the bytes Cloudflare will serve.
-      - name: Sign audited-actions catalog
+  sign:
+    name: Sign canonical catalog
+    if: github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-slim
+    timeout-minutes: 15
+    environment:
+      name: cloudflare
+      deployment: false
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: unsigned-site
+          path: site/dist
+      - name: Install minisign
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq minisign
+      - name: Verify generated catalog is canonical and sign it
         env:
           CATALOG_SIGNING_KEY: ${{ secrets.CATALOG_SIGNING_KEY }}
         run: |
           if [[ -z "${CATALOG_SIGNING_KEY}" ]]; then
-            echo "::warning::CATALOG_SIGNING_KEY not configured; catalog ships unsigned and clients will ignore the remote layer"
-            exit 0
+            echo "::error::CATALOG_SIGNING_KEY is required"
+            exit 1
           fi
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq minisign
+          while IFS= read -r -d '' source; do
+            relative="${source#audited-actions/}"
+            generated="site/dist/client/audited-actions/${relative}"
+            if [[ ! -f "${generated}" ]] || ! cmp -s "${source}" "${generated}"; then
+              echo "::error::Generated catalog differs from canonical source: ${relative}"
+              exit 1
+            fi
+          done < <(find audited-actions -type f -name '*.json' -print0)
+          while IFS= read -r -d '' generated; do
+            relative="${generated#site/dist/client/audited-actions/}"
+            source="audited-actions/${relative}"
+            if [[ ! -f "${source}" ]] || ! cmp -s "${source}" "${generated}"; then
+              echo "::error::Published catalog is not present in canonical source: ${relative}"
+              exit 1
+            fi
+          done < <(find site/dist/client/audited-actions -type f -name '*.json' -print0)
           KEYFILE="${RUNNER_TEMP}/catalog.key"
           trap 'rm -f "${KEYFILE}"' EXIT
           printf '%s\n' "${CATALOG_SIGNING_KEY}" > "${KEYFILE}"
-          # -H (prehashed) pins the signature algorithm regardless of the
-          # installed minisign version; pinprick clients require prehashed
-          # signatures. The default trusted comment embeds `timestamp:<epoch>`,
-          # which clients enforce as the anti-replay freshness signal — never
-          # override it with -t.
-          find site/dist -path '*audited-actions*' -name '*.json' -print0 \
-            | while IFS= read -r -d '' f; do
-                minisign -SH -s "${KEYFILE}" -m "${f}" -x "${f}.minisig"
-              done
-          FIRST_SIGNATURE=$(find site/dist -path '*audited-actions*' -name '*.json.minisig' -print -quit)
-          if [[ -z "${FIRST_SIGNATURE}" ]]; then
-            echo "::error::No audited-actions catalog signatures were produced"
-            exit 1
-          fi
-          minisign -Vm "${FIRST_SIGNATURE%.minisig}" \
-            -x "${FIRST_SIGNATURE}" \
-            -p catalog-minisign.pub
-          COUNT=$(find site/dist -path '*audited-actions*' -name '*.json.minisig' | wc -l)
-          echo "Signed ${COUNT} catalog files"
+          while IFS= read -r -d '' file; do
+            relative="${file#site/dist/client/audited-actions/}"
+            action="${relative%.json}"
+            printf -v trusted_comment 'timestamp:%s\taction:%s' "$(date +%s)" "${action}"
+            minisign -SH -s "${KEYFILE}" -m "${file}" -x "${file}.minisig" -t "${trusted_comment}"
+            minisign -Vm "${file}" -x "${file}.minisig" -p catalog-minisign.pub
+          done < <(find site/dist/client/audited-actions -type f -name '*.json' -print0)
+          test -n "$(find site/dist/client/audited-actions -name '*.json.minisig' -print -quit)"
+      - name: Upload signed site
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: signed-site
+          path: site/dist
+          if-no-files-found: error
+          retention-days: 1
 
-      - name: Deploy to Cloudflare Workers
-        working-directory: site
-        run: npm run deploy
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
-          WRANGLER_SEND_METRICS: "false"
+  deploy:
+    name: Deploy
+    if: github.ref == 'refs/heads/main'
+    needs: sign
+    runs-on: ubuntu-slim
+    timeout-minutes: 15
+    environment: cloudflare
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: signed-site
+          path: site/dist
+      - name: Deploy immutable build to Cloudflare Workers
+        uses: cloudflare/wrangler-action@ebbaa1584979971c8614a24965b4405ff95890e0 # v4.0.0
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: site
+          wranglerVersion: 4.127.0
+          command: deploy --config wrangler.jsonc

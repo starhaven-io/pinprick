@@ -23,6 +23,7 @@ pinprick pin /path/to/repo
 - Branch refs (e.g., `@main`) are flagged — pin to a SHA manually
 - Annotated tags are followed to their underlying commit SHA
 - `docker://` container references are audited and scored separately; registry tags must be replaced with a reviewed `@sha256:` digest manually
+- Only block-style, single-line `uses:` mappings are rewritten. Flow mappings, escaped YAML keys, and multiline values exit 2 and block all writes rather than risking a structurally ambiguous edit
 
 ## Example
 

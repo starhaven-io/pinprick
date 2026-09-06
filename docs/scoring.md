@@ -1,6 +1,6 @@
 # pinprick scoring rubric
 
-**Status:** stable, versioned (rubric version `0.10.0`)
+**Status:** stable, versioned (rubric version `0.11.0`)
 
 This document defines how pinprick computes a single score for a GitHub repository's Actions supply chain posture. It is the public specification that the `pinprick score` CLI subcommand implements against, and that any downstream tool wrapping the engine (dashboards, CI plugins, reporting pipelines) should implement against so scores stay portable and comparable.
 
@@ -12,7 +12,7 @@ Keeping this document public and versioned is deliberate: security scoring is on
 2. **Actionable.** Every rule maps to a concrete remediation. The score is always accompanied by a prioritized fix list.
 3. **Deterministic.** The same inputs always produce the same score. No stochastic inputs, no ML models, no "confidence-weighted" signals in v1.
 4. **Versioned.** The rubric has a semantic version. Every scan records the rubric version used. Re-scoring is always explicit — we never silently mutate historical scores.
-5. **Unique-finding basis.** Action-level rules (`pin.*`, `source.*`, `runtime.*`) fire once per unique `(rule, action_ref)` across the repo, with an `occurrences` list recording every `(workflow, line)` where the action is used. Workflow-level rules (`workflow.*`) fire once per `(rule, workflow_path)`. A repo with 20 workflows that all call `actions/checkout@main` has one fix to make, so the score reflects one finding.
+5. **Unique-finding basis.** Action pinning and source rules (`pin.*`, `source.*`) fire once per unique `(rule, action_ref)` across the repo, with an `occurrences` list recording every `(workflow, line)` where the action is used. Runtime rules fire once per distinct detected source location, including workflow run blocks and action source. Workflow-level rules (`workflow.*`) fire once per `(rule, workflow_path)`. A repo with 20 workflows that all call `actions/checkout@main` has one pinning fix to make, so the score reflects one pinning finding.
 6. **Absolute before relative.** v1 is an absolute rubric ("47/100"). Percentile scoring across a corpus is a later feature and needs real data first.
 
 ## Score formula
@@ -68,11 +68,11 @@ These rules fire against properties of the referenced action itself. Live source
 
 `source.archived` requires a GitHub token (`GITHUB_TOKEN` env var or `gh auth login`); without one, the offline rules still run. The check fires once per unique `action_ref` whose `owner/repo` is archived on GitHub. A repo lookup failure does not abort the scan, but marks report coverage incomplete so the missing deduction cannot be mistaken for a clean result.
 
-`source.advisory` also requires a token. For each tag-pinned action, the tag is matched against the `vulnerable_version_range` of every published GHSA advisory for the repo. SHA-pinned actions are resolved to a tag via the GitHub tags endpoint (bounded pagination, up to 1,000 tags); when no tag pointing at the SHA is found, the action is not guessed at and report coverage is marked incomplete. Sliding-tag (`@v4`) and branch refs are not version-precise, so they trigger `pin.sliding` / `pin.branch` but no advisory matching. Each (action, advisory) match emits its own finding with the GHSA id, severity, the matched range, any patched-version hint, and the advisory URL carried in the finding's `details` field.
+`source.advisory` also requires a token. For each exact tag-pinned action, pinprick queries GitHub's global Advisory Database for the exact Actions package name and version. Subpath actions query and match both the exact subpath package and the parent `owner/repo` package because an advisory may cover the whole repository. Prerelease semantics are preserved when matching each `vulnerable_version_range`. SHA-pinned actions are resolved to a tag via the GitHub tags endpoint (bounded pagination, up to 1,000 tags); when no tag pointing at the SHA is found, the action is not guessed at and report coverage is marked incomplete. Sliding-tag (`@v4`) and branch refs are not version-precise, so they trigger `pin.sliding` / `pin.branch` but no advisory matching. Each (action, advisory) match emits its own finding with the GHSA id, severity, matched range, patched-version hint, and advisory URL.
 
 ### Runtime-fetch rules (category: `runtime`)
 
-These reuse findings from the existing `pinprick audit` pipeline applied to each workflow's `run:` blocks. Severity comes straight from the audit finding.
+These reuse findings from the existing `pinprick audit` pipeline applied to each workflow's `run:` blocks and directly referenced local action source (`./...` and `$/...`). Severity comes straight from the audit finding.
 
 | ID                      | Condition                                          | Severity | Points | Status | Remediation                                        |
 |-------------------------|----------------------------------------------------|----------|--------|--------|----------------------------------------------------|
@@ -86,6 +86,7 @@ Notes:
 - The audit pipeline already suppresses `data format URL` and checksum-verified fetches to allowed matches and applies the trusted-host exemption before `runtime.*` scoring runs, so those never deduct points and there's no double-counting. (Checksum-verified fetches are suppressed as of rubric 0.7.0; they were downgraded one severity level through 0.6.0.)
 - As of v0.8.0, the runtime score scan includes the expanded audit coverage for Docker CLI image pulls/runs, Deno URL execution, `pipx`/`uv` tool installs, additional PowerShell download idioms, and non-literal curl/wget executable downloads.
 - As of v0.10.0, a token-gated run also scores runtime findings from fetched remote action source. Catalog-vouched actions are trusted without a fresh source fetch; `ignore.actions` entries are skipped and reported as a coverage limitation. A truncated tree or failed source-file fetch also marks report coverage incomplete.
+- As of v0.11.0, offline scoring includes directly referenced local `./` and `$/` action source, and unsupported `uses:` targets, unreadable workflows, and incomplete local source scans are reported as coverage notes.
 - Runtime findings are not deduplicated. Each pattern match emits one finding keyed to its `(workflow, line)` — each is a distinct fix in a distinct place.
 - Config interaction: `runtime.*` scoring honors `ignore.patterns` from `.pinprick.toml` (an explicitly accepted risk is not deducted), but **not** the `severity` display threshold — the posture score reflects every finding regardless of what `pinprick audit` is configured to print.
 
@@ -117,7 +118,7 @@ These are deliberately out of scope for v1 to keep the initial rubric defensible
 
 ```jsonc
 {
-  "rubric_version": "0.10.0",
+  "rubric_version": "0.11.0",
   "pinprick_version": "…",
   "target": { "kind": "repo", "path": "./" },
   "score": 72,
@@ -155,7 +156,7 @@ These are deliberately out of scope for v1 to keep the initial rubric defensible
 A compact summary:
 
 ```
-pinprick score  v0.10.0 rubric
+pinprick score  v0.11.0 rubric
 
   Grade:  C   (72 / 100)
 
@@ -165,7 +166,7 @@ pinprick score  v0.10.0 rubric
     medium  -5    pin.sliding                       actions/checkout@v4
     low     -2    pin.full_tag                      actions/setup-node@v4.2.1
 
-  4 workflows scanned, 17 unique actions.
+  4 workflows scanned, 17 unique action references (including local paths).
 
   Run with --json for the full report.
 ```
@@ -207,6 +208,7 @@ Re-scoring an existing scan against a newer rubric is always explicit in the UI.
 
 ## Changelog
 
+- `0.11.0`: Offline scoring covers directly referenced local `./` and `$/` action source; unique action totals count local paths; unsupported `uses:` targets, unreadable workflows, and incomplete source scans are reported as coverage notes; prerelease and CalVer tags classify as full tags; `source.advisory` queries the global Advisory Database by exact package and version and also matches the parent package for subpath actions.
 - `0.10.0`: Added container action pinning rules `pin.docker_latest` (high/-15) and `pin.docker_tag` (medium/-5); `uses: docker://…` references were previously invisible to scoring. Digest-pinned images deduct nothing. Token-gated runs now also score runtime findings from fetched remote action source.
 - `0.9.0`: Removed `source.unverified`. `pinprick score --json` no longer emits publisher allowlist notes, and the `trusted-owners` config key has been removed.
 

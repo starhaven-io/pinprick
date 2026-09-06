@@ -26,7 +26,7 @@ fn clean_workflow_human_output() {
 }
 
 #[test]
-fn bundled_parent_audit_covers_action_subpaths() {
+fn bundled_parent_audit_does_not_cover_action_subpaths() {
     let workflow = "\
 name: cache
 on: push
@@ -44,14 +44,9 @@ jobs:
         .arg("audit")
         .arg(dir.path())
         .assert()
-        .success()
-        .stderr(predicate::str::contains(
-            "actions/cache/restore@55cc834 audited (bundled)",
-        ))
-        .stderr(predicate::str::contains(
-            "actions/cache/save@55cc834 audited (bundled)",
-        ))
-        .stderr(predicate::str::contains("Fetching actions/cache").not());
+        .code(2)
+        .stderr(predicate::str::contains("audited (bundled)").not())
+        .stderr(predicate::str::contains("Fetching actions/cache/restore"));
 }
 
 #[test]
@@ -59,9 +54,9 @@ fn no_audited_catalog_bypasses_bundled_verdict() {
     // --no-audited-catalog must force a fresh scan even for a SHA the bundled
     // catalog vouches for — that is what lets CI re-verify catalog entries
     // against the current detection rules. The dummy token makes the fetch
-    // fail, which is fine: the assertion is that a fetch was attempted instead
-    // of the bundled short-circuit, and a failed scan is a warning, not a
-    // finding.
+    // fail. The assertion is that a fetch was attempted instead of the bundled
+    // short-circuit and that the failed fresh scan cannot produce a clean
+    // verdict.
     let workflow = "\
 name: cache
 on: push
@@ -79,9 +74,10 @@ jobs:
         .arg("--no-audited-catalog")
         .arg(dir.path())
         .assert()
-        .success()
+        .code(2)
         .stderr(predicate::str::contains("audited (bundled)").not())
-        .stderr(predicate::str::contains("Fetching actions/cache/restore"));
+        .stderr(predicate::str::contains("Fetching actions/cache/restore"))
+        .stdout(predicate::str::contains("Coverage incomplete"));
 }
 
 #[test]
@@ -352,6 +348,303 @@ fn checksum_suppressed() {
 }
 
 #[test]
+fn runtime_sidecar_from_an_earlier_step_does_not_suppress() {
+    let workflow = r#"
+name: checksum
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: curl -o tool.sig https://example.com/v1.2.3/tool.sig
+      - name: Verify payload
+        shell: bash
+        run: |
+          curl -o tool https://example.com/tool
+          gpg --verify tool.sig tool
+"#;
+    let dir = common::repo_with_workflow("ci.yml", workflow);
+    let output = common::pinprick_cmd()
+        .arg("--json")
+        .arg("audit")
+        .arg(dir.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let findings = json["findings"].as_array().unwrap();
+    assert_eq!(findings.len(), 1);
+    assert_eq!(
+        findings[0]["pattern_matched"],
+        "curl -o tool https://example.com/tool"
+    );
+    assert_eq!(json["coverage_complete"], true);
+}
+
+#[test]
+fn runtime_sidecar_path_aliases_from_earlier_steps_do_not_suppress() {
+    let workflow = r#"
+name: checksum aliases
+on: push
+jobs:
+  working-directory:
+    runs-on: ubuntu-latest
+    steps:
+      - working-directory: .github/sigs
+        run: curl -o tool.sig https://example.com/v1.2.3/tool.sig
+      - run: |
+          curl -o tool https://example.com/tool
+          gpg --verify .github/sigs/tool.sig tool
+  rename:
+    runs-on: ubuntu-latest
+    steps:
+      - run: curl -o downloaded.sig https://example.com/v1.2.3/downloaded.sig
+      - run: mv downloaded.sig trusted.sig
+      - run: |
+          curl -o payload https://example.com/payload
+          gpg --verify trusted.sig payload
+"#;
+    let dir = common::repo_with_workflow("ci.yml", workflow);
+    let output = common::pinprick_cmd()
+        .arg("--json")
+        .arg("audit")
+        .arg(dir.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let patterns: Vec<&str> = json["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|finding| finding["pattern_matched"].as_str())
+        .collect();
+    assert_eq!(patterns.len(), 2);
+    assert!(patterns.iter().any(|pattern| pattern.contains("/tool")));
+    assert!(patterns.iter().any(|pattern| pattern.contains("/payload")));
+}
+
+#[test]
+fn inline_directory_changes_do_not_hide_cross_step_sidecars() {
+    let workflow = r#"
+name: checksum directories
+on: push
+jobs:
+  same-line:
+    runs-on: ubuntu-latest
+    steps:
+      - run: mkdir -p dl && cd dl && curl -o x.sig https://example.com/v1.2.3/x.sig
+      - run: |
+          curl -o x https://example.com/x
+          gpg --verify dl/x.sig x
+  own-line:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          mkdir -p dl
+          cd dl
+          curl -o x.sig https://example.com/v1.2.3/x.sig
+      - run: |
+          curl -o x https://example.com/x
+          gpg --verify dl/x.sig x
+  subshell:
+    runs-on: ubuntu-latest
+    steps:
+      - run: mkdir -p dl && (cd dl && curl -o x.sig https://example.com/v1.2.3/x.sig)
+      - run: |
+          curl -o x https://example.com/x
+          gpg --verify dl/x.sig x
+  pushd:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          mkdir -p dl
+          pushd dl
+          curl -o x.sig https://example.com/v1.2.3/x.sig
+          popd
+      - run: |
+          curl -o x https://example.com/x
+          gpg --verify dl/x.sig x
+"#;
+    let dir = common::repo_with_workflow("ci.yml", workflow);
+    let output = common::pinprick_cmd()
+        .arg("--json")
+        .arg("audit")
+        .arg(dir.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["findings"].as_array().unwrap().len(), 4);
+    assert_eq!(json["coverage_complete"], true);
+}
+
+#[test]
+fn expanded_verification_material_does_not_suppress() {
+    let workflow = r#"
+name: expanded verification material
+on: push
+jobs:
+  signature:
+    runs-on: ubuntu-latest
+    steps:
+      - run: curl -o f.sig https://example.com/v1.2.3/f.sig
+      - run: |
+          curl -o f https://example.com/f
+          gpg --verify "$PWD/f.sig" f
+  key:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          curl -o key.asc https://example.com/v1.2.3/key.asc
+          gpg --import "$PWD/key.asc"
+      - run: |
+          curl -o payload https://example.com/payload
+          gpg --verify committed.sig payload
+"#;
+    let dir = common::repo_with_workflow("ci.yml", workflow);
+    let output = common::pinprick_cmd()
+        .arg("--json")
+        .arg("audit")
+        .arg(dir.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["findings"].as_array().unwrap().len(), 2);
+    assert_eq!(json["coverage_complete"], true);
+}
+
+#[test]
+fn reviewed_path_binding_evasions_are_fail_closed() {
+    let workflow = r#"
+name: reviewed path binding evasions
+on: push
+jobs:
+  shell-control:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          mkdir -p dl
+          if cd dl; then curl -o tool.sig https://example.com/v1.2.3/tool.sig; fi
+          cd ..
+      - run: |
+          curl -o tool https://example.com/tool
+          gpg --verify dl/tool.sig tool
+  powershell-directory:
+    runs-on: windows-latest
+    steps:
+      - shell: pwsh
+        run: |
+          Set-Location dl
+          curl -o tool.sig https://example.com/v1.2.3/tool.sig
+          Set-Location ..
+      - shell: pwsh
+        run: |
+          curl -o tool https://example.com/tool
+          gpg --verify dl/tool.sig tool
+  process-substitution:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          curl -o tool https://example.com/tool
+          gpg --verify <(curl https://example.com/v1.2.3/tool.sig) tool
+  input-redirection:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          curl -o tool.sig https://example.com/v1.2.3/tool.sig
+          curl -o tool https://example.com/tool
+          gpg --verify /dev/stdin tool <tool.sig
+  negated-verification:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          curl -o tool https://example.com/tool
+          ! gpg --verify trusted.sig tool
+  wrapped-key-import:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          curl -o key.asc https://example.com/v1.2.3/key.asc
+          command gpg --import key.asc
+      - run: |
+          curl -o tool https://example.com/tool
+          gpg --verify trusted.sig tool
+  directory-alias:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          mkdir -p dl
+          curl -o dl/tool.sig https://example.com/v1.2.3/tool.sig
+          ln -s dl alias
+      - run: |
+          curl -o tool https://example.com/tool
+          gpg --verify alias/tool.sig tool
+  self-manifest:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          curl -o tool https://example.com/tool
+          sha256sum -c tool
+"#;
+    let dir = common::repo_with_workflow("ci.yml", workflow);
+    let output = common::pinprick_cmd()
+        .arg("--json")
+        .arg("audit")
+        .arg(dir.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let lines: Vec<u64> = json["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|finding| finding["line"].as_u64())
+        .collect();
+    assert_eq!(lines, vec![13, 25, 31, 38, 44, 53, 63, 69]);
+    assert_eq!(json["coverage_complete"], true);
+}
+
+#[test]
+fn absolute_directory_change_recovers_static_verification() {
+    let digest = "a".repeat(64);
+    let workflow = format!(
+        r#"
+name: absolute directory recovery
+on: push
+jobs:
+  recovery:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          cd "$RUNNER_TEMP"
+          cd /tmp
+          curl -o tool https://example.com/tool
+          echo '{digest}  tool' | sha256sum -c -
+"#
+    );
+    let dir = common::repo_with_workflow("ci.yml", &workflow);
+    let output = common::pinprick_cmd()
+        .arg("--json")
+        .arg("audit")
+        .arg(dir.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(json["findings"].as_array().unwrap().is_empty());
+    assert_eq!(json["coverage_complete"], true);
+}
+
+#[test]
 fn unrelated_checksum_does_not_suppress() {
     let workflow = "\
 name: checksum
@@ -492,13 +785,33 @@ fn audit_skips_unreadable_workflow_and_continues() {
         .output()
         .unwrap();
 
-    // Exit 1 (found the good file's finding), not 2 (aborted on the bad file).
+    // The readable file is still scanned, but unreadable input prevents a
+    // complete verdict and therefore takes precedence over the finding exit.
     assert_eq!(
         output.status.code(),
-        Some(1),
+        Some(2),
         "stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[test]
+fn unsupported_multiline_uses_exits_two() {
+    for uses in [
+        "uses:\n          actions/checkout@v4",
+        "uses: >-\n          actions/checkout@v4",
+    ] {
+        let workflow = format!(
+            "name: malformed\non: push\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - {uses}\n"
+        );
+        let dir = common::repo_with_workflow("ci.yml", &workflow);
+        common::pinprick_cmd()
+            .arg("audit")
+            .arg(dir.path())
+            .assert()
+            .code(2)
+            .stdout(predicate::str::contains("Coverage incomplete"));
+    }
 }
 
 // ── Missing workflows directory ─────────────────────────────────────────────
@@ -1101,25 +1414,27 @@ jobs:
         .output()
         .unwrap();
 
-    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.status.code(), Some(2));
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(json["had_token"], false);
-    assert_eq!(json["actions_scanned"], 0);
-    // Two unique external actions were invisible to the token-less scan; the
-    // duplicate checkout counts once.
-    assert_eq!(json["external_actions_skipped"], 2);
+    assert_eq!(json["actions_scanned"], 1);
+    assert_eq!(json["coverage_complete"], false);
+    // The pinned checkout is covered by the bundled catalog. Only setup-node
+    // lacks source coverage without a token.
+    assert_eq!(json["external_actions_skipped"], 1);
 }
 
 #[test]
-fn no_token_human_note_counts_skipped_actions() {
+fn no_token_human_note_distinguishes_catalog_coverage() {
     let dir = common::repo_with_workflow("ci.yml", common::WORKFLOW_CLEAN);
     common::pinprick_cmd()
         .arg("audit")
         .arg(dir.path())
         .assert()
         .code(0)
+        .stdout(predicate::str::contains("Audited 1 action: 1 bundled"))
         .stdout(predicate::str::contains(
-            "no GitHub token — 1 external action not scanned",
+            "no GitHub token — action source code was not scanned",
         ));
 }
 

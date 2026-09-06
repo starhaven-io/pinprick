@@ -41,6 +41,11 @@ const MAX_LIST_PAGES: usize = 10;
 /// gigabytes of "action source" into memory.
 pub(crate) const MAX_RESPONSE_BYTES: usize = 50 * 1024 * 1024;
 
+/// Raw action source is fetched concurrently and has a much smaller useful
+/// upper bound than tree or catalog responses. Enforce this while streaming,
+/// before several oversized files can be resident at once.
+const MAX_RAW_FILE_BYTES: usize = 8 * 1024 * 1024;
+
 /// Shared HTTP client with request/connect timeouts (a stalled endpoint can't
 /// hang the run) and a bounded redirect policy. reqwest strips `Authorization`
 /// on cross-host redirects, so following GitHub's content redirects is safe.
@@ -54,12 +59,16 @@ pub(crate) fn build_client() -> reqwest::Client {
 }
 
 /// Read a response body, rejecting it past [`MAX_RESPONSE_BYTES`] before it is
-/// fully buffered. For the unbounded-size fetches (action source, trees, the
-/// remote catalog).
+/// fully buffered. Used for trees and the remote catalog; individual source
+/// files have the smaller [`MAX_RAW_FILE_BYTES`] cap.
 pub(crate) async fn read_capped(mut resp: reqwest::Response) -> Result<Vec<u8>> {
+    read_capped_to(&mut resp, MAX_RESPONSE_BYTES).await
+}
+
+async fn read_capped_to(resp: &mut reqwest::Response, max: usize) -> Result<Vec<u8>> {
     let mut buf = Vec::new();
     while let Some(chunk) = resp.chunk().await.context("reading response body")? {
-        within_cap(buf.len(), chunk.len(), MAX_RESPONSE_BYTES)?;
+        within_cap(buf.len(), chunk.len(), max)?;
         buf.extend_from_slice(&chunk);
     }
     Ok(buf)
@@ -471,6 +480,7 @@ impl GitHubClient {
 
     /// List published security advisories for the repo. Draft and withdrawn
     /// advisories are excluded server-side via the `state` filter.
+    #[cfg(test)]
     pub async fn list_security_advisories(
         &self,
         owner: &str,
@@ -492,6 +502,41 @@ impl GitHubClient {
         let advisories: Vec<SecurityAdvisory> =
             resp.json().await.context("parsing security advisories")?;
         Ok(advisories)
+    }
+
+    /// Query GitHub's global advisory corpus for one exact Actions package
+    /// version. Repository advisories alone omit reviewed advisories published
+    /// outside the action's own repository.
+    pub async fn list_action_advisories(
+        &self,
+        package: &str,
+        version: &str,
+    ) -> Result<Vec<SecurityAdvisory>> {
+        let version = version.strip_prefix('v').unwrap_or(version);
+        let affects = percent_encode_component(&format!("{package}@{version}"));
+        let mut advisories = Vec::new();
+        for page in 1..=MAX_LIST_PAGES {
+            let url = format!(
+                "{}/advisories?ecosystem=actions&affects={affects}&per_page={LIST_PAGE_SIZE}&page={page}",
+                self.base
+            );
+            let resp = self.get(&url).await?;
+            ensure_success(
+                &resp,
+                format!("querying global advisories for {package}@{version}"),
+            )?;
+            let mut page_advisories: Vec<SecurityAdvisory> =
+                resp.json().await.context("parsing global advisories")?;
+            let done = page_advisories.len() < LIST_PAGE_SIZE;
+            advisories.append(&mut page_advisories);
+            if done {
+                return Ok(advisories);
+            }
+        }
+        bail!(
+            "global advisory query for {package}@{version} exceeded {} results; refusing a partial result",
+            MAX_LIST_PAGES * LIST_PAGE_SIZE
+        )
     }
 
     /// Return `true` if the repo is archived on GitHub.
@@ -560,7 +605,8 @@ impl GitHubClient {
             );
         }
 
-        let bytes = read_capped(resp).await?;
+        let mut resp = resp;
+        let bytes = read_capped_to(&mut resp, MAX_RAW_FILE_BYTES).await?;
         Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
 }
@@ -1038,6 +1084,49 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn list_action_advisories_filters_and_paginates() {
+            let server = MockServer::start().await;
+            let advisory = |id: String| {
+                json!({
+                    "ghsa_id": id,
+                    "html_url": "https://github.com/advisories/GHSA-test",
+                    "severity": "high",
+                    "summary": "issue",
+                    "vulnerabilities": []
+                })
+            };
+            let first_page: Vec<_> = (0..LIST_PAGE_SIZE)
+                .map(|i| advisory(format!("GHSA-page-one-{i}")))
+                .collect();
+            Mock::given(method("GET"))
+                .and(path("/advisories"))
+                .and(query_param("ecosystem", "actions"))
+                .and(query_param("affects", "owner/repo/path@1.0.0"))
+                .and(query_param("per_page", "100"))
+                .and(query_param("page", "1"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(first_page))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/advisories"))
+                .and(query_param("page", "2"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(json!([advisory("GHSA-page-two".to_string())])),
+                )
+                .mount(&server)
+                .await;
+
+            let advisories = client_for(&server)
+                .await
+                .list_action_advisories("owner/repo/path", "v1.0.0")
+                .await
+                .unwrap();
+            assert_eq!(advisories.len(), LIST_PAGE_SIZE + 1);
+            assert_eq!(advisories.last().unwrap().ghsa_id, "GHSA-page-two");
+        }
+
+        #[tokio::test]
         async fn fetch_tree_and_file() {
             let server = MockServer::start().await;
             Mock::given(method("GET"))
@@ -1079,6 +1168,24 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(body, "ok");
+        }
+
+        #[tokio::test]
+        async fn fetch_file_rejects_oversized_body_while_streaming() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/repos/o/r/contents/action.yml"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_bytes(vec![b'x'; MAX_RAW_FILE_BYTES + 1]),
+                )
+                .mount(&server)
+                .await;
+
+            let result = client_for(&server)
+                .await
+                .fetch_file("o", "r", "action.yml", "sha")
+                .await;
+            assert!(result.is_err());
         }
 
         #[tokio::test]

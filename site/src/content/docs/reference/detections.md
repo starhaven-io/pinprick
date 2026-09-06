@@ -19,7 +19,7 @@ pinprick scans line by line. Each rule is an anchored regex, compiled once at st
 - **Versioned-URL downgrade.** Non-pipe shell, JavaScript, and Python fetch rules only fire if the URL is _unversioned_. A URL is versioned if any path segment matches `v?\d+(\.\d+)+` — e.g. `/v1.2.3/`, `/0.55.8/`. See [Versioned URL heuristic](#versioned-url-heuristic).
 - **Trusted hosts exemption.** Unversioned-URL rules are downgraded to allowed matches when the URL host matches an entry in the user's [`trusted-hosts`](#trusted-hosts-exemption) list.
 - **Data-format exemption.** If a fetch targets a URL whose path ends in a known data-format extension (`.json`, `.yaml`, `.toml`, etc.), it is treated as a data fetch, not a code fetch, and downgraded to an allowed match instead of a finding. See [Data-format exemption](#data-format-exemption).
-- **Checksum suppression.** A non-pipe finding followed within 3 lines by `sha256sum`, `shasum`, `openssl dgst`, `gpg --verify`, or `Get-FileHash` is suppressed only when the command performs an actual comparison or signature check, does not mask failure with `||`, and names every downloaded target, a target-specific sidecar such as `tool.sha256`, or an inline manifest piped to the verifier. Merely calculating a hash, checking an unrelated file, or using a generic manifest whose contents cannot be inspected does not suppress findings. Verified matches are recorded as allowed.
+- **Checksum suppression.** A non-pipe finding followed within 3 lines by `sha256sum`, `shasum`, `openssl dgst`, `gpg --verify`, or `Get-FileHash` is suppressed only when the command performs an actual comparison, does not mask or negate failure, and binds every downloaded target to independently trusted verification material. A downloaded sidecar such as `tool.sha256` is attacker-controlled alongside the payload and does not qualify on its own. Inline manifests require a literal full SHA-256 or SHA-512 digest; signature checks must name the downloaded target. Runtime downloads, imported keys, curl or wget configuration changes, and static copy, move, or link aliases remain tracked across later ordered steps in the same job or composite action. Literal `cd` and `Set-Location` paths are resolved within a shell block; conditional or dynamic directories, subshells, directory stacks, expanded or redirected verification operands, and a payload used as its own checksum manifest fail closed when the binding cannot be proven. Verified matches are recorded as allowed.
 
 :::caution[Pipe-to-shell is never suppressed]
 A piped payload is never written to disk, so no checksum command can verify it. Trusted-host and data-format exemptions also do not apply — the risk is the execution model, not the source.
@@ -516,7 +516,7 @@ Install-Module -Name Pester -RequiredVersion 5.3.1 -Force
 
 ## JavaScript / TypeScript fetches
 
-Flagged in `.js` and `.ts` files inside an action's source tree. Minified bundles (lines longer than 500 characters) are split on `;` and each segment is scanned individually — this catches calls buried inside `dist/index.js`.
+Flagged in reachable `.js` and `.ts` action entrypoints and explicitly referenced helpers. Minified and generated bundle files are scanned for literal URL and process-spawn patterns. Conservative unresolved-variable sink reporting is limited to authored JavaScript and TypeScript source because generic networking internals in bundled dependencies are not actionable evidence of an unpinned runtime fetch. Generated bundles are recognized from conventional `dist/` paths, `.min.js` names, and narrow bundler-runtime markers. Relative imports that the bounded scanner does not follow make coverage incomplete rather than producing a clean verdict.
 
 ### fetch() / axios / got / http.get to a `/latest/` URL
 
@@ -549,6 +549,8 @@ const r = await fetch('https://example.com/api/data');
 const r = await axios.get('https://example.com/api/data');
 ```
 
+In authored source, a recognized sink with an unresolved variable or interpolated template is also reported at medium severity because its version cannot be verified statically. Exact literal assignments and aliases are propagated; concatenation or other dynamic reassignment invalidates that binding.
+
 Not flagged:
 
 - Versioned URL: `fetch('https://example.com/api/1.2.3/data')`
@@ -557,7 +559,7 @@ Not flagged:
 
 ## Python fetches
 
-Flagged in `.py` files inside an action's source tree.
+Flagged in reachable `.py` action helpers. A recognized sink with an unresolved variable or interpolated value is reported at medium severity. Imports that the bounded scanner cannot prove are covered make source coverage incomplete rather than producing a clean verdict.
 
 ### urllib.request.urlopen / requests.get to a `/latest/` URL
 
@@ -623,7 +625,7 @@ Variable or GitHub-expression image names are not classified: the value might ex
 
 ## Dockerfile patterns
 
-Flagged in `Dockerfile` and `*.dockerfile` files inside an action's source tree.
+Flagged in the Dockerfile named by a reachable container action's `runs.image`. Unreferenced Dockerfiles in examples, fixtures, or the action repository's own CI are not executed by consumers and are not scanned.
 
 ### FROM image:latest
 
@@ -675,7 +677,7 @@ RUN curl -L https://example.com/install.sh -o /usr/local/bin/install
 RUN wget https://example.com/tool
 ```
 
-Not flagged: a `curl` line followed within 3 lines by a checksum command that names the downloaded target or its sidecar, which is suppressed and recorded as an allowed match.
+Not flagged: a `curl` line followed within 3 lines by a checksum command fed an inline literal digest for the downloaded target, or by an independent signature verification naming the target. Downloading a checksum sidecar from the same trust domain does not suppress the finding.
 
 ### ADD with a URL source
 

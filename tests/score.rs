@@ -69,6 +69,28 @@ fn sliding_tag_exits_one() {
 }
 
 #[test]
+fn unsupported_multiline_uses_makes_score_incomplete() {
+    let workflow = "name: malformed\non: push\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: >-\n          actions/checkout@v4\n";
+    let dir = common::repo_with_workflow("ci.yml", workflow);
+    let output = common::pinprick_cmd()
+        .arg("--json")
+        .arg("score")
+        .arg(dir.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["coverage_complete"], false);
+    assert!(
+        json["coverage_notes"][0]
+            .as_str()
+            .unwrap()
+            .contains("unsupported uses target")
+    );
+}
+
+#[test]
 fn unknown_owner_sha_pinned_action_scores_cleanly() {
     let dir = common::repo_with_workflow("ci.yml", WORKFLOW_UNKNOWN_OWNER_SHA_PINNED);
     let output = common::pinprick_cmd()
@@ -124,7 +146,7 @@ fn json_output_shape() {
     assert_eq!(output.status.code(), Some(1));
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
 
-    assert_eq!(json["rubric_version"], "0.10.0");
+    assert_eq!(json["rubric_version"], "0.11.0");
     assert_eq!(json["grade"], "A");
     assert_eq!(json["score"], 95);
     assert_eq!(json["coverage_complete"], false);
@@ -223,6 +245,223 @@ fn runtime_rule_fires_on_parallel_run_block() {
         ids.contains(&"runtime.pipe_to_shell".to_string()),
         "ids: {ids:?}"
     );
+}
+
+#[test]
+fn runtime_sidecar_from_an_earlier_step_deducts_points() {
+    let workflow = r#"
+name: checksum
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: curl -o tool.sig https://example.com/v1.2.3/tool.sig
+      - run: |
+          curl -o tool https://example.com/tool
+          gpg --verify tool.sig tool
+"#;
+    let dir = common::repo_with_workflow("ci.yml", workflow);
+    let output = common::pinprick_cmd()
+        .arg("--json")
+        .arg("score")
+        .arg(dir.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(json["findings"].as_array().unwrap().iter().any(|finding| {
+        finding["id"] == "runtime.fetch.medium"
+            && finding["occurrences"][0]["line"].as_u64() == Some(10)
+    }));
+}
+
+#[test]
+fn runtime_sidecar_path_aliases_from_earlier_steps_deduct_points() {
+    let workflow = r#"
+name: checksum aliases
+on: push
+jobs:
+  working-directory:
+    runs-on: ubuntu-latest
+    steps:
+      - working-directory: .github/sigs
+        run: curl -o tool.sig https://example.com/v1.2.3/tool.sig
+      - run: |
+          curl -o tool https://example.com/tool
+          gpg --verify .github/sigs/tool.sig tool
+  rename:
+    runs-on: ubuntu-latest
+    steps:
+      - run: curl -o downloaded.sig https://example.com/v1.2.3/downloaded.sig
+      - run: mv downloaded.sig trusted.sig
+      - run: |
+          curl -o payload https://example.com/payload
+          gpg --verify trusted.sig payload
+"#;
+    let dir = common::repo_with_workflow("ci.yml", workflow);
+    let output = common::pinprick_cmd()
+        .arg("--json")
+        .arg("score")
+        .arg(dir.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let medium_fetches = json["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|finding| finding["id"] == "runtime.fetch.medium")
+        .count();
+    assert_eq!(medium_fetches, 2);
+}
+
+#[test]
+fn inline_directory_and_expanded_verification_bypasses_deduct_points() {
+    let workflow = r#"
+name: checksum path state
+on: push
+jobs:
+  directory:
+    runs-on: ubuntu-latest
+    steps:
+      - run: mkdir -p dl && cd dl && curl -o x.sig https://example.com/v1.2.3/x.sig
+      - run: |
+          curl -o x https://example.com/x
+          gpg --verify dl/x.sig x
+  subshell:
+    runs-on: ubuntu-latest
+    steps:
+      - run: mkdir -p dl && (cd dl && curl -o y.sig https://example.com/v1.2.3/y.sig)
+      - run: |
+          curl -o y https://example.com/y
+          gpg --verify dl/y.sig y
+  expanded-signature:
+    runs-on: ubuntu-latest
+    steps:
+      - run: curl -o f.sig https://example.com/v1.2.3/f.sig
+      - run: |
+          curl -o f https://example.com/f
+          gpg --verify "$PWD/f.sig" f
+  expanded-key:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          curl -o key.asc https://example.com/v1.2.3/key.asc
+          gpg --import "$PWD/key.asc"
+      - run: |
+          curl -o payload https://example.com/payload
+          gpg --verify committed.sig payload
+"#;
+    let dir = common::repo_with_workflow("ci.yml", workflow);
+    let output = common::pinprick_cmd()
+        .arg("--json")
+        .arg("score")
+        .arg(dir.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let medium_fetches = json["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|finding| finding["id"] == "runtime.fetch.medium")
+        .count();
+    assert_eq!(medium_fetches, 4);
+    assert_eq!(json["coverage_complete"], true);
+}
+
+#[test]
+fn reviewed_path_binding_evasions_deduct_points() {
+    let workflow = r#"
+name: reviewed path binding evasions
+on: push
+jobs:
+  shell-control:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          mkdir -p dl
+          if cd dl; then curl -o tool.sig https://example.com/v1.2.3/tool.sig; fi
+          cd ..
+      - run: |
+          curl -o tool https://example.com/tool
+          gpg --verify dl/tool.sig tool
+  process-substitution:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          curl -o tool https://example.com/tool
+          gpg --verify <(curl https://example.com/v1.2.3/tool.sig) tool
+  input-redirection:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          curl -o tool.sig https://example.com/v1.2.3/tool.sig
+          curl -o tool https://example.com/tool
+          gpg --verify /dev/stdin tool <tool.sig
+  negated-verification:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          curl -o tool https://example.com/tool
+          ! gpg --verify trusted.sig tool
+  wrapped-key-import:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          curl -o key.asc https://example.com/v1.2.3/key.asc
+          command gpg --import key.asc
+      - run: |
+          curl -o tool https://example.com/tool
+          gpg --verify trusted.sig tool
+  directory-alias:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          curl -o dl/tool.sig https://example.com/v1.2.3/tool.sig
+          ln -s dl alias
+      - run: |
+          curl -o tool https://example.com/tool
+          gpg --verify alias/tool.sig tool
+  self-manifest:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          curl -o tool https://example.com/tool
+          sha256sum -c tool
+"#;
+    let dir = common::repo_with_workflow("ci.yml", workflow);
+    let output = common::pinprick_cmd()
+        .arg("--json")
+        .arg("score")
+        .arg(dir.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let medium_fetches = json["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|finding| finding["id"] == "runtime.fetch.medium")
+        .count();
+    assert_eq!(medium_fetches, 7);
+    let lines: Vec<u64> = json["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|finding| finding["id"] == "runtime.fetch.medium")
+        .filter_map(|finding| finding["occurrences"][0]["line"].as_u64())
+        .collect();
+    assert_eq!(lines, vec![13, 19, 26, 32, 41, 50, 56]);
+    assert_eq!(json["coverage_complete"], true);
 }
 
 #[test]

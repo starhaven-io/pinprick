@@ -177,7 +177,7 @@ HIGH  .github/workflows/ci.yml:42
 1 finding (1 high, 0 medium, 0 low)
 ```
 
-Without a GitHub token, audit scans local workflow `run:` blocks and local actions referenced with `uses: ./...`. With a token (via `GITHUB_TOKEN`, `GH_TOKEN`, or `gh auth`), it also fetches and scans external action source code — JavaScript, Python, Dockerfiles, and composite action steps.
+Without a GitHub token, audit scans local workflow `run:` blocks and local actions referenced with `uses: ./...` or commit-bound `uses: $/...`. With a token (via `GITHUB_TOKEN`, `GH_TOKEN`, or `gh auth`), it also fetches and scans external action source code, including JavaScript, Python, shell and PowerShell helpers, reachable container-action Dockerfiles, and composite action steps. Missing or unsupported reachable source makes coverage incomplete and exits 2 instead of producing a clean verdict.
 
 Pass `--sarif` to emit SARIF 2.1.0 for upload to [GitHub code scanning](https://docs.github.com/en/code-security/code-scanning). Pass `--verbose` to see every match, including ones that passed the version check or were downgraded to an allowed match by the trusted-host, data-format, jq-pipe, or checksum rules. When auditing a repository you don't control, pass `--no-repo-config` so the target's own `.pinprick.toml` can't set the audit policy.
 
@@ -187,7 +187,7 @@ Compute a posture grade against the public, versioned rubric in [`docs/scoring.m
 
 ```
 $ pinprick score
-pinprick score  v0.9.0 rubric
+pinprick score  v0.11.0 rubric
 
   Grade:  A   (95 / 100)
 
@@ -199,7 +199,7 @@ pinprick score  v0.9.0 rubric
   Run with --json for the full report.
 ```
 
-`score` exits 1 only when at least one finding deducts points. Use `pinprick score --html > report.html` for a shareable static report.
+`score` exits 1 when at least one finding deducts points. Coverage is reported independently, and incomplete badges render an error state rather than an unqualified grade. Use `pinprick score --html > report.html` for a shareable static report.
 
 ### Configuration
 
@@ -254,6 +254,7 @@ Cache cleaned.
 | PowerShell    | `Invoke-WebRequest`/`iwr`/`irm` to unversioned URLs                                                | Medium   |
 | JavaScript    | `fetch()`/`axios`/`got` to `/latest/` URLs                                                         | High     |
 | JavaScript    | `exec("curl ...")`, `child_process` curl                                                           | High     |
+| JavaScript    | unresolved dynamic URL sinks in authored source                                                     | Medium   |
 | Python        | `requests.get`/`urllib` to `/latest/` URLs                                                         | High     |
 | Python        | `subprocess` shelling out to `curl`/`wget`                                                         | High     |
 | Docker        | `FROM :latest` or untagged                                                                         | High     |
@@ -265,7 +266,7 @@ Pipe-to-shell is flagged even when the URL is versioned — a piped payload is n
 
 Unversioned-URL rules don't fire when the URL's path ends in a data-format extension (`.json`, `.yaml`, `.toml`, `.csv`, etc.), or when the fetch is piped into `jq` — the payload is consumed as data, not executed. These matches are only visible under `--verbose`. (Pipe-to-shell takes precedence, so `curl … | jq … | bash` is still flagged.)
 
-Findings followed within 3 lines by checksum verification (`sha256sum --check`, `gpg --verify`, etc.) are suppressed only when the command performs an actual comparison or signature check, does not mask failure with `||`, and names every downloaded target, a target-specific sidecar such as `tool.sha256`, or an inline manifest piped to the verifier. Merely calculating a hash, checking an unrelated file, or using a generic manifest whose contents cannot be inspected does not suppress findings. Verified matches are recorded as allowed under `--verbose`. Pipe-to-shell findings are exempt; the piped payload is never written to disk for a checksum to verify.
+Findings followed within 3 lines by checksum or signature verification (`sha256sum --check`, `gpg --verify`, etc.) are suppressed only when the command performs an actual comparison, does not mask or negate failure, and binds every downloaded target to trusted verification material. A downloaded sidecar such as `tool.sha256` is not trusted by itself; checksum suppression requires an inline literal digest or a signature verified by an independently supplied key. Runtime downloads, imported keys, curl or wget configuration changes, and static copy, move, or link aliases remain tracked across later ordered steps in the same job or composite action. Literal `cd` and `Set-Location` paths are resolved within a shell block; conditional or dynamic directories, subshells, directory stacks, expanded or redirected verification operands, and a payload used as its own checksum manifest fail closed when the binding cannot be proven. Merely calculating a hash or checking an unrelated or opaque manifest does not suppress findings. Verified matches are recorded as allowed under `--verbose`. Pipe-to-shell findings are exempt because the payload is never written to disk for verification.
 
 ## Exit codes
 
@@ -273,7 +274,7 @@ Findings followed within 3 lines by checksum verification (`sha256sum --check`, 
 | ---- | ----------------------------------------------------------------------------------------- |
 | 0    | Clean — no findings, no pending updates                                                   |
 | 1    | Findings present (audit), score deductions present, or updates available (update dry-run) |
-| 2    | Error                                                                                     |
+| 2    | Error, or incomplete audit/pin/update coverage; verified updates may still apply with `update --write` |
 
 ## Building
 

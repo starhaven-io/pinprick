@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       action:
-        description: "Add a new action (OWNER/REPO). Leave empty for a full scan."
+        description: "Add a new action (OWNER/REPO[/SUBPATH]). Leave empty for a full scan."
         required: false
         default: ""
         type: string
@@ -81,21 +81,31 @@ jobs:
 
           UPDATED=0
           if [[ -n "${INPUT_ACTION}" ]]; then
-            if [[ ! "${INPUT_ACTION}" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ || "${INPUT_ACTION}" == *..* ]]; then
-              echo "error: expected OWNER/REPO, got '${INPUT_ACTION}'" >&2
+            if [[ ! "${INPUT_ACTION}" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)*$ ]]; then
+              echo "error: expected OWNER/REPO[/SUBPATH], got '${INPUT_ACTION}'" >&2
               exit 1
             fi
+            IFS='/' read -r -a ACTION_PARTS <<< "${INPUT_ACTION}"
+            for PART in "${ACTION_PARTS[@]}"; do
+              if [[ "${PART}" == "." || "${PART}" == ".." ]]; then
+                echo "error: action path cannot contain '${PART}'" >&2
+                exit 1
+              fi
+            done
             STUB="audited-actions/${INPUT_ACTION}.json"
             mkdir -p "$(dirname "${STUB}")"
             [[ -f "${STUB}" ]] || echo "[]" > "${STUB}"
             SCAN_FILES=("${STUB}")
           else
-            SCAN_FILES=(audited-actions/*/*.json)
+            readarray -d '' -t SCAN_FILES < <(find audited-actions -type f -name '*.json' -print0 | sort -z)
           fi
           for JSON_FILE in "${SCAN_FILES[@]}"; do
-            OWNER=$(basename "$(dirname "${JSON_FILE}")")
-            REPO=$(basename "${JSON_FILE}" .json)
-            echo "--- ${OWNER}/${REPO} ---"
+            ACTION_KEY="${JSON_FILE#audited-actions/}"
+            ACTION_KEY="${ACTION_KEY%.json}"
+            OWNER="${ACTION_KEY%%/*}"
+            OWNER_REST="${ACTION_KEY#*/}"
+            REPO="${OWNER_REST%%/*}"
+            echo "--- ${ACTION_KEY} ---"
             declare -A TAG_SHAS=()
 
             if [[ -n "${INPUT_REF}" && -n "${INPUT_ACTION}" ]]; then
@@ -157,7 +167,7 @@ jobs:
             test:
               runs-on: ubuntu-24.04
               steps:
-                - uses: ${OWNER}/${REPO}@${TAG_SHA} # ${TAG}
+                - uses: ${ACTION_KEY}@${TAG_SHA} # ${TAG}
           YAML
 
               AUDIT_STATUS=0
@@ -226,7 +236,7 @@ jobs:
         run: |
           # -N stages untracked files as intent-to-add so `git diff` sees them
           # as full-content additions; required for the dispatch-add path that
-          # creates brand-new audited-actions/OWNER/REPO.json files.
+          # creates brand-new audited-actions/OWNER/REPO[/SUBPATH].json files.
           git add -N audited-actions/
           if git diff --quiet audited-actions/; then
             echo "changed=false" >> "${GITHUB_OUTPUT}"

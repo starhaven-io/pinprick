@@ -24,4 +24,6 @@ For CI audit runs, the shipped [GitHub Action](/getting-started/github-action/) 
 | ---- | ----------------------------------------------------------------------------------------- |
 | 0    | Clean — no findings, no pending updates                                                   |
 | 1    | Findings present (audit), score deductions present, or updates available (update dry-run) |
-| 2    | Error                                                                                     |
+| 2    | Error; also incomplete coverage for `audit`, `pin`, or `update`                           |
+
+`score` reports coverage completeness independently in human, JSON, HTML, and badge output; its exit status remains finding-based so a qualified report can still be consumed.

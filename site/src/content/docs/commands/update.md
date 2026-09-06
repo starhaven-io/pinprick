@@ -17,12 +17,14 @@ pinprick update /path/to/repo
 
 ## Behavior
 
-- Only checks actions that are already SHA-pinned with a tag comment (e.g., `@sha # v4.1.0`)
+- Checks SHA-pinned actions. A version tag comment (for example `@sha # v4.1.0`) avoids a lookup; for a bare SHA, pinprick asks GitHub which version tag points at it
 - Queries the GitHub Releases API for the latest non-draft, non-prerelease release
 - Compares version numbers numerically — suggests the latest release regardless of major version
 - Dry-run by default — shows what would change without writing files
 - Each update is printed with a link to the release page for easy changelog review
 - Exit code 1 when updates are available (useful in CI)
+- Exit code 2 when any action could not be checked. `--write` stages every result and changes no files when an API lookup fails. A pinned SHA with no version tag is reported as skipped but does not block independently verified updates
+- Flow-style mappings, escaped YAML keys, and multiline `uses:` values are unsupported: they exit 2 and block all writes rather than being mistaken for an up-to-date workflow
 
 ## Filtering with `--only`
 

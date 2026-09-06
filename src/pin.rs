@@ -5,7 +5,7 @@ use std::process::ExitCode;
 
 use crate::auth;
 use crate::github::GitHubClient;
-use crate::output::{PinReport, PinResult, PinSkip};
+use crate::output::{PinReport, PinResult, PinSkip, sanitize_for_terminal};
 use crate::workflow::{self, RefType};
 
 pub async fn run(repo_root: &Path, json: bool, apply: bool) -> Result<ExitCode> {
@@ -26,7 +26,7 @@ async fn run_with_client(
     let mut report = PinReport {
         pinned: Vec::new(),
         skipped: Vec::new(),
-        applied: apply,
+        applied: false,
     };
 
     let mut resolve_cache: HashMap<String, (String, String)> = HashMap::new();
@@ -36,16 +36,29 @@ async fn run_with_client(
     // these too — they are exactly what a CI gate exists to catch. Sliding-tag
     // skips are excluded: those are warnings attached to a successful pin.
     let mut unpinnable = 0usize;
+    let mut coverage_incomplete = false;
+    let mut pending_edits: Vec<(workflow::WorkflowFile, Vec<workflow::ActionEdit>)> = Vec::new();
 
     for file in &files {
         let display_name = workflow::display_path(file.path(), repo_root);
         if !json {
-            eprintln!("Scanning {display_name}...");
+            eprintln!("Scanning {}...", sanitize_for_terminal(&display_name));
         }
 
         let content = workflow::read_workflow(file)?;
         let actions = workflow::scan_content(&content);
-        let mut replacements: Vec<(usize, String, String)> = Vec::new();
+        let mut edits = Vec::new();
+
+        for unsupported in workflow::scan_unsupported_uses(&content) {
+            coverage_incomplete = true;
+            unpinnable += 1;
+            report.skipped.push(PinSkip {
+                file: display_name.clone(),
+                action: unsupported.value,
+                reason: "unsupported uses representation; rewrite refused".to_string(),
+                line: unsupported.line_number,
+            });
+        }
 
         // Container refs are report-only: resolving a tag to a registry digest
         // needs a registry client, so an unpinned image is surfaced as a skip
@@ -87,8 +100,8 @@ async fn run_with_client(
                     if !json {
                         eprint!(
                             "  Resolving {}@{}...",
-                            action.full_name(),
-                            action.ref_string
+                            sanitize_for_terminal(&action.full_name()),
+                            sanitize_for_terminal(&action.ref_string)
                         );
                     }
 
@@ -136,23 +149,15 @@ async fn run_with_client(
                                     line: action.line_number,
                                 });
                             }
-                            if let Some(new_line) =
-                                workflow::build_pinned_line(&action.raw_line, &sha, &tag)
-                            {
-                                replacements.push((
-                                    action.line_number,
-                                    action.raw_line.clone(),
-                                    new_line,
-                                ));
-                                report.pinned.push(PinResult {
-                                    file: workflow::display_path(file.path(), repo_root),
-                                    action: action.full_name(),
-                                    old_ref: action.ref_string.clone(),
-                                    sha,
-                                    tag,
-                                    line: action.line_number,
-                                });
-                            }
+                            edits.push(workflow::action_edit(action, &sha, &tag));
+                            report.pinned.push(PinResult {
+                                file: workflow::display_path(file.path(), repo_root),
+                                action: action.full_name(),
+                                old_ref: action.ref_string.clone(),
+                                sha,
+                                tag,
+                                line: action.line_number,
+                            });
                         }
                         Err(e) => {
                             unpinnable += 1;
@@ -168,9 +173,16 @@ async fn run_with_client(
             }
         }
 
-        if apply && !replacements.is_empty() {
-            workflow::rewrite_actions(file, &replacements)?;
+        if !edits.is_empty() {
+            pending_edits.push((file.clone(), edits));
         }
+    }
+
+    if apply && !coverage_incomplete {
+        for (file, edits) in &pending_edits {
+            workflow::rewrite_actions(file, &workflow::render_action_edits(edits)?)?;
+        }
+        report.applied = true;
     }
 
     if json {
@@ -179,7 +191,9 @@ async fn run_with_client(
         report.print_human();
     }
 
-    if !apply && (!report.pinned.is_empty() || unpinnable > 0) {
+    if coverage_incomplete {
+        Ok(ExitCode::from(2))
+    } else if !apply && (!report.pinned.is_empty() || unpinnable > 0) {
         Ok(ExitCode::from(1))
     } else {
         Ok(ExitCode::SUCCESS)
@@ -366,5 +380,31 @@ mod tests {
             std::fs::read_to_string(&file).unwrap(),
             format!("jobs:\r\n  test:\r\n    steps:\r\n      - uses: o/r@{SHA} # v2\r\n")
         );
+    }
+
+    #[tokio::test]
+    async fn unsupported_uses_blocks_all_writes() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/git/ref/tags/v2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "object": { "sha": SHA, "type": "commit" }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/git/matching-refs/tags/v2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .mount(&server)
+            .await;
+
+        let original = "jobs:\n  test:\n    steps:\n      - uses: o/r@v2\n      - with: { uses: owner/not-an-action@v1 }\n";
+        let (dir, file) = repo_with_workflow(original);
+        let code = run_with_client(dir.path(), true, true, &client_for(&server))
+            .await
+            .unwrap();
+
+        assert_code(code, 2);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), original);
     }
 }
