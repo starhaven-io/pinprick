@@ -195,6 +195,7 @@ jobs:
           codesign --sign "Developer ID Application: Patrick Linnane (${DEVELOPMENT_TEAM})" \
             --options runtime \
             "target/${TARGET}/release/pinprick"
+          codesign --verify --strict --verbose=2 "target/${TARGET}/release/pinprick"
 
       - name: Notarize binary
         if: matrix.sign
@@ -212,6 +213,19 @@ jobs:
             --team-id "${DEVELOPMENT_TEAM}" \
             --password "${NOTARIZATION_PASSWORD}" \
             --wait
+          for attempt in 1 2 3; do
+            if codesign --verify --strict -R='notarized' --check-notarization --verbose=4 "target/${TARGET}/release/pinprick"; then
+              break
+            else
+              status=$?
+            fi
+            if (( status != 3 || attempt == 3 )); then
+              echo "::error::Notarization requirement verification failed after ${attempt} attempt(s)."
+              exit "${status}"
+            fi
+            echo "::warning::Notarization ticket verification failed; retrying in 10 seconds (${attempt}/3)."
+            sleep 10
+          done
 
       - name: Clean up temporary keychain
         if: always() && matrix.sign
@@ -219,6 +233,8 @@ jobs:
           if [[ -f "${RUNNER_TEMP}/${TEMPORARY_KEYCHAIN_FILE}" ]]; then
             security delete-keychain "${RUNNER_TEMP}/${TEMPORARY_KEYCHAIN_FILE}"
           fi
+          rm -f "${RUNNER_TEMP}/certificate.p12" "${RUNNER_TEMP}/pinprick-notarize.zip"
+          rm -rf "${RUNNER_TEMP}/notarize-staging"
 
       - name: Package
         env:
@@ -693,6 +709,38 @@ jobs:
           export HOMEBREW_GIT_EMAIL="${BOT_ID}+${BOT_USER}@users.noreply.github.com"
           brew tap starhaven-io/tap
           brew trust starhaven-io/tap
+          # Homebrew supplies the subject; prepare its DCO trailer before commit-msg validation.
+          TAP_ROOT="$(cd "$(brew --repo starhaven-io/tap)" && pwd -P)"
+          HOOKS_DIR=$(git -C "${TAP_ROOT}" rev-parse --path-format=absolute --git-path hooks)
+          HOOKS_DIR=$(python3 -c 'import pathlib, sys; print(pathlib.Path(sys.argv[1]).resolve())' "${HOOKS_DIR}")
+          case "${HOOKS_DIR}" in
+            "${TAP_ROOT}/"*) ;;
+            *) echo "::error::Tap hooks directory is outside the fresh checkout."; exit 1 ;;
+          esac
+          mkdir -p "${HOOKS_DIR}"
+          DCO_DIR=$(mktemp -d "${RUNNER_TEMP}/cask-dco.XXXXXX")
+          DCO_HOOK="${DCO_DIR}/prepare-commit-msg"
+          PREPARE_HOOK="${HOOKS_DIR}/prepare-commit-msg"
+          cleanup_dco_hook() {
+            if [[ -L "${PREPARE_HOOK}" ]] && [[ "$(readlink "${PREPARE_HOOK}")" == "${DCO_HOOK}" ]]; then
+              rm -- "${PREPARE_HOOK}"
+            fi
+            rm -rf -- "${DCO_DIR}"
+          }
+          trap cleanup_dco_hook EXIT
+          cat > "${DCO_HOOK}" <<'HOOK'
+          #!/bin/sh
+          set -eu
+          author=$(git var GIT_AUTHOR_IDENT)
+          author="${author%> *}>"
+          git interpret-trailers --in-place --where end --if-exists addIfDifferent --if-missing add \
+            --trailer "Signed-off-by: ${author}" "$1"
+          HOOK
+          chmod +x "${DCO_HOOK}"
+          if ! python3 -c 'import os, sys; os.symlink(sys.argv[1], sys.argv[2])' "${DCO_HOOK}" "${PREPARE_HOOK}"; then
+            echo "::error::Cannot install the DCO hook; an existing prepare-commit-msg hook must be preserved."
+            exit 1
+          fi
           brew bump-cask-pr --no-fork --version "${VERSION}" starhaven-io/tap/pinprick
 
           BRANCH_VERSION="${VERSION//,/-}"

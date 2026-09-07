@@ -11,7 +11,7 @@ pinprick clean
 
 ## When to use
 
-- After updating pinprick to a version with new or changed detection rules — clearing the cache forces a fresh scan of all actions
+- To discard local verdicts and repeat source scans. Entries from older scanner versions are already ignored automatically; `--no-audited-catalog` also bypasses bundled and remote verdicts for a single audit
 - To reclaim disk space from accumulated cache entries
 - To troubleshoot unexpected audit results
 
@@ -28,3 +28,5 @@ If there is nothing to clean:
 $ pinprick clean
 Nothing to clean.
 ```
+
+A filesystem error exits 2 and is reported on stderr; a failed removal is never reported as a successful cleanup.

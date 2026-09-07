@@ -20,6 +20,10 @@ clean:
 test:
     cargo test --locked
 
+# Check release tooling using local stubs
+script-tests:
+    PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_*.py'
+
 # Lint
 
 # fleet:block audit
@@ -79,12 +83,16 @@ add-action action_key:
     if [[ "$OBJ_TYPE" == "tag" ]]; then
         LATEST_SHA=$(gh api "repos/${OWNER}/${REPO}/git/tags/${LATEST_SHA}" --jq '.object.sha')
     fi
+    if [[ ! "${LATEST_SHA}" =~ ^[0-9a-fA-F]{40}$ ]]; then
+        echo "error: release did not resolve to a full SHA" >&2
+        exit 1
+    fi
     echo "  resolved sha: ${LATEST_SHA:0:8}"
 
-    TMPDIR=$(mktemp -d)
-    trap 'rm -rf "$TMPDIR"' EXIT
-    mkdir -p "$TMPDIR/.github/workflows"
-    cat > "$TMPDIR/.github/workflows/test.yml" <<YAML
+    SCAN_DIR=$(mktemp -d)
+    trap 'rm -rf "$SCAN_DIR"' EXIT
+    mkdir -p "$SCAN_DIR/.github/workflows"
+    cat > "$SCAN_DIR/.github/workflows/test.yml" <<YAML
     name: test
     on: push
     jobs:
@@ -94,14 +102,15 @@ add-action action_key:
           - uses: ${ACTION_KEY}@${LATEST_SHA} # ${LATEST}
     YAML
 
-    cargo run --locked --release --quiet -- --json audit "$TMPDIR"
+    AUDIT_JSON=$(XDG_CONFIG_HOME="${SCAN_DIR}/config" cargo run --locked --release --quiet -- --json audit --no-repo-config --no-audited-catalog "$SCAN_DIR")
+    jq -e '.scanned_fresh == 1 and .coverage_complete == true and .ignored == 0' <<< "$AUDIT_JSON" >/dev/null
 
     FILE="audited-actions/${ACTION_KEY}.json"
     mkdir -p "$(dirname "$FILE")"
     [[ -f "$FILE" ]] || echo "[]" > "$FILE"
     jq -r --arg sha "$LATEST_SHA" --arg tag "$LATEST" '
       (if any(.[]; .sha == $sha) then . else [{sha: $sha, tag: $tag}] + . end) as $u |
-      "[\n" + ([$u[] | "  { \"sha\": \"\(.sha)\", \"tag\": \"\(.tag)\" }"] | join(",\n")) + "\n]"
+      "[\n" + ([$u[] | "  { \"sha\": \(.sha | tojson), \"tag\": \(.tag | tojson) }"] | join(",\n")) + "\n]"
     ' "$FILE" > "$FILE.tmp"
     command mv "$FILE.tmp" "$FILE"
     echo "  wrote ${FILE}"
@@ -179,6 +188,7 @@ check:
         skip audit zizmor zizmor
     fi
     run cargo test --locked
+    run env PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_*.py'
     echo "--- site-format-check ---"
     (cd site && npm run format:check) || failed=1
     echo "--- site-build ---"

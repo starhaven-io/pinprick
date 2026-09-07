@@ -86,12 +86,41 @@ fn json_output() {
 }
 
 #[test]
-fn always_exits_zero() {
-    common::pinprick_cmd().arg("clean").assert().success();
+fn removal_error_exits_two_without_claiming_success() {
+    let xdg = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir(xdg.path().join("pinprick")).unwrap();
+    let cache = xdg.path().join("pinprick/audited");
+    std::fs::write(&cache, "unexpected file").unwrap();
+    for json in [false, true] {
+        let mut command = common::pinprick_cmd();
+        command.env("XDG_CACHE_HOME", xdg.path());
+        if json {
+            command.arg("--json");
+        }
+        command
+            .arg("clean")
+            .assert()
+            .code(2)
+            .stdout(predicate::str::is_empty())
+            .stderr(predicate::str::contains("Could not remove audit cache"));
+    }
+    assert_eq!(std::fs::read_to_string(cache).unwrap(), "unexpected file");
 }
 
 #[test]
 fn idempotent() {
-    common::pinprick_cmd().arg("clean").assert().success();
-    common::pinprick_cmd().arg("clean").assert().success();
+    let xdg = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir_all(xdg.path().join("pinprick/audited")).unwrap();
+    common::pinprick_cmd()
+        .env("XDG_CACHE_HOME", xdg.path())
+        .arg("clean")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Cache cleaned."));
+    common::pinprick_cmd()
+        .env("XDG_CACHE_HOME", xdg.path())
+        .arg("clean")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Nothing to clean."));
 }

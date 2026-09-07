@@ -22,7 +22,7 @@ use crate::audit_shell::{
     docker_unpinned_images, fetch_output_targets, file_artifact_events,
     git_clone_has_bound_sha_checkout, imports_runtime_gpg_key_at, is_shell_comment_line,
     join_continuations, mutates_curl_config, mutates_wget_config, mutates_wget_config_file,
-    url_piped_to_jq,
+    shell_urls_are_literal, url_piped_to_jq,
 };
 use crate::audit_source::{
     ActionScanStatus, remote_action_scan_key, scan_action_source, scan_local_action_source_graph,
@@ -403,12 +403,6 @@ pub async fn run(
                                 action.full_name()
                             ));
                         }
-                        // Anchor remote-scan findings to the loading `uses:` line
-                        // so SARIF results land inside the scanning repo.
-                        for finding in collector.findings.iter_mut().skip(findings_before) {
-                            finding.workflow_file = Some(display_name.clone());
-                            finding.workflow_line = Some(action.line_number);
-                        }
                         // Only cache clean verdicts for SHA refs — tag and branch
                         // contents can move after the verdict.
                         if scan_status == ActionScanStatus::Complete
@@ -422,6 +416,7 @@ pub async fn run(
                                 action.subpath.as_deref(),
                                 &action.ref_string,
                                 tag,
+                                config,
                             );
                         }
                     }
@@ -438,6 +433,11 @@ pub async fn run(
                             action.full_name()
                         ));
                     }
+                }
+                // Partial graph failures still carry findings from inspected nodes.
+                for finding in collector.findings.iter_mut().skip(findings_before) {
+                    finding.workflow_file = Some(display_name.clone());
+                    finding.workflow_line = Some(action.line_number);
                 }
             }
         } else {
@@ -3096,44 +3096,46 @@ fn check_url_patterns(
     // Check EVERY URL, not just the first: a versioned/trusted decoy before
     // the real fetch must not suppress the finding. Allowed only if all URLs
     // are exempt; any unexempt one is a finding.
-    let mut allowed_reason: Option<&str> = None;
+    let shell_url_ambiguous = matches!(pattern.category, audit_patterns::Category::ShellFetch)
+        && (audit_patterns::SH_CURL_UNVERSIONED.is_match(line)
+            || audit_patterns::SH_WGET_UNVERSIONED.is_match(line)
+            || audit_patterns::SH_DENO_URL.is_match(line))
+        && !shell_urls_are_literal(line);
+    let mut allowed_reasons = Vec::new();
     let mut dangerous = false;
     for url in extract_urls(line) {
-        if url_has_version(url) {
-            allowed_reason.get_or_insert("versioned URL");
+        if url.contains('\\') {
+            dangerous = true;
+            continue;
+        }
+        let reason = if shell_url_ambiguous {
+            // jq classifies the response as data independently of URL components.
+            if url_piped_to_jq(line, url) {
+                "piped to jq"
+            } else {
+                dangerous = true;
+                continue;
+            }
+        } else if url_has_version(url) {
+            "versioned URL"
         } else if config.is_host_trusted(url) {
-            allowed_reason.get_or_insert(REASON_TRUSTED_HOST);
+            REASON_TRUSTED_HOST
         } else if config.is_extra_data_format_exempt(url) {
-            allowed_reason.get_or_insert(REASON_EXTRA_DATA_FORMAT);
+            REASON_EXTRA_DATA_FORMAT
         } else if config.is_data_format_exempt(url) {
-            allowed_reason.get_or_insert("data format URL");
+            "data format URL"
         } else if url_piped_to_jq(line, url) {
-            allowed_reason.get_or_insert("piped to jq");
+            "piped to jq"
         } else {
             dangerous = true;
-            break;
+            continue;
+        };
+        if !allowed_reasons.contains(&reason) {
+            allowed_reasons.push(reason);
         }
     }
 
-    if dangerous {
-        if let Some(reason) = allowed_reason {
-            collector.push_allowed(AuditMatch::from_pattern(
-                pattern,
-                action_name,
-                source_file,
-                line_num,
-                line,
-                reason,
-            ));
-        }
-        collector.push_finding(AuditFinding::from_pattern(
-            pattern,
-            action_name,
-            source_file,
-            line_num,
-            line,
-        ));
-    } else if let Some(reason) = allowed_reason {
+    for reason in allowed_reasons {
         collector.push_allowed(AuditMatch::from_pattern(
             pattern,
             action_name,
@@ -3141,6 +3143,15 @@ fn check_url_patterns(
             line_num,
             line,
             reason,
+        ));
+    }
+    if dangerous {
+        collector.push_finding(AuditFinding::from_pattern(
+            pattern,
+            action_name,
+            source_file,
+            line_num,
+            line,
         ));
     }
     // No URL on the line: nothing to record.
@@ -5074,6 +5085,34 @@ const d = require("node:https").get("https://example.com/install.sh", cb);
     }
 
     #[test]
+    fn shell_url_exemptions_require_literal_word_boundaries() {
+        let config = Config {
+            trusted_hosts: vec!["example.com".into()],
+            ..Config::default()
+        };
+        for line in [
+            "curl 'https://example.com/data.json'",
+            "curl 'https://example.com/$CHANNEL/data.json?limit=1&offset=0'",
+        ] {
+            let mut literal = AuditCollector::new(true);
+            scan_shell_content(line, "test.sh", 1, "", &mut literal, &config);
+            assert!(literal.findings.is_empty(), "{line}");
+            assert_eq!(literal.trusted_host_allowed, 1, "{line}");
+        }
+        for line in [
+            "curl 'https://example.com/data.json'suffix",
+            "curl https://example.com/$CHANNEL/data.json",
+            "curl \"https://example.com/${CHANNEL}/data.json\"",
+        ] {
+            let mut combined = AuditCollector::new(true);
+            scan_shell_content(line, "test.sh", 1, "", &mut combined, &config);
+            assert_eq!(combined.findings.len(), 1, "{line}");
+            assert!(combined.allowed.is_empty(), "{line}");
+            assert_eq!(combined.trusted_host_allowed, 0, "{line}");
+        }
+    }
+
+    #[test]
     fn shell_scan_data_format_url_is_allowed_not_finding() {
         // Real Homebrew/core workflow line — regression anchor.
         let mut c = AuditCollector::new(true);
@@ -5361,6 +5400,28 @@ const d = require("node:https").get("https://example.com/install.sh", cb);
         assert_eq!(c.allowed.len(), 1);
         assert_eq!(c.allowed[0].reason, "trusted host");
         assert_eq!(c.trusted_host_allowed, 1);
+    }
+
+    #[test]
+    fn mixed_url_reasons_preserve_config_impact() {
+        let config = Config {
+            trusted_hosts: vec!["artifacts.example.com".into()],
+            extra_data_formats: vec!["proto".into()],
+            ..Config::default()
+        };
+        let mut collector = AuditCollector::new(true);
+        scan_shell_content(
+            "curl https://example.com/v1.2.3/file https://artifacts.example.com/file https://example.com/schema.proto",
+            "test.sh",
+            1,
+            "",
+            &mut collector,
+            &config,
+        );
+        assert!(collector.findings.is_empty());
+        assert_eq!(collector.trusted_host_allowed, 1);
+        assert_eq!(collector.extra_data_format_allowed, 1);
+        assert_eq!(collector.allowed.len(), 3);
     }
 
     #[test]

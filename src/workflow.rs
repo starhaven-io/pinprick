@@ -810,7 +810,7 @@ pub fn open_child_file_path(repo_root: &Path, rel: &Path) -> Result<Option<File>
         let file = match openat_file(
             &current,
             name,
-            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
         ) {
             Ok(file) => file,
             Err(e) if e == Errno::LOOP || path_is_symlink(&display_path) => {
@@ -861,9 +861,10 @@ fn open_workflow_file(file: &WorkflowFile) -> Result<File> {
     match openat_file(
         &*file.dir,
         file.name.as_os_str(),
-        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
     ) {
-        Ok(handle) => Ok(handle),
+        Ok(handle) if handle.metadata()?.is_file() => Ok(handle),
+        Ok(_) => anyhow::bail!("workflow is not a regular file: {}", file.path.display()),
         Err(e) if e == Errno::LOOP => {
             Err(UnsafeWorkflowPath::symlinked_workflow_file(file.path()).into())
         }
@@ -1737,6 +1738,35 @@ jobs:
 
         let err = open_workflows_dirs(dir.path(), DEFAULT_FORGE_ROOTS).unwrap_err();
         assert!(err.to_string().contains("symlinked directory"));
+    }
+
+    #[test]
+    fn workflow_read_rechecks_regular_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join(".github/workflows/ci.yml");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "name: example\n").unwrap();
+        let files = find_workflows(dir.path()).unwrap();
+        assert!(
+            open_workflow_file(&files[0])
+                .unwrap()
+                .metadata()
+                .unwrap()
+                .is_file()
+        );
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(
+            open_workflow_file(&files[0])
+                .unwrap_err()
+                .to_string()
+                .contains("not a regular file")
+        );
+        assert!(
+            open_child_file_path(dir.path(), Path::new(".github/workflows/ci.yml"))
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

@@ -182,22 +182,7 @@ async fn main() -> ExitCode {
             )
             .await
         }
-        Command::Clean => {
-            let removed = match audited_actions::cache_dir() {
-                Some(dir) if dir.is_dir() => std::fs::remove_dir_all(&dir).is_ok(),
-                _ => false,
-            };
-
-            if cli.json {
-                let msg = serde_json::json!({ "cleaned": removed });
-                println!("{msg}");
-            } else if removed {
-                println!("Cache cleaned.");
-            } else {
-                println!("Nothing to clean.");
-            }
-            return ExitCode::SUCCESS;
-        }
+        Command::Clean => clean_cache(cli.json),
         Command::Completions { shell } => {
             clap_complete::generate(
                 *shell,
@@ -231,4 +216,23 @@ async fn main() -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+fn clean_cache(json: bool) -> anyhow::Result<ExitCode> {
+    let removed = match audited_actions::cache_dir() {
+        Some(dir) => match std::fs::remove_dir_all(&dir) {
+            Ok(()) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(anyhow::anyhow!("Could not remove audit cache: {error}")),
+        },
+        None => false,
+    };
+    if json {
+        println!("{}", serde_json::json!({ "cleaned": removed }));
+    } else if removed {
+        println!("Cache cleaned.");
+    } else {
+        println!("Nothing to clean.");
+    }
+    Ok(ExitCode::SUCCESS)
 }

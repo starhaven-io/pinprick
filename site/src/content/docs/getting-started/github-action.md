@@ -3,7 +3,7 @@ title: GitHub Action
 description: Run pinprick audit in GitHub Actions.
 ---
 
-[`starhaven-io/pinprick-action`](https://github.com/starhaven-io/pinprick-action) is the shipped composite action for CI audit runs. It installs a pinprick release, verifies the downloaded archive checksum, runs `pinprick audit`, and optionally uploads SARIF to GitHub code scanning.
+[`starhaven-io/pinprick-action`](https://github.com/starhaven-io/pinprick-action) is the shipped composite action for CI audit runs. It installs a pinprick release, verifies the downloaded archive checksum and GitHub build provenance, runs `pinprick audit`, and optionally uploads SARIF to GitHub code scanning.
 
 The action runs `audit` only. Use the CLI directly for `pin`, `update`, and `score`.
 
@@ -127,6 +127,6 @@ In Advanced Security mode, SARIF upload happens before optional `fail-on-finding
 
 ## Runner support
 
-The action supports Linux x64, Linux ARM64, and macOS ARM64 runners. On Linux, it downloads the `gnu` release assets, so self-hosted Linux runners need a compatible glibc for the selected pinprick release. Use a direct CLI install on musl/Alpine runners.
+The action supports GitHub-hosted Linux x64, Linux ARM64, and macOS ARM64 runners. It rejects self-hosted runners. On Linux, it downloads the `gnu` release assets. Use a direct CLI install for self-hosted or musl/Alpine environments.
 
 Windows and macOS x64 runners are not supported by the wrapper.

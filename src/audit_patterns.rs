@@ -575,11 +575,17 @@ fn url_path(url: &str) -> &str {
     else {
         return url;
     };
+    if url.contains('\\') {
+        return "";
+    }
     // The path starts at the first `/`, which also ends the authority. Any
     // `user@host` userinfo and any `@` in a later path segment or query are
     // therefore excluded without special-casing `@`.
-    match rest.find('/') {
-        Some(i) => rest[i..].split(['?', '#']).next().unwrap_or_default(),
+    match rest.find(['/', '?', '#']) {
+        Some(i) if rest.as_bytes()[i] == b'/' => {
+            rest[i..].split(['?', '#']).next().unwrap_or_default()
+        }
+        Some(_) => "",
         None => "",
     }
 }
@@ -593,7 +599,7 @@ const DATA_FORMAT_EXTENSIONS: &[&str] = &[
 /// Extract the filename extension from a URL's path. Query strings and
 /// fragments are stripped. Returns `None` if the final path segment has no dot.
 pub fn url_extension(url: &str) -> Option<&str> {
-    let path = url.split(['?', '#']).next().unwrap_or(url);
+    let path = url_path(url).split(['?', '#']).next().unwrap_or_default();
     let last = path.rsplit('/').next().unwrap_or("");
     let dot = last.rfind('.')?;
     Some(&last[dot + 1..])
@@ -603,10 +609,18 @@ pub fn url_extension(url: &str) -> Option<&str> {
 /// optional `user@` prefix, and trailing port/path/query/fragment. Returns
 /// `None` if the URL does not start with `http://` or `https://`.
 pub fn url_host(url: &str) -> Option<&str> {
+    // Shell and HTTP clients disagree on backslashes; do not grant an exemption.
+    if url.contains('\\') {
+        return None;
+    }
     let rest = url
         .strip_prefix("https://")
         .or_else(|| url.strip_prefix("http://"))?;
-    let after_userinfo = rest.split_once('@').map(|(_, r)| r).unwrap_or(rest);
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let after_userinfo = authority
+        .rsplit_once('@')
+        .map(|(_, r)| r)
+        .unwrap_or(authority);
     let end = after_userinfo
         .find(['/', ':', '?', '#'])
         .unwrap_or(after_userinfo.len());
@@ -625,7 +639,8 @@ pub fn url_is_data_format(url: &str) -> bool {
 
 // URLs end at whitespace, quotes, backticks, `)`, or `>` so string-literal and
 // markdown-link syntax never rides into the version/extension/host checks.
-static URL_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"https?://[^\s"'`)>]+"#).unwrap());
+pub(crate) static URL_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"https?://[^\s"'`)>]+"#).unwrap());
 
 /// Extract every URL from a line, in order of appearance.
 pub fn extract_urls(line: &str) -> impl Iterator<Item = &str> {
@@ -819,6 +834,45 @@ pub fn category_str(c: &Category) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn url_components_stay_within_their_boundaries() {
+        assert_eq!(
+            url_host("https://example.com/docs/@reference"),
+            Some("example.com")
+        );
+        assert_eq!(
+            url_host("https://example.com?email=reader@example.org"),
+            Some("example.com")
+        );
+        assert_eq!(url_extension("https://example.json"), None);
+        assert_eq!(url_extension("config.json"), Some("json"));
+        assert!(!url_has_version(
+            "https://example.com?redirect=/v1.2.3/tool"
+        ));
+        assert!(!url_has_version("https://example.com#/v1.2.3/tool"));
+        assert!(url_has_version("https://example.com/v1.2.3/tool?cache=1"));
+    }
+
+    #[test]
+    fn backslash_urls_receive_no_component_exemptions() {
+        for url in [
+            r"https://example.com\folder",
+            r"https://example.com\v1.2.3/tool.json",
+            r"https://example.com/path\config.json",
+        ] {
+            assert_eq!(url_host(url), None);
+            assert!(!url_has_version(url));
+            assert_eq!(url_extension(url), None);
+            assert!(!url_is_data_format(url));
+        }
+        assert_eq!(url_extension("config.json"), Some("json"));
+        assert_eq!(url_extension(r"C:\data\config.json"), Some("json"));
+        assert_eq!(
+            url_host("https://reader@example.com:8080/path"),
+            Some("example.com")
+        );
+    }
 
     // ── url_has_version ─────────────────────────────────────────────────
 
@@ -2084,7 +2138,7 @@ mod tests {
 
     #[test]
     fn pip_install_git_url_versioned_or_sha_is_pinned() {
-        // Version-like tag and a full 40-char SHA are immutable pins.
+        // Version-like tags and full commit SHAs qualify under the pinning heuristic.
         assert!(pip_git_url_has_ref(
             "pip install git+https://github.com/owner/repo.git@v1.2.3"
         ));

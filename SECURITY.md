@@ -38,11 +38,13 @@ with different trust anchors:
   trusted comment — a catalog signed more than 30 days ago is rejected, so a
   compromised CDN cannot replay a superseded-but-validly-signed catalog
   indefinitely. Timestamps more than 10 minutes in the future are also
-  rejected: legitimate runner and client clock drift is expected to stay
-  within minutes, and a far-future timestamp would otherwise stay inside the
-  staleness window until it plus 30 days — turning one signing-clock fault (or
-  a compromised signer) into an extended replay horizon. TLS alone is
+  rejected to prevent a signing-clock fault from extending that replay window. TLS alone is
   deliberately not trusted.
+
+Local cache entries require the current scanner version and default runtime
+trust policy. Scans using configured trusted hosts or extra data formats cannot
+populate reusable clean verdicts. Catalog verification isolates global and
+repository configuration and bypasses all catalog layers.
 
 ### Signing key custody
 
@@ -53,10 +55,7 @@ Only `deploy-site.yml` reads it. Every build job is explicitly restricted to
 refreshes signatures before their 30-day expiry. Relevant pushes to `main`
 also deploy immediately. The workflow writes a temporary runner copy and
 removes it on step exit; maintainers must not retain additional copies. A
-compromise of that workflow or environment is a catalog compromise. Signing the catalog offline
-(committing `.minisig` files next to each JSON and serving them verbatim)
-would take the key out of CI at the cost of maintainer friction on every
-catalog change; that trade-off remains under consideration.
+compromise of that workflow or environment is a catalog compromise.
 
 ### Key rotation
 

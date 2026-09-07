@@ -84,7 +84,7 @@ To suppress a specific pattern that `trusted-hosts` doesn't cover, use [`ignore.
 
 ### `ignore.actions`
 
-Skip scanning specific actions entirely. Useful for actions you've reviewed manually or that produce known false positives. Matches by prefix — `"actions/checkout"` matches `actions/checkout` at any SHA.
+Skip scanning specific actions entirely. Useful for actions you've reviewed manually or that produce known false positives. Matching is case-insensitive and respects path boundaries: `"actions/checkout"` matches that repository at any SHA, while `"actions"` or `"actions/"` matches the owner. Partial repository names do not match.
 
 ### `ignore.patterns`
 

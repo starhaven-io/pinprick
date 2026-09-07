@@ -16,6 +16,7 @@ pinprick completions <SHELL>
 ### zsh
 
 ```bash
+mkdir -p ~/.zfunc
 pinprick completions zsh > ~/.zfunc/_pinprick
 ```
 
@@ -37,6 +38,7 @@ pinprick completions bash > ~/.local/share/bash-completion/completions/pinprick
 ### fish
 
 ```bash
+mkdir -p ~/.config/fish/completions
 pinprick completions fish > ~/.config/fish/completions/pinprick.fish
 ```
 

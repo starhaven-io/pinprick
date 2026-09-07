@@ -32,6 +32,7 @@ permissions: {}
 jobs:
   scan:
     name: Scan
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     permissions:
@@ -156,11 +157,16 @@ jobs:
                 TAG_SHA="${TAG_SHAS["${TAG}"]}"
               fi
 
+              if [[ ! "${TAG_SHA}" =~ ^[0-9a-fA-F]{40}$ ]]; then
+                echo "  Ref did not resolve to a full SHA, skipping ${TAG}"
+                continue
+              fi
+
               echo "  New release: ${TAG} (${TAG_SHA:0:7})"
 
-              TMPDIR=$(mktemp -d)
-              mkdir -p "${TMPDIR}/.github/workflows"
-              cat > "${TMPDIR}/.github/workflows/test.yml" <<YAML
+              SCAN_DIR=$(mktemp -d)
+              mkdir -p "${SCAN_DIR}/.github/workflows"
+              cat > "${SCAN_DIR}/.github/workflows/test.yml" <<YAML
           name: test
           on: push
           jobs:
@@ -171,17 +177,16 @@ jobs:
           YAML
 
               AUDIT_STATUS=0
-              AUDIT_JSON=$(./target/debug/pinprick --json audit "${TMPDIR}" 2>/dev/null) || AUDIT_STATUS=$?
+              AUDIT_JSON=$(XDG_CONFIG_HOME="${SCAN_DIR}/config" ./target/debug/pinprick --json audit --no-repo-config --no-audited-catalog "${SCAN_DIR}") || AUDIT_STATUS=$?
               if [[ "${AUDIT_STATUS}" -eq 0 ]]; then
                 if jq -e '
-                  (.audited_bundled + .audited_local_cache + .audited_remote + .scanned_fresh) == 1
-                  and .ignored == 0
+                  .scanned_fresh == 1 and .coverage_complete == true and .ignored == 0
                 ' <<< "${AUDIT_JSON}" > /dev/null; then
                   echo "  Clean — adding ${TAG}"
                   jq -r --arg sha "${TAG_SHA}" --arg tag "${TAG}" '
                     (if any(.[]; .sha == $sha) then . else [{sha: $sha, tag: $tag}] + . end)
                     | sort_by([(.tag | ltrimstr("v") | split(".") | map(tonumber? // 0)), .tag]) | reverse
-                    | "[\n" + ([.[] | "  { \"sha\": \"\(.sha)\", \"tag\": \"\(.tag)\" }"] | join(",\n")) + "\n]"
+                    | "[\n" + ([.[] | "  { \"sha\": \(.sha | tojson), \"tag\": \(.tag | tojson) }"] | join(",\n")) + "\n]"
                   ' "${JSON_FILE}" > "${JSON_FILE}.tmp"
                   mv "${JSON_FILE}.tmp" "${JSON_FILE}"
                   UPDATED=1
@@ -193,7 +198,7 @@ jobs:
               else
                 echo "  Audit failed (exit ${AUDIT_STATUS}) — skipping ${TAG}"
               fi
-              rm -rf "${TMPDIR}"
+              rm -rf "${SCAN_DIR}"
             done
             unset TAG_SHAS
           done

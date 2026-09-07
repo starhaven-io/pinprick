@@ -387,11 +387,11 @@ fn prerelease_newer(current: &str, candidate: &str) -> bool {
 /// The semver `+build` tail is stripped before the numeric split.
 fn parse_version(s: &str) -> (Vec<u64>, Option<String>) {
     let s = s.trim_start_matches('v');
+    let s = s.split_once('+').map_or(s, |(version, _)| version);
     let (head, pre) = match s.split_once('-') {
         Some((before, suffix)) => (before, Some(suffix.to_string())),
         None => (s, None),
     };
-    let head = head.split_once('+').map(|(b, _)| b).unwrap_or(head);
     let parts = head
         .split('.')
         .filter_map(|p| p.parse::<u64>().ok())
@@ -490,6 +490,9 @@ mod tests {
     fn build_metadata_stripped() {
         assert!(!is_newer("v1.2.3+build.5", "v1.2.3+build.9"));
         assert!(is_newer("v1.2.3+build.9", "v1.2.4+build.1"));
+        assert!(is_newer("v1.2.3-rc.1+build.9", "v1.2.3-rc.2+build.1"));
+        assert!(!is_newer("v1.2.3-rc.2+build.1", "v1.2.3-rc.1+build.9"));
+        assert!(!is_newer("v1.2.3-rc.1+build.1", "v1.2.3-rc.1+build.9"));
     }
 
     #[test]

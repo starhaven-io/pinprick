@@ -37,6 +37,7 @@ async fn run_with_client(
     // skips are excluded: those are warnings attached to a successful pin.
     let mut unpinnable = 0usize;
     let mut coverage_incomplete = false;
+    let mut resolution_failed = false;
     let mut pending_edits: Vec<(workflow::WorkflowFile, Vec<workflow::ActionEdit>)> = Vec::new();
 
     for file in &files {
@@ -160,6 +161,7 @@ async fn run_with_client(
                             });
                         }
                         Err(e) => {
+                            resolution_failed = true;
                             unpinnable += 1;
                             report.skipped.push(PinSkip {
                                 file: workflow::display_path(file.path(), repo_root),
@@ -178,7 +180,7 @@ async fn run_with_client(
         }
     }
 
-    if apply && !coverage_incomplete {
+    if apply && !coverage_incomplete && !resolution_failed {
         for (file, edits) in &pending_edits {
             workflow::rewrite_actions(file, &workflow::render_action_edits(edits)?)?;
         }
@@ -191,7 +193,7 @@ async fn run_with_client(
         report.print_human();
     }
 
-    if coverage_incomplete {
+    if coverage_incomplete || (apply && resolution_failed) {
         Ok(ExitCode::from(2))
     } else if !apply && (!report.pinned.is_empty() || unpinnable > 0) {
         Ok(ExitCode::from(1))
@@ -406,5 +408,74 @@ mod tests {
 
         assert_code(code, 2);
         assert_eq!(std::fs::read_to_string(&file).unwrap(), original);
+    }
+    #[tokio::test]
+    async fn lookup_failure_blocks_every_pending_write() {
+        for failing_status in [401, 404, 500] {
+            for failure_first in [false, true] {
+                let server = MockServer::start().await;
+                Mock::given(method("GET"))
+                    .and(path("/repos/o/available/git/ref/tags/v2"))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                        "object": { "sha": SHA, "type": "commit" }
+                    })))
+                    .mount(&server)
+                    .await;
+                Mock::given(method("GET"))
+                    .and(path("/repos/o/available/git/matching-refs/tags/v2"))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+                    .mount(&server)
+                    .await;
+                Mock::given(method("GET"))
+                    .and(path("/repos/o/unavailable/git/ref/tags/v2"))
+                    .respond_with(ResponseTemplate::new(failing_status))
+                    .mount(&server)
+                    .await;
+                let good = "jobs:\n  test:\n    steps:\n      - uses: o/available@v2\n";
+                let bad = "jobs:\n  test:\n    steps:\n      - uses: o/unavailable@v2\n";
+                let (first, second) = if failure_first {
+                    (bad, good)
+                } else {
+                    (good, bad)
+                };
+                let (dir, file) = repo_with_workflow(first);
+                let other = file.with_file_name("other.yml");
+                std::fs::write(&other, second).unwrap();
+                let code = run_with_client(dir.path(), true, true, &client_for(&server))
+                    .await
+                    .unwrap();
+                assert_code(code, 2);
+                assert_eq!(std::fs::read_to_string(file).unwrap(), first);
+                assert_eq!(std::fs::read_to_string(other).unwrap(), second);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn manual_refs_do_not_block_successful_tag_write() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/git/ref/tags/v2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "object": { "sha": SHA, "type": "commit" }
+            })))
+            .mount(&server)
+            .await;
+        // Comment refinement is best effort after the immutable SHA is resolved.
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/git/matching-refs/tags/v2"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        let original = "jobs:\n  test:\n    steps:\n      - uses: o/r@v2\n      - uses: o/manual@main\n      - uses: docker://example/image:stable\n";
+        let (dir, file) = repo_with_workflow(original);
+        let code = run_with_client(dir.path(), true, true, &client_for(&server))
+            .await
+            .unwrap();
+        assert_code(code, 0);
+        assert_eq!(
+            std::fs::read_to_string(file).unwrap(),
+            original.replace("o/r@v2", &format!("o/r@{SHA} # v2"))
+        );
     }
 }
