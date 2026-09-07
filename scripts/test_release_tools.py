@@ -23,6 +23,25 @@ def workflow_step(workflow: str, name: str) -> str:
 
 
 class ReleaseToolsTests(unittest.TestCase):
+    def test_distinct_release_and_catalog_requests_are_retained(self):
+        for name, group in [('release.yml', 'release'), ('audit-actions.yml', 'audit-actions')]:
+            workflow = (ROOT / '.github/workflows' / name).read_text()
+            concurrency = workflow.split('concurrency:\n', 1)[1].split('\n\n', 1)[0]
+            self.assertEqual(dict(line.strip().split(': ', 1) for line in concurrency.splitlines()), {
+                'group': group, 'cancel-in-progress': 'false', 'queue': 'max',
+            })
+
+    def test_rejected_site_dispatch_cannot_cancel_main_deployment(self):
+        workflow = (ROOT / '.github/workflows/deploy-site.yml').read_text()
+        self.assertIn(
+            "group: ${{ github.ref == 'refs/heads/main' && 'deploy-site' "
+            "|| format('rejected-deploy-{0}', github.run_id) }}",
+            workflow,
+        )
+        push = workflow.split('  schedule:', 1)[0]
+        for path in ['.github/workflows/deploy-site.yml', 'scripts/check-npm-install-policy.mjs']:
+            self.assertIn(f'      - "{path}"', push)
+
     def test_site_deploy_preserves_signed_output_and_uses_locked_tool(self):
         deploy = (ROOT / '.github/workflows/deploy-site.yml').read_text().split('\n  deploy:\n', 1)[1]
         setup, publish = deploy.split('      - name: Deploy signed site to Cloudflare Workers\n', 1)
