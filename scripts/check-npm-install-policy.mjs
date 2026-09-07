@@ -37,13 +37,23 @@ for (const directory of projectDirectories) {
   const lockfile = JSON.parse(await readFile(lockfilePath, "utf8"));
   const errors = [];
 
+  const packages = lockfile.packages;
+  const validLockfile =
+    [2, 3].includes(lockfile.lockfileVersion) &&
+    packages !== null &&
+    typeof packages === "object" &&
+    !Array.isArray(packages);
+  if (!validLockfile) {
+    errors.push("package-lock.json must use lockfileVersion 2 or 3 with a packages object");
+  }
+
   const policy = manifest.allowScripts;
   if (!policy || Array.isArray(policy) || typeof policy !== "object") {
     errors.push("allowScripts must be an object");
   }
 
   const scriptPackages = new Map();
-  for (const [location, metadata] of Object.entries(lockfile.packages ?? {})) {
+  for (const [location, metadata] of Object.entries(validLockfile ? packages : {})) {
     if (!location || metadata.hasInstallScript !== true) continue;
 
     const name = packageNameFromLocation(location);
