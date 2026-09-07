@@ -2,6 +2,7 @@ schema: 1
 visibility: "public"
 license: "agpl"
 params:
+  codecov: true
   astro-docs: true
   renovate: true
   dependabot:
