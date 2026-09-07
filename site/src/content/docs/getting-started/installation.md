@@ -39,7 +39,7 @@ The musl binaries are statically linked, but pinprick makes HTTPS calls to the G
 
 ## GitHub Action
 
-For CI audit runs without hand-rolling the install step, use [`starhaven-io/pinprick-action`](https://github.com/starhaven-io/pinprick-action). The action installs a pinned pinprick release, verifies the downloaded archive checksum, runs `pinprick audit`, and can upload SARIF to GitHub code scanning.
+For CI audit runs without hand-rolling the install step, use [`starhaven-io/pinprick-action`](https://github.com/starhaven-io/pinprick-action). The action installs a pinned pinprick release, verifies the downloaded archive checksum and GitHub build provenance, runs `pinprick audit`, and can upload SARIF to GitHub code scanning.
 
 See [GitHub Action](/getting-started/github-action/) for a SHA-pinned workflow example and input reference.
 
@@ -47,11 +47,7 @@ See [GitHub Action](/getting-started/github-action/) for a SHA-pinned workflow e
 
 Generate completions for your shell:
 
-```bash
-pinprick completions zsh > ~/.zfunc/_pinprick
-pinprick completions bash > /etc/bash_completion.d/pinprick
-pinprick completions fish > ~/.config/fish/completions/pinprick.fish
-```
+See the [completions command](/commands/completions/) for shell-specific installation paths and setup.
 
 ## GitHub authentication
 

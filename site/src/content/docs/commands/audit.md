@@ -26,7 +26,7 @@ For the full list of every rule, including examples and severity, see the [Detec
 pinprick skips exact action identities whose `owner/repo[/subpath]@sha` is already known to be clean. The check consults three sources, in order, and reports which one answered:
 
 - `bundled` — ships with the pinprick binary from `audited-actions/` in the repo
-- `local cache` — written to `$XDG_CACHE_HOME/pinprick/audited/` (default `~/.cache/pinprick/audited/`) after a successful live scan on this machine
+- `local cache` — written to `$XDG_CACHE_HOME/pinprick/audited/` (default `~/.cache/pinprick/audited/`) after a complete, clean live scan under the default runtime trust policy; entries from other scanner versions are ignored
 - `pinprick.rs` — fetched from the public audited-actions list (opt-in via `fetch-remote = true` in `.pinprick.toml`)
 
 See [Audited Actions](/configuration/audited-actions) for details on how the list works and how to contribute.
@@ -81,7 +81,7 @@ If the workflow uses sliding tags like `@v4` instead of branch refs, the summary
 
 Per-action status is colored by semantic category, not by source, so a clean audit looks like a wall of uniform green with only the exceptions popping out:
 
-- **`audited`** — green. Matched an entry in the bundled list, local cache, or `pinprick.rs` list. No network work needed.
+- **`audited`** — green. Matched an entry in the bundled list, local cache, or `pinprick.rs` list. Remote catalog lookups still use the network.
 - **`Fetching`** / **`scanned fresh`** — blue. pinprick fetched the action source over the network and scanned it fresh this run.
 - **`(unpinned)`** / **`unpinned ref scanned`** — yellow. The ref is a branch (`@main`) or sliding tag (`@v4`) — pinprick scans the current tip but the trust does not carry across runs because the content can change.
 - **`ignored`** — dimmed. Skipped per `ignore.actions` in `.pinprick.toml`.

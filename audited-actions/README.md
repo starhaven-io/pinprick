@@ -62,7 +62,7 @@ See [SECURITY.md](../SECURITY.md) for key custody and rotation.
 
 To add a new entry:
 
-1. Run `pinprick audit` against a repository using the action at the SHA you want to add
-2. Confirm zero findings for that action
-3. Add the SHA and tag to the appropriate JSON file (or create a new one)
-4. Open a PR
+1. Run `just add-action owner/repo` from a Pinprick checkout (include the subpath when applicable).
+2. The recipe resolves a full SHA and requires a fresh, complete scan with zero ignored actions under isolated default configuration.
+3. Inspect the generated entry and build the current scanner with `cargo build --locked --release`, then run `scripts/verify-audited-actions.sh target/release/pinprick files <entry-file>` with a GitHub token.
+4. Open a PR with the verification result.

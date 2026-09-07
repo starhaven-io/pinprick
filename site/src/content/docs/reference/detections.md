@@ -13,7 +13,7 @@ This is the canonical list of every rule `pinprick audit` checks. All rules emit
 
 ## How matches are scored
 
-pinprick scans line by line. Each rule is an anchored regex, compiled once at startup.
+pinprick uses bounded source traversal, logical-command parsing, literal propagation, and precompiled patterns. It does not execute workflow or action code.
 
 - **Pipe-to-shell pre-empts other shell rules.** If a line matches a pipe-to-shell rule, no other shell or Docker rule fires on that line. So `curl ... | sh` produces a single high-severity finding instead of one medium (unversioned URL) plus one high (pipe-to-shell).
 - **Versioned-URL downgrade.** Non-pipe shell, JavaScript, and Python fetch rules only fire if the URL is _unversioned_. A URL is versioned if any path segment matches `v?\d+(\.\d+)+` — e.g. `/v1.2.3/`, `/0.55.8/`. See [Versioned URL heuristic](#versioned-url-heuristic).
@@ -365,19 +365,19 @@ uvx --from black@24.10.0 black --check .
 
 **Severity:** Medium
 
-Triggers on `pip install git+https://…` (or `git+http://…`) where the VCS URL has no `@<ref>` suffix. Without a ref, pip installs from the repo's default branch at HEAD, which silently changes over time. Any ref — tag, branch name, or full SHA — suppresses the finding (mirrors `git clone --branch` handling: branch refs are accepted here rather than requiring a SHA).
+Triggers on `pip install git+https://…` (or `git+http://…`) where the VCS URL has no `@<ref>` suffix. Without a ref, pip installs from the repository default branch. A version-like tag or full commit SHA suppresses the finding; branch refs such as `main` remain findings.
 
 ```bash
 pip install git+https://github.com/owner/repo.git
 pip install --user git+https://github.com/owner/repo.git
 pip3 install git+https://gitlab.example.com/team/tool.git
+pip install git+https://github.com/owner/repo.git@main
 ```
 
 Not flagged:
 
 ```bash
 pip install git+https://github.com/owner/repo.git@v1.2.3
-pip install git+https://github.com/owner/repo.git@main
 pip install git+https://github.com/owner/repo.git@abc1234567890abcdef1234567890abcdef123456
 ```
 
@@ -699,7 +699,7 @@ Not flagged:
 
 ## Versioned URL heuristic
 
-A URL is considered _versioned_ if it contains a path segment matching `v?\d+(\.\d+)+` between `/`, `=`, or `@` boundaries:
+A URL is considered _versioned_ if it contains a path segment matching `v?\d+(\.\d+)+` at a path boundary or in a versioned filename (for example `tool-1.2.3.tar.gz`). Hostnames, query strings, and fragments do not qualify:
 
 | URL                                                        | Versioned?                         |
 | ---------------------------------------------------------- | ---------------------------------- |
@@ -716,7 +716,7 @@ This is intentionally strict — `v4` alone is a sliding major-version alias, no
 
 Unversioned URL rules (`curl`/`wget` to an unversioned URL, `fetch()`/`axios` to an unversioned URL, `urllib`/`requests` to an unversioned URL) are **not** emitted as findings when the URL's path ends in a known data-format extension. Instead, the match is recorded as an _allowed_ match with reason `data format URL` and is only visible under `--verbose`.
 
-Rationale: a workflow fetching JSON for `jq` or YAML for parsing is a different risk class from fetching an install script. The payload is consumed as data, never executed. Homebrew/core's `curl -s https://formulae.brew.sh/api/analytics/install/homebrew-core/30d.json` is a real example — the JSON is assigned to a shell variable and parsed, never run.
+Rationale: a workflow fetching JSON for `jq` or YAML for parsing is a different risk class from fetching an install script. The extension is a heuristic for intended data use; it does not prove how a later step consumes the bytes. Homebrew/core's `curl -s https://formulae.brew.sh/api/analytics/install/homebrew-core/30d.json` is a real example — the JSON is assigned to a shell variable and parsed, never run.
 
 **Extensions considered data formats:**
 
@@ -739,7 +739,7 @@ The list can be extended via `extra-data-formats` in [`.pinprick.toml`](/configu
 
 ## Piped-to-`jq` exemption
 
-A `curl`/`wget` whose output is piped into `jq` is recorded as an allowed match with reason `piped to jq` rather than emitted as a finding — even when the URL has no data-format extension. `jq` parses JSON and errors on anything else, so the fetched bytes are consumed as data, never executed.
+A `curl`/`wget` whose output is piped into `jq` is recorded as an allowed match with reason `piped to jq` rather than emitted as a finding — even when the URL has no data-format extension. `jq` parses JSON and errors on other formats. This heuristic describes the observed pipeline; it cannot prove how later commands consume saved output.
 
 This covers the case the [data-format exemption](#data-format-exemption) misses: a REST API endpoint that returns JSON but carries no `.json` in its path. Resolving the latest release of a crate from the registry API is a real example:
 
@@ -825,7 +825,7 @@ actions = [
 ]
 ```
 
-Matches by prefix against `owner/repo`, so `"actions/checkout"` matches every `actions/checkout@anything`. Use this when you've manually reviewed an action and decided it's out of scope — e.g. an action maintained by your own org that you already security-review separately. The blast radius is the entire action, so use sparingly.
+Matching is case-insensitive and respects path boundaries. `"actions/checkout"` matches that repository at any ref; `"actions"` or `"actions/"` matches the owner. Use this when you've manually reviewed an action and decided it's out of scope — e.g. an action maintained by your own org that you already security-review separately. The blast radius is the entire action, so use sparingly.
 
 ### `severity` threshold
 

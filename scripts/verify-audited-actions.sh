@@ -132,7 +132,7 @@ jobs:
 YAML
 
     set +e
-    OUTPUT=$("${BIN}" --json audit --no-audited-catalog "${SCAN_DIR}")
+    OUTPUT=$(XDG_CONFIG_HOME="${SCAN_DIR}/config" "${BIN}" --json audit --no-repo-config --no-audited-catalog "${SCAN_DIR}")
     STATUS=$?
     set -e
     rm -rf "${SCAN_DIR}"

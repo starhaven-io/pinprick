@@ -39,24 +39,21 @@ jobs:
 ";
     let dir = common::repo_with_workflow("ci.yml", workflow);
 
-    common::pinprick_cmd()
-        .env("GITHUB_TOKEN", "dummy")
+    let output = common::pinprick_cmd()
+        .arg("--json")
         .arg("audit")
         .arg(dir.path())
-        .assert()
-        .code(2)
-        .stderr(predicate::str::contains("audited (bundled)").not())
-        .stderr(predicate::str::contains("Fetching actions/cache/restore"));
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["audited_bundled"], 0);
+    assert_eq!(report["external_actions_skipped"], 2);
+    assert_eq!(report["coverage_complete"], false);
 }
 
 #[test]
 fn no_audited_catalog_bypasses_bundled_verdict() {
-    // --no-audited-catalog must force a fresh scan even for a SHA the bundled
-    // catalog vouches for — that is what lets CI re-verify catalog entries
-    // against the current detection rules. The dummy token makes the fetch
-    // fail. The assertion is that a fetch was attempted instead of the bundled
-    // short-circuit and that the failed fresh scan cannot produce a clean
-    // verdict.
     let workflow = "\
 name: cache
 on: push
@@ -64,20 +61,22 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
 ";
     let dir = common::repo_with_workflow("ci.yml", workflow);
-
-    common::pinprick_cmd()
-        .env("GITHUB_TOKEN", "dummy")
-        .arg("audit")
-        .arg("--no-audited-catalog")
-        .arg(dir.path())
-        .assert()
-        .code(2)
-        .stderr(predicate::str::contains("audited (bundled)").not())
-        .stderr(predicate::str::contains("Fetching actions/cache/restore"))
-        .stdout(predicate::str::contains("Coverage incomplete"));
+    for bypass in [false, true] {
+        let mut command = common::pinprick_cmd();
+        command.arg("--json").arg("audit").arg(dir.path());
+        if bypass {
+            command.arg("--no-audited-catalog");
+        }
+        let output = command.output().unwrap();
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(output.status.code(), Some(if bypass { 2 } else { 0 }));
+        assert_eq!(report["audited_bundled"], usize::from(!bypass));
+        assert_eq!(report["external_actions_skipped"], usize::from(bypass));
+        assert_eq!(report["coverage_complete"], !bypass);
+    }
 }
 
 #[test]

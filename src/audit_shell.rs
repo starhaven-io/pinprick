@@ -6,7 +6,7 @@
 //! whether a `git clone` is bound to a SHA checkout, and whether a fetch is
 //! piped into `jq`.
 
-use crate::audit_patterns::{git_clone_has_pinned_ref, has_checksum_verify};
+use crate::audit_patterns::{URL_RE, git_clone_has_pinned_ref, has_checksum_verify};
 use regex::Regex;
 use std::sync::LazyLock;
 
@@ -198,14 +198,6 @@ fn split_shell_control_parts(line: &str) -> Vec<(String, Option<ShellControl>)> 
 }
 
 fn split_shell_pipeline(line: &str) -> Vec<String> {
-    split_shell(line, SplitMode::Pipeline)
-}
-
-enum SplitMode {
-    Pipeline,
-}
-
-fn split_shell(line: &str, mode: SplitMode) -> Vec<String> {
     let mut out = Vec::new();
     let mut current = String::new();
     let mut chars = line.chars().peekable();
@@ -236,11 +228,10 @@ fn split_shell(line: &str, mode: SplitMode) -> Vec<String> {
             continue;
         }
 
-        match mode {
-            SplitMode::Pipeline if ch == '|' && chars.peek() != Some(&'|') => {
-                push_shell_part(&mut out, &mut current);
-            }
-            _ => current.push(ch),
+        if ch == '|' && chars.peek() != Some(&'|') {
+            push_shell_part(&mut out, &mut current);
+        } else {
+            current.push(ch);
         }
     }
 
@@ -341,6 +332,48 @@ fn push_shell_word(words: &mut Vec<String>, current: &mut String) {
     if !current.is_empty() {
         words.push(std::mem::take(current));
     }
+}
+
+/// Whether raw URL components are complete, literal shell argument text.
+pub(crate) fn shell_urls_are_literal(line: &str) -> bool {
+    URL_RE.find_iter(line).all(|found| {
+        let prefix = &line[..found.start()];
+        let suffix = &line[found.end()..];
+        let quote = prefix
+            .chars()
+            .next_back()
+            .filter(|c| matches!(c, '\'' | '"'));
+        let before = if quote.is_some() {
+            &prefix[..prefix.len() - 1]
+        } else {
+            prefix
+        };
+        let begins_word = before.is_empty()
+            || before.ends_with(|c: char| c.is_whitespace() || matches!(c, '(' | '='));
+        if !begins_word || before.ends_with("\\ ") || before.ends_with("\\\t") {
+            return false;
+        }
+        let token = found.as_str();
+        if quote != Some('\'') && token.contains(['$', '`', '\\']) {
+            return false;
+        }
+        if quote.is_none()
+            && token.trim_end_matches([';', '|', '&']).contains([
+                ';', '|', '&', '<', '>', '(', ')', '{', '}', '[', ']', '*', '?',
+            ])
+        {
+            return false;
+        }
+        match quote {
+            Some(quote) => suffix.strip_prefix(quote).is_some_and(|after| {
+                after.is_empty()
+                    || after.starts_with(|c: char| {
+                        c.is_whitespace() || matches!(c, ')' | ';' | '|' | '&' | '<' | '>')
+                    })
+            }),
+            None => !suffix.starts_with(['\'', '"', '`']),
+        }
+    })
 }
 
 pub(crate) fn url_piped_to_jq(line: &str, url: &str) -> bool {
@@ -1986,6 +2019,33 @@ mod tests {
             split_shell_control(r#"printf one\;two || printf 'three;four'"#),
             vec![r#"printf one\;two"#, "printf 'three;four'"]
         );
+    }
+
+    #[test]
+    fn literal_url_words_require_complete_tokens() {
+        for line in [
+            "curl https://example.com/data.json",
+            "wget 'https://example.com/data.json'",
+            "curl --url=\"https://example.com/data.json\" | jq .",
+            "curl https://a.example/file https://b.example/file",
+            r#"DATA="$(curl https://example.com/data.json)""#,
+            "curl 'https://example.com/$CHANNEL/data.json?limit=1&offset=0'",
+            "curl --url=\"https://example.com/data.json?limit=1&offset=0\"",
+        ] {
+            assert!(shell_urls_are_literal(line), "{line}");
+        }
+        for line in [
+            "curl 'https://example.com/'suffix",
+            "curl https://example.com/'suffix'",
+            "curl 'https://example.com/'\"suffix\"",
+            "curl https://example.com/ https://example.com/'suffix'",
+            "curl https://example.com/$CHANNEL/data.json",
+            "curl \"https://example.com/${CHANNEL}/data.json\"",
+            "curl https://example.com/data.json;printf done",
+            "curl https://example.com/data*.json",
+        ] {
+            assert!(!shell_urls_are_literal(line), "{line}");
+        }
     }
 
     #[test]

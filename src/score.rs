@@ -539,9 +539,8 @@ fn warn_enrichment_incomplete(rule: &str, e: &anyhow::Error) {
 /// Fire `source.archived` findings for any pinned action whose repo is
 /// archived on GitHub. Requires a token; the caller has already resolved one.
 ///
-/// API calls are cached per `(owner, repo)` since archived status is a
-/// repo-level property. A failed lookup (404, network) is silently treated
-/// as "not archived" — one bad repo must not nuke the whole scan.
+/// API calls are cached per `(owner, repo)`. Failed lookups mark coverage
+/// incomplete; already collected findings remain in the report.
 async fn enrich_with_source_archived(
     report: &mut ScoreReport,
     repo_root: &Path,
@@ -580,7 +579,7 @@ async fn enrich_with_source_archived(
             Err(e) if is_hard_github_error(&e) => {
                 warn_enrichment_incomplete("source.archived", &e);
                 report.mark_coverage_incomplete(format!("source.archived evaluation stopped: {e}"));
-                return Ok(());
+                break;
             }
             Err(e) => {
                 warn_enrichment_incomplete("source.archived", &e);
@@ -722,7 +721,7 @@ async fn enrich_with_source_advisory(
     let mut advisories: BTreeMap<(String, String), Vec<SecurityAdvisory>> = BTreeMap::new();
     let mut queried: std::collections::BTreeSet<(String, String)> =
         std::collections::BTreeSet::new();
-    for (action_ref, (owner, repo, tag)) in &action_resolved {
+    'advisory_queries: for (action_ref, (owner, repo, tag)) in &action_resolved {
         let package = action_ref
             .rsplit_once('@')
             .map(|(package, _)| package)
@@ -739,7 +738,7 @@ async fn enrich_with_source_advisory(
                     report.mark_coverage_incomplete(format!(
                         "source.advisory evaluation stopped: {e}"
                     ));
-                    return Ok(());
+                    break 'advisory_queries;
                 }
                 Err(e) => {
                     warn_enrichment_incomplete("source.advisory", &e);
@@ -754,6 +753,32 @@ async fn enrich_with_source_advisory(
                 if !existing.iter().any(|item| item.ghsa_id == advisory.ghsa_id) {
                     existing.push(advisory);
                 }
+            }
+        }
+    }
+
+    for (action_ref, (owner, repo, tag)) in &action_resolved {
+        let package = action_ref
+            .rsplit_once('@')
+            .map_or(action_ref.as_str(), |(package, _)| package);
+        let packages = action_advisory_packages(package, owner, repo);
+        for advisory in advisories
+            .get(&(owner.clone(), repo.clone()))
+            .into_iter()
+            .flatten()
+        {
+            if advisory.vulnerabilities.iter().any(|vulnerability| {
+                vuln_is_for_action(vulnerability, &packages)
+                    && vulnerability
+                        .vulnerable_version_range
+                        .as_deref()
+                        .and_then(|range| version_in_range(tag, range))
+                        .is_none()
+            }) {
+                report.mark_coverage_incomplete(format!(
+                    "source.advisory could not evaluate a version range in {} for {action_ref}",
+                    advisory.ghsa_id
+                ));
             }
         }
     }
@@ -852,36 +877,14 @@ async fn enrich_with_remote_runtime(
         }
 
         let mut collector = AuditCollector::new(false);
-        match audit_source::scan_action_source(client, action, &mut collector, config).await {
-            Ok(ActionScanStatus::Complete) => {}
-            Ok(ActionScanStatus::Incomplete) => {
-                report.mark_coverage_incomplete(format!(
-                    "remote source scan incomplete for {action_ref}"
-                ));
-            }
-            Err(e) if is_hard_github_error(&e) => {
-                warn_enrichment_incomplete("runtime (remote action source)", &e);
-                report.mark_coverage_incomplete(format!(
-                    "remote source scan stopped at {action_ref}: {e}"
-                ));
-                return Ok(());
-            }
-            Err(e) => {
-                eprintln!(
-                    "warning: could not scan {} for runtime scoring: {}",
-                    crate::output::sanitize_for_terminal(&action.full_name()),
-                    crate::output::sanitize_for_terminal(&e.to_string())
-                );
-                report.mark_coverage_incomplete(format!(
-                    "remote source scan failed for {action_ref}: {e}"
-                ));
-                continue;
-            }
-        }
+        let scan_result =
+            audit_source::scan_action_source(client, action, &mut collector, config).await;
 
         let mut occs = occurrences.get(action_ref).cloned().unwrap_or_default();
         occs.sort_by(|a, b| a.workflow.cmp(&b.workflow).then(a.line.cmp(&b.line)));
 
+        impact.trusted_host_fetches += collector.trusted_host_allowed;
+        impact.extra_data_format_fetches += collector.extra_data_format_allowed;
         for finding in collector.findings {
             if config.is_pattern_ignored(&finding.description) {
                 impact.findings_suppressed += 1;
@@ -902,6 +905,32 @@ async fn enrich_with_remote_runtime(
                 remediation: rule.remediation(),
                 details: Some(format!("{location} — {}", finding.description)),
             });
+        }
+        match scan_result {
+            Ok(ActionScanStatus::Complete) => {}
+            Ok(ActionScanStatus::Incomplete) => {
+                report.mark_coverage_incomplete(format!(
+                    "remote source scan incomplete for {action_ref}"
+                ));
+            }
+            Err(e) if is_hard_github_error(&e) => {
+                warn_enrichment_incomplete("runtime (remote action source)", &e);
+                report.mark_coverage_incomplete(format!(
+                    "remote source scan stopped at {action_ref}: {e}"
+                ));
+                break;
+            }
+            Err(e) => {
+                eprintln!(
+                    "warning: could not scan {} for runtime scoring: {}",
+                    crate::output::sanitize_for_terminal(&action.full_name()),
+                    crate::output::sanitize_for_terminal(&e.to_string())
+                );
+                report.mark_coverage_incomplete(format!(
+                    "remote source scan failed for {action_ref}: {e}"
+                ));
+                continue;
+            }
         }
     }
 
@@ -1432,7 +1461,6 @@ pub fn render_html(report: &ScoreReport) -> String {
     out.push_str(HTML_CSS);
     out.push_str("</style>\n</head>\n<body>\n<div class=\"container\">\n");
 
-    // Header
     out.push_str("<div class=\"header\">\n  <div class=\"title\">pinprick score</div>\n");
     out.push_str(&format!(
         "  <div class=\"version\">rubric v{} · pinprick {}</div>\n</div>\n",
@@ -1440,7 +1468,6 @@ pub fn render_html(report: &ScoreReport) -> String {
         escape_html(report.pinprick_version)
     ));
 
-    // Grade banner
     out.push_str(&format!(
         "<div class=\"grade-banner\">\n  <div class=\"grade grade-{0}\">{0}</div>\n  <div>\n    <div class=\"score-number\">{1} / 100</div>\n    <div class=\"totals\">{2} workflows scanned · {3} unique actions · {4} findings</div>\n  </div>\n</div>\n",
         escape_html(report.grade),
@@ -1458,7 +1485,6 @@ pub fn render_html(report: &ScoreReport) -> String {
         out.push_str("</ul></div>\n");
     }
 
-    // Findings
     if report.findings.is_empty() {
         out.push_str("<div class=\"no-findings\">No findings. ");
         out.push_str(&escape_html(&format!(
@@ -1486,6 +1512,12 @@ pub fn render_html(report: &ScoreReport) -> String {
                 "  <div class=\"remediation\">{}</div>\n",
                 escape_html(f.remediation)
             ));
+            if let Some(details) = &f.details {
+                out.push_str(&format!(
+                    "  <div class=\"details\">{}</div>\n",
+                    escape_html(details)
+                ));
+            }
             if !f.occurrences.is_empty() {
                 out.push_str("  <ul class=\"occurrences\">\n");
                 for occ in &f.occurrences {
@@ -1505,7 +1537,6 @@ pub fn render_html(report: &ScoreReport) -> String {
         }
     }
 
-    // Footer
     out.push_str("<div class=\"footer\">\n  Generated by <a href=\"https://pinprick.rs\">pinprick</a>. Scoring rubric: <a href=\"https://github.com/starhaven-io/pinprick/blob/main/docs/scoring.md\">docs/scoring.md</a>.\n</div>\n");
 
     out.push_str("</div>\n</body>\n</html>\n");
@@ -2638,18 +2669,19 @@ jobs:
                 category: Category::Pin,
                 severity: Severity::Low,
                 points: 2,
-                action_ref: Some("<evil>/bar@v1".to_string()),
+                action_ref: Some("<example>/bar@v1".to_string()),
                 occurrences: vec![Occurrence {
                     workflow: "a&b.yml".to_string(),
                     line: 1,
                 }],
                 remediation: "Pin to a full 40-char SHA; keep the tag as a comment",
-                details: None,
+                details: Some("Review <package> & its advisory".to_string()),
             }],
         };
         let html = render_html(&report);
-        assert!(!html.contains("<evil>"));
-        assert!(html.contains("&lt;evil&gt;"));
+        assert!(!html.contains("<example>"));
+        assert!(html.contains("&lt;example&gt;"));
+        assert!(html.contains("Review &lt;package&gt; &amp; its advisory"));
         assert!(html.contains("a&amp;b.yml"));
     }
 
@@ -2790,45 +2822,243 @@ jobs:
         }
 
         #[tokio::test]
-        async fn source_advisory_fires_when_pin_is_in_vulnerable_range() {
+        async fn source_archived_retains_findings_before_auth_failure() {
             let dir = tempfile::TempDir::new().unwrap();
             let mut report = base_report(dir.path());
-
+            let workflow = dir.path().join(".github/workflows/ci.yml");
+            let mut content = std::fs::read_to_string(&workflow).unwrap();
+            content.push_str(&format!("      - uses: z/unavailable@{}\n", "b".repeat(40)));
+            std::fs::write(workflow, content).unwrap();
             let server = MockServer::start().await;
-            // The SHA pin resolves to v1.0.0 via the tags endpoint...
             Mock::given(method("GET"))
-                .and(path("/repos/o/r/tags"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(json!([
-                    { "name": "v1.0.0", "commit": { "sha": "a".repeat(40) } }
-                ])))
+                .and(path("/repos/o/r"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"archived": true})))
                 .mount(&server)
                 .await;
-            // ...which falls inside this advisory's vulnerable range.
             Mock::given(method("GET"))
-                .and(path("/advisories"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(json!([
-                    {
-                        "ghsa_id": "GHSA-test",
-                        "html_url": "https://github.com/advisories/GHSA-test",
-                        "severity": "high",
-                        "summary": "vulnerable",
-                        "vulnerabilities": [
-                            {
-                                "package": { "name": "o/r" },
-                                "vulnerable_version_range": "< 1.1.0",
-                                "patched_versions": "1.1.0"
-                            }
-                        ]
-                    }
-                ])))
+                .and(path("/repos/z/unavailable"))
+                .respond_with(ResponseTemplate::new(401))
                 .mount(&server)
                 .await;
             let client = GitHubClient::with_base("t".into(), server.uri());
+            enrich_with_source_archived(&mut report, dir.path(), &client)
+                .await
+                .unwrap();
+            assert!(!report.coverage_complete);
+            assert_eq!(report.findings.len(), 1);
+            assert_eq!(report.findings[0].id, "source.archived");
+            assert_eq!(report.score, 90);
+        }
 
+        #[tokio::test]
+        async fn remote_runtime_retains_findings_and_policy_impact_before_auth_failure() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let _ = base_report(dir.path());
+            let workflow = dir.path().join(".github/workflows/ci.yml");
+            let mut content = std::fs::read_to_string(&workflow).unwrap();
+            content.push_str(&format!("      - uses: z/unavailable@{}\n", "b".repeat(40)));
+            std::fs::write(workflow, content).unwrap();
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path(format!("/repos/o/r/git/trees/{}", "a".repeat(40))))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "tree": [{"path": "action.yml", "type": "blob"}]
+                })))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/repos/o/r/contents/action.yml"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(
+                    "runs:\n  using: composite\n  steps:\n    - shell: bash\n      run: |\n        npm install example-package\n        curl https://artifacts.example.com/tool -o tool\n        curl https://example.com/schema.proto -o schema.proto\n"
+                ))
+                .mount(&server).await;
+            Mock::given(method("GET"))
+                .and(path(format!(
+                    "/repos/z/unavailable/git/trees/{}",
+                    "b".repeat(40)
+                )))
+                .respond_with(ResponseTemplate::new(401))
+                .mount(&server)
+                .await;
+            let config = Config {
+                trusted_hosts: vec!["artifacts.example.com".into()],
+                extra_data_formats: vec!["proto".into()],
+                ..Config::default()
+            };
+            let (mut report, mut impact) = score_repo(dir.path(), &config).unwrap();
+            let client = GitHubClient::with_base("t".into(), server.uri());
+            enrich_with_remote_runtime(&mut report, dir.path(), &client, &config, &mut impact)
+                .await
+                .unwrap();
+            assert!(!report.coverage_complete);
+            assert_eq!(report.findings.len(), 1);
+            assert_eq!(report.findings[0].id, "runtime.fetch.low");
+            assert_eq!(report.score, 97);
+            assert_eq!(impact.trusted_host_fetches, 1);
+            assert_eq!(impact.extra_data_format_fetches, 1);
+        }
+
+        #[tokio::test]
+        async fn current_graph_findings_survive_nested_lookup_errors() {
+            for status in [401, 404, 500] {
+                for depth in [1, 2] {
+                    let dir = tempfile::TempDir::new().unwrap();
+                    let _ = base_report(dir.path());
+                    let workflow = dir.path().join(".github/workflows/ci.yml");
+                    let mut contents = std::fs::read_to_string(&workflow).unwrap();
+                    contents.push_str(&format!("      - uses: z/later@{}\n", "c".repeat(40)));
+                    std::fs::write(&workflow, contents).unwrap();
+                    let server = MockServer::start().await;
+                    for level in 0..depth {
+                        let repo = if level == 0 { "r" } else { "middle" };
+                        let sha = if level == 0 { "a" } else { "b" }.repeat(40);
+                        let child = if level + 1 == depth {
+                            "unavailable"
+                        } else {
+                            "middle"
+                        };
+                        Mock::given(method("GET"))
+                            .and(path(format!("/repos/o/{repo}/git/trees/{sha}")))
+                            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                                "tree": [{"path": "action.yml", "type": "blob"}]
+                            })))
+                            .mount(&server)
+                            .await;
+                        Mock::given(method("GET"))
+                            .and(path(format!("/repos/o/{repo}/contents/action.yml")))
+                            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                                "runs:\n  using: composite\n  steps:\n    - shell: bash\n      run: |\n        npm install example-package\n        curl https://artifacts.example.com/tool -o tool\n        curl https://example.com/schema.proto -o schema.proto\n    - uses: o/{child}@{}\n", "b".repeat(40)
+                            )))
+                            .mount(&server).await;
+                    }
+                    Mock::given(method("GET"))
+                        .and(path(format!(
+                            "/repos/o/unavailable/git/trees/{}",
+                            "b".repeat(40)
+                        )))
+                        .respond_with(ResponseTemplate::new(status))
+                        .mount(&server)
+                        .await;
+                    Mock::given(method("GET"))
+                        .and(path(format!("/repos/z/later/git/trees/{}", "c".repeat(40))))
+                        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"tree": []})))
+                        .expect(if status == 401 { 0 } else { 1 })
+                        .mount(&server)
+                        .await;
+                    let config = Config {
+                        trusted_hosts: vec!["artifacts.example.com".into()],
+                        extra_data_formats: vec!["proto".into()],
+                        ..Config::default()
+                    };
+                    let (mut report, mut impact) = score_repo(dir.path(), &config).unwrap();
+                    let client = GitHubClient::with_base("t".into(), server.uri());
+                    enrich_with_remote_runtime(
+                        &mut report,
+                        dir.path(),
+                        &client,
+                        &config,
+                        &mut impact,
+                    )
+                    .await
+                    .unwrap();
+                    assert!(!report.coverage_complete);
+                    assert!(!report.coverage_notes.is_empty());
+                    assert_eq!(report.findings.len(), depth);
+                    assert_eq!(report.score, 100 - 3 * depth as u32);
+                    assert!(has_deductions(&report));
+                    assert_eq!(impact.trusted_host_fetches, depth);
+                    assert_eq!(impact.extra_data_format_fetches, depth);
+                    for finding in &report.findings {
+                        assert_eq!(finding.id, "runtime.fetch.low");
+                        assert_eq!(finding.action_ref, Some(format!("o/r@{}", "a".repeat(40))));
+                        assert_eq!(finding.occurrences[0].workflow, ".github/workflows/ci.yml");
+                        assert!(finding.details.as_deref().unwrap().contains("action.yml"));
+                    }
+                    server.verify().await;
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn source_advisory_fires_when_pin_is_in_vulnerable_range() {
+            for range in [Some("< 1.1.0"), Some("unsupported range"), None] {
+                let dir = tempfile::TempDir::new().unwrap();
+                let mut report = base_report(dir.path());
+
+                let server = MockServer::start().await;
+                // The SHA pin resolves to v1.0.0 via the tags endpoint...
+                Mock::given(method("GET"))
+                    .and(path("/repos/o/r/tags"))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                        { "name": "v1.0.0", "commit": { "sha": "a".repeat(40) } }
+                    ])))
+                    .mount(&server)
+                    .await;
+                // ...which falls inside this advisory's vulnerable range.
+                Mock::given(method("GET"))
+                    .and(path("/advisories"))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                        {
+                            "ghsa_id": "GHSA-test",
+                            "html_url": "https://github.com/advisories/GHSA-test",
+                            "severity": "high",
+                            "summary": "vulnerable",
+                            "vulnerabilities": [
+                                {
+                                    "package": { "name": "o/r" },
+                                    "vulnerable_version_range": range,
+                                    "patched_versions": "1.1.0"
+                                }
+                            ]
+                        }
+                    ])))
+                    .mount(&server)
+                    .await;
+                let client = GitHubClient::with_base("t".into(), server.uri());
+
+                enrich_with_source_advisory(&mut report, dir.path(), &client)
+                    .await
+                    .unwrap();
+                let supported = range == Some("< 1.1.0");
+                assert_eq!(report.coverage_complete, supported);
+                assert_eq!(
+                    report.findings.iter().any(|f| f.id == "source.advisory"),
+                    supported
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn source_advisory_retains_findings_before_auth_failure() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let mut report = base_report(dir.path());
+            std::fs::write(dir.path().join(".github/workflows/ci.yml"),
+                "on: push\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: o/r@v1.0.0\n      - uses: z/unavailable@v1.0.0\n").unwrap();
+            let server = MockServer::start().await;
+            Mock::given(method("GET")).and(path("/advisories"))
+                .and(wiremock::matchers::query_param("affects", "o/r@1.0.0"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!([{
+                    "ghsa_id": "GHSA-example", "html_url": "https://example.com/advisory",
+                    "severity": "high", "summary": "example advisory",
+                    "vulnerabilities": [{"package": {"name": "o/r"}, "vulnerable_version_range": "< 1.1.0", "patched_versions": "1.1.0"}]
+                }])))
+                .mount(&server).await;
+            Mock::given(method("GET"))
+                .and(path("/advisories"))
+                .and(wiremock::matchers::query_param(
+                    "affects",
+                    "z/unavailable@1.0.0",
+                ))
+                .respond_with(ResponseTemplate::new(401))
+                .mount(&server)
+                .await;
+            let client = GitHubClient::with_base("t".into(), server.uri());
             enrich_with_source_advisory(&mut report, dir.path(), &client)
                 .await
                 .unwrap();
-            assert!(report.findings.iter().any(|f| f.id == "source.advisory"));
+            assert!(!report.coverage_complete);
+            assert_eq!(report.findings.len(), 1);
+            assert_eq!(report.findings[0].id, "source.advisory");
         }
 
         #[tokio::test]

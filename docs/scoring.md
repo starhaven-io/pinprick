@@ -4,16 +4,16 @@
 
 This document defines how pinprick computes a single score for a GitHub repository's Actions supply chain posture. It is the public specification that the `pinprick score` CLI subcommand implements against, and that any downstream tool wrapping the engine (dashboards, CI plugins, reporting pipelines) should implement against so scores stay portable and comparable.
 
-Keeping this document public and versioned is deliberate: security scoring is only trustworthy if anyone can re-derive the score from the raw findings. Vendors that hide the rubric behind "proprietary algorithms" end up being distrusted by the security teams they want as customers.
+Every deduction is public so a reader can re-derive the score from the reported findings. Coverage notes qualify what was actually evaluated.
 
 ## Design principles
 
 1. **Transparent.** Every point deducted is tied to an explicit rule and finding. Given the raw findings, a third party can re-compute the score by hand.
 2. **Actionable.** Every rule maps to a concrete remediation. The score is always accompanied by a prioritized fix list.
-3. **Deterministic.** The same inputs always produce the same score. No stochastic inputs, no ML models, no "confidence-weighted" signals in v1.
+3. **Deterministic.** The same inputs always produce the same score. Inputs include source content, configuration, catalog verdicts, and observed GitHub metadata.
 4. **Versioned.** The rubric has a semantic version. Every scan records the rubric version used. Re-scoring is always explicit — we never silently mutate historical scores.
 5. **Unique-finding basis.** Action pinning and source rules (`pin.*`, `source.*`) fire once per unique `(rule, action_ref)` across the repo, with an `occurrences` list recording every `(workflow, line)` where the action is used. Runtime rules fire once per distinct detected source location, including workflow run blocks and action source. Workflow-level rules (`workflow.*`) fire once per `(rule, workflow_path)`. A repo with 20 workflows that all call `actions/checkout@main` has one pinning fix to make, so the score reflects one pinning finding.
-6. **Absolute before relative.** v1 is an absolute rubric ("47/100"). Percentile scoring across a corpus is a later feature and needs real data first.
+6. **Absolute score.** The score is independent of any comparison corpus.
 
 ## Score formula
 
@@ -33,7 +33,7 @@ Grade bands (absolute):
 | D     | 60 – 69  |
 | F     |  0 – 59  |
 
-Rationale for the flat deduction model: it's trivial to explain, easy to audit, and composes cleanly across rules. Weighted-average models require calibrating weights against each other, which invites arguments that nobody can win. We can always move to a more nuanced formula later; we cannot retroactively earn back trust lost to an opaque one.
+Flat deductions make the result reproducible directly from the finding list.
 
 ## Rule catalog
 
@@ -112,7 +112,7 @@ These are deliberately out of scope for v1 to keep the initial rubric defensible
 
 ## Output
 
-`pinprick score <path>` produces a stable JSON document. A static HTML report is generated from the same JSON.
+`pinprick score <path>` prints a human-readable report by default. `--json` and `--html` render the same report model in machine-readable and standalone HTML formats.
 
 ### JSON schema (sketch)
 
@@ -178,7 +178,7 @@ A single self-contained HTML file with:
 - Score + grade banner
 - Incomplete-coverage warning and reasons, when applicable
 - Prioritized finding list (sorted by points recovered)
-- Remediation text and occurrence locations for each finding
+- Finding details, remediation text, and occurrence locations for each finding
 
 No JavaScript frameworks; plain HTML + a little CSS. The HTML report is shareable as a static artifact.
 
@@ -204,7 +204,7 @@ The rubric version is semver-ish:
 - **Minor** (`0.1.0 → 0.2.0`): new rules added, or point values adjusted. Existing repos may score differently; scans are re-labeled with the new version. Historical scans retain their original rubric version.
 - **Major** (`0.x → 1.0`): structural change to the formula or output schema. Requires a migration note.
 
-Re-scoring an existing scan against a newer rubric is always explicit in the UI. We never silently change a score.
+Saved reports retain their rubric version. Running the CLI again evaluates a new report with the installed rubric and available inputs.
 
 ## Changelog
 

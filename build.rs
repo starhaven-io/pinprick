@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
@@ -6,7 +6,7 @@ fn main() {
     println!("cargo:rerun-if-changed=audited-actions");
 
     let dir = Path::new("audited-actions");
-    let mut data: HashMap<String, Vec<String>> = HashMap::new();
+    let mut data: BTreeMap<String, Vec<String>> = BTreeMap::new();
 
     assert!(dir.is_dir(), "audited-actions directory is missing");
     walk_dir(dir, dir, &mut data).unwrap_or_else(|error| panic!("{error}"));
@@ -20,7 +20,7 @@ fn main() {
 fn walk_dir(
     base: &Path,
     dir: &Path,
-    data: &mut HashMap<String, Vec<String>>,
+    data: &mut BTreeMap<String, Vec<String>>,
 ) -> Result<(), String> {
     let entries =
         fs::read_dir(dir).map_err(|error| format!("could not read {}: {error}", dir.display()))?;

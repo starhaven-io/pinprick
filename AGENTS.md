@@ -1,156 +1,43 @@
 # Agent Instructions for pinprick
 
-pinprick is a CLI tool for GitHub Actions supply chain security. It pins action references to full SHAs, checks for updates, and audits pinned actions for runtime fetch patterns that bypass pinning (e.g., `curl ... latest`).
+Pinprick is a Rust CLI for GitHub Actions supply-chain pinning, updates, runtime-fetch auditing, and posture scoring. `site/` contains its Astro Starlight documentation and signed catalog endpoints. GitHub Actions is the supported target; Forgejo/Gitea workflow discovery is additive, best-effort compatibility. API resolution remains github.com-only.
 
-## Project overview
+## Sources of truth
 
-- **Language:** Rust (2024 edition)
-- **Platform:** macOS, Linux
-- **Architecture:** Single binary CLI with six subcommands (`audit`, `clean`, `completions`, `pin`, `score`, `update`)
-- **License:** AGPL-3.0-only
-- **Dependencies:** clap/clap_complete (CLI), tokio (async), reqwest (HTTP), serde/serde_norway (parsing), regex (pattern matching), colored (terminal output), toml (config parsing)
+- `src/main.rs` defines command flags and dispatch. Public command/configuration documentation lives in `site/src/content/docs/`.
+- `src/workflow.rs` owns workflow discovery, read-only YAML extraction, and format-preserving pin edits; `pin.rs` and `update.rs` resolve their API results before writing.
+- `src/audit.rs`, `audit_patterns.rs`, `audit_shell.rs`, and `audit_source.rs` own bounded source traversal and detection. `site/src/content/docs/reference/detections.md` documents the rules and heuristic limits.
+- `src/audited_actions.rs` and `build.rs` own catalog lookup, verification, caching, and embedding. `audited-actions/README.md` defines exact action identities; `SECURITY.md` covers signing custody and rotation.
+- `src/score.rs` implements the versioned public contract in `docs/scoring.md`.
+- `src/config.rs`, `auth.rs`, `github.rs`, and `output.rs` own configuration, token resolution, API transport, and output boundaries.
+- `Cargo.toml`, `Cargo.lock`, and `rust-toolchain.toml` define Rust requirements. `site/package.json`, its lockfile, and Wrangler config define the independent site root.
 
-## Repository structure
+## Behavioral boundaries
 
-```
-pinprick/
-├── Cargo.toml
-├── build.rs                  # Embeds audited-actions/ into binary at compile time
-├── src/
-│   ├── main.rs              # Entry point, clap CLI definition, command dispatch
-│   ├── audit.rs             # Audit command: scan workflows + action source for runtime fetches
-│   ├── audit_patterns.rs    # Compiled regex patterns for shell/JS/Docker fetch detection
-│   ├── audit_shell.rs       # Shell tokenizer + fetch-target extraction for the audit scanners
-│   ├── audit_source.rs      # Action source selection and fetch (remote trees API, local ./ actions)
-│   ├── audited_actions.rs   # Layered lookup: bundled → local cache → remote → GitHub API
-│   ├── auth.rs              # GitHub token resolution (GITHUB_TOKEN/GH_TOKEN env → gh auth token fallback)
-│   ├── config.rs            # TOML config loading (repo-local or XDG config directory)
-│   ├── github.rs            # GitHub API client (tag→SHA, releases, file trees)
-│   ├── output.rs            # Human-readable (colored) and --json output formatting
-│   ├── pin.rs               # Pin command: resolve tags to SHAs, rewrite files
-│   ├── score.rs             # Score command: compute a posture grade per docs/scoring.md
-│   ├── update.rs            # Update command: check pinned actions for newer releases
-│   └── workflow.rs           # Regex-based uses: line scanning, ActionRef types
-├── audited-actions/          # Pre-audited action SHAs (bundled into binary)
-├── docs/                     # Specs (scoring rubric, etc.) — source of truth for behaviors
-├── scripts/                  # Helper scripts (release notes formatting)
-├── site/                     # Astro Starlight docs site (pinprick.rs)
-├── justfile                  # Task runner (build, test, lint, check)
-├── rustfmt.toml              # Rustfmt configuration (2024 style edition)
-├── .github/
-│   ├── workflows/           # CI, CodeQL, zizmor, release, deploy-site, pinprick-audit, audit-actions
-│   ├── dependabot.yml       # Dependabot for GitHub Actions, Cargo, and npm
-│   └── FUNDING.yml
-└── .gitignore
-```
+1. Never execute fetched action code. Remote JavaScript, Python, shell, Dockerfiles, and metadata are untrusted inputs to static analysis.
+2. Never round-trip workflow files through a YAML serializer for writes. Rewrite supported block-style, single-line `uses:` values while preserving comments and formatting. Unsupported syntax and required resolution failures block all pending pin/update writes. Best-effort tag comments and manual branch/container skips are separate; per-file write failures are not a cross-file transaction.
+3. Scan every supported forge root. Repository configuration must not redirect discovery. Preserve directory-handle containment and symlink refusal for local reads and writes.
+4. Keep action identities exact: a root action verdict does not cover subpaths or siblings. Local cache verdicts require the current scanner version and default runtime trust policy; configured host/data exemptions must not become reusable default-policy verdicts.
+5. Repository config wholly replaces global config. Keep effective suppressions visible and preserve `--no-repo-config`. Canonical catalog verification must also isolate global config and disable all catalog reuse.
+6. Incomplete audit coverage exits 2 in every output format. Score completeness is independent of deductions and must remain visible in human, JSON, HTML, and badge output. Retain findings already collected when a later API request fails.
+7. Keep SARIF rule IDs stable. Change rubric versions deliberately when adjusting scoring semantics; document the contract alongside implementation.
+8. Preserve pipe-to-shell precedence and the distinction between a detected finding, a heuristic allowed match, and missing source coverage. A nearby checksum command qualifies only when its target and independently trusted verification material can be bound.
 
-## Project-specific notes
+Prefer flat modules and direct control flow. Use `LazyLock` for compiled patterns, typed errors for transport, and contextual command errors. Comments should explain constraints or non-obvious rationale; keep command lists and detection details in their public documentation.
 
-### Commands
+## Local checks
 
-- `pinprick pin [PATH] [--write]` — Scan workflow files, resolve action tag refs to full SHAs via GitHub API. Dry-run by default (exits 1 when there are unpinned actions). `--write` rewrites files with `@sha # tag` format. Skips already-pinned (SHA) refs. Warns on branch refs (`@main`) and sliding tags (`@v4`), resolving sliding tags to exact versions.
-- `pinprick update [PATH] [--write] [--only PATTERN]` — Check SHA-pinned actions for newer releases. Dry-run by default, `--write` to apply changes. `--only` restricts the check to actions whose `owner/repo` contains the given substring.
-- `pinprick audit [PATH] [--verbose] [--sarif] [--no-audited-catalog]` — Scan for runtime fetch patterns that bypass pinning. Without a GitHub token, scans local `run:` blocks and local actions referenced with `uses: ./...` or `uses: $/...`. With a token, also fetches and scans remote action source code (JS/TS, Python, Dockerfiles, action.yml). `--verbose` shows allowed matches. `--sarif` outputs SARIF 2.1.0 for GitHub code scanning. Incomplete coverage exits 2 in every output mode.
-- `pinprick score [PATH] [--html] [--badge]` — Compute a supply-chain posture score (0–100, letter grade A–F) for a repository's workflows. Implements the public rubric in `docs/scoring.md` (rubric v0.11.0). The offline rules (`pin.*`, `workflow.*`, `runtime.*`) need no token and include local `./...` and `$/...` action source; with a token it additionally emits the token-gated `source.archived` and `source.advisory` rules and scans fetched remote action source for `runtime.*` findings. Catalog-vouched and `ignore.actions` entries are skipped. JSON and HTML reports expose incomplete coverage, and badges render an error state rather than an unqualified grade when token-gated scans did not run, source fetching was incomplete, or configuration suppressed coverage. Exits 1 when any finding deducts points; incomplete coverage is represented in every output format but does not independently change the score exit status. `--json`, `--html`, and `--badge` are mutually exclusive.
-- `pinprick clean` — Remove locally cached audit results (`$XDG_CACHE_HOME/pinprick/audited/`, default `~/.cache/pinprick/audited/`).
-- `pinprick completions <SHELL>` — Generate shell completions for bash, zsh, fish, etc.
+Read the complete `justfile` before changing gates. Use focused tests while iterating, then run `just check` once the change is stable. It covers Rust clippy/format/tests, typos, dependency policy, workflow security analysis, and site format/build/deployment dry-run. Run `git diff --check` before handoff. A missing tool or failed gate is unverified, not a pass.
 
-### Global flags
+`rust-toolchain.toml` pins the reviewed Rust toolchain. Homebrew's standalone Rust does not honor it, so compare `rustc --version` with `channel`. Install site dependencies with `npm ci --strict-allow-scripts`; preserve package-level allowScripts decisions. Use local mocks for API regressions. No live catalog refresh, release, or deployment is implied by a code review.
 
-- `--json` — Output as JSON for CI integration
-- `--color auto|always|never` — Control color output
-- `--version` / `-V` — Print version
+## Ownership and release operation
 
-### YAML handling
+Fleet-managed files, fenced blocks, and first-party reusable-workflow pins belong to `../dot_github/fleet`; never hand-edit consumer copies. Keep the always-reporting `conclusion` CI job. Repo-owned workflow orchestration stays here.
 
-**Critical design decision:** workflow files are never round-tripped through a YAML parser for writing. Supported writable `uses:` entries use block-style, single-line mappings — regex capture groups replace the ref while preserving leading whitespace, indentation, and surrounding comments. Flow mappings, escaped keys, and multiline values fail closed instead of being rewritten without full structural context. `serde_norway` is only used for read-only extraction of `run:` block contents during audit.
+`release.yml` is a trusted-main manual workflow. It embeds the checked-in catalog, validates crate packaging, builds supported macOS/Linux artifacts, verifies macOS signing/notarization, attaches build provenance, publishes the crate, and opens distribution updates. `pinprick-action` is the separate released adapter: the engine release must open its bot-authored version bump with the existing action/README count assertions. Review and merge that bump to trigger the adapter release; never manually update those version references. The fleet consumes the released adapter, and the Homebrew cask bump must merge separately.
 
-That read-only `run:` extraction (`extract_run_blocks` for workflows and `scan_action_yml_runs` for composite actions) recurses into `parallel:` step groups. GitHub's parallel-steps feature models a `parallel:` step as a sequence of nested steps, so `run:` blocks inside a parallel group (including `parallel:` nested in `parallel:`) are scanned by both `audit` and `score`. A `background:`/`wait:`/`cancel:` step carries no nested `run:` and needs no special handling; line anchoring still walks blocks in document order.
-
-### Workflow discovery
-
-`workflow::find_workflows` scans every forge root in `DEFAULT_FORGE_ROOTS` (`.github`, `.forgejo`, `.gitea`) for a `workflows/` subdirectory. Forgejo and Gitea use GitHub-compatible workflow syntax. Discovery is **purely additive**: each root that exists is scanned and the files are unioned, so extra roots only widen coverage. The list is a compile-time constant and is deliberately *not* configurable via `.pinprick.toml`: a scanned repo (which may be hostile, hence `--no-repo-config`) must never be able to redirect the scan to a decoy directory while real workflows hide in `.github/workflows`. Every root goes through the same symlink-refusing `open_child_dir` path, so a symlinked forge root is refused, never followed. GitLab is out of scope: `.gitlab-ci.yml` is a single file with a different schema and no `uses:` references.
-
-**Support tiers.** GitHub Actions is the first-class, fully supported target. Forgejo/Gitea support is incidental to GHA compatibility and best-effort: don't intentionally break it, but don't constrain a GitHub Actions improvement to preserve forge behavior either. When the two conflict, GHA wins. (Example: tag/release resolution is hardcoded to the github.com API, so `pin`/`update` only resolve github.com-hosted actions; that's an accepted limitation, not a bug to fix at GHA's expense.)
-
-### GitHub auth
-
-1. `GITHUB_TOKEN` environment variable (checked first)
-2. `GH_TOKEN` environment variable (the variable the `gh` CLI itself honors)
-3. `gh auth token` CLI fallback
-4. Graceful degradation: `pin` and `update` require a token; `audit` works without one (reduced coverage)
-
-Rate-limit handling: `github::get` retries once on network/5xx errors and sleeps through `x-ratelimit-reset` when the reset is within 60 s; longer waits bail with `RateLimit`.
-
-### Configuration
-
-A `.pinprick.toml` at the repo root (or `$XDG_CONFIG_HOME/pinprick/config.toml`, default `~/.config/pinprick/config.toml`) customizes behavior. Keys are all optional: `severity`, `fetch-remote`, `trusted-hosts`, `extra-data-formats`, `ignore.actions`, `ignore.patterns`. Per-repo wholly overrides global (no field-level merge). Because the scanned repo's own config applies, `audit`/`score` print a stderr notice whenever a repo-local config suppressed findings or extended runtime/data-format trust, and accept `--no-repo-config` to ignore the repo's file (for scanning repositories you don't control).
-
-### Audit patterns
-
-Six categories of runtime fetch detection:
-- **Pipe-to-shell:** `curl`/`wget` piped into `sh`/`bash`/`python`, `bash <(curl …)` process substitution, `bash -c "$(curl …)"` / `eval "$(…)"` command substitution, PowerShell `iex (iwr …)` / `Invoke-Expression (… DownloadString …)`. Flagged high severity regardless of URL versioning.
-- **Shell:** `curl`/`wget`/`gh release download` with unversioned URLs, non-literal `curl`/`wget` executable outputs, `deno run`/`install` from unversioned URLs, `git clone` without a pinned ref, `go install @latest`, unpinned `pip`/`pipx`/`npm`/`npx`/`cargo install`/`gem install`/`uv tool install`/`uvx` installs
-- **PowerShell:** `Invoke-WebRequest`/`iwr`/`Invoke-RestMethod`/`irm`, `Start-BitsTransfer`, and `WebClient.DownloadFile` with unversioned URLs
-- **JavaScript:** `fetch()`/`axios`/`got`/`http.get` with unversioned URLs, `exec()`/`child_process` shelling out to curl
-- **Python:** `urllib.request.urlopen`/`requests.get` with unversioned URLs, `subprocess` shelling out to curl/wget
-- **Docker:** unpinned `uses: docker://…` container action refs (high for `:latest`/untagged, medium for a mutable named tag; a well-formed `@sha256:` digest passes), `docker pull`/`docker run` with literal images using `:latest` or no tag in shell run blocks, `FROM :latest` or no tag, `curl`/`wget` in `RUN` instructions (escalated to high when piped to a shell), `ADD` with an `http(s)://` URL source (subject to versioning + data-format exemption via the URL-check path)
-
-Pipe-to-shell pre-empts the other shell/Docker patterns so each line emits a single finding. It also reuses the existing `ShellFetch` SARIF category/rule id to keep downstream configs stable.
-
-URL "versioned" heuristic: a URL is considered versioned if any path segment matches `v?\d+(\.\d+)+`; Deno-style `@v1.2.3` path pins count.
-
-Data-format exemption: unversioned-URL rules (shell, JS, Python) do **not** fire when the URL's path ends in a data-format extension (`.json`/`.jsonl`/`.ndjson`, `.yaml`/`.yml`/`.toml`, `.csv`/`.tsv`/`.xml`, `.txt`/`.md`/`.rst`). Matches are recorded as allowed (visible under `--verbose`) with reason `data format URL`. Applies only to the unversioned-URL rules — `/latest/` URLs, pipe-to-shell, and `gh release download` without a tag still fire regardless of extension. `.html` and `.svg` are intentionally excluded because both can carry embedded scripts.
-
-Piped-to-jq exemption: an unversioned-URL fetch whose line pipes into `jq` is recorded as allowed with reason `piped to jq` — the same data-not-code rationale as the data-format exemption, but for JSON API endpoints that carry no file extension (e.g. `curl …/api/v1/crates/<x> | jq …`). The `jq\b` match keeps `jqfoo` from qualifying. Pipe-to-shell matches and pre-empts the URL rules, so `curl … | jq … | bash` is flagged high, never exempted.
-
-Checksum verification: findings followed within 3 lines by `sha256sum`, `shasum`, `openssl dgst`, `gpg --verify`, or `Get-FileHash` are suppressed only when the command performs an actual check or signature verification, does not mask failure with `||`, and binds every downloaded target to independently trusted material. Accepted evidence is an inline literal digest or a signature checked with independently supplied key material. A sidecar, key, or signature downloaded at runtime is not trusted merely because its filename is target-specific. `Get-FileHash` comparisons require a literal 64- or 128-hex digest. Merely calculating a hash, checking an unrelated file, or using a generic manifest whose contents cannot be inspected does not suppress the finding. Verified matches are recorded as allowed (visible under `--verbose`). Pipe-to-shell findings are exempt — the piped payload is never written to disk, so a nearby checksum command cannot verify it.
-
-Git clone ref pinning: `git clone` without `--branch`/`-b` or with a branch name (main, develop, feature/foo) is flagged medium severity. `--branch v1.2.3` (version-like ref) suppresses the finding. A `git checkout <40-char-SHA>` within 3 lines fully suppresses the finding (recorded as allowed, visible under `--verbose`), since the SHA checkout deterministically pins the repo content.
-
-### Exit codes
-
-- `0` — clean (no findings, no pending updates)
-- `1` — findings present (audit) or updates available (update dry-run)
-- `2` — error; also incomplete coverage for `audit`, `pin`, or `update` (`score` reports completeness separately and keeps finding-based exit status)
-
-### CI workflows (`.github/workflows/`)
-
-- **audit-actions.yml** — Weekly scan of tracked actions for new releases, automated PRs for clean entries
-- **cargo-deny.yml** — Weekly `cargo deny check` to catch advisories, yanks, and unmaintained flags that turn an unchanged `Cargo.lock` red; opens or closes a tracking issue as the scan flips
-- **ci.yml** — Dynamic PR checks: conventional commits, clippy + rustfmt + typos, cargo test, coverage, site format + build, audited-actions verification, and a separate zizmor job with `security-events: write`
-- **codeql.yml** — CodeQL security analysis (actions queries) on push to main
-- **deploy-site.yml** — Build and deploy Astro site to Cloudflare Workers
-- **link-check.yml** — Weekly lychee broken-link check across the built site and README
-- **pinprick-audit.yml** — Run pinprick audit on its own workflows with SARIF upload
-- **release.yml** — Manual dispatch: dry-run crate publishing, build cross-platform binaries (linux-amd64 and linux-arm64, each in glibc and static musl variants, plus darwin-arm64), create GitHub release with build provenance attestations, publish the crate to crates.io, open a pinprick-action default-version bump PR, and bump the Homebrew cask (glibc/macOS only)
-- **verify-audited-actions.yml** — Weekly sharded re-verification of audited-actions catalog entries against the current detection rules (`scripts/verify-audited-actions.sh`), with a tracking issue on failure
-- **zizmor.yml** — GitHub Actions security audit on push to main
-
-## Safety / do-not-touch rules
-
-1. Do not round-trip workflow files through a YAML parser when writing pins or
-   updates; preserve the single-line `uses:` replacement model.
-2. Keep repo-local config suppressions visible on stderr, and preserve
-   `--no-repo-config` for scanning repositories the caller does not control.
-3. Treat remote action source as untrusted input. Audit may inspect fetched
-   JavaScript, Python, Docker, and action metadata, but it must not execute
-   fetched action code.
-4. Keep SARIF rule IDs stable when refining detections so downstream code
-   scanning configuration keeps working.
-
-## Required checks
-
-`rust-toolchain.toml` pins CI and rustup-based workstations to the reviewed
-stable toolchain. Homebrew's standalone Rust does not honor that file, so verify
-`rustc --version` matches its `channel` before running the required checks.
-
-- `cargo clippy` with zero warnings
-- `cargo fmt` for formatting
-- `just npm-policy` for the site dependency install-script policy
-- No unnecessary abstractions — flat module structure, no nested directories
-- `thiserror` for typed errors in library code, `anyhow` for context-rich error propagation in commands
-- `LazyLock` for compiled regex constants
+`deploy-site.yml` separates unprivileged build, canonical-byte validation/signing, and deployment. Preserve that credential boundary. Weekly catalog verification and cargo-deny workflows retain failures as tracking issues. Local tests do not prove hosted environment protections, signing credentials, Linux execution, or publication readiness.
 
 <!-- fleet:block commit-and-pr-conventions -->
 

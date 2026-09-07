@@ -249,11 +249,14 @@ fn load_repo_file(repo_root: &Path, name: &str) -> ConfigLoad {
     let mut file = match openat_file(
         &root,
         name,
-        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
     ) {
         Ok(file) => file,
         Err(_) => return ConfigLoad::Absent,
     };
+    if !file.metadata().is_ok_and(|metadata| metadata.is_file()) {
+        return ConfigLoad::Absent;
+    }
 
     let mut content = String::new();
     if file.read_to_string(&mut content).is_err() {
@@ -542,6 +545,22 @@ trusted-hosts = ["artifacts.example.com", "releases.example.org"]
     }
 
     // ── load_file: warn vs silent ──────────────────────────────────────
+
+    #[test]
+    fn repo_config_requires_regular_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(dir.path().join(".pinprick.toml")).unwrap();
+        assert!(matches!(
+            load_repo_file(dir.path(), ".pinprick.toml"),
+            ConfigLoad::Absent
+        ));
+        std::fs::remove_dir(dir.path().join(".pinprick.toml")).unwrap();
+        std::fs::write(dir.path().join(".pinprick.toml"), "severity = \"high\"\n").unwrap();
+        assert!(matches!(
+            load_repo_file(dir.path(), ".pinprick.toml"),
+            ConfigLoad::Loaded(_)
+        ));
+    }
 
     #[test]
     fn load_file_missing_is_absent() {

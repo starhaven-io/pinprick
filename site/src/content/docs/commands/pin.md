@@ -17,6 +17,7 @@ pinprick pin /path/to/repo
 
 - Dry-run by default — shows what would change without writing files, exits 1 when there are unpinned actions (useful for CI gating)
 - `--write` rewrites files in-place with `@sha # tag` format, preserving all comments and formatting
+- A tag-resolution failure with `--write` exits 2 and leaves all workflows unchanged. Dry-run lookup failures exit 1. This pre-write gate does not make later filesystem writes a cross-file transaction
 - Tag refs (e.g., `@v7.0.0`) are resolved to their commit SHA via the GitHub API
 - Sliding tags (e.g., `@v7`) are resolved to the exact release version — `@v7` becomes `# v7.0.0`, not `# v7`
 - Already-pinned refs (40-char hex SHAs) are skipped silently

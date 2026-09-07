@@ -1,3 +1,4 @@
+use crate::config::Config;
 use crate::output::sanitize_for_terminal;
 use minisign_verify::{PublicKey, Signature};
 use serde::Deserialize;
@@ -8,20 +9,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const BUNDLED_JSON: &str = include_str!(concat!(env!("OUT_DIR"), "/bundled_audited_actions.json"));
 const REMOTE_URL: &str = "https://pinprick.rs/audited-actions";
 
-/// Reject a remote catalog whose signed `timestamp:` trusted comment is older
-/// than this. The site re-signs every catalog file on each deploy, and deploys
-/// fire on every main push touching `site/**`, `audited-actions/**`, or
-/// `Cargo.toml` (weekly catalog PRs, dependency bumps, releases), so
-/// production signatures refresh far more often than monthly. A signature
-/// past this window therefore strongly suggests a replayed, superseded
-/// catalog; the cost of a false positive is only a warning and a fresh scan.
+/// Bound replay of a superseded signed catalog. Deployments refresh signatures;
+/// an expired catalog produces a warning and falls back to a fresh scan.
 const MAX_REMOTE_CATALOG_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
-/// Tolerated clock skew for a signed timestamp that sits in the future.
-/// Deploy runners and clients are NTP-synced, so minutes cover legitimate
-/// drift; anything beyond is a signing-system clock fault or a forged
-/// far-future timestamp — which would otherwise stay "fresh" until
-/// `timestamp + MAX_REMOTE_CATALOG_AGE` and defeat the replay window.
+/// Bound future timestamps so a faulty signing clock cannot extend the replay
+/// window indefinitely. Larger client clock drift also requires a fresh scan.
 const MAX_CLOCK_SKEW: Duration = Duration::from_secs(10 * 60);
 
 /// Freshness verdict for a signed catalog timestamp.
@@ -60,9 +53,13 @@ struct AuditedEntry {
     sha: String,
     #[serde(default)]
     pinprick_version: Option<String>,
+    #[serde(default)]
+    policy_version: Option<u8>,
 }
 
 const LOCAL_CACHE_PINPRICK_VERSION: &str = env!("CARGO_PKG_VERSION");
+// Only verdicts produced without custom runtime trust can outlive their config.
+const LOCAL_CACHE_POLICY_VERSION: u8 = 1;
 
 /// Which layer in the lookup satisfied an audited-action check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -187,8 +184,12 @@ impl AuditedActions {
         subpath: Option<&str>,
         sha: &str,
         tag: &str,
+        config: &Config,
     ) {
-        if !is_full_sha(sha) {
+        if !is_full_sha(sha)
+            || !config.trusted_hosts.is_empty()
+            || !config.extra_data_formats.is_empty()
+        {
             return;
         }
         let Some(cache_dir) = &self.cache_dir else {
@@ -214,6 +215,8 @@ impl AuditedActions {
         // the file from accumulating dead entries.
         entries.retain(|e| {
             e.get("pinprick_version").and_then(|v| v.as_str()) == Some(LOCAL_CACHE_PINPRICK_VERSION)
+                && e.get("policy_version").and_then(|v| v.as_u64())
+                    == Some(u64::from(LOCAL_CACHE_POLICY_VERSION))
                 && e.get("action").and_then(|v| v.as_str()).is_some()
         });
 
@@ -228,7 +231,8 @@ impl AuditedActions {
             "action": key,
             "sha": sha,
             "tag": tag,
-            "pinprick_version": LOCAL_CACHE_PINPRICK_VERSION
+            "pinprick_version": LOCAL_CACHE_PINPRICK_VERSION,
+            "policy_version": LOCAL_CACHE_POLICY_VERSION
         }));
 
         if std::fs::create_dir_all(&dir).is_ok()
@@ -434,6 +438,7 @@ fn parse_local_cache_entries(json: &str, key: &str) -> HashSet<String> {
     entries
         .into_iter()
         .filter(|e| e.pinprick_version.as_deref() == Some(LOCAL_CACHE_PINPRICK_VERSION))
+        .filter(|e| e.policy_version == Some(LOCAL_CACHE_POLICY_VERSION))
         .filter(|e| e.action.as_deref() == Some(key))
         .filter_map(|entry| is_full_sha(&entry.sha).then(|| entry.sha.to_ascii_lowercase()))
         .collect()
@@ -585,7 +590,7 @@ mod tests {
         let mut aa = AuditedActions::new(false);
         aa.bundled.clear();
         aa.cache_dir = Some(dir.path().to_path_buf());
-        aa.cache_clean("owner", "repo", None, SHA_A, "v1");
+        aa.cache_clean("owner", "repo", None, SHA_A, "v1", &Config::default());
 
         assert_eq!(
             aa.check("owner", "repo", Some("restore"), SHA_A).await,
@@ -658,7 +663,8 @@ mod tests {
         let rendered = serde_json::to_string(&vec![serde_json::json!({
             "sha": SHA_A,
             "tag": "v1",
-            "pinprick_version": LOCAL_CACHE_PINPRICK_VERSION
+            "pinprick_version": LOCAL_CACHE_PINPRICK_VERSION,
+            "policy_version": LOCAL_CACHE_POLICY_VERSION
         })])
         .unwrap();
         assert!(!parse_local_cache_entries(&rendered, "owner/repo").contains(SHA_A));
@@ -670,11 +676,39 @@ mod tests {
             "action": "owner/repo",
             "sha": SHA_A,
             "tag": "v1",
-            "pinprick_version": LOCAL_CACHE_PINPRICK_VERSION
+            "pinprick_version": LOCAL_CACHE_PINPRICK_VERSION,
+            "policy_version": LOCAL_CACHE_POLICY_VERSION
         })])
         .unwrap();
         assert!(parse_local_cache_entries(&rendered, "owner/repo").contains(SHA_A));
         assert!(!parse_local_cache_entries(&rendered, "owner/repo/subdir").contains(SHA_A));
+    }
+
+    #[test]
+    fn local_cache_requires_default_policy_provenance() {
+        let legacy = serde_json::json!([{
+            "action": "owner/repo",
+            "sha": SHA_A,
+            "pinprick_version": LOCAL_CACHE_PINPRICK_VERSION
+        }]);
+        assert!(parse_local_cache_entries(&legacy.to_string(), "owner/repo").is_empty());
+
+        for config in [
+            Config {
+                trusted_hosts: vec!["example.com".into()],
+                ..Config::default()
+            },
+            Config {
+                extra_data_formats: vec!["bin".into()],
+                ..Config::default()
+            },
+        ] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let mut audited = AuditedActions::new(false);
+            audited.cache_dir = Some(dir.path().to_path_buf());
+            audited.cache_clean("owner", "repo", None, SHA_A, "v1", &config);
+            assert!(!cache_path(dir.path(), "owner", "repo").unwrap().exists());
+        }
     }
 
     #[test]
@@ -683,7 +717,7 @@ mod tests {
         let mut aa = AuditedActions::new(false);
         aa.cache_dir = Some(dir.path().to_path_buf());
 
-        aa.cache_clean("owner", "repo", Some("a"), SHA_A, "v1");
+        aa.cache_clean("owner", "repo", Some("a"), SHA_A, "v1", &Config::default());
 
         assert!(
             aa.load_local_cache("owner", "repo", "owner/repo/a")
@@ -694,7 +728,7 @@ mod tests {
                 .contains(SHA_A)
         );
 
-        aa.cache_clean("owner", "repo", Some("b"), SHA_A, "v1");
+        aa.cache_clean("owner", "repo", Some("b"), SHA_A, "v1", &Config::default());
         assert!(
             aa.load_local_cache("owner", "repo", "owner/repo/b")
                 .contains(SHA_A)
@@ -725,7 +759,7 @@ mod tests {
                 .contains(SHA_A)
         );
 
-        aa.cache_clean("owner", "repo", None, SHA_A, "v1");
+        aa.cache_clean("owner", "repo", None, SHA_A, "v1", &Config::default());
 
         // The SHA is now cached under the current version…
         assert!(

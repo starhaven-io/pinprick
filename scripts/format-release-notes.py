@@ -31,7 +31,7 @@ SKIP_SCOPES = {"audit-actions", "audited-actions"}
 #   * feat(scope): description by @user in https://...
 PR_RE = re.compile(
     r"^\*\s+"
-    r"(?:(?P<type>[a-z]+)(?:\((?P<scope>[^)]*)\))?:\s*)?"
+    r"(?:(?P<type>[a-z]+)(?:\((?P<scope>[^)]*)\))?(?P<breaking>!)?:\s*)?"
     r"(?P<desc>.+?)"
     r"(?:\s+by\s+@[\w-]+)?"
     r"(?:\s+in\s+https?://\S+)?"
@@ -62,10 +62,11 @@ def parse_notes(raw: str) -> tuple[dict[str, list[str]], str | None]:
         pr_scope = pr_match.group("scope") or ""
         desc = pr_match.group("desc").strip()
 
-        if pr_type in SKIP_TYPES or pr_scope in SKIP_SCOPES:
+        breaking = pr_match.group("breaking") is not None
+        if not breaking and (pr_type in SKIP_TYPES or pr_scope in SKIP_SCOPES):
             continue
 
-        section = SECTIONS.get(pr_type, "Other")
+        section = "Breaking Changes" if breaking else SECTIONS.get(pr_type, "Other")
         sections.setdefault(section, []).append(desc)
 
     return sections, changelog_url
@@ -75,7 +76,7 @@ def format_markdown(tag: str, sections: dict[str, list[str]], changelog_url: str
     """Render categorized notes as markdown."""
     lines = [f"## pinprick {tag}", ""]
 
-    ordered_keys = list(dict.fromkeys(SECTIONS.values()))
+    ordered_keys = ["Breaking Changes", *dict.fromkeys(SECTIONS.values())]
     ordered_keys.append("Other")
 
     for heading in ordered_keys:

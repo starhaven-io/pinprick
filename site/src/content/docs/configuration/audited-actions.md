@@ -8,7 +8,7 @@ pinprick maintains a list of GitHub Actions that have been scanned and confirmed
 ## Lookup order
 
 1. **Bundled** — compiled into the binary at build time. Same trust as the binary itself.
-2. **Local cache** — `$XDG_CACHE_HOME/pinprick/audited/` (default `~/.cache/pinprick/audited/`). Populated automatically when you scan an action and it comes back clean.
+2. **Local cache** — `$XDG_CACHE_HOME/pinprick/audited/` (default `~/.cache/pinprick/audited/`). Populated after a complete, clean scan under the default runtime trust policy. Entries are tied to the scanner version; scans using `trusted-hosts` or `extra-data-formats` do not populate this cache.
 3. **Remote** — `https://pinprick.rs/audited-actions/`. Opt-in via `fetch-remote = true` in your [config file](/configuration/config-file).
 4. **GitHub API** — full source fetch and scan as last resort.
 
@@ -42,18 +42,18 @@ This is not a full security review. An action listed as audited may still:
 
 For static analysis of workflow files — permissions, template injection, credential handling — use [zizmor](https://github.com/zizmorcore/zizmor).
 
-## Why the SHA is permanent
+## Scope and freshness
 
-A SHA is a commit hash. If any file in the commit changes — including `dist/index.js` — the hash changes. So an audit result for a SHA is deterministic and permanent.
+A commit SHA binds the action source, including bundled entrypoints. The verdict also depends on the scanner rules and trust policy. Local cache entries require the current scanner version and default runtime trust policy. Pull-request CI re-verifies entries selected by its change routing; scheduled verification scans catalog shards. Release packaging embeds the checked-in catalog without an additional fresh scan. The remote catalog requires a fresh signed timestamp. Use `--no-audited-catalog` to inspect source with the current scanner instead of accepting an existing verdict.
 
 ## Contributing
 
 To add a new entry to the audited-actions list:
 
-1. Run `pinprick audit` against a repository using the action at the SHA you want to add
-2. Confirm zero findings
-3. Add the SHA and tag to the exact identity file: `audited-actions/{owner}/{repo}.json` for a root action or `audited-actions/{owner}/{repo}/{subpath}.json` for a subpath action
-4. Open a PR
+1. In a Pinprick checkout, run `just add-action owner/repo` (include the subpath for a subpath action).
+2. The recipe resolves a full SHA and requires a fresh, complete scan with zero ignored actions under isolated default configuration.
+3. Inspect the generated exact-identity entry and build the current scanner with `cargo build --locked --release`, then run `scripts/verify-audited-actions.sh target/release/pinprick files <entry-file>` with a GitHub token.
+4. Open a PR with the verification result.
 
 Each file is a JSON array:
 
