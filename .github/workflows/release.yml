@@ -12,6 +12,7 @@ defaults:
 concurrency:
   group: release
   cancel-in-progress: false
+  queue: max
 
 permissions: {}
 
@@ -260,6 +261,8 @@ jobs:
         with:
           name: ${{ env.ARTIFACT }}
           path: "${{ env.ARTIFACT }}.tar.gz"
+          if-no-files-found: error
+          retention-days: 7
 
   attest:
     name: Attest (${{ matrix.target }})

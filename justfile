@@ -183,7 +183,7 @@ check:
         skip cargo-deny cargo-deny cargo-deny
     fi
     if command -v zizmor &>/dev/null; then
-        run zizmor --persona auditor .github/workflows/
+        run zizmor --strict-collection --persona auditor .github/workflows/
     else
         skip audit zizmor zizmor
     fi

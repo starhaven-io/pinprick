@@ -272,8 +272,8 @@ Findings followed within 3 lines by checksum or signature verification (`sha256s
 
 | Code | Meaning                                                                                   |
 | ---- | ----------------------------------------------------------------------------------------- |
-| 0    | Clean — no findings, no pending updates                                                   |
-| 1    | Findings present (audit), score deductions present, or updates available (update dry-run) |
+| 0    | Clean result or successful write                                                   |
+| 1    | Audit findings, score deductions, pending or unpinnable references (pin dry-run), or available updates (update dry-run) |
 | 2    | Error, or incomplete audit/pin/update coverage; verified updates may still apply with `update --write` |
 
 ## Building

@@ -26,6 +26,7 @@ defaults:
 concurrency:
   group: audit-actions
   cancel-in-progress: false
+  queue: max
 
 permissions: {}
 
@@ -212,6 +213,7 @@ jobs:
         with:
           name: audited-actions
           path: audited-actions/
+          retention-days: 1
 
   update:
     name: Update

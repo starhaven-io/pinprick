@@ -31,6 +31,7 @@ jobs:
       contents: read
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
+      run_codecov: ${{ steps.matrix.outputs.run_codecov }}
       run_zizmor: ${{ steps.matrix.outputs.run_zizmor }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -47,8 +48,9 @@ jobs:
           # Push to main: run lint to warm the cache, and Coverage so
           # Codecov has a baseline for PR comparisons.
           if [[ "${EVENT_NAME}" == "push" ]]; then
-            echo 'matrix=[{"name":"Lint","check":"lint","runner":"ubuntu-24.04"},{"name":"Coverage","check":"coverage","runner":"ubuntu-24.04","environment":"codecov"}]' >> "${GITHUB_OUTPUT}"
+            echo 'matrix=[{"name":"Lint","check":"lint","runner":"ubuntu-24.04"},{"name":"Coverage","check":"coverage","runner":"ubuntu-24.04"}]' >> "${GITHUB_OUTPUT}"
             echo "run_zizmor=false" >> "${GITHUB_OUTPUT}"
+            echo "run_codecov=true" >> "${GITHUB_OUTPUT}"
             exit 0
           fi
 
@@ -76,7 +78,7 @@ jobs:
             add_check '{"name":"Test (Linux)","check":"test","runner":"ubuntu-24.04"}'
             add_check '{"name":"Test (Linux ARM)","check":"test","runner":"ubuntu-24.04-arm"}'
             add_check '{"name":"Test (macOS)","check":"test","runner":"macos-26"}'
-            add_check '{"name":"Coverage","check":"coverage","runner":"ubuntu-24.04","environment":"codecov"}'
+            add_check '{"name":"Coverage","check":"coverage","runner":"ubuntu-24.04"}'
             add_check '{"name":"MSRV","check":"msrv","runner":"ubuntu-24.04"}'
           fi
 
@@ -116,12 +118,13 @@ jobs:
             add_check '{"name":"Test (Linux)","check":"test","runner":"ubuntu-24.04"}'
             add_check '{"name":"Test (Linux ARM)","check":"test","runner":"ubuntu-24.04-arm"}'
             add_check '{"name":"Test (macOS)","check":"test","runner":"macos-26"}'
-            add_check '{"name":"Coverage","check":"coverage","runner":"ubuntu-24.04","environment":"codecov"}'
+            add_check '{"name":"Coverage","check":"coverage","runner":"ubuntu-24.04"}'
             add_check '{"name":"MSRV","check":"msrv","runner":"ubuntu-24.04"}'
           fi
 
           echo "matrix=${MATRIX}" >> "${GITHUB_OUTPUT}"
           echo "run_zizmor=${RUN_ZIZMOR}" >> "${GITHUB_OUTPUT}"
+          echo "run_codecov=$(jq -r 'any(.[]; .check == "coverage")' <<<"${MATRIX}")" >> "${GITHUB_OUTPUT}"
 
   commits:
     name: Conventional Commits
@@ -137,9 +140,6 @@ jobs:
     if: ${{ needs.generate-matrix.outputs.matrix != '[]' }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
-    environment:
-      name: ${{ matrix.environment }}
-      deployment: false
     permissions:
       contents: read
     strategy:
@@ -274,31 +274,31 @@ jobs:
         run: cargo install cargo-llvm-cov --locked --version 0.9.0
 
       - name: Run tests with coverage
+        id: coverage-tests
         if: matrix.check == 'coverage'
         run: cargo llvm-cov nextest --profile ci --lcov --output-path lcov.info
 
-      - name: Install verified Codecov CLI
-        if: ${{ !cancelled() && matrix.check == 'coverage' }}
-        run: |
-          curl --fail --location --show-error --silent \
-            --output "${RUNNER_TEMP}/codecov" \
-            "https://cli.codecov.io/v11.3.1/linux/codecov"
-          echo "ca1d64196d2d34771084afe76ea657d581bf628e31d993ff8e52ea09cc88a56d  ${RUNNER_TEMP}/codecov" | sha256sum --check --strict
-          chmod 0755 "${RUNNER_TEMP}/codecov"
-
-      - name: Upload coverage to Codecov
+      - name: Normalize report paths
         if: ${{ !cancelled() && matrix.check == 'coverage' }}
         env:
-          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+          TEST_RESULT: ${{ steps.coverage-tests.outcome }}
         run: |
-          "${RUNNER_TEMP}/codecov" upload-process --disable-search --file lcov.info
+          reports=(--junit target/nextest/ci/junit.xml)
+          if [[ -f lcov.info || "${TEST_RESULT}" != failure ]]; then
+            reports+=(--coverage lcov.info)
+          fi
+          python3 -I scripts/upload-codecov.py --prepare "${reports[@]}"
 
-      - name: Upload test results to Codecov
+      - name: Save coverage reports
         if: ${{ !cancelled() && matrix.check == 'coverage' }}
-        env:
-          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
-        run: |
-          "${RUNNER_TEMP}/codecov" upload-process --disable-search --file target/nextest/ci/junit.xml --report-type test_results
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coverage-reports
+          path: |
+            lcov.info
+            target/nextest/ci/junit.xml
+          if-no-files-found: error
+          retention-days: 1
 
       - name: Save coverage tools cache
         if: matrix.check == 'coverage' && github.event_name == 'push' && steps.cov-tools-cache.outputs.cache-hit != 'true'
@@ -384,6 +384,42 @@ jobs:
           fi
           exit "${FAILED}"
 
+  codecov:
+    name: Codecov
+    needs: [generate-matrix, check]
+    # Forks still run coverage tests; Codecov OIDC accepts same-repository runs.
+    if: ${{ !cancelled() && needs.generate-matrix.outputs.run_codecov == 'true' && (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) }}
+    runs-on: ubuntu-slim
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write # Authenticate report uploads to Codecov with GitHub OIDC.
+    steps:
+      - name: Check out the trusted uploader
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha || github.sha }}
+          persist-credentials: false
+          sparse-checkout: /scripts/upload-codecov.py
+          sparse-checkout-cone-mode: false
+          path: codecov-uploader
+
+      - name: Download coverage-reports
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: coverage-reports
+          path: reports
+
+      - name: Upload reports with verified Codecov CLI
+        env:
+          TEST_RESULT: ${{ needs.check.result }}
+        run: |
+          reports=(--junit reports/target/nextest/ci/junit.xml)
+          if [[ -f reports/lcov.info || "${TEST_RESULT}" != failure ]]; then
+            reports+=(--coverage reports/lcov.info)
+          fi
+          python3 -I codecov-uploader/scripts/upload-codecov.py "${reports[@]}"
+
   zizmor:
     name: zizmor
     needs: generate-matrix
@@ -395,13 +431,16 @@ jobs:
 
   conclusion:
     name: conclusion
-    needs: [generate-matrix, commits, check, zizmor]
+    needs: [generate-matrix, commits, check, zizmor, codecov]
     runs-on: ubuntu-slim
     timeout-minutes: 15
     if: always()
     steps:
       - name: Result
         env:
+          CODECOV_ELIGIBLE: ${{ (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) }}
+          RUN_CODECOV: ${{ needs.generate-matrix.outputs.run_codecov }}
+          CODECOV_RESULT: ${{ needs.codecov.result }}
           COMMITS_RESULT: ${{ needs.commits.result }}
           CHECK_RESULT: ${{ needs.check.result }}
           ZIZMOR_RESULT: ${{ needs.zizmor.result }}
@@ -425,4 +464,9 @@ jobs:
             test "${ZIZMOR_RESULT}" = "success"
           else
             test "${ZIZMOR_RESULT}" = "skipped"
+          fi
+          if [[ "${RUN_CODECOV}" == "true" && "${CODECOV_ELIGIBLE}" == "true" ]]; then
+            test "${CODECOV_RESULT}" = "success"
+          else
+            test "${CODECOV_RESULT}" = "skipped"
           fi
