@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise release/catalog shell steps with local command stubs only."""
+"""Exercise workflow shell steps with local command stubs only."""
 
 import importlib.util
 import json
@@ -23,6 +23,44 @@ def workflow_step(workflow: str, name: str) -> str:
 
 
 class ReleaseToolsTests(unittest.TestCase):
+    def test_site_deploy_preserves_signed_output_and_uses_locked_tool(self):
+        deploy = (ROOT / '.github/workflows/deploy-site.yml').read_text().split('\n  deploy:\n', 1)[1]
+        setup, publish = deploy.split('      - name: Deploy signed site to Cloudflare Workers\n', 1)
+        self.assertIn('    needs: sign\n', setup)
+        self.assertIn("    if: github.ref == 'refs/heads/main'\n", setup)
+        self.assertIn('run: node scripts/check-npm-install-policy.mjs site', setup)
+        self.assertLess(setup.index('run: npm ci --strict-allow-scripts'), setup.index('name: signed-site'))
+        self.assertNotIn('CLOUDFLARE_API_TOKEN', setup)
+        self.assertNotIn('CATALOG_SIGNING_KEY', deploy)
+        self.assertNotIn('npm run build', deploy)
+        self.assertIn('        working-directory: site\n', publish)
+        self.assertIn('CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}', publish)
+        self.assertIn('CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}', publish)
+
+        with tempfile.TemporaryDirectory() as temp:
+            site = Path(temp)
+            tool = site / 'node_modules/.bin/wrangler'
+            tool.parent.mkdir(parents=True)
+            tool.write_text('#!/bin/sh\nset -eu\n'
+                            '[ "$#" = 3 ] && [ "$1" = deploy ] && [ "$2" = --config ] && [ "$3" = wrangler.jsonc ]\n'
+                            '[ "$CLOUDFLARE_API_TOKEN" = fixture-token ]\n'
+                            'printf deployed > invocation\n')
+            tool.chmod(0o755)
+            (site / 'package.json').write_text(json.dumps({'scripts': {
+                'predeploy': 'exit 97', 'deploy': 'exit 98', 'postdeploy': 'exit 99',
+            }}))
+            signed = site / 'dist/client/catalog.json.minisig'
+            signed.parent.mkdir(parents=True)
+            signed.write_bytes(b'signed fixture bytes\n')
+            result = subprocess.run(
+                ['bash', '-euo', 'pipefail', '-c', workflow_step('deploy-site.yml', 'Deploy signed site to Cloudflare Workers')],
+                cwd=site, env=dict(os.environ, CLOUDFLARE_API_TOKEN='fixture-token'),
+                capture_output=True, text=True, timeout=10,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual((site / 'invocation').read_text(), 'deployed')
+            self.assertEqual(signed.read_bytes(), b'signed fixture bytes\n')
+
     def test_breaking_changes_survive_internal_change_filter(self):
         spec = importlib.util.spec_from_file_location('notes', ROOT / 'scripts/format-release-notes.py')
         notes = importlib.util.module_from_spec(spec)

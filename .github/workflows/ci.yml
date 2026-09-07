@@ -153,8 +153,8 @@ jobs:
           persist-credentials: false
 
 
-      - name: Test release tooling
-        if: matrix.check == 'lint'
+      - name: Test workflow tooling
+        if: matrix.check == 'lint' || matrix.check == 'site'
         run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_*.py'
 
       - name: Restore cargo build cache
