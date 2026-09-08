@@ -91,6 +91,7 @@ jobs:
         run: |
           TITLE="audited-actions catalog re-verification is failing"
           {
+            echo "<!-- pinprick-state:begin -->"
             for ((I = 0; I < SHARD_COUNT; I++)); do
               STATE=pending
               if [[ "${VERIFY_MODE}" == "shard" && "${I}" -eq "${VERIFY_SHARD}" ]]; then
@@ -98,6 +99,7 @@ jobs:
               fi
               echo "<!-- pinprick-shard-${I}:${STATE} -->"
             done
+            echo "<!-- pinprick-state:end -->"
             echo
             echo "Re-scanning the audited-actions catalog (\`${VERIFY_SCOPE}\`) against the current detection rules reported at least one entry that no longer verifies. Either a rule improvement now flags source that was previously recorded clean — in which case the entry must be removed from the catalog — or the scan could not complete (rate limit, network) and the verdict is unconfirmed."
             echo
@@ -108,7 +110,7 @@ jobs:
             echo "<details><summary>verification output</summary>"
             echo
             echo '```'
-            grep -E '^(---|::error::|  finding: )' verify-output.txt | tail -c 60000 || true
+            grep -E '^(---|::error::|  finding: |  coverage: |Catalog entries inert )' verify-output.txt | LC_ALL=C sed 's/<!--/<! --/g' | LC_ALL=C awk -v limit=60000 -f scripts/tail-complete-lines.awk || true
             echo '```'
             echo
             echo "</details>"
@@ -149,23 +151,36 @@ jobs:
             fi
 
             gh issue view "${N}" --json body --jq .body > issue-body.md
-            if ! grep -q '<!-- pinprick-shard-' issue-body.md; then
-              {
-                for ((I = 0; I < SHARD_COUNT; I++)); do
-                  echo "<!-- pinprick-shard-${I}:pending -->"
-                done
-                echo
-                cat issue-body.md
-              } > issue-body-new.md
-              mv issue-body-new.md issue-body.md
+
+            # Only an exact block at the start of the body is state; see
+            # read-shard-state.sh for why position is what separates it from
+            # action-derived diagnostics.
+            readarray -t SHARD_STATES < <(scripts/read-shard-state.sh issue-body.md "${SHARD_COUNT}")
+            if [[ ${#SHARD_STATES[@]} -ne "${SHARD_COUNT}" ]]; then
+              echo "::error::could not read shard state for issue ${N}; leaving it open"
+              continue
             fi
-            sed -i "s/<!-- pinprick-shard-${VERIFY_SHARD}:[a-z]* -->/<!-- pinprick-shard-${VERIFY_SHARD}:passed -->/" issue-body.md
+            # Nothing that resembles state may survive into the retained body,
+            # so a later run can only read the block this step writes.
+            BODY_REST=$(grep -vE '<!-- pinprick-(state:(begin|end)|shard-)' issue-body.md || true)
+            SHARD_STATES[VERIFY_SHARD]=passed
+
+            {
+              echo "<!-- pinprick-state:begin -->"
+              for ((I = 0; I < SHARD_COUNT; I++)); do
+                echo "<!-- pinprick-shard-${I}:${SHARD_STATES[I]} -->"
+              done
+              echo "<!-- pinprick-state:end -->"
+              printf '%s\n' "${BODY_REST}"
+            } > issue-body-new.md
+            mv issue-body-new.md issue-body.md
+
             gh issue edit "${N}" --body-file issue-body.md
             gh issue comment "${N}" --body "Shard ${VERIFY_SHARD}/${SHARD_COUNT} passed as of ${RUN_URL}."
 
             ALL_PASSED=true
             for ((I = 0; I < SHARD_COUNT; I++)); do
-              if ! grep -q "<!-- pinprick-shard-${I}:passed -->" issue-body.md; then
+              if [[ "${SHARD_STATES[I]}" != "passed" ]]; then
                 ALL_PASSED=false
               fi
             done

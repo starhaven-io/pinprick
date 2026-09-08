@@ -28,6 +28,7 @@ use crate::audit_source::{
     ActionScanStatus, remote_action_scan_key, scan_action_source, scan_local_action_source_graph,
     short_sha,
 };
+use crate::audited_actions::AUDIT_RULES_VERSION;
 use crate::audited_actions::{AuditSource, AuditedActions};
 use crate::auth;
 use crate::config::Config;
@@ -549,6 +550,7 @@ pub async fn run(
         findings: collector.findings,
         allowed: collector.allowed,
         had_token,
+        rules_version: AUDIT_RULES_VERSION,
         audited_bundled,
         audited_local_cache,
         audited_remote,

@@ -48,7 +48,7 @@ jobs:
           # Push to main: run lint to warm the cache, and Coverage so
           # Codecov has a baseline for PR comparisons.
           if [[ "${EVENT_NAME}" == "push" ]]; then
-            echo 'matrix=[{"name":"Lint","check":"lint","runner":"ubuntu-24.04"},{"name":"Coverage","check":"coverage","runner":"ubuntu-24.04"}]' >> "${GITHUB_OUTPUT}"
+            echo 'matrix=[{"name":"Lint","check":"lint","runner":"ubuntu-24.04","fetch_depth":1},{"name":"Coverage","check":"coverage","runner":"ubuntu-24.04","fetch_depth":1}]' >> "${GITHUB_OUTPUT}"
             echo "run_zizmor=false" >> "${GITHUB_OUTPUT}"
             echo "run_codecov=true" >> "${GITHUB_OUTPUT}"
             exit 0
@@ -74,12 +74,12 @@ jobs:
 
           # Rust or build workflow changes: lint + test + MSRV
           if echo "${CHANGED}" | grep -qE '\.rs$|^Cargo\.(toml|lock)$|^build\.rs$|^deny\.toml$|^justfile$|^rust-toolchain\.toml$|^clippy\.toml$|^rustfmt\.toml$|^\.config/|^\.githooks/|^scripts/|^\.github/workflows/(ci|cargo-deny|release)\.yml$'; then
-            add_check '{"name":"Lint","check":"lint","runner":"ubuntu-24.04"}'
-            add_check '{"name":"Test (Linux)","check":"test","runner":"ubuntu-24.04"}'
-            add_check '{"name":"Test (Linux ARM)","check":"test","runner":"ubuntu-24.04-arm"}'
-            add_check '{"name":"Test (macOS)","check":"test","runner":"macos-26"}'
-            add_check '{"name":"Coverage","check":"coverage","runner":"ubuntu-24.04"}'
-            add_check '{"name":"MSRV","check":"msrv","runner":"ubuntu-24.04"}'
+            add_check '{"name":"Lint","check":"lint","runner":"ubuntu-24.04","fetch_depth":1}'
+            add_check '{"name":"Test (Linux)","check":"test","runner":"ubuntu-24.04","fetch_depth":1}'
+            add_check '{"name":"Test (Linux ARM)","check":"test","runner":"ubuntu-24.04-arm","fetch_depth":1}'
+            add_check '{"name":"Test (macOS)","check":"test","runner":"macos-26","fetch_depth":1}'
+            add_check '{"name":"Coverage","check":"coverage","runner":"ubuntu-24.04","fetch_depth":1}'
+            add_check '{"name":"MSRV","check":"msrv","runner":"ubuntu-24.04","fetch_depth":1}'
           fi
 
           # Catalog edits: fully verify the changed catalog files. Detection-
@@ -93,7 +93,7 @@ jobs:
           if echo "${CHANGED}" | grep -qE '^audited-actions/.+\.json$'; then
             VERIFY_CHANGED=true
           fi
-          if echo "${CHANGED}" | grep -qE '^src/|^build\.rs$|^Cargo\.(toml|lock)$|^rust-toolchain\.toml$|^scripts/verify-audited-actions\.sh$'; then
+          if echo "${CHANGED}" | grep -qE '^src/|^build\.rs$|^Cargo\.(toml|lock)$|^rust-toolchain\.toml$|^scripts/(verify-audited-actions\.sh|normalize-audit-json\.py)$'; then
             VERIFY_LATEST=true
           fi
           if [[ "${VERIFY_CHANGED}" == "true" || "${VERIFY_LATEST}" == "true" ]]; then
@@ -102,7 +102,7 @@ jobs:
 
           # Site or audited-actions changes: format check + build
           if echo "${CHANGED}" | grep -qE '^site/|^audited-actions/|^catalog-minisign\.pub$|^Cargo\.toml$|^\.github/workflows/deploy-site\.yml$'; then
-            add_check '{"name":"Site","check":"site","runner":"ubuntu-slim"}'
+            add_check '{"name":"Site","check":"site","runner":"ubuntu-slim","fetch_depth":1}'
           fi
 
           # Workflow changes: Actions security audit
@@ -114,12 +114,12 @@ jobs:
           # changes may skip the expensive matrix; every other unknown path
           # gets the full Rust gate instead of silently receiving no tests.
           if [[ "${MATRIX}" == "[]" ]] && echo "${CHANGED}" | grep -qvE '(^|/)(README|CHANGELOG|CONTRIBUTING|SECURITY)(\.[^/]*)?$|^docs/|\.md$|^LICENSE$'; then
-            add_check '{"name":"Lint","check":"lint","runner":"ubuntu-24.04"}'
-            add_check '{"name":"Test (Linux)","check":"test","runner":"ubuntu-24.04"}'
-            add_check '{"name":"Test (Linux ARM)","check":"test","runner":"ubuntu-24.04-arm"}'
-            add_check '{"name":"Test (macOS)","check":"test","runner":"macos-26"}'
-            add_check '{"name":"Coverage","check":"coverage","runner":"ubuntu-24.04"}'
-            add_check '{"name":"MSRV","check":"msrv","runner":"ubuntu-24.04"}'
+            add_check '{"name":"Lint","check":"lint","runner":"ubuntu-24.04","fetch_depth":1}'
+            add_check '{"name":"Test (Linux)","check":"test","runner":"ubuntu-24.04","fetch_depth":1}'
+            add_check '{"name":"Test (Linux ARM)","check":"test","runner":"ubuntu-24.04-arm","fetch_depth":1}'
+            add_check '{"name":"Test (macOS)","check":"test","runner":"macos-26","fetch_depth":1}'
+            add_check '{"name":"Coverage","check":"coverage","runner":"ubuntu-24.04","fetch_depth":1}'
+            add_check '{"name":"MSRV","check":"msrv","runner":"ubuntu-24.04","fetch_depth":1}'
           fi
 
           echo "matrix=${MATRIX}" >> "${GITHUB_OUTPUT}"
@@ -149,7 +149,11 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: ${{ matrix.fetch_depth || 1 }}
+          # No `|| 1` default: GitHub expressions treat 0 as falsy, so a
+          # full-history request would be silently rewritten to a shallow
+          # clone and base-relative diffs would fail. Every matrix entry
+          # sets its own depth instead.
+          fetch-depth: ${{ matrix.fetch_depth }}
           persist-credentials: false
 
 
@@ -351,6 +355,20 @@ jobs:
         run: |
           FAILED=0
           while IFS= read -r -d '' JSON_FILE; do
+            if ! jq -e '
+              type == "array" and
+              all(.[];
+                type == "object" and
+                keys_unsorted == ["sha", "tag", "rules_version"] and
+                (.sha | type == "string" and test("^[0-9a-f]{40}$")) and
+                (.tag | type == "string") and
+                (.rules_version |
+                  type == "number" and . >= 1 and . <= 4294967295 and . == floor))
+            ' "${JSON_FILE}" > /dev/null; then
+              echo "::error::${JSON_FILE} has a non-canonical or unstamped entry"
+              FAILED=1
+              continue
+            fi
             SORTED=$(jq 'sort_by([(.tag | ltrimstr("v") | split(".") | map(tonumber? // 0)), .tag]) | reverse' "${JSON_FILE}")
             ACTUAL=$(jq '.' "${JSON_FILE}")
             if [[ "${SORTED}" != "${ACTUAL}" ]]; then
@@ -374,9 +392,30 @@ jobs:
         run: |
           FAILED=0
           if [[ "${VERIFY_CHANGED}" == "true" ]]; then
-            readarray -t CATALOG_FILES < <(git diff --name-only --diff-filter=d "${BASE_SHA}...HEAD" -- audited-actions/ | grep -E '\.json$' || true)
-            if [[ ${#CATALOG_FILES[@]} -gt 0 ]]; then
-              scripts/verify-audited-actions.sh target/release/pinprick files "${CATALOG_FILES[@]}" || FAILED=1
+            # Three outcomes must stay distinct. A failed diff means
+            # verification did not happen and has to fail closed; folding it
+            # into `|| true` let a shallow checkout skip catalog verification
+            # and still report success. A change that only deletes catalog
+            # files has nothing left to scan and is how a verdict is revoked.
+            # An empty result with no deletions means this selection and
+            # generate-matrix's disagree.
+            DIFF_OK=1
+            CHANGED=$(git diff --name-only "${BASE_SHA}...HEAD" -- audited-actions/) || DIFF_OK=0
+            PRESENT=$(git diff --name-only --diff-filter=d "${BASE_SHA}...HEAD" -- audited-actions/) || DIFF_OK=0
+            if [[ "${DIFF_OK}" -eq 0 ]]; then
+              echo "::error::could not diff audited-actions against ${BASE_SHA}; changed entries NOT verified"
+              FAILED=1
+            else
+              readarray -t CHANGED_FILES < <(grep -E '\.json$' <<< "${CHANGED}" || true)
+              readarray -t CATALOG_FILES < <(grep -E '\.json$' <<< "${PRESENT}" || true)
+              if [[ ${#CATALOG_FILES[@]} -gt 0 ]]; then
+                scripts/verify-audited-actions.sh target/release/pinprick files "${CATALOG_FILES[@]}" || FAILED=1
+              elif [[ ${#CHANGED_FILES[@]} -gt 0 ]]; then
+                echo "Catalog change only removes entries; no surviving files to re-verify."
+              else
+                echo "::error::catalog changes were detected but no catalog files resolved; changed entries NOT verified"
+                FAILED=1
+              fi
             fi
           fi
           if [[ "${VERIFY_LATEST}" == "true" ]]; then

@@ -158,7 +158,7 @@ esac
 set -euo pipefail
 [[ "$*" == *"--no-repo-config --no-audited-catalog"* ]]
 [[ "$XDG_CONFIG_HOME" == "${@: -1}/config" ]]
-printf '{"scanned_fresh":%s,"coverage_complete":true,"ignored":0}\\n' "$FRESH"
+printf '{"scanned_fresh":%s,"rules_version":7,"coverage_complete":true,"ignored":0}\\n' "$FRESH"
 ''')
                 for executable in [root / 'bin/gh', root / 'target/debug/pinprick']:
                     executable.chmod(0o755)
@@ -170,7 +170,66 @@ printf '{"scanned_fresh":%s,"coverage_complete":true,"ignored":0}\\n' "$FRESH"
                 self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
                 entries = json.loads((root / 'audited-actions/example/action.json').read_text())
                 self.assertEqual(len(entries), expected_entries)
+                if entries:
+                    self.assertTrue(all(entry['rules_version'] == 7 for entry in entries))
                 self.assertEqual(list((root / 'scratch').iterdir()), [])
+
+    def test_add_action_restamp_preserves_canonical_version_order(self):
+        just = shutil.which('just')
+        if just is None:
+            self.skipTest('just is required to exercise the add-action recipe')
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            binary_dir = root / 'bin'
+            binary_dir.mkdir()
+            scratch = root / 'scratch'
+            scratch.mkdir()
+            catalog = root / 'audited-actions/example/action.json'
+            catalog.parent.mkdir(parents=True)
+            catalog.write_text(json.dumps([
+                {'sha': ('0' * 39) + '3', 'tag': 'v3.0.0', 'rules_version': 1},
+                {'sha': ('0' * 39) + '2', 'tag': 'v2.0.0', 'rules_version': 1},
+            ]))
+            (binary_dir / 'gh').write_text('''#!/usr/bin/env bash
+set -euo pipefail
+case "$2:$4" in
+  */releases/latest:.tag_name) printf 'v2.0.0\n' ;;
+  */git/ref/tags/v2.0.0:.object.sha) printf '%040d\n' 2 ;;
+  */git/ref/tags/v2.0.0:.object.type) printf 'commit\n' ;;
+  *) exit 9 ;;
+esac
+''')
+            (binary_dir / 'cargo').write_text('''#!/usr/bin/env bash
+set -euo pipefail
+[[ "$*" == *"--json audit --no-repo-config --no-audited-catalog"* ]]
+printf '%s\n' '{"scanned_fresh":1,"rules_version":1,"coverage_complete":true,"ignored":0}'
+''')
+            if sys.platform == 'darwin':
+                (binary_dir / 'mktemp').write_text(
+                    '#!/usr/bin/env bash\nexec /usr/bin/mktemp -d "$TMPDIR/scan.XXXXXXXX"\n'
+                )
+            for executable in (binary_dir / 'gh', binary_dir / 'cargo'):
+                executable.chmod(0o755)
+            if sys.platform == 'darwin':
+                (binary_dir / 'mktemp').chmod(0o755)
+
+            result = subprocess.run(
+                [just, '--justfile', str(ROOT / 'justfile'), '--working-directory',
+                 str(root), 'add-action', 'example/action'],
+                cwd=root,
+                env=dict(
+                    os.environ,
+                    PATH=f'{binary_dir}{os.pathsep}{os.environ["PATH"]}',
+                    TMPDIR=str(scratch),
+                ),
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            entries = json.loads(catalog.read_text())
+            self.assertEqual([entry['tag'] for entry in entries], ['v3.0.0', 'v2.0.0'])
+            self.assertTrue(all(list(entry) == ['sha', 'tag', 'rules_version'] for entry in entries))
 
 
 class CaskDCOTests(unittest.TestCase):

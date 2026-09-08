@@ -1,14 +1,14 @@
 [
-  { "sha": "74fab322a3284a20a7ed29a380819081d22c6511", "tag": "v0.6.0" },
-  { "sha": "475e6e84a584bc6d5d6f65958beff2732905f8a3", "tag": "v0.5.3" },
-  { "sha": "27422e98d47725851c131ffd98cdf933a7366f8c", "tag": "v0.5.2" },
-  { "sha": "f8bc129dec3c77e762c87170a8da66d60678a63c", "tag": "v0.5.1" },
-  { "sha": "c247aaa3a3f4a994e03c200d070aab378727c5c0", "tag": "v0.5.0" },
-  { "sha": "ce4153094c7d245d3cc310772758fdca7280ed5a", "tag": "v0.4.3" },
-  { "sha": "a663b6d119c2e5f4ff239bfdf155f50143e67706", "tag": "v0.4.2" },
-  { "sha": "1b185de6c0ab59b2d15b19278bf9d537255ff5a8", "tag": "v0.4.1" },
-  { "sha": "5adca23b3098208cd4d19cd291abb3ae1c4cb432", "tag": "v0.4.0" },
-  { "sha": "834248de335b3a7c862e1c75b2c7a4dd7940c7d0", "tag": "v0.3.0" },
-  { "sha": "b711e85aacbd9cf73e0285b16b0f3d0b35b3ae60", "tag": "v0.2.0" },
-  { "sha": "d52684fdf26c13aec4a37eb09029af8fd41b6f01", "tag": "v0.1.0" }
+  { "sha": "74fab322a3284a20a7ed29a380819081d22c6511", "tag": "v0.6.0", "rules_version": 1 },
+  { "sha": "475e6e84a584bc6d5d6f65958beff2732905f8a3", "tag": "v0.5.3", "rules_version": 1 },
+  { "sha": "27422e98d47725851c131ffd98cdf933a7366f8c", "tag": "v0.5.2", "rules_version": 1 },
+  { "sha": "f8bc129dec3c77e762c87170a8da66d60678a63c", "tag": "v0.5.1", "rules_version": 1 },
+  { "sha": "c247aaa3a3f4a994e03c200d070aab378727c5c0", "tag": "v0.5.0", "rules_version": 1 },
+  { "sha": "ce4153094c7d245d3cc310772758fdca7280ed5a", "tag": "v0.4.3", "rules_version": 1 },
+  { "sha": "a663b6d119c2e5f4ff239bfdf155f50143e67706", "tag": "v0.4.2", "rules_version": 1 },
+  { "sha": "1b185de6c0ab59b2d15b19278bf9d537255ff5a8", "tag": "v0.4.1", "rules_version": 1 },
+  { "sha": "5adca23b3098208cd4d19cd291abb3ae1c4cb432", "tag": "v0.4.0", "rules_version": 1 },
+  { "sha": "834248de335b3a7c862e1c75b2c7a4dd7940c7d0", "tag": "v0.3.0", "rules_version": 1 },
+  { "sha": "b711e85aacbd9cf73e0285b16b0f3d0b35b3ae60", "tag": "v0.2.0", "rules_version": 1 },
+  { "sha": "d52684fdf26c13aec4a37eb09029af8fd41b6f01", "tag": "v0.1.0", "rules_version": 1 }
 ]

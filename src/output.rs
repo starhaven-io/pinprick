@@ -428,6 +428,8 @@ pub struct AuditReport {
     pub allowed: Vec<AuditMatch>,
     pub actions_scanned: usize,
     pub had_token: bool,
+    /// Detection semantics used for this audit and for catalog verdicts it earns.
+    pub rules_version: u32,
     /// Number of actions whose SHA matched the bundled list.
     #[serde(default)]
     pub audited_bundled: usize,
@@ -947,6 +949,7 @@ mod sarif_tests {
             allowed: vec![],
             actions_scanned: 0,
             had_token: false,
+            rules_version: crate::audited_actions::AUDIT_RULES_VERSION,
             audited_bundled: 0,
             audited_local_cache: 0,
             audited_remote: 0,
@@ -1139,6 +1142,7 @@ mod audit_summary_tests {
             allowed: vec![],
             actions_scanned: 0,
             had_token: true,
+            rules_version: crate::audited_actions::AUDIT_RULES_VERSION,
             audited_bundled: 0,
             audited_local_cache: 0,
             audited_remote: 0,

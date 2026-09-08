@@ -103,14 +103,19 @@ add-action action_key:
     YAML
 
     AUDIT_JSON=$(XDG_CONFIG_HOME="${SCAN_DIR}/config" cargo run --locked --release --quiet -- --json audit --no-repo-config --no-audited-catalog "$SCAN_DIR")
-    jq -e '.scanned_fresh == 1 and .coverage_complete == true and .ignored == 0' <<< "$AUDIT_JSON" >/dev/null
+    RULES_VERSION=$(jq -er '
+      select(.scanned_fresh == 1 and .coverage_complete == true and .ignored == 0) |
+      .rules_version |
+      select(type == "number" and . >= 1 and . <= 4294967295 and . == floor)
+    ' <<< "$AUDIT_JSON")
 
     FILE="audited-actions/${ACTION_KEY}.json"
     mkdir -p "$(dirname "$FILE")"
     [[ -f "$FILE" ]] || echo "[]" > "$FILE"
-    jq -r --arg sha "$LATEST_SHA" --arg tag "$LATEST" '
-      (if any(.[]; .sha == $sha) then . else [{sha: $sha, tag: $tag}] + . end) as $u |
-      "[\n" + ([$u[] | "  { \"sha\": \(.sha | tojson), \"tag\": \(.tag | tojson) }"] | join(",\n")) + "\n]"
+    jq -r --arg sha "$LATEST_SHA" --arg tag "$LATEST" --argjson rules_version "$RULES_VERSION" '
+      ([{sha: $sha, tag: $tag, rules_version: $rules_version}] + [.[] | select(.sha != $sha)])
+      | sort_by([(.tag | ltrimstr("v") | split(".") | map(tonumber? // 0)), .tag]) | reverse
+      | "[\n" + ([.[] | "  { \"sha\": \(.sha | tojson), \"tag\": \(.tag | tojson), \"rules_version\": \(.rules_version) }"] | join(",\n")) + "\n]"
     ' "$FILE" > "$FILE.tmp"
     command mv "$FILE.tmp" "$FILE"
     echo "  wrote ${FILE}"

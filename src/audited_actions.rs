@@ -9,6 +9,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const BUNDLED_JSON: &str = include_str!(concat!(env!("OUT_DIR"), "/bundled_audited_actions.json"));
 const REMOTE_URL: &str = "https://pinprick.rs/audited-actions";
 
+/// Version of the audit detection semantics that catalog verdicts depend on.
+/// Bump this deliberately whenever a detection or suppression change could
+/// invalidate an existing clean verdict; entries remain inert until they are
+/// re-verified and stamped with the new version.
+pub(crate) const AUDIT_RULES_VERSION: u32 = 1;
+
 /// Bound replay of a superseded signed catalog. Deployments refresh signatures;
 /// an expired catalog produces a warning and falls back to a fresh scan.
 const MAX_REMOTE_CATALOG_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
@@ -55,6 +61,8 @@ struct AuditedEntry {
     pinprick_version: Option<String>,
     #[serde(default)]
     policy_version: Option<u8>,
+    #[serde(default)]
+    rules_version: Option<u32>,
 }
 
 const LOCAL_CACHE_PINPRICK_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -208,15 +216,17 @@ impl AuditedActions {
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
 
-        // Drop entries written by other pinprick versions before the dedup
+        // Drop entries written under other scanner provenance before the dedup
         // check. The reader (`parse_local_cache_entries`) already ignores them,
-        // so without this a stale same-SHA entry would block the write — the
-        // cache would never re-warm after an upgrade. Pruning here also keeps
-        // the file from accumulating dead entries.
+        // so without this a stale same-SHA entry would block the write and the
+        // cache would never re-warm. Pruning also avoids accumulating dead
+        // entries.
         entries.retain(|e| {
             e.get("pinprick_version").and_then(|v| v.as_str()) == Some(LOCAL_CACHE_PINPRICK_VERSION)
                 && e.get("policy_version").and_then(|v| v.as_u64())
                     == Some(u64::from(LOCAL_CACHE_POLICY_VERSION))
+                && e.get("rules_version").and_then(|v| v.as_u64())
+                    == Some(u64::from(AUDIT_RULES_VERSION))
                 && e.get("action").and_then(|v| v.as_str()).is_some()
         });
 
@@ -232,7 +242,8 @@ impl AuditedActions {
             "sha": sha,
             "tag": tag,
             "pinprick_version": LOCAL_CACHE_PINPRICK_VERSION,
-            "policy_version": LOCAL_CACHE_POLICY_VERSION
+            "policy_version": LOCAL_CACHE_POLICY_VERSION,
+            "rules_version": AUDIT_RULES_VERSION
         }));
 
         if std::fs::create_dir_all(&dir).is_ok()
@@ -419,16 +430,25 @@ fn trusted_comment_action(comment: &str) -> Option<&str> {
 }
 
 fn load_bundled() -> HashMap<String, HashSet<String>> {
-    let map: HashMap<String, Vec<String>> = serde_json::from_str(BUNDLED_JSON).unwrap_or_default();
+    parse_bundled(BUNDLED_JSON)
+}
+
+fn parse_bundled(json: &str) -> HashMap<String, HashSet<String>> {
+    let map: HashMap<String, Vec<AuditedEntry>> = serde_json::from_str(json).unwrap_or_default();
     map.into_iter()
-        .map(|(k, v)| (k, v.into_iter().collect()))
+        .map(|(key, entries)| (key, current_catalog_shas(entries)))
         .collect()
 }
 
 fn parse_entries(json: &str) -> HashSet<String> {
     let entries: Vec<AuditedEntry> = serde_json::from_str(json).unwrap_or_default();
+    current_catalog_shas(entries)
+}
+
+fn current_catalog_shas(entries: impl IntoIterator<Item = AuditedEntry>) -> HashSet<String> {
     entries
         .into_iter()
+        .filter(|entry| entry.rules_version == Some(AUDIT_RULES_VERSION))
         .filter_map(|entry| is_full_sha(&entry.sha).then(|| entry.sha.to_ascii_lowercase()))
         .collect()
 }
@@ -439,6 +459,7 @@ fn parse_local_cache_entries(json: &str, key: &str) -> HashSet<String> {
         .into_iter()
         .filter(|e| e.pinprick_version.as_deref() == Some(LOCAL_CACHE_PINPRICK_VERSION))
         .filter(|e| e.policy_version == Some(LOCAL_CACHE_POLICY_VERSION))
+        .filter(|e| e.rules_version == Some(AUDIT_RULES_VERSION))
         .filter(|e| e.action.as_deref() == Some(key))
         .filter_map(|entry| is_full_sha(&entry.sha).then(|| entry.sha.to_ascii_lowercase()))
         .collect()
@@ -615,8 +636,8 @@ mod tests {
     #[test]
     fn render_entries_round_trips() {
         let entries = vec![
-            serde_json::json!({ "sha": SHA_A, "tag": "v1" }),
-            serde_json::json!({ "sha": SHA_B, "tag": "v2" }),
+            serde_json::json!({ "sha": SHA_A, "tag": "v1", "rules_version": AUDIT_RULES_VERSION }),
+            serde_json::json!({ "sha": SHA_B, "tag": "v2", "rules_version": AUDIT_RULES_VERSION }),
         ];
         let rendered = render_entries(&entries).unwrap();
         assert!(rendered.ends_with('\n'));
@@ -632,6 +653,7 @@ mod tests {
         let entries = vec![serde_json::json!({
             "sha": SHA_C,
             "tag": r#"v1 "stable" \ release"#,
+            "rules_version": AUDIT_RULES_VERSION,
         })];
         let rendered = render_entries(&entries).unwrap();
         let parsed: Vec<serde_json::Value> =
@@ -643,19 +665,58 @@ mod tests {
     }
 
     #[test]
-    fn local_cache_ignores_unversioned_legacy_entries() {
+    fn catalog_and_local_cache_ignore_unversioned_legacy_entries() {
         let rendered = format!(r#"[{{ "sha": "{SHA_A}", "tag": "v1" }}]"#);
-        assert!(parse_entries(&rendered).contains(SHA_A));
+        assert!(!parse_entries(&rendered).contains(SHA_A));
         assert!(!parse_local_cache_entries(&rendered, "owner/repo").contains(SHA_A));
     }
 
     #[test]
+    fn catalog_reader_accepts_only_current_rules_entries() {
+        let rendered = serde_json::to_string(&vec![
+            serde_json::json!({
+                "sha": SHA_A,
+                "tag": "current",
+                "rules_version": AUDIT_RULES_VERSION,
+            }),
+            serde_json::json!({
+                "sha": SHA_B,
+                "tag": "future",
+                "rules_version": AUDIT_RULES_VERSION + 1,
+            }),
+            serde_json::json!({ "sha": SHA_C, "tag": "missing" }),
+        ])
+        .unwrap();
+
+        let shas = parse_entries(&rendered);
+        assert_eq!(shas, HashSet::from([SHA_A.to_string()]));
+    }
+
+    #[test]
+    fn bundled_reader_filters_mixed_rules_per_entry() {
+        let rendered = serde_json::json!({
+            "owner/action": [
+                { "sha": SHA_A, "rules_version": AUDIT_RULES_VERSION },
+                { "sha": SHA_B, "rules_version": AUDIT_RULES_VERSION + 1 },
+                { "sha": SHA_C }
+            ]
+        })
+        .to_string();
+
+        assert_eq!(
+            parse_bundled(&rendered)["owner/action"],
+            HashSet::from([SHA_A.to_string()])
+        );
+    }
+
+    #[test]
     fn catalog_reader_rejects_abbreviated_or_non_hex_shas() {
-        let rendered = r#"[
-            { "sha": "abc123", "tag": "v1" },
-            { "sha": "gggggggggggggggggggggggggggggggggggggggg", "tag": "v2" }
-        ]"#;
-        assert!(parse_entries(rendered).is_empty());
+        let rendered = serde_json::json!([
+            { "sha": "abc123", "tag": "v1", "rules_version": AUDIT_RULES_VERSION },
+            { "sha": "gggggggggggggggggggggggggggggggggggggggg", "tag": "v2", "rules_version": AUDIT_RULES_VERSION }
+        ])
+        .to_string();
+        assert!(parse_entries(&rendered).is_empty());
     }
 
     #[test]
@@ -664,7 +725,8 @@ mod tests {
             "sha": SHA_A,
             "tag": "v1",
             "pinprick_version": LOCAL_CACHE_PINPRICK_VERSION,
-            "policy_version": LOCAL_CACHE_POLICY_VERSION
+            "policy_version": LOCAL_CACHE_POLICY_VERSION,
+            "rules_version": AUDIT_RULES_VERSION
         })])
         .unwrap();
         assert!(!parse_local_cache_entries(&rendered, "owner/repo").contains(SHA_A));
@@ -677,7 +739,8 @@ mod tests {
             "sha": SHA_A,
             "tag": "v1",
             "pinprick_version": LOCAL_CACHE_PINPRICK_VERSION,
-            "policy_version": LOCAL_CACHE_POLICY_VERSION
+            "policy_version": LOCAL_CACHE_POLICY_VERSION,
+            "rules_version": AUDIT_RULES_VERSION
         })])
         .unwrap();
         assert!(parse_local_cache_entries(&rendered, "owner/repo").contains(SHA_A));
@@ -685,11 +748,33 @@ mod tests {
     }
 
     #[test]
+    fn local_cache_requires_current_rules_version() {
+        let base = serde_json::json!({
+            "action": "owner/repo",
+            "sha": SHA_A,
+            "tag": "v1",
+            "pinprick_version": LOCAL_CACHE_PINPRICK_VERSION,
+            "policy_version": LOCAL_CACHE_POLICY_VERSION,
+        });
+        for rules_version in [None, Some(AUDIT_RULES_VERSION + 1)] {
+            let mut entry = base.clone();
+            if let Some(version) = rules_version {
+                entry["rules_version"] = version.into();
+            }
+            assert!(
+                parse_local_cache_entries(&serde_json::json!([entry]).to_string(), "owner/repo")
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
     fn local_cache_requires_default_policy_provenance() {
         let legacy = serde_json::json!([{
             "action": "owner/repo",
             "sha": SHA_A,
-            "pinprick_version": LOCAL_CACHE_PINPRICK_VERSION
+            "pinprick_version": LOCAL_CACHE_PINPRICK_VERSION,
+            "rules_version": AUDIT_RULES_VERSION
         }]);
         assert!(parse_local_cache_entries(&legacy.to_string(), "owner/repo").is_empty());
 
@@ -738,22 +823,37 @@ mod tests {
         let on_disk: Vec<serde_json::Value> =
             serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
         assert_eq!(on_disk.len(), 2);
+        assert!(
+            on_disk
+                .iter()
+                .all(|entry| entry["rules_version"] == AUDIT_RULES_VERSION)
+        );
     }
 
     #[test]
-    fn cache_clean_rewarms_after_version_change() {
-        // A legacy entry (written by an older pinprick, no version field) must
-        // not permanently block re-warming. The reader already ignores it, so
-        // re-recording the same SHA has to replace it under the current version
-        // rather than dedup-skipping — otherwise the cache never re-warms.
+    fn cache_clean_rewarms_after_rules_version_change() {
+        // A same-SHA entry written under other detection semantics must not
+        // block re-warming after a source build changes the rules version.
         let dir = tempfile::TempDir::new().unwrap();
         let mut aa = AuditedActions::new(false);
         aa.cache_dir = Some(dir.path().to_path_buf());
 
         let path = cache_path(dir.path(), "owner", "repo").unwrap();
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, format!(r#"[{{ "sha": "{SHA_A}", "tag": "v1" }}]"#)).unwrap();
-        // Pre-state: the legacy entry is invisible to the reader.
+        std::fs::write(
+            &path,
+            serde_json::json!([{
+                "action": "owner/repo",
+                "sha": SHA_A,
+                "tag": "v1",
+                "pinprick_version": LOCAL_CACHE_PINPRICK_VERSION,
+                "policy_version": LOCAL_CACHE_POLICY_VERSION,
+                "rules_version": AUDIT_RULES_VERSION + 1,
+            }])
+            .to_string(),
+        )
+        .unwrap();
+        // Pre-state: the stale entry is invisible to the reader.
         assert!(
             !aa.load_local_cache("owner", "repo", "owner/repo")
                 .contains(SHA_A)
@@ -761,15 +861,16 @@ mod tests {
 
         aa.cache_clean("owner", "repo", None, SHA_A, "v1", &Config::default());
 
-        // The SHA is now cached under the current version…
+        // The SHA is now cached under current scanner provenance…
         assert!(
             aa.load_local_cache("owner", "repo", "owner/repo")
                 .contains(SHA_A)
         );
-        // …and the stale legacy entry was pruned rather than duplicated.
+        // …and the stale entry was pruned rather than duplicated.
         let on_disk: Vec<serde_json::Value> =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(on_disk.len(), 1);
+        assert_eq!(on_disk[0]["rules_version"], AUDIT_RULES_VERSION);
     }
 
     #[test]
@@ -834,6 +935,22 @@ mod tests {
                 .respond_with(ResponseTemplate::new(200).set_body_string(sig.to_string()))
                 .mount(server)
                 .await;
+        }
+
+        fn catalog_body(entries: &[(&str, &str)]) -> String {
+            serde_json::to_string(
+                &entries
+                    .iter()
+                    .map(|(sha, tag)| {
+                        json!({
+                            "sha": sha,
+                            "tag": tag,
+                            "rules_version": AUDIT_RULES_VERSION,
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap()
         }
 
         /// Like `test_identity`, but the signer takes an explicit trusted
@@ -926,7 +1043,7 @@ mod tests {
             // freshness window must be ignored — that is the replay defense:
             // an old signature stays valid forever, but not fresh forever.
             let (key, sign) = test_identity_with_trusted_comment();
-            let body = serde_json::to_string(&json!([{ "sha": SHA_A, "tag": "v1" }])).unwrap();
+            let body = catalog_body(&[(SHA_A, "v1")]);
             let stale = now_epoch() - MAX_REMOTE_CATALOG_AGE.as_secs() - 86_400;
             let sig = sign(
                 body.as_bytes(),
@@ -946,7 +1063,7 @@ mod tests {
         async fn fetch_remote_list_fresh_and_within_skew_timestamps_are_accepted() {
             // Fresh: inside the window. Slightly future: NTP drift, not replay.
             let (key, sign) = test_identity_with_trusted_comment();
-            let body = serde_json::to_string(&json!([{ "sha": SHA_A, "tag": "v1" }])).unwrap();
+            let body = catalog_body(&[(SHA_A, "v1")]);
 
             let server = MockServer::start().await;
             for (action_key, timestamp) in [
@@ -985,7 +1102,7 @@ mod tests {
             // fault (or a compromised signer) would grant a CDN an extended
             // replay horizon for a later-revoked entry.
             let (key, sign) = test_identity_with_trusted_comment();
-            let body = serde_json::to_string(&json!([{ "sha": SHA_A, "tag": "v1" }])).unwrap();
+            let body = catalog_body(&[(SHA_A, "v1")]);
             let future = now_epoch() + MAX_CLOCK_SKEW.as_secs() + 3_600;
             let sig = sign(
                 body.as_bytes(),
@@ -1008,7 +1125,7 @@ mod tests {
         #[tokio::test]
         async fn fetch_remote_list_signature_without_timestamp_is_rejected() {
             let (key, sign) = test_identity_with_trusted_comment();
-            let body = serde_json::to_string(&json!([{ "sha": SHA_A, "tag": "v1" }])).unwrap();
+            let body = catalog_body(&[(SHA_A, "v1")]);
             let sig = sign(body.as_bytes(), "no clock here");
 
             let server = MockServer::start().await;
@@ -1023,11 +1140,7 @@ mod tests {
         #[tokio::test]
         async fn fetch_remote_list_parses_signed_entries() {
             let (key, sign) = test_identity();
-            let body = serde_json::to_string(&json!([
-                { "sha": SHA_A, "tag": "v1" },
-                { "sha": SHA_B, "tag": "v2" }
-            ]))
-            .unwrap();
+            let body = catalog_body(&[(SHA_A, "v1"), (SHA_B, "v2")]);
 
             let server = MockServer::start().await;
             mount_signed(
@@ -1047,9 +1160,38 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn fetch_remote_list_ignores_signed_entries_for_other_rules() {
+            let (key, sign) = test_identity();
+            let body = serde_json::to_string(&json!([
+                { "sha": SHA_A, "tag": "missing" },
+                { "sha": SHA_B, "tag": "future", "rules_version": AUDIT_RULES_VERSION + 1 }
+            ]))
+            .unwrap();
+
+            let server = MockServer::start().await;
+            mount_signed(
+                &server,
+                "actions/version-mismatch",
+                &body,
+                &sign(body.as_bytes(), "actions/version-mismatch"),
+            )
+            .await;
+
+            let mut aa = AuditedActions::new(true);
+            aa.catalog_key = Some(key);
+            aa.remote_url = server.uri();
+            assert!(
+                aa.fetch_remote_list("actions/version-mismatch")
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+
+        #[tokio::test]
         async fn fetch_remote_list_rejects_signature_relocated_to_another_action() {
             let (key, sign) = test_identity();
-            let body = serde_json::to_string(&json!([{ "sha": SHA_A, "tag": "v1" }])).unwrap();
+            let body = catalog_body(&[(SHA_A, "v1")]);
             let sig = sign(body.as_bytes(), "actions/source");
 
             let server = MockServer::start().await;
@@ -1123,7 +1265,7 @@ mod tests {
         #[tokio::test]
         async fn fetch_remote_list_missing_signature_is_none() {
             let (key, _) = test_identity();
-            let body = serde_json::to_string(&json!([{ "sha": SHA_A, "tag": "v1" }])).unwrap();
+            let body = catalog_body(&[(SHA_A, "v1")]);
 
             let server = MockServer::start().await;
             Mock::given(method("GET"))
@@ -1142,10 +1284,13 @@ mod tests {
         #[tokio::test]
         async fn fetch_remote_list_tampered_body_is_none() {
             let (key, sign) = test_identity();
-            let signed_body =
-                serde_json::to_string(&json!([{ "sha": SHA_A, "tag": "v1" }])).unwrap();
-            let tampered_body =
-                serde_json::to_string(&json!([{ "sha": "evil", "tag": "v1" }])).unwrap();
+            let signed_body = catalog_body(&[(SHA_A, "v1")]);
+            let tampered_body = serde_json::to_string(&json!([{
+                "sha": "evil",
+                "tag": "v1",
+                "rules_version": AUDIT_RULES_VERSION,
+            }]))
+            .unwrap();
 
             let server = MockServer::start().await;
             // Signature is over the original body; the server returns a
@@ -1168,7 +1313,7 @@ mod tests {
         async fn fetch_remote_list_wrong_key_is_none() {
             let (_, sign) = test_identity();
             let (other_key, _) = test_identity();
-            let body = serde_json::to_string(&json!([{ "sha": SHA_A, "tag": "v1" }])).unwrap();
+            let body = catalog_body(&[(SHA_A, "v1")]);
 
             let server = MockServer::start().await;
             mount_signed(
@@ -1190,7 +1335,7 @@ mod tests {
             // Even with a perfectly signed catalog available, a build without
             // a public key must not honor remote entries.
             let (_, sign) = test_identity();
-            let body = serde_json::to_string(&json!([{ "sha": SHA_A, "tag": "v1" }])).unwrap();
+            let body = catalog_body(&[(SHA_A, "v1")]);
 
             let server = MockServer::start().await;
             mount_signed(
@@ -1211,7 +1356,7 @@ mod tests {
         async fn check_falls_through_to_remote_layer() {
             let (key, sign) = test_identity();
             let sha = "feedfacefeedfacefeedfacefeedfacefeedface";
-            let body = serde_json::to_string(&json!([{ "sha": sha, "tag": "v3" }])).unwrap();
+            let body = catalog_body(&[(sha, "v3")]);
 
             let server = MockServer::start().await;
             mount_signed(
@@ -1239,7 +1384,7 @@ mod tests {
         async fn check_uses_subpath_remote_identity() {
             let (key, sign) = test_identity();
             let sha = "feedfacefeedfacefeedfacefeedfacefeedface";
-            let body = serde_json::to_string(&json!([{ "sha": sha, "tag": "v3" }])).unwrap();
+            let body = catalog_body(&[(sha, "v3")]);
 
             let server = MockServer::start().await;
             mount_signed(
@@ -1266,7 +1411,7 @@ mod tests {
         async fn parent_remote_verdict_does_not_cover_subpath() {
             let (key, sign) = test_identity();
             let sha = "feedfacefeedfacefeedfacefeedfacefeedface";
-            let body = serde_json::to_string(&json!([{ "sha": sha, "tag": "v3" }])).unwrap();
+            let body = catalog_body(&[(sha, "v3")]);
 
             let server = MockServer::start().await;
             mount_signed(
