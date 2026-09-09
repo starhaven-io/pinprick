@@ -257,6 +257,17 @@ pub async fn run(
 
         let mut actions = workflow::scan_content(&content);
         for action in workflow::scan_local_actions(&content) {
+            // A reference that resolves to a real workflow file is a
+            // reusable-workflow call, not an action directory, and every
+            // workflow under a forge root is already enumerated and scanned in
+            // its own right. Anything that does not resolve stays an action.
+            if workflow::resolves_to_workflow_file(
+                repo_root,
+                &action.path,
+                workflow::DEFAULT_FORGE_ROOTS,
+            ) {
+                continue;
+            }
             let key = format!("local:{}", action.path);
             if !scanned_actions.insert(key.clone()) {
                 continue;
