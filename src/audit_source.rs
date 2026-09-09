@@ -1697,10 +1697,9 @@ fn local_action_dir(repo_root: &Path, action: &LocalActionRef) -> Result<PathBuf
         anyhow::bail!("local action path must start with ./ or $/");
     };
     let rel_path = Path::new(rel);
-    if rel.is_empty()
-        || !rel_path
-            .components()
-            .all(|c| matches!(c, Component::Normal(_)))
+    if !rel_path
+        .components()
+        .all(|c| matches!(c, Component::Normal(_)))
     {
         anyhow::bail!("local action path escapes the repository");
     }

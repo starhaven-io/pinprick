@@ -324,10 +324,9 @@ fn is_safe_local_action_path(path: &str) -> bool {
     let Some(rel) = path.strip_prefix("./").or_else(|| path.strip_prefix("$/")) else {
         return false;
     };
-    !rel.is_empty()
-        && Path::new(rel)
-            .components()
-            .all(|c| matches!(c, Component::Normal(_)))
+    Path::new(rel)
+        .components()
+        .all(|c| matches!(c, Component::Normal(_)))
 }
 
 fn classify_ref(r: &str) -> RefType {
@@ -1302,10 +1301,14 @@ jobs:
     }
 
     #[test]
-    fn scan_local_actions_accepts_self_repository_syntax() {
-        let actions = scan_local_actions("steps:\n  - uses: $/.github/actions/my-action\n");
-        assert_eq!(actions.len(), 1);
-        assert_eq!(actions[0].path, "$/.github/actions/my-action");
+    fn scan_local_actions_accepts_repository_root_syntax() {
+        let yaml = "steps:\n  - uses: ./\n  - uses: $/\n  - uses: $/.github/actions/my-action\n";
+        let actions = scan_local_actions(yaml);
+        assert_eq!(actions.len(), 3);
+        assert_eq!(actions[0].path, "./");
+        assert_eq!(actions[1].path, "$/");
+        assert_eq!(actions[2].path, "$/.github/actions/my-action");
+        assert!(scan_unsupported_uses(yaml).is_empty());
     }
 
     #[test]
