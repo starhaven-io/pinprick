@@ -71,6 +71,139 @@ runs:
 }
 
 #[test]
+fn local_reusable_workflow_call_does_not_break_coverage() {
+    let dir = common::repo_with_workflow(
+        "ci.yml",
+        "\
+name: caller
+on: pull_request
+jobs:
+  commits:
+    uses: $/.github/workflows/reusable-commits.yml
+",
+    );
+    std::fs::write(
+        dir.path().join(".github/workflows/reusable-commits.yml"),
+        "\
+name: reusable commits
+on:
+  workflow_call:
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
+",
+    )
+    .unwrap();
+
+    let output = common::pinprick_cmd()
+        .arg("--json")
+        .arg("audit")
+        .arg(dir.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["coverage_complete"], true);
+    assert!(report["findings"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn yaml_suffixed_local_action_directory_is_still_scanned() {
+    let dir = common::repo_with_workflow(
+        "ci.yml",
+        "\
+name: caller
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: ./.github/actions/check.yml
+",
+    );
+    let action_dir = dir.path().join(".github/actions/check.yml");
+    std::fs::create_dir_all(&action_dir).unwrap();
+    std::fs::write(
+        action_dir.join("action.yml"),
+        "\
+name: check
+description: an action directory named like a workflow file
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: curl -fsSL https://example.com/install.sh | bash
+",
+    )
+    .unwrap();
+
+    let output = common::pinprick_cmd()
+        .arg("--json")
+        .arg("audit")
+        .arg(dir.path())
+        .output()
+        .unwrap();
+
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["actions_scanned"], 1);
+    assert_eq!(report["coverage_complete"], true);
+    assert_eq!(report["findings"].as_array().unwrap().len(), 1);
+    assert_eq!(output.status.code(), Some(1));
+}
+
+#[test]
+fn anchored_steps_do_not_hide_a_local_action() {
+    // YAML node properties put step context out of reach of a line scanner, so
+    // classification must not depend on recognizing `steps:` at all.
+    let dir = common::repo_with_workflow(
+        "ci.yml",
+        "\
+name: caller
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps: &audit_steps
+      - uses: ./.github/actions/check.yml
+  rerun:
+    runs-on: ubuntu-latest
+    steps: *audit_steps
+",
+    );
+    let action_dir = dir.path().join(".github/actions/check.yml");
+    std::fs::create_dir_all(&action_dir).unwrap();
+    std::fs::write(
+        action_dir.join("action.yml"),
+        "\
+name: check
+description: an action directory named like a workflow file
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: curl -fsSL https://example.com/install.sh | bash
+",
+    )
+    .unwrap();
+
+    let output = common::pinprick_cmd()
+        .arg("--json")
+        .arg("audit")
+        .arg(dir.path())
+        .output()
+        .unwrap();
+
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["actions_scanned"], 1);
+    assert_eq!(report["coverage_complete"], true);
+    assert_eq!(report["findings"].as_array().unwrap().len(), 1);
+    assert_eq!(output.status.code(), Some(1));
+}
+
+#[test]
 fn bundled_parent_audit_does_not_cover_action_subpaths() {
     let workflow = "\
 name: cache

@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use regex::Regex;
 use rustix::fs::{self as rfs, AtFlags, Dir, Mode, OFlags};
 use rustix::io::Errno;
+use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::os::unix::ffi::OsStrExt;
@@ -318,6 +319,39 @@ pub fn parse_local_uses_line(line: &str, line_number: usize) -> Option<LocalActi
             line_number,
         })
     })
+}
+
+/// Whether a local `uses:` value resolves to a real reusable-workflow file.
+///
+/// GitHub distinguishes a workflow call from an action structurally, not by
+/// filename, and YAML node properties such as anchors put that structure out of
+/// reach of a line scanner. So this asks the filesystem instead: the reference
+/// is a workflow call only when it names an existing regular file directly
+/// under a forge `workflows/` directory. A directory (including one named
+/// `check.yml`), a missing path, a symlink, or any error answers `false`, so an
+/// unresolved reference stays an action and is scanned or reported unscannable.
+/// Skipping is never the fallback.
+pub fn resolves_to_workflow_file(repo_root: &Path, path: &str, forge_roots: &[&str]) -> bool {
+    let Some(rel) = path.strip_prefix("./").or_else(|| path.strip_prefix("$/")) else {
+        return false;
+    };
+    let rel_path = Path::new(rel);
+    let components: Vec<_> = rel_path.components().collect();
+    let [
+        Component::Normal(forge),
+        Component::Normal(workflows),
+        Component::Normal(_),
+    ] = components.as_slice()
+    else {
+        return false;
+    };
+    if !forge_roots.iter().any(|root| *forge == OsStr::new(root)) {
+        return false;
+    }
+    if *workflows != OsStr::new("workflows") {
+        return false;
+    }
+    matches!(open_child_file_path(repo_root, rel_path), Ok(Some(_)))
 }
 
 fn is_safe_local_action_path(path: &str) -> bool {
@@ -1309,6 +1343,83 @@ jobs:
         assert_eq!(actions[1].path, "$/");
         assert_eq!(actions[2].path, "$/.github/actions/my-action");
         assert!(scan_unsupported_uses(yaml).is_empty());
+    }
+
+    #[test]
+    fn resolver_accepts_only_real_workflow_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".github/workflows")).unwrap();
+        std::fs::write(
+            root.join(".github/workflows/child.yml"),
+            "on: workflow_call\n",
+        )
+        .unwrap();
+        // An action directory named like a workflow file is not a workflow.
+        std::fs::create_dir_all(root.join(".github/actions/check.yml")).unwrap();
+        // Nor is a directory sitting inside the workflows directory.
+        std::fs::create_dir_all(root.join(".github/workflows/decoy.yml")).unwrap();
+
+        let roots = DEFAULT_FORGE_ROOTS;
+        assert!(resolves_to_workflow_file(
+            root,
+            "$/.github/workflows/child.yml",
+            roots
+        ));
+        assert!(resolves_to_workflow_file(
+            root,
+            "./.github/workflows/child.yml",
+            roots
+        ));
+        assert!(!resolves_to_workflow_file(
+            root,
+            "./.github/actions/check.yml",
+            roots
+        ));
+        assert!(!resolves_to_workflow_file(
+            root,
+            "./.github/workflows/decoy.yml",
+            roots
+        ));
+        assert!(!resolves_to_workflow_file(
+            root,
+            "./.github/workflows/missing.yml",
+            roots
+        ));
+        assert!(!resolves_to_workflow_file(
+            root,
+            "./.github/workflows/nested/child.yml",
+            roots
+        ));
+        assert!(!resolves_to_workflow_file(
+            root,
+            "./elsewhere/child.yml",
+            roots
+        ));
+        assert!(!resolves_to_workflow_file(
+            root,
+            "external/action@v1",
+            roots
+        ));
+    }
+
+    #[test]
+    fn resolver_refuses_a_symlinked_workflow() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".github/workflows")).unwrap();
+        std::fs::write(root.join("real.yml"), "on: workflow_call\n").unwrap();
+        std::os::unix::fs::symlink(
+            root.join("real.yml"),
+            root.join(".github/workflows/link.yml"),
+        )
+        .unwrap();
+        // A symlink errors out, and an error must never mean "skip".
+        assert!(!resolves_to_workflow_file(
+            root,
+            "$/.github/workflows/link.yml",
+            DEFAULT_FORGE_ROOTS
+        ));
     }
 
     #[test]
