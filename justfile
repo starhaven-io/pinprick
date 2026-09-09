@@ -22,7 +22,7 @@ test:
 
 # Check release tooling using local stubs
 script-tests:
-    PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_*.py'
+    python3 -B -m unittest discover -s scripts -p 'test_*.py'
 
 # Lint
 
@@ -193,7 +193,7 @@ check:
         skip audit zizmor zizmor
     fi
     run cargo test --locked
-    run env PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_*.py'
+    run python3 -B -m unittest discover -s scripts -p 'test_*.py'
     echo "--- site-format-check ---"
     (cd site && npm run format:check) || failed=1
     echo "--- site-build ---"
