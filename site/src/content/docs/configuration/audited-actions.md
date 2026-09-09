@@ -7,8 +7,8 @@ pinprick maintains a list of GitHub Actions that have been scanned and confirmed
 
 ## Lookup order
 
-1. **Bundled** — compiled into the binary at build time. Same trust as the binary itself.
-2. **Local cache** — `$XDG_CACHE_HOME/pinprick/audited/` (default `~/.cache/pinprick/audited/`). Populated after a complete, clean scan under the default runtime trust policy. Entries are tied to the scanner version; scans using `trusted-hosts` or `extra-data-formats` do not populate this cache.
+1. **Bundled** — compiled into the binary at build time. Same trust as the binary itself. Only entries stamped with the binary's current detection-rules version are honored.
+2. **Local cache** — `$XDG_CACHE_HOME/pinprick/audited/` (default `~/.cache/pinprick/audited/`). Populated after a complete, clean scan under the default runtime trust policy. Entries are tied to both the scanner and detection-rules versions; scans using `trusted-hosts` or `extra-data-formats` do not populate this cache.
 3. **Remote** — `https://pinprick.rs/audited-actions/`. Opt-in via `fetch-remote = true` in your [config file](/configuration/config-file).
 4. **GitHub API** — full source fetch and scan as last resort.
 
@@ -16,7 +16,7 @@ pinprick maintains a list of GitHub Actions that have been scanned and confirmed
 
 A remote catalog entry tells pinprick to _skip scanning_ a SHA, so its integrity matters more than TLS alone can guarantee — a compromised CDN must not be able to mark malicious SHAs as audited. Every catalog file is therefore signed with [minisign](https://jedisct1.github.io/minisign/): the signature is served next to the file (`….json.minisig`), and the pinprick binary verifies it against a public key embedded at build time before honoring any entry.
 
-Verification is fail-closed. The authenticated trusted comment binds both the signing timestamp and the exact action key, so a valid catalog response cannot be relocated to another action. A missing or invalid signature, missing or mismatched action identity, stale signed timestamp, or binary built without the public key disables the remote layer. With a GitHub token, pinprick falls back to a fresh API scan; without one, coverage is reported incomplete and no clean verdict is produced. Nothing is silently trusted.
+Verification is fail-closed. The authenticated trusted comment binds both the signing timestamp and the exact action key, so a valid catalog response cannot be relocated to another action. A missing or invalid signature, missing or mismatched action identity, stale signed timestamp, binary built without the public key, or entry without the running binary's detection-rules version disables that verdict. With a GitHub token, pinprick falls back to a fresh API scan; without one, coverage is reported incomplete and no clean verdict is produced. Nothing is silently trusted.
 
 ## What "audited" means
 
@@ -44,19 +44,19 @@ For static analysis of workflow files — permissions, template injection, crede
 
 ## Scope and freshness
 
-A commit SHA binds the action source, including bundled entrypoints. The verdict also depends on the scanner rules and trust policy. Local cache entries require the current scanner version and default runtime trust policy. Pull-request CI re-verifies entries selected by its change routing; scheduled verification scans catalog shards. Release packaging embeds the checked-in catalog without an additional fresh scan. The remote catalog requires a fresh signed timestamp. Use `--no-audited-catalog` to inspect source with the current scanner instead of accepting an existing verdict.
+A commit SHA binds the action source, including bundled entrypoints. The verdict also depends on the scanner rules and trust policy. Each bundled or remote entry records the detection-rules version reported by the scan that earned it, and pinprick honors the entry only while that version equals the running binary's. This integer changes deliberately with detection semantics, not with every pinprick release. Local cache entries require the current scanner and detection-rules versions plus the default runtime trust policy. Pull-request CI re-verifies entries selected by its change routing; scheduled verification scans catalog shards. Release packaging embeds the checked-in catalog without an additional fresh scan. The remote catalog requires a fresh signed timestamp. Use `--no-audited-catalog` to inspect source with the current scanner instead of accepting an existing verdict.
 
 ## Contributing
 
 To add a new entry to the audited-actions list:
 
 1. In a Pinprick checkout, run `just add-action owner/repo` (include the subpath for a subpath action).
-2. The recipe resolves a full SHA and requires a fresh, complete scan with zero ignored actions under isolated default configuration.
+2. The recipe resolves a full SHA and requires a fresh, complete scan with zero ignored actions under isolated default configuration, then copies the report's detection-rules version into the entry.
 3. Inspect the generated exact-identity entry and build the current scanner with `cargo build --locked --release`, then run `scripts/verify-audited-actions.sh target/release/pinprick files <entry-file>` with a GitHub token.
 4. Open a PR with the verification result.
 
 Each file is a JSON array:
 
 ```json
-[{ "sha": "9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0", "tag": "v7.0.0" }]
+[{ "sha": "9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0", "tag": "v7.0.0", "rules_version": 1 }]
 ```

@@ -23,10 +23,14 @@ with different trust anchors:
 
 - **Bundled** — compiled into the binary at build time; trusted exactly as
   hard as the binary itself (releases carry build provenance attestations).
-  Because a detection-rule improvement can invalidate a verdict recorded
-  under older rules, CI re-verifies entries whenever the rules change and a
-  scheduled workflow re-scans a rotating weekly shard until the full catalog
-  has been covered (`scripts/verify-audited-actions.sh`).
+  Each entry records the detection-rules version that produced its verdict,
+  and the running binary honors it only when that stamp equals the binary's
+  current rules version. The build rejects unstamped source entries. Because a
+  detection-rule improvement can invalidate a verdict recorded under older
+  rules, the version in `src/audited_actions.rs` is bumped deliberately; CI
+  re-verifies entries and a scheduled workflow re-scans a rotating weekly
+  shard until the full catalog has been covered
+  (`scripts/verify-audited-actions.sh`).
 - **Remote** (`https://pinprick.rs/audited-actions/`, opt-in via
   `fetch-remote = true`) — every served file is signed with
   [minisign](https://jedisct1.github.io/minisign/) during deploy, and the
@@ -34,17 +38,22 @@ with different trust anchors:
   `catalog-minisign.pub` and embedded at build time. Verification is
   fail-closed: an unsigned, tampered, legacy-format (non-prehashed),
   timestamp-less, or stale catalog is ignored with a warning and the action
-  is scanned normally. Freshness is judged by minisign's signed `timestamp:`
+  is scanned normally. A validly signed entry is still inert when its
+  detection-rules stamp is missing or does not equal the running binary's.
+  Freshness is judged by minisign's signed `timestamp:`
   trusted comment — a catalog signed more than 30 days ago is rejected, so a
   compromised CDN cannot replay a superseded-but-validly-signed catalog
   indefinitely. Timestamps more than 10 minutes in the future are also
   rejected to prevent a signing-clock fault from extending that replay window. TLS alone is
   deliberately not trusted.
 
-Local cache entries require the current scanner version and default runtime
-trust policy. Scans using configured trusted hosts or extra data formats cannot
-populate reusable clean verdicts. Catalog verification isolates global and
-repository configuration and bypasses all catalog layers.
+Local cache entries require the current scanner version, detection-rules
+version, and default runtime trust policy. Scans using configured trusted hosts
+or extra data formats cannot populate reusable clean verdicts. Catalog
+verification isolates global and repository configuration and bypasses all
+catalog layers. If an inert bundled
+or remote entry cannot be scanned normally, incomplete coverage remains
+visible and the audit exits 2; a stale verdict never supplies a clean result.
 
 ### Signing key custody
 

@@ -1,15 +1,15 @@
 [
-  { "sha": "55cc8345863c7cc4c66a329aec7e433d2d1c52a9", "tag": "v6.1.0" },
-  { "sha": "2c8a9bd7457de244a408f35966fab2fb45fda9c8", "tag": "v6.0.0" },
-  { "sha": "caa296126883cff596d87d8935842f9db880ef25", "tag": "v5.1.0" },
-  { "sha": "27d5ce7f107fe9357f9df03efb73ab90386fccae", "tag": "v5.0.5" },
-  { "sha": "668228422ae6a00e4ad889ee87cd7109ec5666a7", "tag": "v5.0.4" },
-  { "sha": "cdf6c1fa76f9f475f3d7449005a359c84ca0f306", "tag": "v5.0.3" },
-  { "sha": "8b402f58fbc84540c8b491a91e594a4576fec3d7", "tag": "v5.0.2" },
-  { "sha": "9255dc7a253b0ccc959486e2bca901246202afeb", "tag": "v5.0.1" },
-  { "sha": "a7833574556fa59680c1b7cb190c1735db73ebf0", "tag": "v5.0.0" },
-  { "sha": "0057852bfaa89a56745cba8c7296529d2fc39830", "tag": "v4.3.0" },
-  { "sha": "0400d5f644dc74513175e3cd8d07132dd4860809", "tag": "v4.2.4" },
-  { "sha": "5a3ec84eff668545956fd18022155c47e93e2684", "tag": "v4.2.3" },
-  { "sha": "6f8efc29b200d32929f49075959781ed54ec270c", "tag": "v3.5.0" }
+  { "sha": "55cc8345863c7cc4c66a329aec7e433d2d1c52a9", "tag": "v6.1.0", "rules_version": 1 },
+  { "sha": "2c8a9bd7457de244a408f35966fab2fb45fda9c8", "tag": "v6.0.0", "rules_version": 1 },
+  { "sha": "caa296126883cff596d87d8935842f9db880ef25", "tag": "v5.1.0", "rules_version": 1 },
+  { "sha": "27d5ce7f107fe9357f9df03efb73ab90386fccae", "tag": "v5.0.5", "rules_version": 1 },
+  { "sha": "668228422ae6a00e4ad889ee87cd7109ec5666a7", "tag": "v5.0.4", "rules_version": 1 },
+  { "sha": "cdf6c1fa76f9f475f3d7449005a359c84ca0f306", "tag": "v5.0.3", "rules_version": 1 },
+  { "sha": "8b402f58fbc84540c8b491a91e594a4576fec3d7", "tag": "v5.0.2", "rules_version": 1 },
+  { "sha": "9255dc7a253b0ccc959486e2bca901246202afeb", "tag": "v5.0.1", "rules_version": 1 },
+  { "sha": "a7833574556fa59680c1b7cb190c1735db73ebf0", "tag": "v5.0.0", "rules_version": 1 },
+  { "sha": "0057852bfaa89a56745cba8c7296529d2fc39830", "tag": "v4.3.0", "rules_version": 1 },
+  { "sha": "0400d5f644dc74513175e3cd8d07132dd4860809", "tag": "v4.2.4", "rules_version": 1 },
+  { "sha": "5a3ec84eff668545956fd18022155c47e93e2684", "tag": "v4.2.3", "rules_version": 1 },
+  { "sha": "6f8efc29b200d32929f49075959781ed54ec270c", "tag": "v3.5.0", "rules_version": 1 }
 ]

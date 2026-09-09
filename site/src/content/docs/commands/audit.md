@@ -25,9 +25,9 @@ For the full list of every rule, including examples and severity, see the [Detec
 
 pinprick skips exact action identities whose `owner/repo[/subpath]@sha` is already known to be clean. The check consults three sources, in order, and reports which one answered:
 
-- `bundled` — ships with the pinprick binary from `audited-actions/` in the repo
-- `local cache` — written to `$XDG_CACHE_HOME/pinprick/audited/` (default `~/.cache/pinprick/audited/`) after a complete, clean live scan under the default runtime trust policy; entries from other scanner versions are ignored
-- `pinprick.rs` — fetched from the public audited-actions list (opt-in via `fetch-remote = true` in `.pinprick.toml`)
+- `bundled` — ships with the pinprick binary from `audited-actions/` in the repo; entries from other detection-rules versions are ignored
+- `local cache` — written to `$XDG_CACHE_HOME/pinprick/audited/` (default `~/.cache/pinprick/audited/`) after a complete, clean live scan under the default runtime trust policy; entries from other scanner or detection-rules versions are ignored
+- `pinprick.rs` — fetched from the public audited-actions list (opt-in via `fetch-remote = true` in `.pinprick.toml`); signed entries from other detection-rules versions are ignored
 
 See [Audited Actions](/configuration/audited-actions) for details on how the list works and how to contribute.
 
@@ -42,7 +42,7 @@ Missing entrypoints, symlinked source, truncated trees that omit the selected ac
 ## Output formats
 
 - Default: colored human-readable output with severity buckets
-- `--json`: machine-readable JSON for CI integration
+- `--json`: machine-readable JSON for CI integration, including `rules_version`, the detection semantics used for the report
 - `--sarif`: SARIF 2.1.0 for upload to GitHub code scanning
 - `--verbose`: also report _allowed_ matches (fetches that fired a rule but were dropped because the URL is versioned, data-shaped, piped to `jq`, checksum-verified, or matched by `trusted-hosts`)
 - `--no-repo-config`: ignore the scanned repository's `.pinprick.toml` and use the global config (or defaults)

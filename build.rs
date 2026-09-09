@@ -6,7 +6,7 @@ fn main() {
     println!("cargo:rerun-if-changed=audited-actions");
 
     let dir = Path::new("audited-actions");
-    let mut data: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut data: BTreeMap<String, Vec<Entry>> = BTreeMap::new();
 
     assert!(dir.is_dir(), "audited-actions directory is missing");
     walk_dir(dir, dir, &mut data).unwrap_or_else(|error| panic!("{error}"));
@@ -20,7 +20,7 @@ fn main() {
 fn walk_dir(
     base: &Path,
     dir: &Path,
-    data: &mut BTreeMap<String, Vec<String>>,
+    data: &mut BTreeMap<String, Vec<Entry>>,
 ) -> Result<(), String> {
     let entries =
         fs::read_dir(dir).map_err(|error| format!("could not read {}: {error}", dir.display()))?;
@@ -36,8 +36,8 @@ fn walk_dir(
                 .map_err(|error| format!("could not read {}: {error}", path.display()))?;
             let entries = serde_json::from_str::<Vec<Entry>>(&content)
                 .map_err(|error| format!("{} contains invalid JSON: {error}", path.display()))?;
-            let mut shas = Vec::with_capacity(entries.len());
-            for entry in entries {
+            let mut embedded_entries = Vec::with_capacity(entries.len());
+            for mut entry in entries {
                 if !is_full_sha(&entry.sha) {
                     return Err(format!(
                         "{} contains non-canonical SHA `{}`",
@@ -45,9 +45,10 @@ fn walk_dir(
                         entry.sha
                     ));
                 }
-                shas.push(entry.sha.to_ascii_lowercase());
+                entry.sha.make_ascii_lowercase();
+                embedded_entries.push(entry);
             }
-            data.insert(key, shas);
+            data.insert(key, embedded_entries);
         }
     }
     Ok(())
@@ -65,7 +66,8 @@ fn path_to_key(base: &Path, path: &Path) -> Option<String> {
     Some(s.replace('\\', "/"))
 }
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, serde::Serialize)]
 struct Entry {
     sha: String,
+    rules_version: u32,
 }

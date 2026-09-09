@@ -180,14 +180,16 @@ jobs:
               AUDIT_STATUS=0
               AUDIT_JSON=$(XDG_CONFIG_HOME="${SCAN_DIR}/config" ./target/debug/pinprick --json audit --no-repo-config --no-audited-catalog "${SCAN_DIR}") || AUDIT_STATUS=$?
               if [[ "${AUDIT_STATUS}" -eq 0 ]]; then
-                if jq -e '
-                  .scanned_fresh == 1 and .coverage_complete == true and .ignored == 0
-                ' <<< "${AUDIT_JSON}" > /dev/null; then
+                if RULES_VERSION=$(jq -er '
+                  select(.scanned_fresh == 1 and .coverage_complete == true and .ignored == 0) |
+                  .rules_version |
+                  select(type == "number" and . >= 1 and . <= 4294967295 and . == floor)
+                ' <<< "${AUDIT_JSON}"); then
                   echo "  Clean — adding ${TAG}"
-                  jq -r --arg sha "${TAG_SHA}" --arg tag "${TAG}" '
-                    (if any(.[]; .sha == $sha) then . else [{sha: $sha, tag: $tag}] + . end)
+                  jq -r --arg sha "${TAG_SHA}" --arg tag "${TAG}" --argjson rules_version "${RULES_VERSION}" '
+                    ([{sha: $sha, tag: $tag, rules_version: $rules_version}] + [.[] | select(.sha != $sha)])
                     | sort_by([(.tag | ltrimstr("v") | split(".") | map(tonumber? // 0)), .tag]) | reverse
-                    | "[\n" + ([.[] | "  { \"sha\": \(.sha | tojson), \"tag\": \(.tag | tojson) }"] | join(",\n")) + "\n]"
+                    | "[\n" + ([.[] | "  { \"sha\": \(.sha | tojson), \"tag\": \(.tag | tojson), \"rules_version\": \(.rules_version) }"] | join(",\n")) + "\n]"
                   ' "${JSON_FILE}" > "${JSON_FILE}.tmp"
                   mv "${JSON_FILE}.tmp" "${JSON_FILE}"
                   UPDATED=1
