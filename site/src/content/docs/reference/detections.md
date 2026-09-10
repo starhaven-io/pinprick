@@ -137,6 +137,8 @@ Not flagged:
 
 Triggers when `curl` or `wget` writes a `$`-sourced URL to a target that does not look like a data file. pinprick cannot inspect the URL path, so this is intentionally lower severity than a known unversioned URL.
 
+An unresolved output target is treated as potentially executable. For example, `--output "$2"` and `--output "${RUNNER_TEMP}/body.json"` trigger even when the intended response is JSON; the scanner cannot establish the destination. A literal `--output body.json` can use the data-format exemption. A literal executable target with a variable URL also triggers. Curl's `--disable` option does not resolve an expanded destination.
+
 ```bash
 curl -fsSL "$RELEASE_URL" -o tool
 wget "$TOOL_URL" -O bin/tool
@@ -770,7 +772,9 @@ The exemption applies only to the _unversioned-URL_ rules — the same scope as 
 
 When a finding is intentional and you want `pinprick audit` to stop flagging it, reach for the tightest mechanism that covers the case. Each mechanism lives in [`.pinprick.toml`](/configuration/config-file), is visible in code review, and applies across the whole repo.
 
-There are two distinct outcomes to be aware of:
+There are three distinct outcomes to be aware of:
+
+- **Accepted finding** — a repository-local [`accept-workflow-findings`](/configuration/config-file#accept-workflow-findings) entry binds an exact finding to the complete reviewed workflow's SHA-256 and a reason. It remains visible in every output format, including ordinary human output. Source coverage is unchanged, and workflow changes invalidate the acceptance.
 
 - **Allowed match** — the rule still matched, but the finding is recorded as allowed instead of emitted. Visible under `--verbose` with a reason, so a reviewer auditing the audit can still see what fired. Used by [`trusted-hosts`](#trusted-hosts), [`extra-data-formats`](#extra-data-formats), the [versioned-URL heuristic](#versioned-url-heuristic), the [data-format exemption](#data-format-exemption), the [piped-to-`jq` exemption](#piped-to-jq-exemption), and the [audited-actions list](/commands/audit#audited-actions-list).
 - **Removed finding** — the finding is dropped from the report entirely and is not visible under `--verbose`. Used by [`ignore.patterns`](#ignorepatterns), [`ignore.actions`](#ignoreactions), and [`severity`](#severity-threshold).
