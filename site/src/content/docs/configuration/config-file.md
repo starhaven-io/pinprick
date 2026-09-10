@@ -82,6 +82,25 @@ trusted-hosts = [
 
 To suppress a specific pattern that `trusted-hosts` doesn't cover, use [`ignore.patterns`](#ignorepatterns) instead.
 
+### `accept-workflow-findings`
+
+Accept a reviewed finding in a local workflow without skipping source coverage or hiding other findings. Each entry matches the exact repository-relative workflow path, SHA-256 of the complete workflow bytes, category, severity, description, and logical command from `pinprick audit --json`. A nonempty reason is required. Wildcards and substring matching are not supported.
+
+```toml
+[[accept-workflow-findings]]
+workflow = ".github/workflows/scan.yml"
+workflow-sha256 = "<SHA-256 of the reviewed workflow>"
+category = "shell_fetch"
+severity = "low"
+description = "<exact finding description>"
+command = '<exact pattern_matched from the audit JSON>'
+reason = "<owner, justification, compensating controls, and review conditions>"
+```
+
+Only repository-local configuration can accept workflow findings. Entries do not apply to remote or local action findings, do not skip any source reads, and do not make incomplete coverage successful. Any workflow byte change invalidates its acceptances; review the changed workflow before updating its hash. An invalid or stale entry accepts nothing. Use `shasum -a 256 .github/workflows/scan.yml` to compute the hash after review.
+
+Accepted findings remain visible in ordinary human output and the JSON `accepted` array. SARIF retains the original result with an external, accepted suppression and its justification. The audit exits zero only when coverage is complete and no unaccepted findings remain. `--no-repo-config` restores the findings. Acceptance changes audit policy only: it does not improve posture scores or create reusable clean action catalog verdicts.
+
 ### `ignore.actions`
 
 Skip scanning specific actions entirely. Useful for actions you've reviewed manually or that produce known false positives. Matching is case-insensitive and respects path boundaries: `"actions/checkout"` matches that repository at any SHA, while `"actions"` or `"actions/"` matches the owner. Partial repository names do not match.

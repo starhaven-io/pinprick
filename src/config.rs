@@ -36,6 +36,10 @@ pub struct Config {
     #[serde(default)]
     pub trusted_hosts: Vec<String>,
 
+    /// Exact, reviewed local workflow findings accepted by repository policy.
+    #[serde(default)]
+    pub accept_workflow_findings: Vec<WorkflowAcceptance>,
+
     /// Where this configuration was loaded from. Not part of the file format —
     /// used to attribute suppressions to the scanned repo's own config, which
     /// matters when auditing a repository you don't control.
@@ -74,6 +78,18 @@ pub struct IgnoreConfig {
     /// Suppress findings whose description contains these strings
     #[serde(default)]
     pub patterns: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct WorkflowAcceptance {
+    pub workflow: String,
+    pub workflow_sha256: String,
+    pub category: String,
+    pub severity: String,
+    pub description: String,
+    pub command: String,
+    pub reason: String,
 }
 
 impl Config {

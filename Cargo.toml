@@ -1,6 +1,6 @@
 [package]
 name = "pinprick"
-version = "0.24.2"
+version = "0.25.0"
 edition = "2024"
 rust-version = "1.88.0"
 description = "GitHub Actions supply chain security tool"
@@ -45,6 +45,7 @@ thiserror = "2"
 colored = "3"
 toml = "1"
 semver = "1"
+sha2 = "0.10"
 minisign-verify = "0.2.5"
 rustix = { version = "1", features = ["fs"] }
 

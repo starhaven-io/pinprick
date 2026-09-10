@@ -423,8 +423,18 @@ impl AuditMatch {
 }
 
 #[derive(Serialize)]
+pub struct AcceptedFinding {
+    #[serde(flatten)]
+    pub finding: AuditFinding,
+    pub reason: String,
+    pub workflow_sha256: String,
+}
+
+#[derive(Serialize)]
 pub struct AuditReport {
     pub findings: Vec<AuditFinding>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub accepted: Vec<AcceptedFinding>,
     pub allowed: Vec<AuditMatch>,
     pub actions_scanned: usize,
     pub had_token: bool,
@@ -472,6 +482,19 @@ pub struct AuditReport {
 
 impl AuditReport {
     pub fn print_human(&self, verbose: bool) {
+        for accepted in &self.accepted {
+            let f = &accepted.finding;
+            println!(
+                "ACCEPTED  {}:{}",
+                sanitize_for_terminal(&f.source_file),
+                f.line.unwrap_or(1)
+            );
+            println!("      {}", sanitize_for_terminal(&f.description));
+            println!("      {}", sanitize_for_terminal(&f.pattern_matched));
+            println!("      reason: {}", sanitize_for_terminal(&accepted.reason));
+            println!("      workflow SHA-256: {}", accepted.workflow_sha256);
+            println!();
+        }
         for f in &self.findings {
             let sev = match f.severity.as_str() {
                 "high" => "HIGH".red().bold(),
@@ -518,7 +541,12 @@ impl AuditReport {
             }
         }
 
-        if self.findings.is_empty() && self.coverage_complete {
+        if self.findings.is_empty() && !self.accepted.is_empty() {
+            println!(
+                "No unaccepted runtime fetch risks found; {} explicitly accepted.",
+                self.accepted.len()
+            );
+        } else if self.findings.is_empty() && self.coverage_complete {
             println!("No runtime fetch risks found.");
         } else if self.findings.is_empty() {
             println!("No runtime fetch risks found in the completed portion of the scan.");
@@ -696,7 +724,13 @@ impl AuditReport {
         let results = self
             .findings
             .iter()
-            .map(|f| {
+            .map(|finding| (finding, None))
+            .chain(
+                self.accepted
+                    .iter()
+                    .map(|entry| (&entry.finding, Some(&entry.reason))),
+            )
+            .map(|(f, reason)| {
                 let (uri, start_line) =
                     if let (Some(wf), Some(wl)) = (f.workflow_file.as_ref(), f.workflow_line) {
                         (wf.clone(), wl)
@@ -710,6 +744,15 @@ impl AuditReport {
                 }
 
                 SarifResult {
+                    suppressions: reason
+                        .map(|reason| {
+                            vec![SarifSuppression {
+                                kind: "external",
+                                status: "accepted",
+                                justification: reason.clone(),
+                            }]
+                        })
+                        .unwrap_or_default(),
                     rule_id: format!("pinprick/{}", f.category),
                     level: sarif_level(&f.severity).to_string(),
                     message: SarifText { text },
@@ -887,11 +930,20 @@ struct SarifConfig {
 
 #[derive(Serialize)]
 struct SarifResult {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    suppressions: Vec<SarifSuppression>,
     #[serde(rename = "ruleId")]
     rule_id: String,
     level: String,
     message: SarifText,
     locations: Vec<SarifLocation>,
+}
+
+#[derive(Serialize)]
+struct SarifSuppression {
+    kind: &'static str,
+    status: &'static str,
+    justification: String,
 }
 
 #[derive(Serialize)]
@@ -946,6 +998,7 @@ mod sarif_tests {
     fn report(findings: Vec<AuditFinding>) -> AuditReport {
         AuditReport {
             findings,
+            accepted: Vec::new(),
             allowed: vec![],
             actions_scanned: 0,
             had_token: false,
@@ -1138,6 +1191,7 @@ mod audit_summary_tests {
 
     fn empty_report() -> AuditReport {
         AuditReport {
+            accepted: Vec::new(),
             findings: vec![],
             allowed: vec![],
             actions_scanned: 0,

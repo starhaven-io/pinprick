@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use serde_norway::Value;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::Path;
@@ -33,7 +34,9 @@ use crate::audited_actions::{AuditSource, AuditedActions};
 use crate::auth;
 use crate::config::Config;
 use crate::github::GitHubClient;
-use crate::output::{AuditFinding, AuditMatch, AuditReport, sanitize_for_terminal};
+use crate::output::{
+    AcceptedFinding, AuditFinding, AuditMatch, AuditReport, sanitize_for_terminal,
+};
 use crate::workflow;
 use colored::Colorize;
 use regex::Regex;
@@ -187,6 +190,7 @@ pub async fn run(
     let mut ignored = 0usize;
     let mut external_skipped: HashSet<String> = HashSet::new();
     let mut coverage_failures = Vec::new();
+    let mut workflow_digests = HashMap::new();
 
     for file in &files {
         let display_name = workflow::display_path(file.path(), repo_root);
@@ -211,6 +215,10 @@ pub async fn run(
             }
         };
 
+        workflow_digests.insert(
+            display_name.clone(),
+            format!("{:x}", Sha256::digest(content.as_bytes())),
+        );
         match extract_job_run_blocks(file.path(), &content) {
             Ok(jobs) => {
                 for run_blocks in jobs {
@@ -510,6 +518,7 @@ pub async fn run(
         eprintln!();
     }
 
+    let accepted = accept_workflow_findings(&mut collector.findings, &workflow_digests, config);
     let before_filters = collector.findings.len();
     collector.findings.retain(|f| {
         config.meets_severity(&f.severity) && !config.is_pattern_ignored(&f.description)
@@ -521,6 +530,9 @@ pub async fn run(
     if config.is_repo_local() {
         let trusted_host_allowed = collector.trusted_host_allowed;
         let mut parts = Vec::new();
+        if !accepted.is_empty() {
+            parts.push(format!("workflow findings accepted: {}", accepted.len()));
+        }
         if suppressed > 0 {
             parts.push(format!("findings suppressed: {suppressed}"));
         }
@@ -559,6 +571,7 @@ pub async fn run(
     let report = AuditReport {
         actions_scanned: completed_actions.len(),
         findings: collector.findings,
+        accepted,
         allowed: collector.allowed,
         had_token,
         rules_version: AUDIT_RULES_VERSION,
@@ -589,6 +602,44 @@ pub async fn run(
     } else {
         Ok(ExitCode::SUCCESS)
     }
+}
+
+fn accept_workflow_findings(
+    findings: &mut Vec<AuditFinding>,
+    workflow_digests: &HashMap<String, String>,
+    config: &Config,
+) -> Vec<AcceptedFinding> {
+    // Only the bytes read through workflow discovery can authorize an acceptance.
+    // Action findings, unreadable files, and global configuration never qualify.
+    if !config.is_repo_local() || config.accept_workflow_findings.is_empty() {
+        return Vec::new();
+    }
+    let mut accepted = Vec::new();
+    let mut remaining = Vec::new();
+    for finding in findings.drain(..) {
+        let acceptance = config.accept_workflow_findings.iter().find(|entry| {
+            finding.action.is_empty()
+                && finding.workflow_file.is_none()
+                && entry.workflow == finding.source_file
+                && workflow_digests.get(&entry.workflow) == Some(&entry.workflow_sha256)
+                && entry.category == finding.category
+                && entry.severity == finding.severity
+                && entry.description == finding.description
+                && entry.command == finding.pattern_matched
+                && !entry.reason.trim().is_empty()
+        });
+        if let Some(entry) = acceptance {
+            accepted.push(AcceptedFinding {
+                finding,
+                reason: entry.reason.clone(),
+                workflow_sha256: entry.workflow_sha256.clone(),
+            });
+        } else {
+            remaining.push(finding);
+        }
+    }
+    *findings = remaining;
+    accepted
 }
 
 /// Surface `uses: docker://…` container refs. A digest-pinned image is the
