@@ -32,6 +32,7 @@ jobs:
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
       run_codecov: ${{ steps.matrix.outputs.run_codecov }}
+      run_pinprick: ${{ steps.matrix.outputs.run_pinprick }}
       run_zizmor: ${{ steps.matrix.outputs.run_zizmor }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -49,6 +50,7 @@ jobs:
           # Codecov has a baseline for PR comparisons.
           if [[ "${EVENT_NAME}" == "push" ]]; then
             echo 'matrix=[{"name":"Lint","check":"lint","runner":"ubuntu-24.04","fetch_depth":1},{"name":"Coverage","check":"coverage","runner":"ubuntu-24.04","fetch_depth":1}]' >> "${GITHUB_OUTPUT}"
+            echo "run_pinprick=false" >> "${GITHUB_OUTPUT}"
             echo "run_zizmor=false" >> "${GITHUB_OUTPUT}"
             echo "run_codecov=true" >> "${GITHUB_OUTPUT}"
             exit 0
@@ -64,6 +66,7 @@ jobs:
             fi
           }
           RUN_ZIZMOR=false
+          RUN_PINPRICK=false
 
           # `edited` (title/body/base) also runs the full path-derived matrix. The
           # aggregate "conclusion" job is the only required status check, so it must
@@ -109,6 +112,9 @@ jobs:
           if echo "${CHANGED}" | grep -qE '^\.github/workflows/'; then
             RUN_ZIZMOR=true
           fi
+          if echo "${CHANGED}" | grep -qE '^src/|^Cargo\.(toml|lock)$|^rust-toolchain\.toml$|^\.github/workflows/'; then
+            RUN_PINPRICK=true
+          fi
 
           # Fail safe for unclassified project inputs. Documentation-only
           # changes may skip the expensive matrix; every other unknown path
@@ -123,6 +129,7 @@ jobs:
           fi
 
           echo "matrix=${MATRIX}" >> "${GITHUB_OUTPUT}"
+          echo "run_pinprick=${RUN_PINPRICK}" >> "${GITHUB_OUTPUT}"
           echo "run_zizmor=${RUN_ZIZMOR}" >> "${GITHUB_OUTPUT}"
           echo "run_codecov=$(jq -r 'any(.[]; .check == "coverage")' <<<"${MATRIX}")" >> "${GITHUB_OUTPUT}"
 
@@ -468,9 +475,24 @@ jobs:
       security-events: write # required for zizmor SARIF upload
     uses: starhaven-io/.github/.github/workflows/reusable-zizmor.yml@e748ec16bd1207114a766d1d761a6743a6e3bf3a # v2026.09.09.4
 
+  pinprick:
+    name: pinprick
+    needs: generate-matrix
+    if: needs.generate-matrix.outputs.run_pinprick == 'true'
+    permissions:
+      contents: read
+      security-events: write # required for SARIF upload on same-repository changes
+    # Temporary trade-off: gate with the released engine until the fleet-pinned
+    # scanner can follow a local reusable-workflow call. Restore PR-time
+    # build-from-source dogfooding when that support is delivered.
+    uses: starhaven-io/.github/.github/workflows/reusable-pinprick-audit.yml@e748ec16bd1207114a766d1d761a6743a6e3bf3a # v2026.09.09.4
+    with:
+      advanced-security: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+      fail-on-findings: true
+
   conclusion:
     name: conclusion
-    needs: [generate-matrix, commits, check, zizmor, codecov]
+    needs: [generate-matrix, commits, check, zizmor, pinprick, codecov]
     runs-on: ubuntu-slim
     timeout-minutes: 15
     if: always()
@@ -483,29 +505,41 @@ jobs:
           COMMITS_RESULT: ${{ needs.commits.result }}
           CHECK_RESULT: ${{ needs.check.result }}
           ZIZMOR_RESULT: ${{ needs.zizmor.result }}
+          PINPRICK_RESULT: ${{ needs.pinprick.result }}
           MATRIX: ${{ needs.generate-matrix.outputs.matrix }}
           RUN_ZIZMOR: ${{ needs.generate-matrix.outputs.run_zizmor }}
+          RUN_PINPRICK: ${{ needs.generate-matrix.outputs.run_pinprick }}
           EVENT_NAME: ${{ github.event_name }}
           MATRIX_RESULT: ${{ needs.generate-matrix.result }}
         run: |
+          require_result() {
+            local name="$1" result="$2" required="$3"
+            case "${required}" in
+              true) test "${result}" = success ;;
+              false) test "${result}" = skipped ;;
+              *) echo "::error::Invalid routing decision for ${name}."; return 1 ;;
+            esac || { echo "::error::${name} ended with ${result:-no result}."; return 1; }
+          }
+
           test "${MATRIX_RESULT}" = "success"
-          if [[ "${EVENT_NAME}" == "pull_request" ]]; then
-            test "${COMMITS_RESULT}" = "success"
-          else
-            test "${COMMITS_RESULT}" = "skipped"
-          fi
+          case "${EVENT_NAME}" in
+            pull_request) require_result commits "${COMMITS_RESULT}" true ;;
+            push) require_result commits "${COMMITS_RESULT}" false ;;
+            *) echo "::error::Unexpected CI event."; exit 1 ;;
+          esac
           if [[ "${MATRIX}" == "[]" ]]; then
-            test "${CHECK_RESULT}" = "skipped"
+            require_result check "${CHECK_RESULT}" false
+          elif [[ -n "${MATRIX}" ]]; then
+            require_result check "${CHECK_RESULT}" true
           else
-            test "${CHECK_RESULT}" = "success"
+            echo "::error::The check matrix could not be determined."
+            exit 1
           fi
-          if [[ "${RUN_ZIZMOR}" == "true" ]]; then
-            test "${ZIZMOR_RESULT}" = "success"
-          else
-            test "${ZIZMOR_RESULT}" = "skipped"
-          fi
-          if [[ "${RUN_CODECOV}" == "true" && "${CODECOV_ELIGIBLE}" == "true" ]]; then
-            test "${CODECOV_RESULT}" = "success"
-          else
-            test "${CODECOV_RESULT}" = "skipped"
-          fi
+          require_result zizmor "${ZIZMOR_RESULT}" "${RUN_ZIZMOR}"
+          require_result pinprick "${PINPRICK_RESULT}" "${RUN_PINPRICK}"
+          case "${RUN_CODECOV}:${CODECOV_ELIGIBLE}" in
+            true:true) CODECOV_REQUIRED=true ;;
+            true:false | false:true | false:false) CODECOV_REQUIRED=false ;;
+            *) echo "::error::Invalid Codecov routing decision."; exit 1 ;;
+          esac
+          require_result codecov "${CODECOV_RESULT}" "${CODECOV_REQUIRED}"
