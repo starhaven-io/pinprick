@@ -3,6 +3,10 @@ visibility: "public"
 license: "agpl"
 params:
   codecov: true
+  conclusion:
+    workflow: ".github/workflows/ci.yml"
+    audit-jobs: ["pinprick"]
+    pinprick-jobs: ["pinprick"]
   astro-docs: true
   renovate: true
   dependabot:
