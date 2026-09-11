@@ -5,6 +5,14 @@ on:
     branches:
       - main
     paths:
+      - "**/*.rs"
+      - "**/Cargo.toml"
+      - "**/Cargo.lock"
+      - "**/rust-toolchain*"
+      - "**/rust-project.json"
+      - "**/.cargo/**"
+      - "audited-actions/**"
+      - "catalog-minisign.pub"
       - ".github/workflows/**"
 
 concurrency:
@@ -19,10 +27,10 @@ jobs:
     permissions:
       contents: read
       security-events: write # required to upload SARIF results
-    uses: starhaven-io/.github/.github/workflows/reusable-codeql.yml@1c1fb84659360d176444ef9f7de1db2884c442ba # v2026.09.10.2
+    uses: starhaven-io/.github/.github/workflows/reusable-codeql.yml@a2ff1457a008d2fe895f044330469e38d6d97a6d # v2026.09.10.3
     with:
-      languages: '["actions"]'
-      runner: "ubuntu-slim"
+      languages: '["actions","rust"]'
+      runner: "ubuntu-24.04"
       timeout-minutes: 30
-      build-mode: ""
+      build-mode: "none"
       build-profile: ""
