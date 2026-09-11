@@ -3,6 +3,7 @@ use serde_norway::Value;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::fmt::Write as _;
 use std::path::Path;
 use std::process::ExitCode;
 use std::sync::LazyLock;
@@ -215,10 +216,11 @@ pub async fn run(
             }
         };
 
-        workflow_digests.insert(
-            display_name.clone(),
-            format!("{:x}", Sha256::digest(content.as_bytes())),
-        );
+        let mut workflow_digest = String::with_capacity(64);
+        for byte in Sha256::digest(content.as_bytes()) {
+            write!(workflow_digest, "{byte:02x}")?;
+        }
+        workflow_digests.insert(display_name.clone(), workflow_digest);
         match extract_job_run_blocks(file.path(), &content) {
             Ok(jobs) => {
                 for run_blocks in jobs {

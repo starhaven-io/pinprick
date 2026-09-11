@@ -3,6 +3,7 @@ mod common;
 use predicates::prelude::*;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::fmt::Write as _;
 
 const COMMAND: &str = r#"curl --output "$OUTPUT" "$URL""#;
 const DESCRIPTION: &str =
@@ -15,17 +16,20 @@ fn workflow(extra: &str) -> String {
 }
 
 fn acceptance(source: &str) -> String {
+    let mut digest = String::with_capacity(64);
+    for byte in Sha256::digest(source.as_bytes()) {
+        write!(digest, "{byte:02x}").unwrap();
+    }
     format!(
         r#"[[accept-workflow-findings]]
 workflow = ".github/workflows/scan.yml"
-workflow-sha256 = "{:x}"
+workflow-sha256 = "{digest}"
 category = "shell_fetch"
 severity = "low"
 description = {DESCRIPTION:?}
 command = {COMMAND:?}
 reason = "Maintainer accepts this reviewed archive input; never execute its contents."
-"#,
-        Sha256::digest(source.as_bytes())
+"#
     )
 }
 
@@ -44,7 +48,7 @@ fn audit(path: &std::path::Path, options: &[&str]) -> (i32, Value) {
 
 #[test]
 fn reviewed_workflow_finding_remains_visible_in_every_format() {
-    let source = workflow("");
+    let source = workflow("# reviewed\n");
     let dir = common::repo_with_config("scan.yml", &source, &acceptance(&source));
     let (status, report) = audit(dir.path(), &["--json"]);
     assert_eq!(status, 0);
@@ -53,6 +57,10 @@ fn reviewed_workflow_finding_remains_visible_in_every_format() {
     assert_eq!(report["accepted"].as_array().unwrap().len(), 1);
     assert_eq!(report["accepted"][0]["pattern_matched"], COMMAND);
     assert_eq!(report["accepted"][0]["description"], DESCRIPTION);
+    assert_eq!(
+        report["accepted"][0]["workflow_sha256"],
+        "0da65ac968ce73f7bd73a7adc681581a93e07c8fd8eb11b856e1e4ef9a0ae58c"
+    );
     assert!(
         report["accepted"][0]["reason"]
             .as_str()
