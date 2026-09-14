@@ -5,6 +5,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -20,6 +21,15 @@ def workflow_step(workflow: str, name: str) -> str:
     step = content.split(f'      - name: {name}\n', 1)[1]
     step = step.split('\n      - ', 1)[0]
     return textwrap.dedent(step.split('        run: |\n', 1)[1].split('\n        id:', 1)[0])
+
+
+def just_recipe(signature: str) -> str:
+    # Run the checked-in shell body even on CI runners without just.
+    content = (ROOT / 'justfile').read_text().split(f'\n{signature}:\n', 1)[1]
+    body = textwrap.dedent(re.split(r'\n(?=\S)', content, maxsplit=1)[0])
+    if not body.startswith('#!/usr/bin/env bash\n') or '{{' in body:
+        raise AssertionError('recipe requires just evaluation instead of direct Bash execution')
+    return body
 
 
 class ReleaseToolsTests(unittest.TestCase):
@@ -135,6 +145,8 @@ codesign() {
         for fresh, expected_entries in [(1, 2), (0, 0)]:
             with self.subTest(fresh=fresh), tempfile.TemporaryDirectory() as temp:
                 root = Path(temp)
+                (root / 'scripts').mkdir()
+                shutil.copy2(ROOT / 'scripts/audited-actions.jq', root / 'scripts')
                 (root / 'bin').mkdir()
                 (root / 'scratch').mkdir()
                 (root / 'target/debug').mkdir(parents=True)
@@ -175,11 +187,10 @@ printf '{"scanned_fresh":%s,"rules_version":7,"coverage_complete":true,"ignored"
                 self.assertEqual(list((root / 'scratch').iterdir()), [])
 
     def test_add_action_restamp_preserves_canonical_version_order(self):
-        just = shutil.which('just')
-        if just is None:
-            self.skipTest('just is required to exercise the add-action recipe')
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
+            (root / 'scripts').mkdir()
+            shutil.copy2(ROOT / 'scripts/audited-actions.jq', root / 'scripts')
             binary_dir = root / 'bin'
             binary_dir.mkdir()
             scratch = root / 'scratch'
@@ -214,8 +225,8 @@ printf '%s\n' '{"scanned_fresh":1,"rules_version":1,"coverage_complete":true,"ig
                 (binary_dir / 'mktemp').chmod(0o755)
 
             result = subprocess.run(
-                [just, '--justfile', str(ROOT / 'justfile'), '--working-directory',
-                 str(root), 'add-action', 'example/action'],
+                ['bash', '-euo', 'pipefail', '-c', just_recipe('add-action action_key'),
+                 'add-action', 'example/action'],
                 cwd=root,
                 env=dict(
                     os.environ,

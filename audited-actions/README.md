@@ -51,6 +51,8 @@ Each file is named for the exact action identity and contains an array of audite
 
 `rules_version` records the detection semantics that produced that entry's clean verdict. It is earned from the current scanner's JSON report, not chosen manually. It changes only when detection or suppression semantics could invalidate existing verdicts, independently of the pinprick release version.
 
+Tags must name a full release version (at least three numeric components, with an optional `v` prefix and version suffix), not a sliding alias such as `v3` or `v3.1`. Calendar versions such as `2026.09.13.1` are supported. Manual SHA audits use `sha:<first-seven-characters>`. Adding another release at an already-recorded SHA preserves its existing full release label while refreshing the audit stamp.
+
 ## Trust model
 
 These files reach users two ways with different trust anchors:

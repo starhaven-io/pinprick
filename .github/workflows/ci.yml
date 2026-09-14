@@ -357,18 +357,19 @@ jobs:
           WRANGLER_SEND_METRICS: "false"
 
 
-      - name: Check sort order
+      - name: Check catalog format and sort order
         if: matrix.check == 'verify-audited'
         run: |
           FAILED=0
           while IFS= read -r -d '' JSON_FILE; do
-            if ! jq -e '
+            if ! jq -e -L scripts '
+              include "audited-actions";
               type == "array" and
               all(.[];
                 type == "object" and
                 keys_unsorted == ["sha", "tag", "rules_version"] and
                 (.sha | type == "string" and test("^[0-9a-f]{40}$")) and
-                (.tag | type == "string") and
+                (. as $entry | .tag | is_catalog_tag($entry.sha)) and
                 (.rules_version |
                   type == "number" and . >= 1 and . <= 4294967295 and . == floor))
             ' "${JSON_FILE}" > /dev/null; then
@@ -376,7 +377,7 @@ jobs:
               FAILED=1
               continue
             fi
-            SORTED=$(jq 'sort_by([(.tag | ltrimstr("v") | split(".") | map(tonumber? // 0)), .tag]) | reverse' "${JSON_FILE}")
+            SORTED=$(jq -L scripts 'include "audited-actions"; sort_catalog' "${JSON_FILE}")
             ACTUAL=$(jq '.' "${JSON_FILE}")
             if [[ "${SORTED}" != "${ACTUAL}" ]]; then
               echo "::error::${JSON_FILE} is not sorted by version"

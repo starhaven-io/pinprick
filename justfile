@@ -76,6 +76,12 @@ add-action action_key:
         echo "error: no releases found for ${OWNER_REPO}" >&2
         exit 1
     fi
+    if ! jq -en -L scripts --arg tag "$LATEST" '
+      include "audited-actions"; $tag | is_release_tag
+    ' > /dev/null; then
+        echo "error: unsupported release tag '${LATEST}'; expected a full release version" >&2
+        exit 1
+    fi
     echo "  latest release: $LATEST"
 
     LATEST_SHA=$(gh api "repos/${OWNER}/${REPO}/git/ref/tags/${LATEST}" --jq '.object.sha')
@@ -112,10 +118,8 @@ add-action action_key:
     FILE="audited-actions/${ACTION_KEY}.json"
     mkdir -p "$(dirname "$FILE")"
     [[ -f "$FILE" ]] || echo "[]" > "$FILE"
-    jq -r --arg sha "$LATEST_SHA" --arg tag "$LATEST" --argjson rules_version "$RULES_VERSION" '
-      ([{sha: $sha, tag: $tag, rules_version: $rules_version}] + [.[] | select(.sha != $sha)])
-      | sort_by([(.tag | ltrimstr("v") | split(".") | map(tonumber? // 0)), .tag]) | reverse
-      | "[\n" + ([.[] | "  { \"sha\": \(.sha | tojson), \"tag\": \(.tag | tojson), \"rules_version\": \(.rules_version) }"] | join(",\n")) + "\n]"
+    jq -r -L scripts --arg sha "$LATEST_SHA" --arg tag "$LATEST" --argjson rules_version "$RULES_VERSION" '
+      include "audited-actions"; add_audited_entry($sha; $tag; $rules_version)
     ' "$FILE" > "$FILE.tmp"
     command mv "$FILE.tmp" "$FILE"
     echo "  wrote ${FILE}"
