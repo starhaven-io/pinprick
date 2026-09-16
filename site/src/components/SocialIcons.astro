@@ -6,11 +6,9 @@ declare const __PINPRICK_VERSION__: string;
 const version = __PINPRICK_VERSION__;
 ---
 
-{
-  version && (
-    <a class="version-badge" href={`https://github.com/starhaven-io/pinprick/releases/tag/v${version}`}>
-      v{version}
-    </a>
-  )
-}
+{version && (
+  <a class="version-badge" href={`https://github.com/starhaven-io/pinprick/releases/tag/v${version}`}>
+    v{version}
+  </a>
+)}
 <Default {...Astro.props} />
