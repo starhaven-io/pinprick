@@ -1,4 +1,5 @@
 [
+  { "sha": "848c272c7bfe984a197bd4d16383f4c106ec61e6", "tag": "2026.09.21.1", "rules_version": 1 },
   { "sha": "1e34f2e2acaa766b7efacb8c26352e6abbb023f9", "tag": "2026.09.13.1", "rules_version": 1 },
   { "sha": "f8d4222eb633e65c2a0157383cf80861fc7fae7f", "tag": "2026.09.07.1", "rules_version": 1 },
   { "sha": "3cdb78d0f62ad29dd32de765782654f4eedea607", "tag": "2026.08.31.1", "rules_version": 1 },
