@@ -91,6 +91,29 @@ fn unsupported_multiline_uses_makes_score_incomplete() {
 }
 
 #[test]
+fn uses_after_folded_step_name_is_scored() {
+    let workflow = "name: folded\non: push\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - name: >\n          Check out\n        uses: evil/action@main\n";
+    let dir = common::repo_with_workflow("ci.yml", workflow);
+    let output = common::pinprick_cmd()
+        .arg("--json")
+        .arg("score")
+        .arg(dir.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        json["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| finding["id"] == "pin.branch"),
+        "{json}"
+    );
+}
+
+#[test]
 fn unknown_owner_sha_pinned_action_scores_cleanly() {
     let dir = common::repo_with_workflow("ci.yml", WORKFLOW_UNKNOWN_OWNER_SHA_PINNED);
     let output = common::pinprick_cmd()
