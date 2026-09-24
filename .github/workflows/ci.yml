@@ -278,7 +278,7 @@ jobs:
 
       - name: Install cargo-nextest
         if: matrix.check == 'coverage'
-        run: cargo install cargo-nextest --locked --version 0.9.144
+        run: cargo install cargo-nextest --locked --version 0.9.145
 
       - name: Install cargo-llvm-cov
         if: matrix.check == 'coverage'
