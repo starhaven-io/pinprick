@@ -1610,9 +1610,10 @@ pub(crate) fn scan_js_content(
 }
 
 fn sink_waits_for_argument(line: &str, markers: &[&str]) -> bool {
+    let quotes = JavaScriptQuoteIndex::new(line);
     markers.iter().any(|marker| {
         line.match_indices(marker).any(|(index, _)| {
-            sink_argument_start(line, marker, index)
+            sink_argument_start(line, marker, index, &quotes)
                 .is_some_and(|start| !sink_first_argument_is_complete(&line[start..]))
         })
     })
@@ -2073,15 +2074,26 @@ fn matching_closing_parenthesis(value: &str, open: usize) -> Option<usize> {
 }
 
 fn update_literal_url_binding(line: &str, bindings: &mut HashMap<String, String>) {
-    let Some((left, right)) = line.split_once('=') else {
+    let Some((last, _)) = line
+        .match_indices('=')
+        .take_while(|(index, _)| !line[index + 1..].starts_with(['=', '>']))
+        .last()
+    else {
         return;
     };
-    if right.starts_with(['=', '>']) {
-        return;
+    let mut right_start = last + 1;
+    for left in line[..last].rsplit('=') {
+        let right = &line[right_start..];
+        right_start -= left.len() + 1;
+        update_single_literal_url_binding(left, right, bindings);
     }
-    if right.contains('=') {
-        update_literal_url_binding(right, bindings);
-    }
+}
+
+fn update_single_literal_url_binding(
+    left: &str,
+    right: &str,
+    bindings: &mut HashMap<String, String>,
+) {
     let left = left.trim_end();
     let compound_operator = [
         ">>>", "??", "&&", "||", "**", "//", "<<", ">>", "+", "-", "*", "/", "%", "&", "|", "^",
@@ -2215,9 +2227,10 @@ fn javascript_indentation(line: &str) -> usize {
 }
 
 fn javascript_unbraced_arrow_parameter_names(line: &str) -> Option<HashSet<String>> {
+    let quotes = JavaScriptQuoteIndex::new(line);
     let (arrow, _) = line
         .match_indices("=>")
-        .filter(|(index, _)| !javascript_position_is_quoted(line, *index))
+        .filter(|(index, _)| !quotes.is_quoted(*index))
         .last()?;
     if !line[arrow + 2..].trim().is_empty() {
         return None;
@@ -2277,45 +2290,207 @@ fn remove_parameter_bindings(parameters: &str, bindings: &mut HashMap<String, St
 
 fn javascript_bound_parameter_names(parameters: &str) -> HashSet<String> {
     let mut names = HashSet::new();
-    for parameter in top_level_comma_segments(parameters) {
-        collect_javascript_binding_pattern(parameter, &mut names);
+    let delimiters = JavaScriptDelimiterIndex::new(parameters);
+    for parameter in delimiters.comma_segments(parameters) {
+        collect_javascript_binding_pattern(parameter, &delimiters, &mut names);
     }
     names
 }
 
-fn collect_javascript_binding_pattern(pattern: &str, names: &mut HashSet<String>) {
-    let pattern = top_level_split_once(pattern, '=')
-        .map_or(pattern, |(binding, _)| binding)
-        .trim();
-    let pattern = pattern.strip_prefix("...").unwrap_or(pattern).trim();
-    let pattern = top_level_split_once(pattern, ':')
-        .map_or(pattern, |(binding, _)| binding)
-        .trim();
-    if pattern.starts_with('{') && pattern.ends_with('}') {
-        for property in top_level_comma_segments(&pattern[1..pattern.len() - 1]) {
-            if let Some((_, binding)) = top_level_split_once(property, ':') {
-                collect_javascript_binding_pattern(binding, names);
-            } else {
-                collect_javascript_binding_pattern(property, names);
+fn collect_javascript_binding_pattern<'a>(
+    pattern: &'a str,
+    delimiters: &JavaScriptDelimiterIndex<'a>,
+    names: &mut HashSet<String>,
+) {
+    let mut pending = vec![pattern];
+    while let Some(pattern) = pending.pop() {
+        let pattern = delimiters
+            .split_once(pattern, '=')
+            .map_or(pattern, |(binding, _)| binding)
+            .trim();
+        let pattern = pattern.strip_prefix("...").unwrap_or(pattern).trim();
+        let pattern = delimiters
+            .split_once(pattern, ':')
+            .map_or(pattern, |(binding, _)| binding)
+            .trim();
+        if pattern.starts_with('{') && pattern.ends_with('}') {
+            for property in delimiters.comma_segments(&pattern[1..pattern.len() - 1]) {
+                pending.push(
+                    delimiters
+                        .split_once(property, ':')
+                        .map_or(property, |(_, binding)| binding),
+                );
             }
+            continue;
         }
-        return;
-    }
-    if pattern.starts_with('[') && pattern.ends_with(']') {
-        for item in top_level_comma_segments(&pattern[1..pattern.len() - 1]) {
-            collect_javascript_binding_pattern(item, names);
+        if pattern.starts_with('[') && pattern.ends_with(']') {
+            pending.extend(delimiters.comma_segments(&pattern[1..pattern.len() - 1]));
+            continue;
         }
-        return;
+        if let Some(name) = pattern
+            .split(|character: char| !is_javascript_identifier_character(character))
+            .rfind(|name| {
+                !name.is_empty()
+                    && !name.as_bytes()[0].is_ascii_digit()
+                    && !matches!(*name, "public" | "private" | "protected" | "readonly")
+            })
+        {
+            names.insert(name.to_string());
+        }
     }
-    if let Some(name) = pattern
-        .split(|character: char| !is_javascript_identifier_character(character))
-        .rfind(|name| {
-            !name.is_empty()
-                && !name.as_bytes()[0].is_ascii_digit()
-                && !matches!(*name, "public" | "private" | "protected" | "readonly")
-        })
-    {
-        names.insert(name.to_string());
+}
+
+struct JavaScriptDelimiterSpan {
+    start: usize,
+    after: usize,
+    after_parenthesis: usize,
+    character: char,
+}
+
+// These helpers historically treat template strings as opaque and count mixed
+// delimiters by depth. Keep that grammar separate from the interpolation-aware
+// quote index, while allowing nested callers to skip an already-scanned span.
+pub(crate) struct JavaScriptDelimiterIndex<'a> {
+    source: &'a str,
+    spans: Vec<JavaScriptDelimiterSpan>,
+}
+
+impl<'a> JavaScriptDelimiterIndex<'a> {
+    pub(crate) fn new(source: &'a str) -> Self {
+        let mut spans: Vec<_> = source
+            .char_indices()
+            .filter(|(_, character)| {
+                matches!(
+                    character,
+                    '\'' | '"' | '`' | '\\' | '(' | '[' | '{' | ')' | ']' | '}'
+                )
+            })
+            .map(|(start, character)| JavaScriptDelimiterSpan {
+                start,
+                character,
+                after: 0,
+                after_parenthesis: 0,
+            })
+            .collect();
+        let mut following_groups = vec![None; spans.len()];
+        let mut following_parentheses = vec![None; spans.len()];
+        let mut next_group = None;
+        let mut next_parenthesis = None;
+        let mut next_quotes = [None; 3];
+        let mut after_next_quotes = next_quotes;
+        // Index each possible local starting point, including calls inside a
+        // template interpolation. A whole-file quote state would hide those.
+        for index in (0..spans.len()).rev() {
+            following_groups[index] = next_group;
+            following_parentheses[index] = next_parenthesis;
+            let following_quotes = next_quotes;
+            let character = spans[index].character;
+            if let Some(quote) = ['\'', '"', '`']
+                .iter()
+                .position(|&quote| quote == character)
+            {
+                let closing: Option<usize> = next_quotes[quote];
+                spans[index].after = closing.map_or(0, |closing| spans[closing].start + 1);
+                next_group = closing.and_then(|closing| following_groups[closing]);
+                next_parenthesis = closing.and_then(|closing| following_parentheses[closing]);
+                next_quotes[quote] = Some(index);
+            } else if matches!(character, '(' | '[' | '{') {
+                spans[index].after =
+                    next_group.map_or(0, |closing: usize| spans[closing].start + 1);
+                next_group = next_group.and_then(|closing| following_groups[closing]);
+                if character == '(' {
+                    spans[index].after_parenthesis =
+                        next_parenthesis.map_or(0, |closing: usize| spans[closing].start + 1);
+                    next_parenthesis =
+                        next_parenthesis.and_then(|closing| following_parentheses[closing]);
+                }
+            } else if matches!(character, ')' | ']' | '}') {
+                next_group = Some(index);
+                if character == ')' {
+                    next_parenthesis = Some(index);
+                }
+            } else if character == '\\'
+                && spans
+                    .get(index + 1)
+                    .is_some_and(|next| next.start == spans[index].start + 1)
+            {
+                next_quotes = after_next_quotes;
+            }
+            after_next_quotes = following_quotes;
+        }
+        Self { source, spans }
+    }
+
+    fn offset(&self, value: &str) -> usize {
+        let offset = value.as_ptr() as usize - self.source.as_ptr() as usize;
+        assert!(offset <= self.source.len() && value.len() <= self.source.len() - offset);
+        offset
+    }
+
+    fn split_once(&self, value: &'a str, needle: char) -> Option<(&'a str, &'a str)> {
+        let start = self.offset(value);
+        let end = start + value.len();
+        let mut position = start;
+        let mut span_index = self.spans.partition_point(|span| span.start < position);
+        while position < end {
+            if let Some(span) = self.spans.get(span_index)
+                && span.start == position
+            {
+                span_index += 1;
+                if matches!(span.character, '\'' | '"' | '`' | '(' | '[' | '{') {
+                    position = if span.after == 0 {
+                        end
+                    } else {
+                        span.after.min(end)
+                    };
+                    span_index = self.spans.partition_point(|span| span.start < position);
+                    continue;
+                }
+            }
+            let character = self.source[position..].chars().next()?;
+            if character == needle {
+                return Some((
+                    &value[..position - start],
+                    &value[position - start + character.len_utf8()..],
+                ));
+            }
+            position += character.len_utf8();
+        }
+        None
+    }
+
+    pub(crate) fn arguments(&self, mut value: &'a str) -> Vec<&'a str> {
+        let mut arguments = Vec::new();
+        while let Some((argument, rest)) = self.split_once(value, ',') {
+            arguments.push(argument.trim());
+            value = rest;
+        }
+        if !value.trim().is_empty() {
+            arguments.push(value.trim());
+        }
+        arguments
+    }
+
+    fn comma_segments(&self, value: &'a str) -> Vec<&'a str> {
+        self.arguments(value)
+            .into_iter()
+            .filter(|value| !value.is_empty())
+            .collect()
+    }
+
+    pub(crate) fn call_parts(&self, value: &'a str) -> Option<(&'a str, &'a str)> {
+        let value = value.trim_start();
+        value.strip_prefix('(')?;
+        let start = self.offset(value);
+        let index = self
+            .spans
+            .binary_search_by_key(&start, |span| span.start)
+            .ok()?;
+        let after = self.spans[index].after_parenthesis;
+        if after == 0 || after > start + value.len() {
+            return None;
+        }
+        Some((&value[1..after - start - 1], &value[after - start..]))
     }
 }
 
@@ -2668,11 +2843,13 @@ fn scan_indirect_url_sink(
     language: &str,
     report_unresolved: bool,
 ) {
+    let quotes = JavaScriptQuoteIndex::new(line);
+    let quotes = &quotes;
     let mut sinks: Vec<(usize, usize)> = markers
         .iter()
         .flat_map(|marker| {
             line.match_indices(marker).filter_map(move |(index, _)| {
-                sink_argument_start(line, marker, index).map(|start| (index, start))
+                sink_argument_start(line, marker, index, quotes).map(|start| (index, start))
             })
         })
         .collect();
@@ -2884,15 +3061,19 @@ fn scan_indirect_url_sink(
     }
 }
 
-fn sink_argument_start(line: &str, marker: &str, index: usize) -> Option<usize> {
+fn sink_argument_start(
+    line: &str,
+    marker: &str,
+    index: usize,
+    quotes: &JavaScriptQuoteIndex,
+) -> Option<usize> {
     let boundary = line[..index].chars().next_back();
     let prefix = line[..index].trim_end();
     let valid_boundary = boundary.is_none_or(|c| {
         c == '.' && marker == "fetch"
             || c != '.' && c != '_' && c != '$' && !c.is_ascii_alphanumeric()
     });
-    if !valid_boundary || javascript_position_is_quoted(line, index) || prefix.ends_with("function")
-    {
+    if !valid_boundary || quotes.is_quoted(index) || prefix.ends_with("function") {
         return None;
     }
 
@@ -2910,7 +3091,93 @@ fn sink_argument_start(line: &str, marker: &str, index: usize) -> Option<usize> 
     }
 }
 
-pub(crate) fn javascript_position_is_quoted(line: &str, position: usize) -> bool {
+// Scans only as far as the furthest position asked about. Dependency passes
+// ask about loader calls near the top of most files, and scanning whole files
+// on every pass made many-file actions slower than per-query prefix scans.
+pub(crate) struct JavaScriptQuoteIndex<'a> {
+    line: &'a str,
+    scan: std::cell::RefCell<JavaScriptQuoteScan>,
+}
+
+#[derive(Default)]
+struct JavaScriptQuoteScan {
+    next: usize,
+    quoted: Vec<bool>,
+    quote: Option<char>,
+    escaped: bool,
+    template_expressions: Vec<usize>,
+}
+
+impl<'a> JavaScriptQuoteIndex<'a> {
+    pub(crate) fn new(line: &'a str) -> Self {
+        Self {
+            line,
+            scan: std::cell::RefCell::new(JavaScriptQuoteScan {
+                quoted: vec![false],
+                ..JavaScriptQuoteScan::default()
+            }),
+        }
+    }
+
+    pub(crate) fn is_quoted(&self, position: usize) -> bool {
+        let mut scan = self.scan.borrow_mut();
+        while scan.next < position {
+            scan.step(self.line);
+        }
+        scan.quoted.get(position).copied().unwrap_or(false)
+    }
+}
+
+impl JavaScriptQuoteScan {
+    fn step(&mut self, line: &str) {
+        let mut characters = line[self.next..].chars();
+        let character = characters.next().expect("callers query within the line");
+        let mut end = self.next + character.len_utf8();
+        if self.escaped {
+            self.escaped = false;
+        } else if character == '\\' && self.quote.is_some() {
+            self.escaped = true;
+        } else if self.quote == Some('`') && character == '$' && characters.next() == Some('{') {
+            // A prefix ending at `$` has not entered the expression yet.
+            self.mark(end, true);
+            end += 1;
+            self.quote = None;
+            self.template_expressions.push(1);
+        } else if matches!(character, '\'' | '"' | '`') {
+            self.quote = if self.quote == Some(character) {
+                None
+            } else if self.quote.is_none() {
+                Some(character)
+            } else {
+                self.quote
+            };
+        } else if self.quote.is_none()
+            && let Some(depth) = self.template_expressions.last_mut()
+        {
+            if character == '{' {
+                *depth += 1;
+            } else if character == '}' {
+                *depth -= 1;
+                if *depth == 0 {
+                    self.template_expressions.pop();
+                    self.quote = Some('`');
+                }
+            }
+        }
+        self.mark(end, self.quote.is_some());
+        self.next = end;
+    }
+
+    fn mark(&mut self, position: usize, quoted: bool) {
+        if self.quoted.len() <= position {
+            self.quoted.resize(position + 1, false);
+        }
+        self.quoted[position] = quoted;
+    }
+}
+
+#[cfg(test)]
+fn javascript_position_is_quoted(line: &str, position: usize) -> bool {
     let mut quote = None;
     let mut escaped = false;
     let mut template_expressions: Vec<usize> = Vec::new();
@@ -4462,6 +4729,116 @@ curl -fsSL "$RELEASE_URL" | cat > tool"#,
             bindings.get("endpoint").map(String::as_str),
             Some("https://example.com/v1.2.3/tool")
         );
+    }
+
+    #[test]
+    fn chained_bindings_preserve_inner_invalidation_and_comparison_boundaries() {
+        let url = "https://example.com/v1.2.3/tool";
+        for (line, remaining) in [
+            ("first = second = dynamic", vec![]),
+            ("first = second == candidate", vec!["second"]),
+            ("first = second => candidate", vec!["second"]),
+            ("first += second", vec!["second"]),
+        ] {
+            let mut bindings = HashMap::from([
+                ("first".to_string(), url.to_string()),
+                ("second".to_string(), url.to_string()),
+            ]);
+            update_literal_url_binding(line, &mut bindings);
+            assert_eq!(bindings.len(), remaining.len(), "{line}");
+            for name in remaining {
+                assert_eq!(bindings.get(name).map(String::as_str), Some(url), "{line}");
+            }
+        }
+    }
+
+    #[test]
+    fn javascript_quote_index_preserves_prefix_semantics() {
+        let alphabet = ['a', '\'', '"', '`', '\\', '$', '{', '}', 'é'];
+        for number in 0..alphabet.len().pow(5) {
+            let mut encoded = number;
+            let mut line = String::new();
+            for _ in 0..5 {
+                line.push(alphabet[encoded % alphabet.len()]);
+                encoded /= alphabet.len();
+            }
+            assert_quote_prefixes(&line);
+        }
+        for line in [
+            "`text ${fetch(endpoint)} more`",
+            "`outer ${`inner ${fn({key: 'value'})}`} tail`",
+            "'escaped \\\' quote' + \"é\"",
+            "`escaped \\${quoted} ${call()} $",
+        ] {
+            assert_quote_prefixes(line);
+        }
+    }
+
+    #[test]
+    fn javascript_delimiter_index_preserves_subslice_splitting() {
+        let alphabet = [
+            'a', '\'', '"', '`', '\\', '(', ')', '[', ']', '{', '}', ',', '=', ':',
+        ];
+        for mut encoded in 0..alphabet.len().pow(4) {
+            let mut source = String::new();
+            for _ in 0..4 {
+                source.push(alphabet[encoded % alphabet.len()]);
+                encoded /= alphabet.len();
+            }
+            let index = JavaScriptDelimiterIndex::new(&source);
+            for start in 0..=source.len() {
+                for end in start..=source.len() {
+                    let value = &source[start..end];
+                    for needle in [',', '=', ':'] {
+                        assert_eq!(
+                            index.split_once(value, needle),
+                            top_level_split_once(value, needle),
+                            "{source:?}: {start}..{end}, {needle}"
+                        );
+                    }
+                    assert_eq!(index.comma_segments(value), top_level_comma_segments(value));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn deeply_nested_binding_patterns_preserve_parameter_names() {
+        let pattern = format!("{}endpoint{}", "[{value:".repeat(5000), "}]".repeat(5000));
+        assert_eq!(
+            javascript_bound_parameter_names(&pattern),
+            HashSet::from(["endpoint".to_string()])
+        );
+        assert_eq!(
+            javascript_bound_parameter_names(
+                "{url: endpoint = fallback, ...rest}, [first, second]"
+            ),
+            HashSet::from(["endpoint", "rest", "first", "second"].map(str::to_string))
+        );
+    }
+
+    fn assert_quote_prefixes(line: &str) {
+        let positions: Vec<usize> = line
+            .char_indices()
+            .map(|(index, _)| index)
+            .chain([line.len()])
+            .collect();
+        let forward = JavaScriptQuoteIndex::new(line);
+        let backward = JavaScriptQuoteIndex::new(line);
+        for &position in &positions {
+            assert_eq!(
+                forward.is_quoted(position),
+                javascript_position_is_quoted(line, position),
+                "{line:?} at {position}"
+            );
+        }
+        for &position in positions.iter().rev() {
+            assert_eq!(
+                backward.is_quoted(position),
+                javascript_position_is_quoted(line, position),
+                "{line:?} at {position} queried after later positions"
+            );
+        }
     }
 
     #[test]
