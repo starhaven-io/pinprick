@@ -22,6 +22,7 @@ params:
       group: "npm-dependencies"
       directory: "/site"
   npm-policy:
+    strict-allow-scripts: true
     projects: ["site"]
   link-check:
     targets: "--config lychee.toml --root-dir site/dist/client './site/dist/client/**/*.html' README.md"
