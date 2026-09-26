@@ -13,7 +13,7 @@ const REMOTE_URL: &str = "https://pinprick.rs/audited-actions";
 /// Bump this deliberately whenever a detection or suppression change could
 /// invalidate an existing clean verdict; entries remain inert until they are
 /// re-verified and stamped with the new version.
-pub(crate) const AUDIT_RULES_VERSION: u32 = 1;
+pub(crate) const AUDIT_RULES_VERSION: u32 = 2;
 
 /// Bound replay of a superseded signed catalog. Deployments refresh signatures;
 /// an expired catalog produces a warning and falls back to a fresh scan.
@@ -758,7 +758,11 @@ mod tests {
             "pinprick_version": LOCAL_CACHE_PINPRICK_VERSION,
             "policy_version": LOCAL_CACHE_POLICY_VERSION,
         });
-        for rules_version in [None, Some(AUDIT_RULES_VERSION + 1)] {
+        for rules_version in [
+            None,
+            Some(AUDIT_RULES_VERSION - 1),
+            Some(AUDIT_RULES_VERSION + 1),
+        ] {
             let mut entry = base.clone();
             if let Some(version) = rules_version {
                 entry["rules_version"] = version.into();

@@ -35,9 +35,21 @@ pub(crate) fn is_shell_comment_line(line: &str) -> bool {
 /// Join shell lines ending in `\` into a single logical line, anchored at the
 /// 0-based index of the first physical line.
 pub(crate) fn join_continuations(content: &str) -> Vec<(usize, String)> {
+    join_source_continuations(content, false)
+}
+
+pub(crate) fn join_docker_continuations(content: &str) -> Vec<(usize, String)> {
+    join_source_continuations(content, true)
+}
+
+fn join_source_continuations(content: &str, dockerfile: bool) -> Vec<(usize, String)> {
     let mut out: Vec<(usize, String)> = Vec::new();
     let mut pending: Option<(usize, String)> = None;
     for (i, raw) in content.lines().enumerate() {
+        // Docker removes full comment lines before resolving continuations.
+        if dockerfile && is_shell_comment_line(raw) {
+            continue;
+        }
         let trimmed_end = raw.trim_end();
         // A comment never continues onto the next line — a trailing backslash
         // is just comment text, so the next line is a new command. Joining it
@@ -71,7 +83,7 @@ pub(crate) fn join_continuations(content: &str) -> Vec<(usize, String)> {
 }
 
 fn ends_with_pipeline_operator(line: &str) -> bool {
-    line.ends_with('|') || line.ends_with("&&") || line.ends_with("||")
+    line.ends_with('|') || line.ends_with("|&") || line.ends_with("&&") || line.ends_with("||")
 }
 
 #[derive(Debug, Clone)]
@@ -89,7 +101,7 @@ struct ShellStage {
 
 #[derive(Debug, Clone)]
 struct GitCloneCommand {
-    dir: String,
+    dir: Option<String>,
     command_index: usize,
 }
 
@@ -174,7 +186,7 @@ fn split_shell_control_parts(line: &str) -> Vec<(String, Option<ShellControl>)> 
                 chars.next();
                 Some(ShellControl::Or)
             }
-            '&' if chars.peek() != Some(&'>') && !current.trim_end().ends_with('>') => {
+            '&' if chars.peek() != Some(&'>') && !current.trim_end().ends_with(['>', '|']) => {
                 Some(ShellControl::Background)
             }
             _ => None,
@@ -230,6 +242,9 @@ fn split_shell_pipeline(line: &str) -> Vec<String> {
 
         if ch == '|' && chars.peek() != Some(&'|') {
             push_shell_part(&mut out, &mut current);
+            if chars.peek() == Some(&'&') {
+                chars.next();
+            }
         } else {
             current.push(ch);
         }
@@ -377,24 +392,217 @@ pub(crate) fn shell_urls_are_literal(line: &str) -> bool {
 }
 
 pub(crate) fn url_piped_to_jq(line: &str, url: &str) -> bool {
+    let mut seen = false;
+    for command in parse_shell_line(shell_pipeline_body(line)) {
+        for (index, stage) in command.stages.iter().enumerate() {
+            if fetch_url_arguments(stage).contains(&url) {
+                seen = true;
+                if !fetch_output_targets_for_stage(stage, false, false).is_empty()
+                    || !command.stages.get(index + 1).is_some_and(stage_invokes_jq)
+                {
+                    return false;
+                }
+            }
+        }
+    }
+    seen
+}
+
+fn shell_pipeline_body(line: &str) -> &str {
+    static CAPTURED_PIPELINE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"^\s*(?:(?:export|local|readonly)\s+)?[A-Za-z_][A-Za-z0-9_]*="?\$\("#).unwrap()
+    });
+    let Some(prefix) = CAPTURED_PIPELINE.find(line) else {
+        return line;
+    };
+    let end = if line[..prefix.end()].contains("=\"") {
+        line.trim_end().strip_suffix(")\"")
+    } else {
+        line.trim_end().strip_suffix(')')
+    };
+    end.and_then(|body| body.get(prefix.end()..))
+        .unwrap_or(line)
+}
+
+fn fetch_url_arguments(stage: &ShellStage) -> Vec<&str> {
+    let Some(command) = wrapped_command_word_index(&stage.words) else {
+        return Vec::new();
+    };
+    let Some(program) = fetch_program(&stage.words[command]) else {
+        return Vec::new();
+    };
+    let mut urls = Vec::new();
+    let mut words = stage.words[command + 1..].iter();
+    let mut options = true;
+    while let Some(word) = words.next() {
+        if matches!(word.as_str(), ">" | ">>" | "<" | "2>" | "2>>") {
+            words.next();
+            continue;
+        }
+        if options && word == "--" {
+            options = false;
+            continue;
+        }
+        if options && word == "--url" {
+            if let Some(url) = words.next() {
+                urls.push(url.as_str());
+            }
+        } else if options && word.starts_with("--url=") {
+            urls.push(&word[6..]);
+        } else if options
+            && (matches!(
+                word.as_str(),
+                "--output"
+                    | "--output-dir"
+                    | "--header"
+                    | "--user-agent"
+                    | "--referer"
+                    | "--user"
+                    | "--password"
+                    | "--proxy"
+                    | "--request"
+                    | "--data"
+                    | "--data-raw"
+                    | "--data-binary"
+                    | "--form"
+                    | "--cacert"
+                    | "--cert"
+                    | "--key"
+                    | "--cookie"
+                    | "--cookie-jar"
+                    | "--connect-timeout"
+                    | "--max-time"
+                    | "--retry"
+                    | "--resolve"
+                    | "--connect-to"
+                    | "--config"
+                    | "--output-document"
+                    | "--directory-prefix"
+            ) || program == "curl"
+                && matches!(
+                    word.as_str(),
+                    "-o" | "-H"
+                        | "-A"
+                        | "-e"
+                        | "-u"
+                        | "-x"
+                        | "-X"
+                        | "-d"
+                        | "-F"
+                        | "-b"
+                        | "-c"
+                        | "-m"
+                        | "-K"
+                )
+                || program == "wget" && matches!(word.as_str(), "-O" | "-P" | "-o" | "-a" | "-U"))
+        {
+            words.next();
+        } else if !(options && word.starts_with('-')) {
+            urls.push(word.as_str());
+        }
+    }
+    urls
+}
+
+pub(crate) fn schemeless_fetch_urls(line: &str) -> Vec<String> {
+    static HOST_PATH: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?i)^(?:[a-z0-9-]+\.)+[a-z][a-z0-9-]*(?::[0-9]+)?(?:/[^\s]*)?$").unwrap()
+    });
+    parse_shell_line(shell_pipeline_body(line))
+        .iter()
+        .flat_map(|command| command.stages.iter())
+        .flat_map(|stage| {
+            fetch_url_arguments(stage)
+                .into_iter()
+                .filter(|url| HOST_PATH.is_match(url))
+                .map(str::to_string)
+        })
+        .collect()
+}
+
+pub(crate) fn fetch_piped_to_interpreter(line: &str) -> bool {
     parse_shell_line(line).into_iter().any(|command| {
-        let Some(fetch_stage) = command
-            .stages
-            .iter()
-            .position(|stage| stage.text.contains(url))
-        else {
-            return false;
-        };
-        command
-            .stages
-            .iter()
-            .skip(fetch_stage + 1)
-            .any(stage_invokes_jq)
+        let mut fetched = false;
+        for stage in command.stages {
+            let Some(index) = wrapped_command_word_index(&stage.words) else {
+                continue;
+            };
+            // PowerShell groups a fetch to read a member: `(iwr …).Content | iex`.
+            let executable = stage.words[index]
+                .trim_start_matches('(')
+                .rsplit(['/', '\\'])
+                .next()
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            if fetched
+                && matches!(
+                    executable.as_str(),
+                    "bash"
+                        | "sh"
+                        | "zsh"
+                        | "dash"
+                        | "ash"
+                        | "ksh"
+                        | "fish"
+                        | "python"
+                        | "python3"
+                        | "node"
+                        | "nodejs"
+                        | "ruby"
+                        | "perl"
+                        | "pwsh"
+                        | "powershell"
+                        | "iex"
+                        | "invoke-expression"
+                )
+            {
+                return true;
+            }
+            fetched |= fetch_program(&executable).is_some()
+                || matches!(
+                    executable.as_str(),
+                    "iwr" | "irm" | "invoke-webrequest" | "invoke-restmethod"
+                );
+        }
+        false
     })
 }
 
 fn stage_invokes_jq(stage: &ShellStage) -> bool {
-    command_word_index(&stage.words).is_some_and(|idx| stage.words[idx] == "jq")
+    let Some(index) = wrapped_command_word_index(&stage.words) else {
+        return false;
+    };
+    if stage.words[index].rsplit('/').next() != Some("jq") {
+        return false;
+    }
+    let mut filter_seen = false;
+    let mut arguments = stage.words[index + 1..].iter();
+    while let Some(word) = arguments.next() {
+        if matches!(word.as_str(), "--arg" | "--argjson") {
+            if arguments.next().is_none() || arguments.next().is_none() {
+                return false;
+            }
+        } else if matches!(
+            word.as_str(),
+            "--raw-output"
+                | "--compact-output"
+                | "--slurp"
+                | "--exit-status"
+                | "--monochrome-output"
+                | "--color-output"
+                | "--sort-keys"
+                | "--unbuffered"
+        ) || word.starts_with('-')
+            && word.len() > 1
+            && word[1..].chars().all(|flag| "rcseMCSj".contains(flag))
+        {
+        } else if word.starts_with('-') || filter_seen {
+            return false;
+        } else {
+            filter_seen = true;
+        }
+    }
+    true
 }
 
 fn command_word_index(words: &[String]) -> Option<usize> {
@@ -530,6 +738,8 @@ pub(crate) fn file_artifact_events(
         }
         let imports_gpg_key = command.stages.iter().any(stage_is_gpg_import);
         let piped = command.stages.len() > 1;
+        let mut stream_sources = Vec::new();
+        let mut streamed_fetch = false;
         for stage in command.stages {
             if control_flow_stage_changes_directory(&stage) {
                 events.push(FileArtifactEvent::UnresolvedDirectory);
@@ -546,7 +756,92 @@ pub(crate) fn file_artifact_events(
             for target in fetch_output_targets_for_stage(&stage, wget_configured, curl_configured) {
                 events.push(FileArtifactEvent::Download(target));
             }
-            if has_checksum_verify(&stage.text) {
+            if let Some(index) = wrapped_command_word_index(&stage.words) {
+                let program = stage.words[index]
+                    .rsplit(['/', '\\'])
+                    .next()
+                    .unwrap_or_default();
+                streamed_fetch |= fetch_program(program).is_some();
+                let operands = &stage.words[index + 1..];
+                stream_sources.extend(input_redirection_sources(&stage.words));
+                if program == "cat" {
+                    stream_sources.extend(
+                        operands
+                            .iter()
+                            .take_while(|word| !matches!(word.as_str(), ">" | ">>"))
+                            .filter(|word| {
+                                !word.starts_with('-') && !shell_word_is_input_redirection(word)
+                            })
+                            .cloned(),
+                    );
+                }
+                if program == "dd" {
+                    stream_sources.extend(
+                        operands
+                            .iter()
+                            .filter_map(|word| word.strip_prefix("if=").map(str::to_string)),
+                    );
+                }
+                if matches!(program, "cat" | "tee" | "dd") {
+                    let mut destinations = redirect_output_target(&stage.words)
+                        .into_iter()
+                        .collect::<Vec<_>>();
+                    if program == "tee" {
+                        let mut operands = operands.iter();
+                        while let Some(word) = operands.next() {
+                            if matches!(word.as_str(), ">" | ">>") {
+                                break;
+                            }
+                            if shell_word_is_input_redirection(word) {
+                                if word.trim_start_matches(|character: char| {
+                                    character.is_ascii_digit()
+                                }) == "<"
+                                {
+                                    operands.next();
+                                }
+                                continue;
+                            }
+                            if !word.starts_with(['-', '>']) {
+                                destinations.push(word.clone());
+                            }
+                        }
+                    }
+                    if program == "dd" {
+                        destinations.extend(
+                            operands
+                                .iter()
+                                .filter_map(|word| word.strip_prefix("of=").map(str::to_string)),
+                        );
+                    }
+                    for destination in destinations {
+                        if streamed_fetch {
+                            events.push(FileArtifactEvent::Download(destination.clone()));
+                        }
+                        for source in &stream_sources {
+                            events.push(FileArtifactEvent::Transfer {
+                                source: source.clone(),
+                                destination: destination.clone(),
+                            });
+                        }
+                    }
+                }
+                if matches!(program, "tar" | "bsdtar")
+                    && let Some(archives) = tar_extraction_archives(operands)
+                {
+                    if streamed_fetch {
+                        events.push(FileArtifactEvent::Download(
+                            UNKNOWN_FETCH_OUTPUT.to_string(),
+                        ));
+                    }
+                    for source in stream_sources.iter().chain(&archives) {
+                        events.push(FileArtifactEvent::Transfer {
+                            source: source.clone(),
+                            destination: UNKNOWN_FETCH_OUTPUT.to_string(),
+                        });
+                    }
+                }
+            }
+            if stage_runs_checksum_verify(&stage) {
                 events.push(FileArtifactEvent::Verification);
             }
         }
@@ -555,6 +850,93 @@ pub(crate) fn file_artifact_events(
         }
     }
     events
+}
+
+/// Files a stage reads through input redirection, spaced (`< file`) or
+/// attached (`<file`), with or without a descriptor (`0<file`). Heredocs,
+/// process substitution, and descriptor duplication are not files.
+fn input_redirection_sources(words: &[String]) -> Vec<String> {
+    let mut sources = Vec::new();
+    let mut words = words.iter();
+    while let Some(word) = words.next() {
+        let Some(file) = word
+            .trim_start_matches(|character: char| character.is_ascii_digit())
+            .strip_prefix('<')
+        else {
+            continue;
+        };
+        if file.is_empty() {
+            sources.extend(words.next().cloned());
+        } else if !file.starts_with(['<', '(', '&']) {
+            sources.push(file.trim_start_matches('>').to_string());
+        }
+    }
+    sources
+}
+
+/// Archives an extracting `tar` reads, or `None` when it does not extract.
+/// Every plain operand is kept as a possible archive because traditional
+/// syntax and member lists make the archive position ambiguous.
+fn tar_extraction_archives(operands: &[String]) -> Option<Vec<String>> {
+    let mut extract = false;
+    let mut expect_archive = false;
+    let mut archives = Vec::new();
+    for (position, word) in operands.iter().enumerate() {
+        if expect_archive {
+            archives.push(word.clone());
+            expect_archive = false;
+            continue;
+        }
+        // Long options may be abbreviated to any unambiguous prefix.
+        if let Some(option) = word.strip_prefix("--") {
+            let (name, value) = option
+                .split_once('=')
+                .map_or((option, None), |(name, value)| (name, Some(value)));
+            let abbreviates = |full: &str| name.len() >= 2 && full.starts_with(name);
+            if abbreviates("extract") || abbreviates("get") {
+                extract = true;
+            } else if abbreviates("file") {
+                match value {
+                    Some(archive) => archives.push(archive.to_string()),
+                    None => expect_archive = true,
+                }
+            }
+            continue;
+        }
+        if shell_word_is_input_redirection(word) || word.starts_with('>') {
+            continue;
+        }
+        // Traditional options (`xf archive`, `fx archive`) take their values
+        // from the following operands, which are all kept.
+        if position == 0
+            && !word.starts_with('-')
+            && word
+                .chars()
+                .all(|character| character.is_ascii_alphabetic())
+        {
+            extract |= word.contains('x');
+            continue;
+        }
+        let Some(cluster) = word.strip_prefix('-') else {
+            archives.push(word.clone());
+            continue;
+        };
+        for (index, option) in cluster.char_indices() {
+            if option == 'x' {
+                extract = true;
+            }
+            if option == 'f' {
+                let attached = &cluster[index + 1..];
+                if attached.is_empty() {
+                    expect_archive = true;
+                } else {
+                    archives.push(attached.to_string());
+                }
+                break;
+            }
+        }
+    }
+    extract.then_some(archives)
 }
 
 fn command_has_unresolved_directory_scope(command: &str) -> bool {
@@ -724,10 +1106,37 @@ fn file_transfer_command_index(words: &[String]) -> Option<usize> {
     })
 }
 
-fn wrapped_command_word_index(words: &[String]) -> Option<usize> {
+pub(crate) fn wrapped_command_word_index(words: &[String]) -> Option<usize> {
     let mut index = command_word_index(words)?;
     loop {
-        match words.get(index).map(String::as_str)? {
+        // A wrapper asked only to describe itself runs nothing.
+        let wrapper = words.get(index)?.rsplit(['/', '\\']).next()?;
+        if matches!(
+            wrapper,
+            "command" | "builtin" | "env" | "sudo" | "doas" | "exec" | "nice" | "time" | "nohup"
+        ) && words[index + 1..]
+            .iter()
+            .take_while(|word| word.starts_with('-'))
+            .any(|word| {
+                matches!(word.as_str(), "--help" | "--version")
+                    || wrapper == "sudo"
+                        && matches!(
+                            word.as_str(),
+                            "-l" | "--list"
+                                | "-v"
+                                | "--validate"
+                                | "-k"
+                                | "-K"
+                                | "-V"
+                                | "--reset-timestamp"
+                                | "--remove-timestamp"
+                        )
+                    || wrapper == "doas" && word == "-C"
+            })
+        {
+            return None;
+        }
+        match words.get(index)?.rsplit(['/', '\\']).next()? {
             "command" => {
                 index += 1;
                 while matches!(words.get(index).map(String::as_str), Some("-p" | "--")) {
@@ -763,6 +1172,83 @@ fn wrapped_command_word_index(words: &[String]) -> Option<usize> {
                     }
                 }
             }
+            "sudo" => {
+                index += 1;
+                while let Some(word) = words.get(index) {
+                    if word == "--" {
+                        index += 1;
+                        break;
+                    }
+                    if matches!(
+                        word.as_str(),
+                        "-u" | "--user"
+                            | "-g"
+                            | "--group"
+                            | "-h"
+                            | "--host"
+                            | "-p"
+                            | "--prompt"
+                            | "-C"
+                            | "--close-from"
+                            | "-R"
+                            | "--chroot"
+                            | "-D"
+                            | "--chdir"
+                    ) {
+                        index += 2;
+                    } else if word.starts_with('-') || shell_assignment(word) {
+                        index += 1;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            "doas" => {
+                index += 1;
+                while let Some(word) = words.get(index) {
+                    if matches!(word.as_str(), "-u" | "-C") {
+                        index += 2;
+                    } else if word.starts_with('-') {
+                        index += 1;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            "exec" => {
+                index += 1;
+                while let Some(word) = words.get(index) {
+                    if word == "-a" {
+                        index += 2;
+                    } else if word == "--" {
+                        index += 1;
+                        break;
+                    } else if word.starts_with('-') {
+                        index += 1;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            "nice" => {
+                index += 1;
+                while let Some(word) = words.get(index) {
+                    if matches!(word.as_str(), "-n" | "--adjustment") {
+                        index += 2;
+                    } else if word.starts_with('-') {
+                        index += 1;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            "time" => {
+                index += 1;
+                while words.get(index).is_some_and(|word| word.starts_with('-')) {
+                    index += 1;
+                }
+            }
+            "nohup" | "busybox" => index += 1,
             _ => return Some(index),
         }
     }
@@ -1039,7 +1525,7 @@ fn curl_output_targets(words: &[String], configured: bool) -> Vec<String> {
                 .iter()
                 .filter(|word| !word.starts_with('-'))
                 .filter_map(|url| {
-                    (url.starts_with("http://") || url.starts_with("https://"))
+                    crate::audit_patterns::is_http_url(url)
                         .then(|| url_basename(url))
                         .flatten()
                 })
@@ -1248,7 +1734,7 @@ fn wget_output_targets(words: &[String], configured: bool) -> Vec<String> {
     }
     let mut inferred: Vec<String> = words
         .iter()
-        .filter(|word| word.starts_with("http://") || word.starts_with("https://"))
+        .filter(|word| crate::audit_patterns::is_http_url(word))
         .filter_map(|url| url_basename(url))
         .collect();
     if let Some(directory) = directory_prefix {
@@ -1318,7 +1804,7 @@ pub(crate) fn checksum_verifies_target_with_material_policy(
     let verification_count = parse_shell_line(line)
         .iter()
         .flat_map(|command| &command.stages)
-        .filter(|stage| has_checksum_verify(&stage.text))
+        .filter(|stage| stage_runs_checksum_verify(stage))
         .count();
     let working_directories = vec![working_directory.map(str::to_string); verification_count];
     checksum_verifies_target_with_material_policy_at(
@@ -1353,7 +1839,7 @@ pub(crate) fn checksum_verifies_target_with_material_policy_at(
                 || command.following_control == Some(ShellControl::And)
         });
         for (checksum_stage, stage) in command.stages.iter().enumerate() {
-            if !has_checksum_verify(&stage.text) {
+            if !stage_runs_checksum_verify(stage) {
                 continue;
             }
             let working_directory = verification_working_directories
@@ -1370,7 +1856,7 @@ pub(crate) fn checksum_verifies_target_with_material_policy_at(
             }
             let downloaded_verification_material = runtime_downloads.iter().any(|download| {
                 !same_shell_path(download, target)
-                    && stage.words.iter().any(|word| {
+                    && verification_material_words(stage).iter().any(|word| {
                         checksum_word_matches_download_at(word, download, working_directory)
                     })
             });
@@ -1414,12 +1900,34 @@ pub(crate) fn imports_runtime_gpg_key_at(
                 if !stage_is_gpg_import(stage) {
                     return false;
                 }
+                if stage.words[command_index + 1..].iter().any(|word| {
+                    matches!(
+                        word.split('=').next().unwrap_or_default(),
+                        "--recv-keys" | "--fetch-keys" | "--receive-keys"
+                    )
+                }) {
+                    return true;
+                }
                 let dynamic_import = stage.words[command_index + 1..]
                     .iter()
                     .any(|word| shell_word_is_dynamic(word));
+                // The key may arrive as an operand, on standard input, or from
+                // an earlier stage of the pipeline.
+                let imported_words: Vec<String> = stage.words[command_index + 1..]
+                    .iter()
+                    .cloned()
+                    .chain(input_redirection_sources(&stage.words))
+                    .chain(command.stages[..stage_index].iter().flat_map(|source| {
+                        source
+                            .words
+                            .iter()
+                            .cloned()
+                            .chain(input_redirection_sources(&source.words))
+                    }))
+                    .collect();
                 let imported_download = runtime_downloads.iter().any(|download| {
                     download != UNKNOWN_FETCH_OUTPUT
-                        && stage.words[command_index + 1..].iter().any(|word| {
+                        && imported_words.iter().any(|word| {
                             checksum_word_matches_download_at(word, download, working_directory)
                         })
                 });
@@ -1449,6 +1957,51 @@ pub(crate) fn is_gpg_verification(line: &str) -> bool {
         .any(|command| command.stages.iter().any(stage_is_gpg_verification))
 }
 
+/// A verifier the stage runs, not verifier text it prints or passes along.
+fn stage_runs_checksum_verify(stage: &ShellStage) -> bool {
+    if let Some(index) = wrapped_command_word_index(&stage.words) {
+        let program = stage.words[index]
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let program = program.strip_suffix(".exe").unwrap_or(&program);
+        if matches!(
+            program,
+            "sha256sum" | "sha512sum" | "shasum" | "openssl" | "gpg" | "cosign" | "minisign"
+        ) {
+            return has_checksum_verify(&stage.words[index..].join(" "));
+        }
+    }
+    // PowerShell compares `Get-FileHash` output inside an expression.
+    unquoted_code(&stage.text)
+        .to_ascii_lowercase()
+        .contains("get-filehash")
+        && has_checksum_verify(&stage.text)
+}
+
+/// `text` with quoted strings blanked out.
+fn unquoted_code(text: &str) -> String {
+    let mut code = String::with_capacity(text.len());
+    let mut quote = None;
+    let mut escaped = false;
+    for character in text.chars() {
+        if escaped {
+            escaped = false;
+        } else if character == '\\' && quote != Some('\'') {
+            escaped = true;
+        } else if quote == Some(character) {
+            quote = None;
+            continue;
+        } else if quote.is_none() && matches!(character, '\'' | '"') {
+            quote = Some(character);
+            continue;
+        }
+        code.push(if quote.is_some() { ' ' } else { character });
+    }
+    code
+}
+
 fn stage_is_gpg_verification(stage: &ShellStage) -> bool {
     let Some(command_index) = wrapped_command_word_index(&stage.words) else {
         return false;
@@ -1470,9 +2023,12 @@ fn stage_is_gpg_import(stage: &ShellStage) -> bool {
         .rsplit(['/', '\\'])
         .next()
         .is_some_and(|executable| matches!(executable, "gpg" | "gpg.exe"))
-        && stage.words[command_index + 1..]
-            .iter()
-            .any(|word| word == "--import" || word == "-import")
+        && stage.words[command_index + 1..].iter().any(|word| {
+            matches!(
+                word.split('=').next().unwrap_or_default(),
+                "--import" | "-import" | "--recv-keys" | "--fetch-keys" | "--receive-keys"
+            )
+        })
 }
 
 fn stage_has_dynamic_verification_input(stage: &ShellStage) -> bool {
@@ -1480,10 +2036,44 @@ fn stage_has_dynamic_verification_input(stage: &ShellStage) -> bool {
         || stage.text.contains("<(")
         || stage.text.contains(">(")
         || wrapped_command_word_index(&stage.words).is_some_and(|command_index| {
-            stage.words[command_index + 1..]
-                .iter()
-                .any(|word| shell_word_is_dynamic(word) || shell_word_is_input_redirection(word))
+            stage.words[command_index + 1..].iter().any(|word| {
+                shell_word_is_dynamic(word)
+                    || shell_word_is_input_redirection(word)
+                    || URL_RE.is_match(word)
+            })
         })
+}
+
+fn verification_material_words(stage: &ShellStage) -> Vec<&str> {
+    let minisign = wrapped_command_word_index(&stage.words).is_some_and(|index| {
+        matches!(
+            stage.words[index].rsplit('/').next(),
+            Some("minisign" | "minisign.exe")
+        )
+    });
+    stage
+        .words
+        .iter()
+        .map(|word| {
+            if minisign
+                && let Some(flags) = word
+                    .strip_prefix('-')
+                    .filter(|flags| !flags.starts_with('-'))
+            {
+                for (index, flag) in flags.char_indices() {
+                    if "mpPxsS".contains(flag) {
+                        let attached = &flags[index + 1..];
+                        return if attached.is_empty() {
+                            word.as_str()
+                        } else {
+                            attached
+                        };
+                    }
+                }
+            }
+            word.as_str()
+        })
+        .collect()
 }
 
 fn stage_is_negated(stage: &ShellStage) -> bool {
@@ -1509,12 +2099,49 @@ fn checksum_stage_verifies_named_target(
     if checksum_stage_reads_named_manifest(stage) {
         return false;
     }
-    let names_target = stage
-        .words
-        .iter()
-        .any(|word| checksum_word_matches_download_at(word, target, working_directory));
-    if !names_target || !stage.text.to_ascii_lowercase().contains("get-filehash") {
-        return names_target;
+    if !stage.text.to_ascii_lowercase().contains("get-filehash") {
+        let Some(command) = wrapped_command_word_index(&stage.words) else {
+            return false;
+        };
+        let program = stage.words[command]
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or_default();
+        if matches!(program, "cosign" | "cosign.exe")
+            && !stage.words[command + 1..]
+                .iter()
+                .any(|word| word == "verify-blob")
+        {
+            return false;
+        }
+        let mut arguments = stage.words[command + 1..].iter();
+        let mut last_target = None;
+        while let Some(word) = arguments.next() {
+            if matches!(
+                word.as_str(),
+                "--key"
+                    | "--signature"
+                    | "--certificate"
+                    | "--bundle"
+                    | "--certificate-identity"
+                    | "--certificate-oidc-issuer"
+                    | "--homedir"
+                    | "--keyring"
+                    | "--status-fd"
+                    | "-P"
+                    | "-p"
+                    | "-x"
+            ) {
+                arguments.next();
+            } else if word == "-m" || word.starts_with('-') && word.ends_with('m') {
+                last_target = arguments.next();
+            } else if !word.starts_with('-') && !matches!(word.as_str(), "verify" | "verify-blob") {
+                last_target = Some(word);
+            }
+        }
+        return last_target.is_some_and(|word| {
+            checksum_word_matches_download_at(word, target, working_directory)
+        });
     }
 
     POWERSHELL_FILE_HASH_LITERAL_COMPARE_RE
@@ -1602,6 +2229,11 @@ fn checksum_word_matches_download_at(
 ) -> bool {
     let target = normalize_path_token(target);
     word.split_whitespace().any(|word| {
+        let word = if word.starts_with('-') {
+            word.split_once('=').map_or(word, |(_, value)| value)
+        } else {
+            word
+        };
         let word = word.strip_prefix('*').unwrap_or(word);
         let Some(word) = resolve_shell_path(word, working_directory) else {
             return false;
@@ -1637,18 +2269,39 @@ pub(crate) fn git_clone_has_bound_sha_checkout(logical: &[(usize, String)], li: 
             .all(|clone| clone_has_bound_sha_checkout(logical, li, clone))
 }
 
+/// The pattern match stands unless parsing positively shows every clone on the
+/// line is pinned; a clone the parser cannot see (`sh -c`, or text that only
+/// mentions one) stays a finding.
+pub(crate) fn has_unpinned_git_clone(line: &str) -> bool {
+    if !crate::audit_patterns::SH_GIT_CLONE.is_match(line) {
+        return false;
+    }
+    let clones: Vec<_> = parse_shell_line(line)
+        .into_iter()
+        .flat_map(|command| command.stages)
+        .filter(stage_has_git_clone)
+        .collect();
+    crate::audit_patterns::SH_GIT_CLONE.find_iter(line).count() > clones.len()
+        || clones
+            .iter()
+            .any(|stage| !git_clone_has_pinned_ref(&stage.text))
+}
+
 fn unpinned_git_clones(line: &str) -> Vec<GitCloneCommand> {
     parse_shell_line(line)
         .into_iter()
         .enumerate()
-        .filter_map(|(command_index, command)| {
-            if command.stages.iter().any(stage_has_git_clone)
-                && !git_clone_has_pinned_ref(&command.text)
-            {
-                git_clone_dir(&command).map(|dir| GitCloneCommand { dir, command_index })
-            } else {
-                None
-            }
+        .flat_map(|(command_index, command)| {
+            command
+                .stages
+                .into_iter()
+                .filter(|stage| {
+                    stage_has_git_clone(stage) && !git_clone_has_pinned_ref(&stage.text)
+                })
+                .map(move |stage| GitCloneCommand {
+                    dir: git_clone_dir(&stage),
+                    command_index,
+                })
         })
         .collect()
 }
@@ -1658,11 +2311,7 @@ fn stage_has_git_clone(stage: &ShellStage) -> bool {
         .is_some_and(|idx| stage.words.get(idx + 1).is_some_and(|w| w == "clone"))
 }
 
-fn git_clone_dir(command: &ShellCommand) -> Option<String> {
-    let stage = command
-        .stages
-        .iter()
-        .find(|stage| stage_has_git_clone(stage))?;
+fn git_clone_dir(stage: &ShellStage) -> Option<String> {
     let git = git_word_index(&stage.words)?;
     let args = &stage.words[git + 2..];
     let mut positionals = Vec::new();
@@ -1722,6 +2371,9 @@ fn clone_has_bound_sha_checkout(
     clone_line: usize,
     clone: &GitCloneCommand,
 ) -> bool {
+    let Some(clone_dir) = clone.dir.as_deref() else {
+        return false;
+    };
     let mut current_dir: Option<String> = None;
     for offset in 0..=3 {
         let Some((_, line)) = logical.get(clone_line + offset) else {
@@ -1736,7 +2388,7 @@ fn clone_has_bound_sha_checkout(
                 current_dir = Some(dir);
                 continue;
             }
-            if command_has_bound_checkout(command, &clone.dir, current_dir.as_deref()) {
+            if command_has_bound_checkout(command, clone_dir, current_dir.as_deref()) {
                 return true;
             }
         }
@@ -1786,15 +2438,40 @@ fn git_checkout_sha_dir(stage: &ShellStage) -> Option<Option<String>> {
             continue;
         }
         if word == "checkout" && stage.words.get(i + 1).is_some_and(|sha| is_full_sha(sha)) {
-            return Some(checkout_dir);
+            return stage.words[i + 2..]
+                .iter()
+                .all(|word| matches!(word.as_str(), "--quiet" | "-q" | "--force" | "-f"))
+                .then_some(checkout_dir);
         }
         i += 1;
     }
     None
 }
 
+/// Git in the command position, after wrappers and an opening subshell.
 fn git_word_index(words: &[String]) -> Option<usize> {
-    words.iter().position(|word| word == "git")
+    let mut words = words.to_vec();
+    if let Some(first) = words.first_mut() {
+        *first = first.trim_start_matches('(').to_string();
+    }
+    // A Dockerfile line starts with its `RUN` instruction and options.
+    let offset = if words
+        .first()
+        .is_some_and(|word| word.eq_ignore_ascii_case("RUN"))
+    {
+        1 + words[1..]
+            .iter()
+            .take_while(|word| word.starts_with("--"))
+            .count()
+    } else {
+        0
+    };
+    let index = offset + wrapped_command_word_index(&words[offset..])?;
+    words[index]
+        .rsplit(['/', '\\'])
+        .next()
+        .is_some_and(|name| name == "git" || name == "git.exe")
+        .then_some(index)
 }
 
 fn is_full_sha(word: &str) -> bool {
@@ -1834,6 +2511,25 @@ fn normalize_path_token(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wrapped_interpreters_receive_piped_fetches() {
+        for line in [
+            "curl -fsSL https://example.com/x.sh | busybox sh",
+            "curl -fsSL https://example.com/x.sh | exec bash",
+            "curl -fsSL https://example.com/x.sh | exec -a installer bash",
+            "curl -fsSL https://example.com/x.sh | nice -n 10 bash",
+            "curl -fsSL https://example.com/x.sh | nohup bash",
+            "curl -fsSL https://example.com/x.sh | time -p sh",
+            "curl -fsSL https://example.com/x.sh | doas -u root sh",
+            "(iwr https://example.com/x.ps1 -UseBasicParsing).Content | iex",
+        ] {
+            assert!(fetch_piped_to_interpreter(line), "{line}");
+        }
+        assert!(!fetch_piped_to_interpreter(
+            "curl -fsSL https://example.com/x.json | nice -n 10 jq ."
+        ));
+    }
 
     #[test]
     fn is_shell_comment_line_detects_leading_hash() {

@@ -6,7 +6,7 @@ Pinprick is a Rust CLI for GitHub Actions supply-chain pinning, updates, runtime
 
 - `src/main.rs` defines command flags and dispatch. Public command/configuration documentation lives in `site/src/content/docs/`.
 - `src/workflow.rs` owns workflow discovery, read-only YAML extraction, and format-preserving pin edits; `pin.rs` and `update.rs` resolve their API results before writing.
-- `src/audit.rs`, `audit_patterns.rs`, `audit_shell.rs`, and `audit_source.rs` own bounded source traversal and detection. `site/src/content/docs/reference/detections.md` documents the rules and heuristic limits.
+- `src/audit.rs`, `audit_patterns.rs`, `audit_shell.rs`, `audit_source.rs`, and `audit_javascript.rs` own bounded source traversal and detection. JavaScript location analysis runs in a self-invoked worker process so parser failures leave coverage incomplete instead of ending the scan. `site/src/content/docs/reference/detections.md` documents the rules and heuristic limits.
 - `src/audited_actions.rs` and `build.rs` own catalog lookup, verification, caching, and embedding. `audited-actions/README.md` defines exact action identities; `SECURITY.md` covers signing custody and rotation.
 - `src/score.rs` implements the versioned public contract in `docs/scoring.md`.
 - `src/config.rs`, `auth.rs`, `github.rs`, and `output.rs` own configuration, token resolution, API transport, and output boundaries.

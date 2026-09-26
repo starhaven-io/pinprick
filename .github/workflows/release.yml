@@ -61,22 +61,23 @@ jobs:
           fi
 
       - name: Fail if version already on crates.io
+        working-directory: ${{ runner.temp }}
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
-          BODY="${RUNNER_TEMP}/crate-version.json"
-          STATUS_FILE="${RUNNER_TEMP}/crate-version.status"
+          # A literal .json output name lets pinprick's fetch rules see that
+          # the versioned endpoint's response is data.
+          ENDPOINT="https://crates.io/api/v1/crates/pinprick/${VERSION}"
           if ! curl -sS -A "pinprick-release-preflight" \
-            -o "${BODY}" -w '%{http_code}' \
-            "https://crates.io/api/v1/crates/pinprick/${VERSION}" \
-            | tee "${STATUS_FILE}" | jq -e 'tonumber' >/dev/null; then
+            -o crate-version.json -w '%{http_code}' "${ENDPOINT}" \
+            | tee crate-version.status | jq -e 'tonumber' >/dev/null; then
             echo "::error::Could not determine whether pinprick ${VERSION} exists on crates.io"
             exit 1
           fi
-          STATUS=$(<"${STATUS_FILE}")
+          STATUS=$(<crate-version.status)
           case "${STATUS}" in
             200)
-              jq -e .version "${BODY}" >/dev/null
+              jq -e .version crate-version.json >/dev/null
               echo "::error::pinprick ${VERSION} is already on crates.io — bump the version in Cargo.toml before dispatching a release"
               exit 1
               ;;

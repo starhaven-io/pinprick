@@ -24,6 +24,24 @@ pub fn repo_with_workflows(files: &[(&str, &str)]) -> TempDir {
     dir
 }
 
+/// Create a temporary repo whose workflow runs the local action at `./act`,
+/// with `action.yml` and the given files under that directory.
+pub fn repo_with_local_action(action_yml: &str, files: &[(&str, &str)]) -> TempDir {
+    let dir = repo_with_workflow(
+        "ci.yml",
+        "name: local\non: push\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: ./act\n",
+    );
+    let action = dir.path().join("act");
+    fs::create_dir_all(&action).unwrap();
+    fs::write(action.join("action.yml"), action_yml).unwrap();
+    for (path, content) in files {
+        let path = action.join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, content).unwrap();
+    }
+    dir
+}
+
 /// Create a temporary repo directory with a workflow file and a `.pinprick.toml` config.
 pub fn repo_with_config(filename: &str, workflow: &str, config: &str) -> TempDir {
     let dir = repo_with_workflow(filename, workflow);

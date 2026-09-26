@@ -16,8 +16,9 @@ pinprick audit /path/to/repo
 
 - Shell commands in workflow `run:` blocks and composite `action.yml` steps, plus statically referenced non-vendored `.sh`, `.bash`, `.zsh`, and `.ps1` helpers
 - JavaScript and TypeScript entrypoints declared by action metadata, plus statically referenced helpers, including minified bundles
-- Python helpers statically referenced by composite action steps
-- Dockerfiles named by a reachable container action's `runs.image` field. Unreferenced example and test Dockerfiles are not executed by consumers and are not scanned
+- Python helpers statically referenced by composite action steps, including modules imported from the entry script's directory, package initializers, and files run through the action's or the script's own location
+- Python and Node `run:` blocks selected by the step's effective `shell`; unsupported shells produce incomplete coverage
+- Dockerfiles named by a reachable container action's `runs.image` field, or an exact action-root `Dockerfile`/`dockerfile` when metadata is absent. Unreferenced example and test Dockerfiles are not scanned
 
 For the full list of every rule, including examples and severity, see the [Detections reference](/reference/detections).
 

@@ -46,7 +46,7 @@ For static analysis of workflow files themselves — permissions, template injec
 Each file is named for the exact action identity and contains an array of audited SHAs with their corresponding tags: `owner/repo.json` for a root action and `owner/repo/subpath.json` for a subpath action. A root-action verdict never covers a subpath action at the same commit.
 
 ```json
-[{ "sha": "de0fac2e4500dabe0009e67214ff5f5447ce83dd", "tag": "v6.0.2", "rules_version": 1 }]
+[{ "sha": "de0fac2e4500dabe0009e67214ff5f5447ce83dd", "tag": "v6.0.2", "rules_version": 2 }]
 ```
 
 `rules_version` records the detection semantics that produced that entry's clean verdict. It is earned from the current scanner's JSON report, not chosen manually. It changes only when detection or suppression semantics could invalidate existing verdicts, independently of the pinprick release version.

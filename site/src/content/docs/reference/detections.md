@@ -15,6 +15,14 @@ This is the canonical list of every rule `pinprick audit` checks. All rules emit
 
 pinprick uses bounded source traversal, logical-command parsing, literal propagation, and precompiled patterns. It does not execute workflow or action code.
 
+Workflow, reusable-workflow, and composite steps honor their declared `shell`, including inherited workflow/job defaults. Python and Node steps use the corresponding source scanner. Unsupported shells leave coverage incomplete. Declared action entrypoints lead to literal local imports, Python modules resolved from the entry script's directory, package initializers, and files executed through the action's or a script's own location: `$GITHUB_ACTION_PATH` and `${{ github.action_path }}` in any spelling (including step `env:` values, `$env:GITHUB_ACTION_PATH`, and `Join-Path`), `python -m` from the action directory, shell `$(dirname "$0")` and `BASH_SOURCE`, PowerShell `$PSScriptRoot`, Node `__dirname` and `import.meta.url`, and Python `__file__`. Composite shell, Python, and Node steps are all followed this way.
+
+Path joins (with each language's rules for absolute parts), concatenation, template and f-string interpolation, conditional and logical expressions, variables holding these values, and working-directory changes (`cd`, `pushd`, `process.chdir`, `os.chdir`, and `cwd` options) are evaluated. Shell assignments and directory changes apply in command order; a change inside a branch, loop, function, or after `&&` or `||` may not have happened, a subshell's changes end with it, and a loop that changes its own directory or variables leaves coverage incomplete. A followed file starts in the directory it was run from. In a composite step, changing to any directory that is not a resolved action location leaves coverage incomplete, because the workspace or an input can lead back into the action. A file run by an interpreter is scanned as that interpreter's language whatever its extension; a container action's `ENTRYPOINT`, `CMD`, and `RUN` are traced back to the files `COPY` or `ADD` placed in the image.
+
+Location provenance survives every expression: a value stored in an object or array, returned by an unrecognized function, spread into arguments, bound more than once, or too large or deeply aliased to evaluate is still derived from the location. An execution through a location that does not evaluate to exactly one existing file, and any other unresolved required source, leaves coverage incomplete; mentioning the location or reading a data file through it does not. Copying an action file (`cp`, `mv`, `ln`, `install`, `rsync`, or `cat` with an output redirection) scans a recognized source file, ignores structured data, and otherwise leaves coverage incomplete.
+
+JavaScript and TypeScript are parsed and names resolve to their declarations, so a name reused in unrelated code does not inherit a location. Any mention of `__dirname`, `__filename`, `GITHUB_ACTION_PATH`, `import.meta`, or a step variable holding the action path draws on a location, whatever it is bound to. Provenance follows arguments into the parameters of functions and methods defined in the same file, callbacks, fields (per class, object, or variable where the holder is known, and by name where it is not), instances of classes whose fields hold a location, and objects a function changes through its parameters or `this`. Outside class and object-literal methods, `this` may be any object: fields read through it are matched by name, and a located receiver reaches `this` in the methods called on it, in getters defined on it, and in functions bound or applied to it or passed along with it, including methods passed as fields of an object whose methods are known. A getter, a property descriptor's `get`, or an implicit method such as `toString` that returns a location makes its object located. A field written through an object nested in another is matched by name, since the nested object may be anything stored there, unless the outer object is a literal that only ever holds fresh values. Because code can reach the global object without naming it, a field stored under a global is also matched by name through objects of unknown origin, and the global object, or any property on the path to that field, used as a value carries it. Arithmetic, comparison, and unary results are not paths; everything else derived from a location, including file contents and modules loaded through a located specifier or loader, keeps its provenance. Node's built-ins are modelled as behaving normally, a heuristic rather than a proof: path functions are evaluated as Node's, and `createRequire` imported from `node:module` is taken as Node's own, so the file it is given only sets where its loader resolves from. A built-in module such a loader returns carries no location, while any other module it loads may be one of the action's files and is treated as located. A method called on a built-in module, loaded by a literal name directly or through an interop helper that only copies its properties, such as esbuild's `__toESM`, is Node's own, so its located arguments do not reach functions of the same name in the action's files. That stops holding for a member any of those files may replace, by writing to it or with `Object.assign` or `Object.defineProperty`, whether on the module itself, a variable holding it, or a function the file passes it to, on the parameter that receives it or on what the function returns, when the call reaches that function through a variable that may name it, at once, as a method of an object literal a variable may hold, or through `call`; and a module with any such member is not trusted through an interop helper at all, since the helper may rename members. A replacement made through a function the analysis cannot identify is outside the model. An action whose files visibly replace or reach around the loader withdraws this for all of them: taking more than `createRequire` from `node:module`; loading `module` other than to call its `createRequire`, or loading `vm`, `inspector`, or `repl`; loading or importing a specifier it does not spell out, other than a path relative to itself; using a loader's cache or passing a loader on; naming `syncBuiltinESMExports` or `getBuiltinModule`; writing through a `constructor`; or evaluating code other than the `eval("require")` and `Function("return this")` forms bundlers emit. Replacement concealed from these checks, such as reaching the `Function` constructor through a computed key, is outside the model. A file that reassigns `__dirname` or `__filename` (directly or in `eval` code), writes or passes on `import.meta`, or writes the variable holding the action path does not evaluate it to the location, so executions through it are unresolved. A located execution option leaves the execution unresolved unless the option cannot choose what runs, such as `cwd`, `encoding`, `stdio`, or a timeout; `shell`, `execPath`, `execArgv`, `env`, and `input` can each run a helper. Functions reached only through a computed key, or passed as a field of an object whose methods are unknown, are not followed as callbacks or receivers. A file that cannot be parsed, or whose analysis fails or runs too long, leaves coverage incomplete. An `exec` call is treated as a regular-expression match only when its receiver is a literal, or a variable holding one that is only read or passed to a string method, and the file neither evaluates code nor exposes `RegExp` or a regular expression's prototype. Python bindings are not scope-aware, so a name reused in unrelated code can make an execution unresolved, and Python paths passed as function parameters are not followed, so a helper a Python function runs through its parameter can be missed.
+
 - **Pipe-to-shell pre-empts other shell rules.** If a line matches a pipe-to-shell rule, no other shell or Docker rule fires on that line. So `curl ... | sh` produces a single high-severity finding instead of one medium (unversioned URL) plus one high (pipe-to-shell).
 - **Versioned-URL downgrade.** Non-pipe shell, JavaScript, and Python fetch rules only fire if the URL is _unversioned_. A URL is versioned if any path segment matches `v?\d+(\.\d+)+` — e.g. `/v1.2.3/`, `/0.55.8/`. See [Versioned URL heuristic](#versioned-url-heuristic).
 - **Trusted hosts exemption.** Unversioned-URL rules are downgraded to allowed matches when the URL host matches an entry in the user's [`trusted-hosts`](#trusted-hosts-exemption) list.
@@ -25,6 +33,8 @@ pinprick uses bounded source traversal, logical-command parsing, literal propaga
 A piped payload is never written to disk, so no checksum command can verify it. Trusted-host and data-format exemptions also do not apply — the risk is the execution model, not the source.
 :::
 
+Verification applies to the downloaded file version that exists when the check runs; checking an earlier copy does not cover a later overwrite. The verifier must be the command that runs; verifier text an `echo` or `printf` prints does not count. Runtime key retrieval, URL-valued key operands, downloaded material copied through `tee`, `cat`, or `dd` (including by input redirection with or without a descriptor, such as `0<file`), imported into GPG from standard input or a pipe, and extracted downloaded archives (in any `tar` option form, including abbreviated long options) cannot establish independent trust. Recognized runtime fetches in Python or Node steps, in any source file beside a composite action, or anything a nested action a composite step uses may write, also prevent later shell verification in its steps from assuming that its file inputs are independent, because their output paths cannot be bound by the shell scanner.
+
 ## Pipe-to-shell
 
 Flagged in shell `run:` blocks, composite `action.yml` steps, and Dockerfile `RUN` lines. High severity regardless of URL versioning.
@@ -33,7 +43,7 @@ Flagged in shell `run:` blocks, composite `action.yml` steps, and Dockerfile `RU
 
 **Severity:** High
 
-Triggers on `curl` or `wget` piped into `sh`, `bash`, `zsh`, `dash`, `ash`, `ksh`, `fish`, or `python`/`python3`, optionally via `sudo`.
+Triggers on `curl` or `wget` piped into a supported shell or interpreter, including `sh`, `bash`, `python`/`python3`, and `node`. Recognized command wrappers include `sudo`, `doas`, `env`, `command`, `exec`, `nice`, `nohup`, `time`, and `busybox`; `|&` is also treated as a pipeline. A wrapper asked only for help, its version, or (for `sudo` and `doas`) a permission check runs nothing, so nothing after it counts as a verifier, checkout, or `jq`.
 
 ```bash
 curl -sSL https://example.com/releases/download/v1.2.3/install.sh | sh
@@ -68,7 +78,7 @@ Equivalent to piping to shell: the script is executed without ever being written
 
 **Severity:** High
 
-Triggers on `bash -c "$(…)"` or `eval "$(…)"` wrapping a fetch.
+Triggers on shell `-c`, Python `-c`, Node/Ruby/Perl `-e`, or `eval` wrapping a fetch in command substitution. Shell here-strings containing fetched command output, backtick substitution, and `source` or `.` of a `/dev/stdin` here-string are also checked.
 
 ```bash
 bash -c "$(curl -fsSL https://example.com/install.sh)"
@@ -81,7 +91,7 @@ Same risk: fetched bytes are handed straight to a shell.
 
 **Severity:** High
 
-Triggers on `iex` / `Invoke-Expression` combined with `iwr` / `Invoke-WebRequest` / `irm` / `Invoke-RestMethod` / `DownloadString`.
+Triggers on `iex` / `Invoke-Expression` wrapping `iwr` / `Invoke-WebRequest` / `irm` / `Invoke-RestMethod` / `DownloadString` or receiving its output through a pipeline, and on `[scriptblock]::Create` wrapping a fetch. Fetched content stored in a variable and executed later is not tracked.
 
 ```powershell
 iex (iwr https://example.com/install.ps1)
@@ -118,7 +128,7 @@ curl -L "https://github.com/owner/repo/releases/download/v1.2.3/tool.tar.gz"
 
 **Severity:** Medium
 
-Triggers on `curl` or `wget` fetching an `http://` or `https://` URL whose path contains no version segment.
+Triggers on `curl` or `wget` fetching an HTTP(S) URL whose path contains no version segment. Scheme matching is case-insensitive. Literal domain/path operands without a scheme are also checked when they belong to a fetch command.
 
 ```bash
 curl -L https://example.com/install.sh -o install.sh
@@ -214,7 +224,7 @@ Deno URL imports commonly pin by embedding the version after the package name (`
 
 **Severity:** Medium
 
-Triggers on `git clone` without `--branch`/`-b` or with a branch name that doesn't look like a version tag.
+Triggers on `git clone` without `--branch`/`-b` or with a branch name that doesn't look like a version tag. The finding stands unless every clone on the line is parsed as pinned; a clone inside `sh -c` or text that only mentions one counts as unpinned.
 
 ```bash
 git clone https://github.com/org/repo
@@ -233,7 +243,7 @@ git clone --depth 1 --branch v1.2.3 https://github.com/org/repo
 A bare `git clone` defaults to HEAD of the default branch, which is mutable. Pinning to a version tag via `--branch` makes the clone deterministic (at least to the tag level).
 
 :::tip[SHA checkout suppression]
-If `git checkout <40-character-SHA>` appears within 3 lines after an unpinned `git clone`, the finding is fully suppressed (recorded as an allowed match visible under `--verbose`). The SHA checkout deterministically pins the repository content.
+If `git checkout <40-character-SHA>` runs as a command within 3 lines after an unpinned `git clone`, the finding is fully suppressed (recorded as an allowed match visible under `--verbose`). The SHA checkout deterministically pins the repository content.
 
 ```bash
 # This produces zero findings:
@@ -627,7 +637,7 @@ Variable or GitHub-expression image names are not classified: the value might ex
 
 ## Dockerfile patterns
 
-Flagged in the Dockerfile named by a reachable container action's `runs.image`. Unreferenced Dockerfiles in examples, fixtures, or the action repository's own CI are not executed by consumers and are not scanned.
+Flagged in the Dockerfile named by a reachable container action's `runs.image`, or the exact action-root `Dockerfile`/`dockerfile` when no action metadata exists. Unreferenced Dockerfiles in examples, fixtures, or the action repository's own CI are not scanned. Docker continuation parsing skips full comment lines. Wildcard or directory `COPY` sources require a complete repository tree to establish complete coverage.
 
 ### FROM image:latest
 
@@ -714,6 +724,8 @@ A URL is considered _versioned_ if it contains a path segment matching `v?\d+(\.
 
 This is intentionally strict — `v4` alone is a sliding major-version alias, not a pinned release.
 
+Literal and percent-encoded dot segments are normalized before the version check: `/v1.2.3/../tool` does not retain a version segment. A `latest` path component or query value remains high severity even when another component contains a version or the URL ends in a data-format extension.
+
 ## Data-format exemption
 
 Unversioned URL rules (`curl`/`wget` to an unversioned URL, `fetch()`/`axios` to an unversioned URL, `urllib`/`requests` to an unversioned URL) are **not** emitted as findings when the URL's path ends in a known data-format extension. Instead, the match is recorded as an _allowed_ match with reason `data format URL` and is only visible under `--verbose`.
@@ -741,7 +753,7 @@ The list can be extended via `extra-data-formats` in [`.pinprick.toml`](/configu
 
 ## Piped-to-`jq` exemption
 
-A `curl`/`wget` whose output is piped into `jq` is recorded as an allowed match with reason `piped to jq` rather than emitted as a finding — even when the URL has no data-format extension. `jq` parses JSON and errors on other formats. This heuristic describes the observed pipeline; it cannot prove how later commands consume saved output.
+A `curl`/`wget` whose output is piped directly into `jq` is recorded as an allowed match with reason `piped to jq` even when the URL has no data-format extension. Every occurrence of the exact URL must be an operand of a qualifying fetch. Saving the response separately, passing it through an intermediate command such as `tee`, or invoking `jq` with null input, raw input, or a separate input file does not qualify. This heuristic describes the observed pipeline; it cannot prove how later commands consume saved output.
 
 This covers the case the [data-format exemption](#data-format-exemption) misses: a REST API endpoint that returns JSON but carries no `.json` in its path. Resolving the latest release of a crate from the registry API is a real example:
 

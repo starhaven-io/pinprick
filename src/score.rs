@@ -347,23 +347,26 @@ pub fn score_repo(repo_root: &Path, config: &Config) -> Result<(ScoreReport, Con
             coverage_notes.push(format!("{display}: workflow YAML could not be parsed"));
         }
 
-        // Runtime findings (runtime.*) — reuse the audit pipeline's shell
-        // scanner on each `run:` block.
+        // Runtime findings (runtime.*) share audit's effective-shell dispatch.
         if let Ok(jobs) = audit::extract_job_run_blocks(file.path(), &content) {
             let mut collector = AuditCollector::new(false);
             for run_blocks in jobs {
                 let mut shell_state = audit::ShellScanState::default();
                 for block in &run_blocks {
-                    audit::scan_shell_content_with_state_at(
-                        &block.content,
+                    if !audit::scan_run_block(
+                        block,
                         &display,
-                        block.line,
                         "",
                         &mut collector,
                         config,
-                        block.working_directory.as_deref(),
                         &mut shell_state,
-                    );
+                    ) {
+                        coverage_notes.push(format!(
+                            "{display}:{}: unsupported run shell `{}`",
+                            block.line,
+                            block.shell.as_deref().unwrap_or_default()
+                        ));
+                    }
                 }
             }
             impact.trusted_host_fetches += collector.trusted_host_allowed;

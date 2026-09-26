@@ -726,3 +726,92 @@ fn badge_conflicts_with_json_and_html() {
             "--badge cannot be combined with --html",
         ));
 }
+
+#[test]
+fn env_indirected_composite_helper_is_scored() {
+    let action = serde_json::json!({
+        "name": "local",
+        "description": "local",
+        "runs": { "using": "composite", "steps": [{
+            "shell": "bash",
+            "run": "bash \"$SCRIPT\"",
+            "env": { "SCRIPT": "${{ github.action_path }}/install.sh" }
+        }] }
+    })
+    .to_string();
+    let dir = common::repo_with_local_action(
+        &action,
+        &[(
+            "install.sh",
+            "curl -fsSL https://example.com/install.sh | bash\n",
+        )],
+    );
+    let output = common::pinprick_cmd()
+        .args(["--json", "score"])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        json["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| finding["id"] == "runtime.pipe_to_shell"),
+        "{json}"
+    );
+}
+
+#[test]
+fn latest_fetches_in_separate_composite_steps_are_each_deducted() {
+    let action = serde_json::json!({
+        "name": "local",
+        "description": "local",
+        "runs": { "using": "composite", "steps": [
+            { "shell": "node {0}", "run": "fetch('https://example.com/latest?x=1')" },
+            { "shell": "node {0}", "run": "fetch('https://another.example.com/latest?x=1')" },
+        ] }
+    })
+    .to_string();
+    let dir = common::repo_with_local_action(&action, &[]);
+    let output = common::pinprick_cmd()
+        .args(["--json", "score"])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["totals"]["points_deducted"], 30, "{json}");
+    assert_eq!(json["score"], 70, "{json}");
+}
+
+#[test]
+fn latest_fetch_in_action_source_is_deducted_once() {
+    let action = serde_json::json!({
+        "name": "local",
+        "description": "local",
+        "runs": { "using": "node20", "main": "index.js" }
+    })
+    .to_string();
+    let dir = common::repo_with_local_action(
+        &action,
+        &[(
+            "index.js",
+            "fetch(\"https://example.com/releases/latest/download/tool\");\n",
+        )],
+    );
+    let output = common::pinprick_cmd()
+        .args(["--json", "score"])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let ids: Vec<_> = json["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|finding| finding["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["runtime.fetch.high"], "{json}");
+    assert_eq!(json["totals"]["points_deducted"], 15, "{json}");
+}

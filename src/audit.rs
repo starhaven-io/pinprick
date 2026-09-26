@@ -11,20 +11,20 @@ use std::sync::LazyLock;
 use crate::audit_patterns::{
     self, DOCKER_PATTERNS, DOCKER_URL_PATTERNS, JS_PATTERNS, JS_URL_PATTERNS,
     PS_INSTALL_MODULE_UNVERSIONED, PY_PATTERNS, PY_URL_PATTERNS, Pattern,
-    SH_CARGO_INSTALL_UNVERSIONED, SH_GEM_INSTALL_UNVERSIONED, SH_GH_RELEASE_LATEST, SH_GIT_CLONE,
+    SH_CARGO_INSTALL_UNVERSIONED, SH_GEM_INSTALL_UNVERSIONED, SH_GH_RELEASE_LATEST,
     SH_NPM_UNVERSIONED, SH_NPX_UNVERSIONED, SH_PIP_GIT_URL_UNVERSIONED, SH_PIP_UNVERSIONED,
     SH_PIPX_UNVERSIONED, SH_UV_TOOL_INSTALL_UNVERSIONED, SH_UVX_UNVERSIONED, SHELL_PATTERNS,
     SHELL_PIPE_PATTERNS, SHELL_URL_PATTERNS, cargo_install_has_version, extract_urls,
-    gem_install_has_version, gh_release_has_tag, git_clone_has_pinned_ref, npm_install_has_version,
-    npx_has_version, pip_git_url_has_ref, pip_install_has_version, pipx_install_has_version,
+    gem_install_has_version, gh_release_has_tag, npm_install_has_version, npx_has_version,
+    pip_git_url_has_ref, pip_install_has_version, pipx_install_has_version,
     ps_install_has_required_version, url_has_version, uv_tool_install_has_version, uvx_has_version,
 };
 use crate::audit_shell::{
     FileArtifactEvent, UNKNOWN_FETCH_OUTPUT, checksum_verifies_target_with_material_policy_at,
-    docker_unpinned_images, fetch_output_targets, file_artifact_events,
-    git_clone_has_bound_sha_checkout, imports_runtime_gpg_key_at, is_shell_comment_line,
-    join_continuations, mutates_curl_config, mutates_wget_config, mutates_wget_config_file,
-    shell_urls_are_literal, url_piped_to_jq,
+    docker_unpinned_images, fetch_output_targets, fetch_piped_to_interpreter, file_artifact_events,
+    git_clone_has_bound_sha_checkout, has_unpinned_git_clone, imports_runtime_gpg_key_at,
+    is_shell_comment_line, join_continuations, join_docker_continuations, mutates_curl_config,
+    mutates_wget_config, mutates_wget_config_file, shell_urls_are_literal, url_piped_to_jq,
 };
 use crate::audit_source::{
     ActionScanStatus, remote_action_scan_key, scan_action_source, scan_local_action_source_graph,
@@ -132,6 +132,7 @@ pub struct AuditCollector {
     /// Matches allowed via `extra-data-formats` — counted regardless of
     /// verbosity so repo-config notices surface score shaping.
     pub extra_data_format_allowed: usize,
+    allowed_count: usize,
 }
 
 impl AuditCollector {
@@ -142,6 +143,7 @@ impl AuditCollector {
             verbose,
             trusted_host_allowed: 0,
             extra_data_format_allowed: 0,
+            allowed_count: 0,
         }
     }
 
@@ -149,7 +151,12 @@ impl AuditCollector {
         self.findings.push(finding);
     }
 
+    pub(crate) fn has_matches(&self) -> bool {
+        !self.findings.is_empty() || self.allowed_count > 0
+    }
+
     pub fn push_allowed(&mut self, allowed: AuditMatch) {
+        self.allowed_count += 1;
         if allowed.reason == REASON_TRUSTED_HOST {
             self.trusted_host_allowed += 1;
         }
@@ -226,16 +233,20 @@ pub async fn run(
                 for run_blocks in jobs {
                     let mut shell_state = ShellScanState::default();
                     for block in &run_blocks {
-                        scan_shell_content_with_state_at(
-                            &block.content,
+                        if !scan_run_block(
+                            block,
                             &display_name,
-                            block.line,
                             "",
                             &mut collector,
                             config,
-                            block.working_directory.as_deref(),
                             &mut shell_state,
-                        );
+                        ) {
+                            coverage_failures.push(format!(
+                                "{display_name}:{}: unsupported run shell `{}`",
+                                block.line,
+                                block.shell.as_deref().unwrap_or_default()
+                            ));
+                        }
                     }
                 }
             }
@@ -702,6 +713,7 @@ pub(crate) struct WorkflowRunBlock {
     pub(crate) line: usize,
     pub(crate) content: String,
     pub(crate) working_directory: Option<String>,
+    pub(crate) shell: Option<String>,
 }
 
 pub(crate) fn extract_job_run_blocks(
@@ -714,6 +726,7 @@ pub(crate) fn extract_job_run_blocks(
     let mut jobs_with_blocks = Vec::new();
     let mut cursor: usize = 0; // 0-based line index, monotonically advancing
     let workflow_working_directory = run_working_directory(&yaml);
+    let workflow_shell = run_shell(&yaml);
 
     // Walk jobs.*.steps[].run, including nested parallel groups.
     // serde_norway's Mapping preserves insertion order, so iterating here
@@ -725,18 +738,17 @@ pub(crate) fn extract_job_run_blocks(
             if let Some(steps) = job.get("steps") {
                 let job_working_directory =
                     run_working_directory(job).or(workflow_working_directory);
-                for (run, working_directory) in
-                    collect_step_run_blocks_with_directory(steps, job_working_directory)
-                {
-                    let (line, next_cursor) = find_run_line(content, run, cursor);
+                for mut block in collect_step_run_blocks(
+                    steps,
+                    job_working_directory,
+                    run_shell(job).or(workflow_shell),
+                ) {
+                    let (line, next_cursor) = find_run_line(content, &block.content, cursor);
                     cursor = next_cursor;
                     // Line 0 (not found) is kept — the block is still
                     // scanned, just unanchored.
-                    blocks.push(WorkflowRunBlock {
-                        line,
-                        content: run.to_string(),
-                        working_directory: working_directory.map(str::to_string),
-                    });
+                    block.line = line;
+                    blocks.push(block);
                 }
             }
             if !blocks.is_empty() {
@@ -756,6 +768,14 @@ fn run_working_directory(value: &Value) -> Option<&str> {
         .and_then(Value::as_str)
 }
 
+fn run_shell(value: &Value) -> Option<&str> {
+    value
+        .get("defaults")
+        .and_then(|defaults| defaults.get("run"))
+        .and_then(|run| run.get("shell"))
+        .map(|shell| shell.as_str().unwrap_or_default())
+}
+
 /// Collect the `run:` block bodies under a `steps:` sequence in document
 /// order, descending into `parallel:` groups.
 ///
@@ -764,14 +784,16 @@ fn run_working_directory(value: &Value) -> Option<&str> {
 /// `parallel:` nested inside `parallel:`. A `background: true` step keeps its
 /// own `run:` key and is collected like any other step. Steps without a `run:`
 /// (`uses:`, `wait:`, `cancel:`) contribute nothing.
-pub(crate) fn collect_step_run_blocks_with_directory<'a>(
+pub(crate) fn collect_step_run_blocks<'a>(
     steps: &'a Value,
     default_working_directory: Option<&'a str>,
-) -> Vec<(&'a str, Option<&'a str>)> {
+    default_shell: Option<&'a str>,
+) -> Vec<WorkflowRunBlock> {
     fn collect<'a>(
         steps: &'a Value,
         default_working_directory: Option<&'a str>,
-        runs: &mut Vec<(&'a str, Option<&'a str>)>,
+        default_shell: Option<&'a str>,
+        runs: &mut Vec<WorkflowRunBlock>,
     ) {
         let Some(sequence) = steps.as_sequence() else {
             return;
@@ -785,14 +807,23 @@ pub(crate) fn collect_step_run_blocks_with_directory<'a>(
                 .get("working-directory")
                 .and_then(Value::as_str)
                 .or(default_working_directory);
+            let shell = step
+                .get("shell")
+                .map(|shell| shell.as_str().unwrap_or_default())
+                .or(default_shell);
             for (key, value) in mapping {
                 match key.as_str() {
                     Some("run") => {
                         if let Some(run) = value.as_str() {
-                            runs.push((run, working_directory));
+                            runs.push(WorkflowRunBlock {
+                                line: 0,
+                                content: run.to_string(),
+                                working_directory: working_directory.map(str::to_string),
+                                shell: shell.map(str::to_string),
+                            });
                         }
                     }
-                    Some("parallel") => collect(value, working_directory, runs),
+                    Some("parallel") => collect(value, working_directory, shell, runs),
                     _ => {}
                 }
             }
@@ -800,8 +831,60 @@ pub(crate) fn collect_step_run_blocks_with_directory<'a>(
     }
 
     let mut runs = Vec::new();
-    collect(steps, default_working_directory, &mut runs);
+    collect(steps, default_working_directory, default_shell, &mut runs);
     runs
+}
+
+pub(crate) fn scan_run_block(
+    block: &WorkflowRunBlock,
+    source_file: &str,
+    action_name: &str,
+    collector: &mut AuditCollector,
+    config: &Config,
+    state: &mut ShellScanState,
+) -> bool {
+    let shell = block.shell.as_deref().unwrap_or("bash");
+    let executable = shell
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .rsplit('/')
+        .next()
+        .unwrap_or_default();
+    if matches!(executable, "python" | "python3" | "node") {
+        let findings_before = collector.findings.len();
+        let allowed_before = collector.allowed.len();
+        let allowed_count_before = collector.allowed_count;
+        if executable == "node" {
+            scan_js_content(&block.content, source_file, action_name, collector, config);
+        } else {
+            scan_py_content(&block.content, source_file, action_name, collector, config);
+        }
+        if collector.findings.len() > findings_before
+            || collector.allowed_count > allowed_count_before
+        {
+            state.assume_unbound_download();
+        }
+        let offset = block.line.saturating_sub(1);
+        for finding in &mut collector.findings[findings_before..] {
+            finding.line = finding.line.map(|line| line.saturating_add(offset));
+        }
+        for allowed in &mut collector.allowed[allowed_before..] {
+            allowed.line = allowed.line.map(|line| line.saturating_add(offset));
+        }
+        return true;
+    }
+    scan_shell_content_with_state_at(
+        &block.content,
+        source_file,
+        block.line,
+        action_name,
+        collector,
+        config,
+        block.working_directory.as_deref(),
+        state,
+    );
+    matches!(executable, "bash" | "sh" | "zsh" | "pwsh" | "powershell")
 }
 
 /// Locate the 1-based line of `run_content` in the raw file, starting the
@@ -844,6 +927,21 @@ pub(crate) struct ShellScanState {
     runtime_gpg_key_imported: bool,
 }
 
+impl ShellScanState {
+    /// Code outside this shell stream fetched something, and its file writes
+    /// cannot be bound to shell paths.
+    pub(crate) fn assume_unbound_download(&mut self) {
+        if !self
+            .runtime_downloads
+            .iter()
+            .any(|path| path == UNKNOWN_FETCH_OUTPUT)
+        {
+            self.runtime_downloads
+                .push(UNKNOWN_FETCH_OUTPUT.to_string());
+        }
+    }
+}
+
 #[derive(Clone)]
 enum RuntimeDirectory {
     Known(String),
@@ -853,6 +951,7 @@ enum RuntimeDirectory {
 struct RuntimeDownloadRecord {
     raw: String,
     canonical: String,
+    generation: usize,
 }
 
 struct RuntimeVerificationContext {
@@ -860,6 +959,7 @@ struct RuntimeVerificationContext {
     downloads: Vec<String>,
     working_directory: Option<String>,
     trust_gpg_verification: bool,
+    generations: HashMap<String, usize>,
 }
 
 impl RuntimeDirectory {
@@ -1053,6 +1153,8 @@ pub(crate) fn scan_shell_content_with_state_at(
     let mut curl_configured = curl_config_file_mutated;
     let mut runtime_gpg_key_imported = state.runtime_gpg_key_imported;
     let mut runtime_directory = RuntimeDirectory::from_working_directory(working_directory);
+    let mut generations = HashMap::new();
+    let mut next_generation = 0;
     for (_, line) in &logical {
         let mut line_downloads = Vec::new();
         let mut verification_contexts = Vec::new();
@@ -1071,21 +1173,32 @@ pub(crate) fn scan_shell_content_with_state_at(
                 }
                 FileArtifactEvent::Download(target) => {
                     let canonical = runtime_directory.resolve(&target);
+                    next_generation += 1;
+                    generations.insert(canonical.clone(), next_generation);
                     line_downloads.push(RuntimeDownloadRecord {
                         raw: target,
                         canonical: canonical.clone(),
+                        generation: next_generation,
                     });
                     runtime_downloads.push(canonical);
                 }
                 FileArtifactEvent::Transfer {
                     source,
                     destination,
-                } => propagate_runtime_artifact_transfer(
-                    &source,
-                    &destination,
-                    &runtime_directory,
-                    &mut runtime_downloads,
-                ),
+                } => {
+                    let target = runtime_directory.resolve(&destination);
+                    generations.retain(|path, _| {
+                        target != UNKNOWN_FETCH_OUTPUT
+                            && path != &target
+                            && !path.starts_with(&format!("{target}/"))
+                    });
+                    propagate_runtime_artifact_transfer(
+                        &source,
+                        &destination,
+                        &runtime_directory,
+                        &mut runtime_downloads,
+                    );
+                }
                 FileArtifactEvent::RuntimeGpgImport(command) => {
                     runtime_gpg_key_imported |= imports_runtime_gpg_key_at(
                         &command,
@@ -1099,6 +1212,7 @@ pub(crate) fn scan_shell_content_with_state_at(
                         downloads: runtime_downloads.clone(),
                         working_directory: runtime_directory.known().map(str::to_string),
                         trust_gpg_verification: !runtime_gpg_key_imported,
+                        generations: generations.clone(),
                     });
                     verification_index += 1;
                 }
@@ -1121,14 +1235,7 @@ pub(crate) fn scan_shell_content_with_state_at(
         }
         let line_num = base_line + start;
         let before = collector.findings.len();
-        check_patterns(
-            &SHELL_PIPE_PATTERNS,
-            joined,
-            source_file,
-            line_num,
-            action_name,
-            collector,
-        );
+        check_pipe_patterns(joined, source_file, line_num, action_name, collector);
         if collector.findings.len() > before {
             pipe_shell_lines.insert(line_num);
         }
@@ -1169,6 +1276,7 @@ pub(crate) fn scan_shell_content_with_state_at(
                 action_name,
                 collector,
                 config,
+                before,
             );
         }
 
@@ -1222,7 +1330,7 @@ pub(crate) fn scan_shell_content_with_state_at(
             NonLiteralFetch::None => {}
         }
 
-        if SH_GIT_CLONE.is_match(line) && !git_clone_has_pinned_ref(line) {
+        if has_unpinned_git_clone(line) {
             if git_clone_has_bound_sha_checkout(&logical, li) {
                 collector.push_allowed(AuditMatch::new(
                     &audit_patterns::Severity::Medium,
@@ -1312,19 +1420,27 @@ fn checksum_suppresses_finding(
 fn canonical_runtime_targets(
     raw_targets: &[String],
     records: &[RuntimeDownloadRecord],
-) -> Option<Vec<String>> {
+) -> Option<Vec<(String, usize)>> {
     let mut targets = Vec::new();
     for raw_target in raw_targets {
         let normalized = normalize_runtime_artifact_path(raw_target);
-        let mut candidates = records
+        let candidates: Vec<_> = records
             .iter()
             .filter(|record| normalize_runtime_artifact_path(&record.raw) == normalized)
-            .map(|record| record.canonical.as_str());
-        let candidate = candidates.next()?;
-        if candidate == UNKNOWN_FETCH_OUTPUT || candidates.any(|other| other != candidate) {
+            .collect();
+        let candidate = candidates.first()?;
+        if candidate.canonical == UNKNOWN_FETCH_OUTPUT
+            || candidates
+                .iter()
+                .any(|other| other.canonical != candidate.canonical)
+        {
             return None;
         }
-        targets.push(candidate.to_string());
+        targets.extend(
+            candidates
+                .into_iter()
+                .map(|record| (record.canonical.clone(), record.generation)),
+        );
     }
     Some(targets)
 }
@@ -1332,7 +1448,7 @@ fn canonical_runtime_targets(
 fn checksum_within_window(
     logical: &[(usize, String)],
     li: usize,
-    targets: &[String],
+    targets: &[(String, usize)],
     verification_contexts_through_line: &[Vec<RuntimeVerificationContext>],
 ) -> bool {
     (0..=3).any(|offset| {
@@ -1345,14 +1461,15 @@ fn checksum_within_window(
             .any(|context| {
                 let mut working_directories = vec![None; context.index + 1];
                 working_directories[context.index] = context.working_directory.clone();
-                targets.iter().all(|target| {
-                    checksum_verifies_target_with_material_policy_at(
-                        &logical[verify_index].1,
-                        target,
-                        &context.downloads,
-                        context.trust_gpg_verification,
-                        &working_directories,
-                    )
+                targets.iter().all(|(target, generation)| {
+                    context.generations.get(target) == Some(generation)
+                        && checksum_verifies_target_with_material_policy_at(
+                            &logical[verify_index].1,
+                            target,
+                            &context.downloads,
+                            context.trust_gpg_verification,
+                            &working_directories,
+                        )
                 })
             })
     })
@@ -1487,6 +1604,7 @@ pub(crate) fn scan_js_content(
                         action_name,
                         collector,
                         config,
+                        before,
                     );
                 }
             }
@@ -1552,6 +1670,7 @@ pub(crate) fn scan_js_content(
 
         if line.len() > MINIFIED_LINE_THRESHOLD {
             for segment in code_segments(line) {
+                let before = collector.findings.len();
                 check_patterns(
                     &JS_PATTERNS,
                     segment,
@@ -1568,9 +1687,11 @@ pub(crate) fn scan_js_content(
                     action_name,
                     collector,
                     config,
+                    before,
                 );
             }
         } else {
+            let before = collector.findings.len();
             check_patterns(
                 &JS_PATTERNS,
                 line,
@@ -1587,6 +1708,7 @@ pub(crate) fn scan_js_content(
                 action_name,
                 collector,
                 config,
+                before,
             );
         }
     }
@@ -1891,6 +2013,7 @@ pub(crate) fn scan_py_content(
                         action_name,
                         collector,
                         config,
+                        before,
                     );
                 }
             }
@@ -1930,6 +2053,7 @@ pub(crate) fn scan_py_content(
             parameter_scopes.push(scope);
         }
 
+        let before = collector.findings.len();
         check_patterns(
             &PY_PATTERNS,
             &code,
@@ -1946,6 +2070,7 @@ pub(crate) fn scan_py_content(
             action_name,
             collector,
             config,
+            before,
         );
     }
 
@@ -2478,6 +2603,39 @@ impl<'a> JavaScriptDelimiterIndex<'a> {
             .collect()
     }
 
+    /// The leading expression of `value`: up to its first top-level `;`,
+    /// `,`, line break, or unmatched closing delimiter.
+    pub(crate) fn leading_expression(&self, value: &'a str) -> &'a str {
+        let start = self.offset(value);
+        let end = start + value.len();
+        let mut position = start;
+        let mut span_index = self.spans.partition_point(|span| span.start < position);
+        while position < end {
+            if let Some(span) = self.spans.get(span_index)
+                && span.start == position
+            {
+                span_index += 1;
+                if matches!(span.character, '\'' | '"' | '`' | '(' | '[' | '{') {
+                    position = if span.after == 0 {
+                        end
+                    } else {
+                        span.after.min(end)
+                    };
+                    span_index = self.spans.partition_point(|span| span.start < position);
+                    continue;
+                }
+            }
+            let Some(character) = self.source[position..].chars().next() else {
+                break;
+            };
+            if matches!(character, ';' | ',' | '\n' | ')' | ']' | '}') {
+                return &value[..position - start];
+            }
+            position += character.len_utf8();
+        }
+        &value[..position.min(end) - start]
+    }
+
     pub(crate) fn call_parts(&self, value: &'a str) -> Option<(&'a str, &'a str)> {
         let value = value.trim_start();
         value.strip_prefix('(')?;
@@ -2734,7 +2892,7 @@ fn exact_static_url(value: &str) -> Option<String> {
         return None;
     }
     let decoded = decode_javascript_url_literal(literal)?;
-    (decoded.starts_with("https://") || decoded.starts_with("http://")).then_some(decoded)
+    audit_patterns::is_http_url(&decoded).then_some(decoded)
 }
 
 fn decode_javascript_url_literal(literal: &str) -> Option<String> {
@@ -2859,7 +3017,7 @@ fn scan_indirect_url_sink(
         let argument = line[start..]
             .trim_start_matches(|character: char| character.is_whitespace() || character == '(');
         if let Some(url) = static_concatenated_sink_url(argument) {
-            if url.starts_with("https://") || url.starts_with("http://") {
+            if audit_patterns::is_http_url(&url) {
                 let synthetic = if language == "Python" {
                     format!("requests.get(\"{url}\")")
                 } else {
@@ -2894,6 +3052,7 @@ fn scan_indirect_url_sink(
                         action_name,
                         collector,
                         config,
+                        before,
                     );
                 }
                 if collector.findings.len() > before
@@ -2908,9 +3067,9 @@ fn scan_indirect_url_sink(
             continue;
         }
         if let Some(literal) = static_sink_literal(argument) {
-            if !(literal.starts_with("https://") || literal.starts_with("http://"))
+            if !audit_patterns::is_http_url(literal)
                 && let Some(decoded) = decode_javascript_url_literal(literal)
-                && (decoded.starts_with("https://") || decoded.starts_with("http://"))
+                && audit_patterns::is_http_url(&decoded)
             {
                 let synthetic = if language == "Python" {
                     format!("requests.get(\"{decoded}\")")
@@ -2946,6 +3105,7 @@ fn scan_indirect_url_sink(
                         action_name,
                         collector,
                         config,
+                        before,
                     );
                 }
                 if collector.findings.len() > before
@@ -3031,6 +3191,7 @@ fn scan_indirect_url_sink(
                     action_name,
                     collector,
                     config,
+                    before,
                 );
             }
             if collector.findings.len() > before
@@ -3271,7 +3432,7 @@ pub(crate) fn scan_dockerfile_content(
     // Dockerfile RUN instructions lean heavily on trailing-backslash
     // continuations; scan logical lines so a fetch split across physical
     // lines is still seen whole.
-    let logical = join_continuations(content);
+    let logical = join_docker_continuations(content);
 
     // Multi-stage builds name stages via `FROM … AS <name>`. Collect those
     // names so a later `FROM <name>` is recognized as a stage reference, not an
@@ -3286,14 +3447,7 @@ pub(crate) fn scan_dockerfile_content(
     for (start, line) in &logical {
         let line_num = start + 1;
         let before = collector.findings.len();
-        check_patterns(
-            &SHELL_PIPE_PATTERNS,
-            line,
-            source_file,
-            line_num,
-            action_name,
-            collector,
-        );
+        check_pipe_patterns(line, source_file, line_num, action_name, collector);
         if collector.findings.len() > before {
             pipe_shell_lines.insert(line_num);
         }
@@ -3317,6 +3471,7 @@ pub(crate) fn scan_dockerfile_content(
             continue;
         }
 
+        let before = collector.findings.len();
         check_patterns(
             &DOCKER_PATTERNS,
             line,
@@ -3334,9 +3489,10 @@ pub(crate) fn scan_dockerfile_content(
             action_name,
             collector,
             config,
+            before,
         );
 
-        if SH_GIT_CLONE.is_match(line) && !git_clone_has_pinned_ref(line) {
+        if has_unpinned_git_clone(line) {
             if git_clone_has_bound_sha_checkout(&logical, li) {
                 collector.push_allowed(AuditMatch::new(
                     &audit_patterns::Severity::Medium,
@@ -3409,6 +3565,7 @@ fn push_pkg_finding(
     ));
 }
 
+#[allow(clippy::too_many_arguments)]
 fn check_url_patterns(
     patterns: &[Pattern],
     line: &str,
@@ -3417,14 +3574,63 @@ fn check_url_patterns(
     action_name: &str,
     collector: &mut AuditCollector,
     config: &Config,
+    since: usize,
 ) {
     // The URL classification below is line-level, so every matching pattern
     // would reach the identical verdict on the identical URL set: record once
     // for the first match instead of once per pattern (`curl … && wget …`
     // previously emitted two findings for the same line).
-    let Some(pattern) = patterns.iter().find(|p| p.regex.is_match(line)) else {
+    let bare_urls = if patterns
+        .first()
+        .is_some_and(|pattern| matches!(pattern.category, audit_patterns::Category::ShellFetch))
+    {
+        crate::audit_shell::schemeless_fetch_urls(line)
+    } else {
+        Vec::new()
+    };
+    let Some(pattern) = patterns
+        .iter()
+        .find(|p| p.regex.is_match(line))
+        .or_else(|| (!bare_urls.is_empty()).then(|| &patterns[0]))
+    else {
         return;
     };
+
+    let urls: Vec<_> = extract_urls(line)
+        .map(|url| (url.to_string(), url.to_string()))
+        .chain(
+            bare_urls
+                .into_iter()
+                .map(|url| (format!("https://{url}"), url)),
+        )
+        .collect();
+    if urls
+        .iter()
+        .any(|(url, _)| audit_patterns::url_is_latest(url))
+    {
+        let finding = AuditFinding::new(
+            &audit_patterns::Severity::High,
+            &pattern.category,
+            action_name,
+            source_file,
+            line_num,
+            line,
+            "runtime fetch from a 'latest' URL — can change without notice",
+        );
+        // A language rule checked against this same text may already report
+        // this fetch; one fetch must not be charged twice by audit or score.
+        // Separate invocations can share a line number (inline run blocks all
+        // start at 1), so only findings from this invocation count.
+        if !collector.findings[since..].iter().any(|existing| {
+            existing.source_file == finding.source_file
+                && existing.line == finding.line
+                && existing.category == finding.category
+                && existing.severity == finding.severity
+        }) {
+            collector.push_finding(finding);
+        }
+        return;
+    }
 
     // Check EVERY URL, not just the first: a versioned/trusted decoy before
     // the real fetch must not suppress the finding. Allowed only if all URLs
@@ -3436,14 +3642,16 @@ fn check_url_patterns(
         && !shell_urls_are_literal(line);
     let mut allowed_reasons = Vec::new();
     let mut dangerous = false;
-    for url in extract_urls(line) {
+    for (url, operand) in &urls {
         if url.contains('\\') {
             dangerous = true;
             continue;
         }
-        let reason = if shell_url_ambiguous {
+        let reason = if shell_url_ambiguous
+            || url != operand && operand.contains(['$', '`', '\\', '*', '?', '[', ']'])
+        {
             // jq classifies the response as data independently of URL components.
-            if url_piped_to_jq(line, url) {
+            if url_piped_to_jq(line, operand) {
                 "piped to jq"
             } else {
                 dangerous = true;
@@ -3457,7 +3665,7 @@ fn check_url_patterns(
             REASON_EXTRA_DATA_FORMAT
         } else if config.is_data_format_exempt(url) {
             "data format URL"
-        } else if url_piped_to_jq(line, url) {
+        } else if url_piped_to_jq(line, operand) {
             "piped to jq"
         } else {
             dangerous = true;
@@ -3488,6 +3696,33 @@ fn check_url_patterns(
         ));
     }
     // No URL on the line: nothing to record.
+}
+
+fn check_pipe_patterns(
+    line: &str,
+    source_file: &str,
+    line_num: usize,
+    action_name: &str,
+    collector: &mut AuditCollector,
+) {
+    let command = line
+        .trim_start()
+        .split_once(char::is_whitespace)
+        .filter(|(instruction, _)| instruction.eq_ignore_ascii_case("RUN"))
+        .map_or(line, |(_, command)| command);
+    let pattern = SHELL_PIPE_PATTERNS
+        .iter()
+        .find(|pattern| pattern.regex.is_match(line))
+        .or_else(|| fetch_piped_to_interpreter(command).then_some(&SHELL_PIPE_PATTERNS[0]));
+    if let Some(pattern) = pattern {
+        collector.push_finding(AuditFinding::from_pattern(
+            pattern,
+            action_name,
+            source_file,
+            line_num,
+            line,
+        ));
+    }
 }
 
 fn check_patterns(
@@ -4732,6 +4967,289 @@ curl -fsSL "$RELEASE_URL" | cat > tool"#,
     }
 
     #[test]
+    fn reviewed_fetch_execution_forms_keep_pipe_precedence() {
+        for line in [
+            "curl https://example.com/v1.2.3/tool | sudo -E bash -",
+            "curl https://example.com/v1.2.3/tool | /usr/bin/env bash",
+            "irm https://example.com/v1.2.3/tool | iex",
+            "python3 -c \"$(curl https://example.com/v1.2.3/tool)\"",
+            "node -e \"$(curl https://example.com/v1.2.3/tool)\"",
+            "node --eval \"$(curl https://example.com/v1.2.3/tool)\"",
+            "ruby -e \"$(curl https://example.com/v1.2.3/tool)\"",
+            ". <(curl https://example.com/v1.2.3/tool)",
+            "bash <<< \"$(curl https://example.com/v1.2.3/tool)\"",
+            "curl https://example.com/v1.2.3/tool |& bash",
+        ] {
+            let mut collector = AuditCollector::new(true);
+            scan_shell_content(line, "test.sh", 1, "", &mut collector, &DEFAULT_CONFIG);
+            assert_eq!(collector.findings.len(), 1, "{line}");
+            assert_eq!(collector.findings[0].severity, "high", "{line}");
+            assert_eq!(
+                collector.findings[0].finding_kind,
+                Some(audit_patterns::FindingKind::PipeToShell),
+                "{line}"
+            );
+        }
+        let mut collector = AuditCollector::new(false);
+        scan_dockerfile_content(
+            "FROM scratch\nRUN curl \\\n# ignored by Docker\n https://example.com/v1.2.3/tool | sudo -E bash\n",
+            "Dockerfile",
+            "",
+            &mut collector,
+            &DEFAULT_CONFIG,
+        );
+        assert_eq!(collector.findings.len(), 1);
+        assert_eq!(collector.findings[0].severity, "high");
+    }
+
+    #[test]
+    fn url_and_command_exemptions_cannot_cover_other_fetches() {
+        let sha = "a".repeat(40);
+        for line in [
+            "curl HTTPS://example.com/tool -o tool".to_string(),
+            "curl example.com/tool -o tool".to_string(),
+            "wget -O tool example.com/tool".to_string(),
+            "curl -o tool https://example.com/tool | jq .".to_string(),
+            "curl https://example.com/tool | tee tool | jq .".to_string(),
+            "curl https://example.com/tool | jq -n .".to_string(),
+            "curl https://example.com/tool | jq . input.json".to_string(),
+            "curl https://example.com/v1.2.3/../tool -o tool".to_string(),
+            "curl https://example.com/v1.2.3/%2e%2e/tool -o tool".to_string(),
+            "curl https://example.com/tool -o tool; echo 'https://example.com/tool' | jq ."
+                .to_string(),
+            "curl https://example.com/tool -o tool; curl https://example.com/tool.json | jq ."
+                .to_string(),
+            "git clone --branch v1.2.3 https://example.com/a && git clone https://example.com/b"
+                .to_string(),
+            format!("git clone https://example.com/a\ngit -C a checkout {sha} -- file"),
+        ] {
+            let mut collector = AuditCollector::new(true);
+            scan_shell_content(&line, "test.sh", 1, "", &mut collector, &DEFAULT_CONFIG);
+            assert_eq!(collector.findings.len(), 1, "{line}");
+        }
+        for line in [
+            "curl HTTPS://example.com/v1.2.3/tool -o tool",
+            "curl example.com/v1.2.3/tool -o tool",
+            "curl example.com/data | jq .",
+            "curl https://example.com/data | jq -r --arg key value .key",
+            "DATA=$(curl https://example.com/data | jq -r .key)",
+            "curl -o tool.sh https://example.com/v1.2.3/tool",
+        ] {
+            let mut collector = AuditCollector::new(true);
+            scan_shell_content(line, "test.sh", 1, "", &mut collector, &DEFAULT_CONFIG);
+            assert!(collector.findings.is_empty(), "{line}");
+        }
+    }
+
+    #[test]
+    fn verification_must_follow_the_same_download_generation() {
+        let digest = "a".repeat(64);
+        for script in [
+            format!(
+                "echo '{digest} tool' | sha256sum -c - && curl -o tool https://example.com/tool"
+            ),
+            format!(
+                "curl -o tool https://example.com/v1.2.3/tool\necho '{digest} tool' | sha256sum -c - && curl -o tool https://example.com/tool"
+            ),
+        ] {
+            let mut collector = AuditCollector::new(true);
+            scan_shell_content(&script, "test.sh", 1, "", &mut collector, &DEFAULT_CONFIG);
+            assert_eq!(collector.findings.len(), 1, "{script}");
+        }
+        for latest in [
+            "'https://example.com/latest'",
+            "\"https://example.com/latest?format=json\"",
+            "https://example.com/latest/data.json",
+        ] {
+            let script = format!("curl -o tool {latest}\necho '{digest} tool' | sha256sum -c -");
+            let mut collector = AuditCollector::new(true);
+            scan_shell_content(&script, "test.sh", 1, "", &mut collector, &DEFAULT_CONFIG);
+            assert_eq!(collector.findings.len(), 1, "{script}");
+            assert_eq!(collector.findings[0].severity, "high", "{script}");
+        }
+    }
+
+    #[test]
+    fn downloaded_or_network_verification_material_never_suppresses() {
+        for (setup, verification) in [
+            (
+                "",
+                "cosign verify-blob --key https://example.com/v1.2.3/key.pem --signature trusted.sig tool",
+            ),
+            (
+                "curl -o key.pem https://example.com/v1.2.3/key.pem\n",
+                "cosign verify-blob --key=key.pem --signature trusted.sig tool",
+            ),
+            (
+                "curl https://example.com/v1.2.3/key.pem | tee key.pem\n",
+                "cosign verify-blob --key key.pem --signature trusted.sig tool",
+            ),
+            (
+                "curl -o key.raw https://example.com/v1.2.3/key.pem\ncat key.raw > key.pem\n",
+                "cosign verify-blob --key key.pem --signature trusted.sig tool",
+            ),
+            (
+                "curl -o keys.tar https://example.com/v1.2.3/keys.tar\ntar -xf keys.tar\n",
+                "cosign verify-blob --key key.pem --signature trusted.sig tool",
+            ),
+            (
+                "curl -o key.pub https://example.com/v1.2.3/key.pub\n",
+                "minisign -V -m tool -pkey.pub -xtrusted.sig",
+            ),
+            (
+                "curl https://example.com/v1.2.3/key.pem | dd of=key.pem\n",
+                "cosign verify-blob --key key.pem --signature trusted.sig tool",
+            ),
+            (
+                "curl -o key.raw https://example.com/v1.2.3/key.pem\ndd if=key.raw of=key.pem\n",
+                "cosign verify-blob --key key.pem --signature trusted.sig tool",
+            ),
+            (
+                "gpg --recv-keys 12345678\n",
+                "gpg --verify trusted.sig tool",
+            ),
+            (
+                "gpg --fetch-keys https://example.com/key.asc\n",
+                "gpg --verify trusted.sig tool",
+            ),
+            (
+                "",
+                "cosign verify-blob --key tool --signature trusted.sig different-file",
+            ),
+            (
+                "curl -o key.raw https://example.com/v1.2.3/key.pem\ncat <key.raw > key.pem\n",
+                "cosign verify-blob --key key.pem --signature trusted.sig tool",
+            ),
+            (
+                "curl -o key.raw https://example.com/v1.2.3/key.pem\ntee key.pem <key.raw\n",
+                "cosign verify-blob --key key.pem --signature trusted.sig tool",
+            ),
+            (
+                "curl -o key.raw https://example.com/v1.2.3/key.pem\ntee key.pem < key.raw\n",
+                "cosign verify-blob --key key.pem --signature trusted.sig tool",
+            ),
+            (
+                "curl -o keys.tar https://example.com/v1.2.3/keys.tar\ntar -xfkeys.tar\n",
+                "cosign verify-blob --key key.pem --signature trusted.sig tool",
+            ),
+            (
+                "curl -o keys.tar https://example.com/v1.2.3/keys.tar\ntar --extract --file=keys.tar\n",
+                "cosign verify-blob --key key.pem --signature trusted.sig tool",
+            ),
+            (
+                "curl -o keys.tar https://example.com/v1.2.3/keys.tar\ntar -x <keys.tar\n",
+                "cosign verify-blob --key key.pem --signature trusted.sig tool",
+            ),
+            (
+                "curl -o key.raw https://example.com/v1.2.3/key.pem\ncat 0<key.raw > key.pem\n",
+                "cosign verify-blob --key key.pem --signature trusted.sig tool",
+            ),
+            (
+                "curl -o key.raw https://example.com/v1.2.3/key.pem\ndd 0<key.raw of=key.pem\n",
+                "cosign verify-blob --key key.pem --signature trusted.sig tool",
+            ),
+            (
+                "curl -o key.raw https://example.com/v1.2.3/key.pem\ntee key.pem 0<key.raw\n",
+                "cosign verify-blob --key key.pem --signature trusted.sig tool",
+            ),
+            (
+                "curl -o keys.tar https://example.com/v1.2.3/keys.tar\ntar -xf - 0<keys.tar\n",
+                "cosign verify-blob --key key.pem --signature trusted.sig tool",
+            ),
+            (
+                "curl -o keys.tar https://example.com/v1.2.3/keys.tar\ntar --extr -f keys.tar\n",
+                "cosign verify-blob --key key.pem --signature trusted.sig tool",
+            ),
+            (
+                "curl -o keys.tar https://example.com/v1.2.3/keys.tar\ntar -x --fil=keys.tar\n",
+                "cosign verify-blob --key key.pem --signature trusted.sig tool",
+            ),
+            (
+                "curl -o keys.tar https://example.com/v1.2.3/keys.tar\ntar fx keys.tar\n",
+                "cosign verify-blob --key key.pem --signature trusted.sig tool",
+            ),
+            (
+                "curl -o key.pub https://example.com/v1.2.3/key.pub\ngpg --import <key.pub\n",
+                "gpg --verify trusted.sig tool",
+            ),
+            (
+                "curl -o key.pub https://example.com/v1.2.3/key.pub\ncat key.pub | gpg --import\n",
+                "gpg --verify trusted.sig tool",
+            ),
+        ] {
+            let script = format!("{setup}curl -o tool https://example.com/tool\n{verification}");
+            let mut collector = AuditCollector::new(true);
+            scan_shell_content(&script, "test.sh", 1, "", &mut collector, &DEFAULT_CONFIG);
+            assert_eq!(collector.findings.len(), 1, "{script}");
+        }
+        let script = format!(
+            "gpg --recv-keys 12345678\ncurl -o tool https://example.com/tool\necho '{} tool' | sha256sum -c -",
+            "a".repeat(64)
+        );
+        let mut collector = AuditCollector::new(true);
+        scan_shell_content(&script, "test.sh", 1, "", &mut collector, &DEFAULT_CONFIG);
+        assert!(collector.findings.is_empty());
+    }
+
+    #[test]
+    fn language_run_steps_preserve_runtime_material_taint() {
+        for verbose in [false, true] {
+            for (shell, content) in [
+                (
+                    "python",
+                    "import urllib.request\nopen('key.pem', 'wb').write(urllib.request.urlopen('https://example.com/v1.2.3/key.pem').read())",
+                ),
+                (
+                    "node",
+                    "fetch('https://example.com/v1.2.3/key.pem').then(r => r.text()).then(key => require('fs').writeFileSync('key.pem', key));",
+                ),
+            ] {
+                let mut collector = AuditCollector::new(verbose);
+                let mut state = ShellScanState::default();
+                for (shell, content) in [
+                    (shell, content),
+                    (
+                        "bash",
+                        "curl -o tool https://example.com/tool\ncosign verify-blob --key key.pem --signature trusted.sig tool",
+                    ),
+                ] {
+                    assert!(scan_run_block(
+                        &WorkflowRunBlock {
+                            line: 1,
+                            content: content.to_string(),
+                            working_directory: None,
+                            shell: Some(shell.to_string())
+                        },
+                        "test.yml",
+                        "",
+                        &mut collector,
+                        &DEFAULT_CONFIG,
+                        &mut state
+                    ));
+                }
+                assert_eq!(collector.findings.len(), 1, "{shell}, verbose={verbose}");
+            }
+        }
+        let mut collector = AuditCollector::new(false);
+        let mut state = ShellScanState::default();
+        let block = WorkflowRunBlock {
+            line: 1,
+            content: "print('hello')".to_string(),
+            working_directory: None,
+            shell: Some("python".to_string()),
+        };
+        assert!(scan_run_block(
+            &block,
+            "test.yml",
+            "",
+            &mut collector,
+            &DEFAULT_CONFIG,
+            &mut state
+        ));
+        assert!(state.runtime_downloads.is_empty());
+    }
+
+    #[test]
     fn chained_bindings_preserve_inner_invalidation_and_comparison_boundaries() {
         let url = "https://example.com/v1.2.3/tool";
         for (line, remaining) in [
@@ -4838,6 +5356,36 @@ curl -fsSL "$RELEASE_URL" | cat > tool"#,
                 javascript_position_is_quoted(line, position),
                 "{line:?} at {position} queried after later positions"
             );
+        }
+    }
+
+    #[test]
+    fn latest_url_fetch_is_reported_once_per_line() {
+        let url = "https://example.com/releases/latest/download/tool";
+        let mut js = AuditCollector::new(false);
+        scan_js_content(
+            &format!("fetch(\"{url}\");\n"),
+            "x.js",
+            "",
+            &mut js,
+            &Config::default(),
+        );
+        let mut py = AuditCollector::new(false);
+        scan_py_content(
+            &format!("requests.get(\"{url}\")\n"),
+            "x.py",
+            "",
+            &mut py,
+            &Config::default(),
+        );
+        for collector in [js, py] {
+            let descriptions: Vec<_> = collector
+                .findings
+                .iter()
+                .map(|finding| finding.description.as_str())
+                .collect();
+            assert_eq!(descriptions.len(), 1, "{descriptions:?}");
+            assert_eq!(collector.findings[0].severity, "high");
         }
     }
 
@@ -6209,6 +6757,79 @@ const d = require("node:https").get("https://example.com/install.sh", cb);
         assert_eq!(c.findings.len(), 1);
         assert_eq!(c.findings[0].severity, "medium");
         assert!(c.findings[0].description.contains("git clone"));
+    }
+
+    #[test]
+    fn printed_verifier_text_does_not_suppress() {
+        for (verification, findings) in [
+            (
+                "cosign verify-blob --key key.pem --signature trusted.sig tool",
+                0,
+            ),
+            (
+                "echo 'cosign verify-blob --key key.pem --signature trusted.sig tool'",
+                1,
+            ),
+            (
+                "printf '%s\\n' cosign verify-blob --key key.pem --signature trusted.sig tool",
+                1,
+            ),
+            (
+                "nice --help cosign verify-blob --key key.pem --signature trusted.sig tool",
+                1,
+            ),
+            (
+                "sudo -l cosign verify-blob --key key.pem --signature trusted.sig tool",
+                1,
+            ),
+            (
+                "doas -C rules.conf cosign verify-blob --key key.pem --signature trusted.sig tool",
+                1,
+            ),
+            (
+                "env --help cosign verify-blob --key key.pem --signature trusted.sig tool",
+                1,
+            ),
+        ] {
+            let script = format!("curl -o tool https://example.com/tool\n{verification}");
+            let mut c = AuditCollector::new(false);
+            scan_shell_content(&script, "test.sh", 1, "", &mut c, &DEFAULT_CONFIG);
+            assert_eq!(c.findings.len(), findings, "{script}");
+        }
+    }
+
+    #[test]
+    fn git_clone_finding_survives_inconclusive_parsing() {
+        for (script, findings) in [
+            ("(git clone https://github.com/org/repo)", 1),
+            ("/usr/bin/git clone https://github.com/org/repo", 1),
+            ("sh -c 'git clone https://github.com/org/repo'", 1),
+            (
+                "/usr/bin/git clone --depth 1 --branch v1.2.3 https://github.com/org/repo",
+                0,
+            ),
+            (
+                "git clone --branch v1.2.3 https://github.com/org/a && sh -c 'git clone https://github.com/org/b'",
+                1,
+            ),
+            (
+                "git clone https://github.com/org/a\necho /usr/bin/git -C a checkout aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                1,
+            ),
+            (
+                "git clone https://github.com/org/a\n/usr/bin/git -C a checkout aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                0,
+            ),
+            (
+                "git clone https://github.com/org/a\nsudo -l git -C a checkout aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                1,
+            ),
+            ("curl https://example.com/tool | nice --help jq .", 1),
+        ] {
+            let mut c = AuditCollector::new(false);
+            scan_shell_content(script, "test.sh", 1, "", &mut c, &DEFAULT_CONFIG);
+            assert_eq!(c.findings.len(), findings, "{script}");
+        }
     }
 
     #[test]
