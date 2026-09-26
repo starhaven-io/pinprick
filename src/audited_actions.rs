@@ -66,8 +66,10 @@ struct AuditedEntry {
 }
 
 const LOCAL_CACHE_PINPRICK_VERSION: &str = env!("CARGO_PKG_VERSION");
-// Only verdicts produced without custom runtime trust can outlive their config.
-const LOCAL_CACHE_POLICY_VERSION: u8 = 1;
+// Retires local verdicts that must not outlive their provenance within one
+// pinprick version: those produced with custom runtime trust (before 1) and
+// those from a workflow scan that could miss `uses:` keys (before 2).
+const LOCAL_CACHE_POLICY_VERSION: u8 = 2;
 
 /// Which layer in the lookup satisfied an audited-action check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -777,6 +779,15 @@ mod tests {
             "rules_version": AUDIT_RULES_VERSION
         }]);
         assert!(parse_local_cache_entries(&legacy.to_string(), "owner/repo").is_empty());
+
+        let previous = serde_json::json!([{
+            "action": "owner/repo",
+            "sha": SHA_A,
+            "pinprick_version": LOCAL_CACHE_PINPRICK_VERSION,
+            "policy_version": LOCAL_CACHE_POLICY_VERSION - 1,
+            "rules_version": AUDIT_RULES_VERSION
+        }]);
+        assert!(parse_local_cache_entries(&previous.to_string(), "owner/repo").is_empty());
 
         for config in [
             Config {

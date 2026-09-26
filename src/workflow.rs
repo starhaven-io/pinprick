@@ -61,8 +61,8 @@ static ESCAPED_YAML_KEY_RE: LazyLock<Regex> = LazyLock::new(|| {
 // literal docs or scripts cannot false-match on `uses:` text.
 static BLOCK_SCALAR_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(concat!(
-        r#"^(\s*)(?:"#,
-        r#"(?:-\s+)?(?:[A-Za-z0-9_-]+|\"(?:[^\"\\]|\\.)*\"|'[^']*')\s*:\s*"#,
+        r#"^(?P<indent>\s*)(?:"#,
+        r#"(?P<dash>-\s+)?(?:[A-Za-z0-9_-]+|\"(?:[^\"\\]|\\.)*\"|'[^']*')\s*:\s*"#,
         r#"(?:(?:&[^\s]+|![^\s]+)\s+)*"#,
         r#"|-\s+(?:(?:&[^\s]+|![^\s]+)\s+)*"#,
         r#")[|>][0-9+\-]*\s*(?:#.*)?$"#,
@@ -587,7 +587,12 @@ fn scannable_lines(content: &str) -> impl Iterator<Item = (usize, &str)> {
         }
 
         if let Some(caps) = BLOCK_SCALAR_RE.captures(line) {
-            block_parent_col = Some(caps.get(1).unwrap().as_str().len());
+            // The scalar ends at the first line not indented past its parent
+            // node: the key in `- key: |`, the dash in a bare `- |` entry.
+            // Measuring from the dash would swallow sibling keys, such as a
+            // `uses:` that follows `- name: >` in the same step.
+            let indent = caps["indent"].len();
+            block_parent_col = Some(indent + caps.name("dash").map_or(0, |dash| dash.len()));
             return (!candidate_uses_values_on_line(line).is_empty() || has_escaped_uses_key(line))
                 .then_some((i + 1, line));
         }
@@ -687,8 +692,75 @@ pub fn scan_unsupported_uses(content: &str) -> Vec<UnsupportedUsesRef> {
                 line_number,
             }),
     );
+    // Any entry above already refuses the file, so the parsed-document check
+    // only has to catch what the line scan cannot see.
+    if unsupported.is_empty() {
+        unsupported = uses_hidden_from_line_scan(content);
+    }
     unsupported.sort_by_key(|entry| entry.line_number);
     unsupported
+}
+
+/// Discovery and edits stay line-based, so every `uses` string in the parsed
+/// document must be a value the line scan also saw. Tagged, anchored, and
+/// explicit (`? uses`) keys, or a layout the scan misreads, would otherwise
+/// drop an action from coverage without any unsupported entry.
+fn uses_hidden_from_line_scan(content: &str) -> Vec<UnsupportedUsesRef> {
+    let Ok(document) = serde_norway::from_str::<serde_norway::Value>(content) else {
+        return vec![UnsupportedUsesRef {
+            value: "<unparsable YAML>".to_string(),
+            line_number: 0,
+        }];
+    };
+    let seen: std::collections::HashSet<&str> = scannable_lines(content)
+        .flat_map(|(_, line)| candidate_uses_values_on_line(line))
+        .map(|value| value.value)
+        .collect();
+    let mut parsed = std::collections::BTreeSet::new();
+    collect_uses_values(&document, &mut parsed);
+    parsed
+        .into_iter()
+        .filter(|value| !seen.contains(value))
+        .map(|value| UnsupportedUsesRef {
+            value: value.to_string(),
+            line_number: content
+                .lines()
+                .position(|line| !value.is_empty() && line.contains(value))
+                .map_or(0, |index| index + 1),
+        })
+        .collect()
+}
+
+fn collect_uses_values<'a>(
+    value: &'a serde_norway::Value,
+    found: &mut std::collections::BTreeSet<&'a str>,
+) {
+    match value {
+        serde_norway::Value::Mapping(mapping) => {
+            for (key, value) in mapping {
+                if untagged(key).as_str() == Some("uses")
+                    && let Some(reference) = untagged(value).as_str()
+                {
+                    found.insert(reference);
+                }
+                collect_uses_values(value, found);
+            }
+        }
+        serde_norway::Value::Sequence(sequence) => {
+            for item in sequence {
+                collect_uses_values(item, found);
+            }
+        }
+        serde_norway::Value::Tagged(tagged) => collect_uses_values(&tagged.value, found),
+        _ => {}
+    }
+}
+
+fn untagged(value: &serde_norway::Value) -> &serde_norway::Value {
+    match value {
+        serde_norway::Value::Tagged(tagged) => untagged(&tagged.value),
+        value => value,
+    }
 }
 
 #[cfg(test)]
@@ -1698,6 +1770,58 @@ jobs:
         let refs = scan_content(yaml);
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].full_name(), "real/action");
+    }
+
+    #[test]
+    fn scan_ends_dash_line_block_scalar_at_sibling_key() {
+        for opener in [
+            "- name: >",
+            "- name: |",
+            "- if: >-",
+            "-   if: |+",
+            "- &a name: >",
+        ] {
+            let key = " ".repeat(6 + 1 + opener[1..].find(|c: char| c != ' ').unwrap());
+            let yaml = format!(
+                "jobs:\n  b:\n    steps:\n      {opener}\n{key}  folded text\n{key}uses: evil/action@main\n      - uses: good/action@v2\n"
+            );
+            let refs: Vec<_> = scan_content(&yaml)
+                .into_iter()
+                .map(|action| action.full_name())
+                .collect();
+            assert_eq!(refs, ["evil/action", "good/action"], "opener {opener:?}");
+            assert!(scan_unsupported_uses(&yaml).is_empty(), "opener {opener:?}");
+        }
+    }
+
+    #[test]
+    fn uses_keys_hidden_from_line_scan_are_unsupported() {
+        for (step, line_number) in [
+            ("- !!str uses: evil/action@main", 4),
+            ("- &key uses: evil/action@main", 4),
+            ("- ? uses\n        : evil/action@main", 5),
+        ] {
+            let yaml = format!("jobs:\n  b:\n    steps:\n      {step}\n");
+            assert!(scan_content(&yaml).is_empty(), "{step}");
+            let unsupported = scan_unsupported_uses(&yaml);
+            assert_eq!(unsupported.len(), 1, "{step}");
+            assert_eq!(unsupported[0].value, "evil/action@main", "{step}");
+            assert_eq!(unsupported[0].line_number, line_number, "{step}");
+        }
+    }
+
+    #[test]
+    fn aliased_uses_step_is_not_unsupported() {
+        let yaml = "jobs:\n  b:\n    steps:\n      - &checkout\n        uses: actions/checkout@v4\n      - *checkout\n";
+        assert_eq!(scan_content(yaml).len(), 1);
+        assert!(scan_unsupported_uses(yaml).is_empty());
+    }
+
+    #[test]
+    fn unparsable_workflow_is_unsupported() {
+        let unsupported = scan_unsupported_uses("jobs:\n  b: [\n");
+        assert_eq!(unsupported.len(), 1);
+        assert_eq!(unsupported[0].value, "<unparsable YAML>");
     }
 
     #[test]

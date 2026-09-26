@@ -259,6 +259,57 @@ jobs:
 }
 
 #[test]
+fn uses_hidden_by_block_scalars_or_key_properties_stays_in_coverage() {
+    let folded_name = "\
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: >
+          Check out
+        uses: evil/action@main
+";
+    let tagged_key = "\
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - !!str uses: evil/action@main
+";
+    for (workflow, skipped, failure) in [
+        (folded_name, 1, "external action was skipped"),
+        (
+            tagged_key,
+            0,
+            ":6: unsupported uses target `evil/action@main`",
+        ),
+    ] {
+        let dir = common::repo_with_workflow("ci.yml", workflow);
+        let output = common::pinprick_cmd()
+            .arg("--json")
+            .arg("audit")
+            .arg(dir.path())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2), "{workflow}");
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["external_actions_skipped"], skipped, "{workflow}");
+        assert_eq!(report["coverage_complete"], false, "{workflow}");
+        assert!(
+            report["coverage_failures"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry.as_str().unwrap().contains(failure)),
+            "{workflow}: {}",
+            report["coverage_failures"]
+        );
+    }
+}
+
+#[test]
 fn human_output_sanitizes_terminal_escapes() {
     // A matched run-block line carrying an ANSI escape must not reach the
     // terminal verbatim — otherwise a hostile action could spoof or hide a
