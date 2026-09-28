@@ -24,7 +24,7 @@
   "devDependencies": {
     "prettier": "^3.9.8",
     "prettier-plugin-astro": "^1.0.1",
-    "wrangler": "4.135.0"
+    "wrangler": "4.136.1"
   },
   "allowScripts": {
     "esbuild": false,
