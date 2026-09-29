@@ -180,39 +180,31 @@ jobs:
             target/
           key: ${{ runner.os }}-${{ runner.arch }}-cargo-debug-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
 
-      - name: Restore coverage tools cache
-        id: cov-tools-cache
-        if: matrix.check == 'coverage'
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            ~/.cargo/bin/cargo-nextest
-            ~/.cargo/bin/cargo-llvm-cov
-            ~/.cargo/.crates.toml
-            ~/.cargo/.crates2.json
-          key: ${{ runner.os }}-${{ runner.arch }}-cargo-cov-tools-${{ hashFiles('.github/workflows/ci.yml') }}
-          restore-keys: ${{ runner.os }}-${{ runner.arch }}-cargo-cov-tools-
-
-      - name: Restore lint tools cache
-        id: lint-tools-cache
-        if: matrix.check == 'lint'
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            ~/.cargo/bin/typos
-            ~/.cargo/bin/cargo-deny
-            ~/.cargo/.crates.toml
-            ~/.cargo/.crates2.json
-          key: ${{ runner.os }}-${{ runner.arch }}-cargo-lint-tools-${{ hashFiles('.github/workflows/ci.yml') }}
-          restore-keys: ${{ runner.os }}-${{ runner.arch }}-cargo-lint-tools-
-
       - name: Install typos-cli
         if: matrix.check == 'lint'
-        run: cargo install typos-cli --locked --version 1.50.2
+        env:
+          TYPOS_SHA256: "abcb3e257c7c2abeff4d903f7fe68071357637605bdb283ce2251f44bc70dc09"
+        run: |
+          archive="${RUNNER_TEMP}/typos.tar.gz"
+          curl --fail --location --proto '=https' --proto-redir '=https' \
+            --output "${archive}" \
+            "https://github.com/crate-ci/typos/releases/download/v1.50.2/typos-v1.50.2-x86_64-unknown-linux-musl.tar.gz"
+          echo "${TYPOS_SHA256}  ${archive}" | sha256sum --check --strict
+          tar --extract --gzip --file "${archive}" --directory "${RUNNER_TEMP}" ./typos
+          echo "${RUNNER_TEMP}" >> "${GITHUB_PATH}"
 
       - name: Install cargo-deny
         if: matrix.check == 'lint'
-        run: cargo install cargo-deny --locked --version 0.20.2
+        env:
+          CARGO_DENY_SHA256: "9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f"
+        run: |
+          archive="${RUNNER_TEMP}/cargo-deny.tar.gz"
+          curl --fail --location --proto '=https' --proto-redir '=https' \
+            --output "${archive}" \
+            "https://github.com/EmbarkStudios/cargo-deny/releases/download/0.20.2/cargo-deny-0.20.2-x86_64-unknown-linux-musl.tar.gz"
+          echo "${CARGO_DENY_SHA256}  ${archive}" | sha256sum --check --strict
+          tar --extract --gzip --file "${archive}" --directory "${RUNNER_TEMP}" --strip-components=1 --wildcards '*/cargo-deny'
+          echo "${RUNNER_TEMP}" >> "${GITHUB_PATH}"
 
       - name: Clippy
         if: matrix.check == 'lint'
@@ -241,18 +233,6 @@ jobs:
             target/
           key: ${{ runner.os }}-${{ runner.arch }}-cargo-debug-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
 
-      - name: Save lint tools cache
-        if: matrix.check == 'lint' && github.event_name == 'push' && steps.lint-tools-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            ~/.cargo/bin/typos
-            ~/.cargo/bin/cargo-deny
-            ~/.cargo/.crates.toml
-            ~/.cargo/.crates2.json
-          key: ${{ runner.os }}-${{ runner.arch }}-cargo-lint-tools-${{ hashFiles('.github/workflows/ci.yml') }}
-
-
       - name: Test
         if: matrix.check == 'test'
         run: cargo test --locked
@@ -278,11 +258,29 @@ jobs:
 
       - name: Install cargo-nextest
         if: matrix.check == 'coverage'
-        run: cargo install cargo-nextest --locked --version 0.9.146
+        env:
+          CARGO_NEXTEST_SHA256: "b64617e8640624e8f9ba99819e37d7971154e97836d7ae4774fed4715501a6aa"
+        run: |
+          archive="${RUNNER_TEMP}/cargo-nextest.tar.gz"
+          curl --fail --location --proto '=https' --proto-redir '=https' \
+            --output "${archive}" \
+            "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.146/cargo-nextest-0.9.146-x86_64-unknown-linux-musl.tar.gz"
+          echo "${CARGO_NEXTEST_SHA256}  ${archive}" | sha256sum --check --strict
+          tar --extract --gzip --file "${archive}" --directory "${RUNNER_TEMP}" cargo-nextest
+          echo "${RUNNER_TEMP}" >> "${GITHUB_PATH}"
 
       - name: Install cargo-llvm-cov
         if: matrix.check == 'coverage'
-        run: cargo install cargo-llvm-cov --locked --version 0.9.1
+        env:
+          CARGO_LLVM_COV_SHA256: "3fca950394a3c49457657c158b1619cec8dfd2647ae5b48746734c0ab969a522"
+        run: |
+          archive="${RUNNER_TEMP}/cargo-llvm-cov.tar.gz"
+          curl --fail --location --proto '=https' --proto-redir '=https' \
+            --output "${archive}" \
+            "https://github.com/taiki-e/cargo-llvm-cov/releases/download/v0.9.1/cargo-llvm-cov-x86_64-unknown-linux-musl.tar.gz"
+          echo "${CARGO_LLVM_COV_SHA256}  ${archive}" | sha256sum --check --strict
+          tar --extract --gzip --file "${archive}" --directory "${RUNNER_TEMP}" cargo-llvm-cov
+          echo "${RUNNER_TEMP}" >> "${GITHUB_PATH}"
 
       - name: Run tests with coverage
         id: coverage-tests
@@ -310,18 +308,6 @@ jobs:
             target/nextest/ci/junit.xml
           if-no-files-found: error
           retention-days: 1
-
-      - name: Save coverage tools cache
-        if: matrix.check == 'coverage' && github.event_name == 'push' && steps.cov-tools-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            ~/.cargo/bin/cargo-nextest
-            ~/.cargo/bin/cargo-llvm-cov
-            ~/.cargo/.crates.toml
-            ~/.cargo/.crates2.json
-          key: ${{ runner.os }}-${{ runner.arch }}-cargo-cov-tools-${{ hashFiles('.github/workflows/ci.yml') }}
-
 
       - name: Setup Node
         if: matrix.check == 'site'
