@@ -7,6 +7,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -54,17 +55,23 @@ fi
 exit "$AUDIT_STATUS"
 ''')
         self.pinprick.chmod(0o755)
+        # A developer's own token would send the budget check to the real API.
+        self.environ = {
+            key: value for key, value in os.environ.items()
+            if key not in ('GITHUB_TOKEN', 'GH_TOKEN')
+        }
 
     def verify(self, output, status, trailing_nul=False, invalid_utf8=False,
-               duplicate_keys=False):
+               duplicate_keys=False, extra_env=None):
         env = dict(
-            os.environ,
+            self.environ,
             AUDIT_OUTPUT=output,
             AUDIT_STATUS=str(status),
             AUDIT_TRAILING_NUL='1' if trailing_nul else '0',
             AUDIT_INVALID_UTF8='1' if invalid_utf8 else '0',
             AUDIT_DUPLICATE_KEYS='1' if duplicate_keys else '0',
             TMPDIR=str(self.scratch),
+            **(extra_env or {}),
         )
         result = subprocess.run(
             [self.bash, str(SCRIPT), str(self.pinprick), 'files',
@@ -99,7 +106,7 @@ exit "$AUDIT_STATUS"
             [self.bash, str(SCRIPT), str(self.pinprick), 'files', str(catalog)],
             cwd=elsewhere,
             env=dict(
-                os.environ,
+                self.environ,
                 AUDIT_OUTPUT=self.report(),
                 AUDIT_STATUS='0',
                 AUDIT_TRAILING_NUL='0',
@@ -123,6 +130,91 @@ exit "$AUDIT_STATUS"
         self.assertIn('Checked 1 catalog entries.', stdout)
         self.assertEqual(stderr, '')
         self.assertEqual(list(self.scratch.iterdir()), [])
+
+    def budget_env(self, remaining=None, reset_in=0, token='test-token', status=200):
+        """Stub curl's response headers with the given budget (None fails the request) and record sleeps."""
+        stubs = self.root / 'stubs'
+        stubs.mkdir()
+        (stubs / 'curl').write_text(f'''#!/usr/bin/env bash
+printf '%s\\n' "$*" >> "{self.root}/curl-args"
+{{ cat; echo '---'; }} >> "{self.root}/curl-stdin"
+[[ -n "$API_HEADERS" ]] || exit 7
+printf '%s' "$API_HEADERS"
+''')
+        (stubs / 'sleep').write_text(f'''#!/usr/bin/env bash
+printf '%s\\n' "$1" >> "{self.root}/slept"
+''')
+        for stub in stubs.iterdir():
+            stub.chmod(0o755)
+        headers = '' if remaining is None else (
+            f'HTTP/2 {status}\r\nX-RateLimit-Remaining: {remaining}\r\n'
+            f'X-RateLimit-Reset: {int(time.time()) + reset_in}\r\nETag: "root-v1"\r\n\r\n'
+        )
+        env = {'PATH': f'{stubs}{os.pathsep}{os.environ["PATH"]}', 'API_HEADERS': headers}
+        if token:
+            env['GITHUB_TOKEN'] = token
+        return env
+
+    def slept(self):
+        path = self.root / 'slept'
+        return [int(line) for line in path.read_text().split()] if path.exists() else []
+
+    def test_low_api_budget_waits_for_its_reset(self):
+        result = self.verify(self.report(), 0, extra_env=self.budget_env(remaining=5, reset_in=600))
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertIn('API budget low (5 requests left)', result.stdout)
+        [delay] = self.slept()
+        self.assertTrue(595 <= delay <= 605, delay)
+        self.assertNotIn('test-token', (self.root / 'curl-args').read_text())
+        self.assertIn('https://api.github.com/', (self.root / 'curl-args').read_text())
+        self.assertIn('Authorization: Bearer test-token', (self.root / 'curl-stdin').read_text())
+
+    def test_exhausted_budget_refusal_still_waits(self):
+        result = self.verify(self.report(), 0,
+                             extra_env=self.budget_env(remaining=0, reset_in=300, status=403))
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        [delay] = self.slept()
+        self.assertTrue(295 <= delay <= 305, delay)
+
+    def test_later_budget_reads_revalidate_the_root_etag(self):
+        catalog = self.root / 'audited-actions/example/action.json'
+        catalog.write_text(json.dumps([
+            {'sha': '0123456789abcdef0123456789abcdef01234567', 'tag': 'v1.2.3', 'rules_version': 1},
+            {'sha': '89abcdef0123456789abcdef0123456789abcdef', 'tag': 'v1.2.2', 'rules_version': 1},
+        ]))
+        result = self.verify(self.report(), 0, extra_env=self.budget_env(remaining=5000, reset_in=600))
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        first, second, _ = (self.root / 'curl-stdin').read_text().split('---\n')
+        self.assertNotIn('If-None-Match', first)
+        self.assertIn('If-None-Match: "root-v1"', second)
+
+    def test_wait_is_capped_at_one_reset_window(self):
+        result = self.verify(self.report(), 0, extra_env=self.budget_env(remaining=0, reset_in=7200))
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertEqual(self.slept(), [3660])
+
+    def test_ample_api_budget_does_not_wait(self):
+        result = self.verify(self.report(), 0, extra_env=self.budget_env(remaining=5000, reset_in=600))
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertEqual(self.slept(), [])
+
+    def test_unreadable_api_budget_warns_and_still_verifies(self):
+        result = self.verify(self.report(), 0, extra_env=self.budget_env(remaining=None))
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertIn('::warning::could not read the GitHub API budget', result.stdout)
+        self.assertEqual(self.slept(), [])
+
+    def test_unreadable_api_budget_cannot_hide_an_incomplete_scan(self):
+        result = self.verify(self.report(coverage_complete=False), 2,
+                             extra_env=self.budget_env(remaining=None))
+        self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
+        self.assertIn('could not be scanned (exit 2)', result.stdout)
+
+    def test_budget_is_not_read_without_github_token(self):
+        result = self.verify(self.report(), 0, extra_env=self.budget_env(remaining=5, token=None))
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertFalse((self.root / 'curl-args').exists())
+        self.assertEqual(self.slept(), [])
 
     def test_report_rules_version_must_match_entry_stamp(self):
         result = self.verify(self.report(rules_version=2), 0)

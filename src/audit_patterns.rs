@@ -44,8 +44,8 @@ re!(SH_CURL_LATEST, r#"curl\b.*[/=]latest(?:[/\s"]|$)"#);
 re!(SH_WGET_LATEST, r#"wget\b.*[/=]latest(?:[/\s"]|$)"#);
 // Matches every `gh release download`; gh_release_has_tag decides pinned vs latest.
 re!(SH_GH_RELEASE_LATEST, r"gh\s+release\s+download\s");
-re!(SH_CURL_UNVERSIONED, r#"curl\b.*https?://[^\s"']+"#);
-re!(SH_WGET_UNVERSIONED, r#"wget\b.*https?://[^\s"']+"#);
+re!(SH_CURL_UNVERSIONED, r#"curl\b.*(?i:https?)://[^\s"']+"#);
+re!(SH_WGET_UNVERSIONED, r#"wget\b.*(?i:https?)://[^\s"']+"#);
 // Install rules tolerate flags between `install` and the package —
 // flag-first (`pip install -U requests`, `npm i -g yarn`) is the common idiom.
 re!(
@@ -66,7 +66,7 @@ re!(
 );
 re!(
     SH_IWR_UNVERSIONED,
-    r#"(?i)\b(Invoke-WebRequest|iwr|Invoke-RestMethod|irm)\b.*https?://[^\s"']+"#
+    r#"(?i)\b(Invoke-WebRequest|iwr|Invoke-RestMethod|irm)\b.*(?i:https?)://[^\s"']+"#
 );
 re!(
     SH_BITS_LATEST,
@@ -74,7 +74,7 @@ re!(
 );
 re!(
     SH_BITS_UNVERSIONED,
-    r#"(?i)\bStart-BitsTransfer\b.*https?://[^\s"']+"#
+    r#"(?i)\bStart-BitsTransfer\b.*(?i:https?)://[^\s"']+"#
 );
 re!(
     SH_WEBCLIENT_DOWNLOADFILE_LATEST,
@@ -82,11 +82,11 @@ re!(
 );
 re!(
     SH_WEBCLIENT_DOWNLOADFILE_UNVERSIONED,
-    r#"(?i)\bDownloadFile\s*\(.*https?://[^\s"']+"#
+    r#"(?i)\bDownloadFile\s*\(.*(?i:https?)://[^\s"']+"#
 );
 re!(
     SH_DENO_URL,
-    r#"(?i)\bdeno\s+(?:run|install)\b.*https?://[^\s"']+"#
+    r#"(?i)\bdeno\s+(?:run|install)\b.*(?i:https?)://[^\s"']+"#
 );
 
 // The shell may sit any number of pipe stages after the fetch — `curl … | tr
@@ -97,7 +97,7 @@ re!(
 );
 re!(
     SH_PROC_SUB_FETCH,
-    r"(?i)\b(bash|sh|zsh|dash|ash|ksh|fish|python3?|source)\s+<\(\s*(curl|wget)\b"
+    r"(?i)(?:\b(bash|sh|zsh|dash|ash|ksh|fish|python3?|source)|(?:^|[;&|]\s*)\.)\s+<\(\s*(curl|wget)\b"
 );
 // Requires an execution context — `bash … -c "$( … )"` or `eval "$( … )"`.
 // A bare `script.sh "$(curl …)"` passes fetched bytes as an argument, which
@@ -105,11 +105,11 @@ re!(
 // that a high-severity false positive.
 re!(
     SH_CMD_SUB_FETCH,
-    r#"(?i)\b(?:(?:bash|sh|zsh|dash|ash|ksh|fish)\b[^|&;]*?\s-\w*c\s+|eval\b[^|&;]*?)["']?\$\(\s*(curl|wget)\b"#
+    r#"(?i)(?:\b(?:(?:bash|sh|zsh|dash|ash|ksh|fish|python3?)\b[^|&;]*?\s-\w*c\s+|(?:node(?:js)?|ruby|perl)\b[^|&;]*?\s(?:-\w*e|--eval)\s+|(?:bash|sh|zsh|dash|ash|ksh|fish)\s+<<<\s*|source\s+/dev/stdin\s+<<<\s*|eval\b[^|&;]*?)|(?:^|[;&|]\s*)\.\s+/dev/stdin\s+<<<\s*)["']?(?:\$\(|`)\s*(curl|wget)\b"#
 );
 re!(
     SH_IEX_FETCH,
-    r"(?i)\b(iex|Invoke-Expression)\b.*\b(iwr|Invoke-WebRequest|Invoke-RestMethod|irm|DownloadString)\b"
+    r"(?i)\b(iex|Invoke-Expression)\b.*\b(iwr|Invoke-WebRequest|Invoke-RestMethod|irm|DownloadString)\b|\[scriptblock\]::Create\s*\(.*\b(?:iwr|Invoke-WebRequest|Invoke-RestMethod|irm|DownloadString)\b"
 );
 
 re!(SH_GIT_CLONE, r"git\s+clone\s");
@@ -144,7 +144,7 @@ re!(
 );
 re!(
     SH_PIP_GIT_URL_UNVERSIONED,
-    r"pip3?\s+install\b[^#\n]*\bgit\+https?://\S+"
+    r"pip3?\s+install\b[^#\n]*\bgit\+(?i:https?)://\S+"
 );
 
 pub static SHELL_PATTERNS: LazyLock<Vec<Pattern>> = LazyLock::new(|| {
@@ -296,13 +296,13 @@ re!(
     r"\b(?:exec|spawn)\w*\s*\(.*\b(curl|wget)\b"
 );
 re!(JS_CHILD_PROC_CURL, r"child_process.*\bcurl\b");
-re!(JS_FETCH_URL, r#"fetch\s*\(\s*["'`]https?://"#);
-re!(JS_AXIOS_URL, r#"axios\.\w+\s*\(\s*["'`]https?://"#);
-re!(JS_GOT_URL, r#"\bgot(?:\.\w+)?\s*\(\s*["'`]https?://"#);
-re!(JS_HTTP_URL, r#"https?\.get\s*\(\s*["'`]https?://"#);
+re!(JS_FETCH_URL, r#"fetch\s*\(\s*["'`](?i:https?)://"#);
+re!(JS_AXIOS_URL, r#"axios\.\w+\s*\(\s*["'`](?i:https?)://"#);
+re!(JS_GOT_URL, r#"\bgot(?:\.\w+)?\s*\(\s*["'`](?i:https?)://"#);
+re!(JS_HTTP_URL, r#"https?\.get\s*\(\s*["'`](?i:https?)://"#);
 re!(
     JS_REQUIRE_HTTP_GET,
-    r#"require\(\s*["'](?:node:)?https?["']\s*\)\.get\s*\(\s*["'`]https?://"#
+    r#"require\(\s*["'](?:node:)?https?["']\s*\)\.get\s*\(\s*["'`](?i:https?)://"#
 );
 
 pub static JS_PATTERNS: LazyLock<Vec<Pattern>> = LazyLock::new(|| {
@@ -405,7 +405,7 @@ re!(
 re!(DOCKER_FROM_DIGEST, r"(?i)^FROM\s+(?:--\S+\s+)*\S+@sha256:");
 re!(DOCKER_RUN_CURL, r"(?i)^RUN\b.*\bcurl\b");
 re!(DOCKER_RUN_WGET, r"(?i)^RUN\b.*\bwget\b");
-re!(DOCKER_ADD_URL, r"(?i)^ADD\b[^#]*\bhttps?://\S+");
+re!(DOCKER_ADD_URL, r"(?i)^ADD\b[^#]*\b(?i:https?)://\S+");
 
 pub static DOCKER_PATTERNS: LazyLock<Vec<Pattern>> = LazyLock::new(|| {
     vec![
@@ -464,11 +464,11 @@ re!(PY_SUBPROCESS_CURL, r"subprocess\b.*\bcurl\b");
 re!(PY_SUBPROCESS_WGET, r"subprocess\b.*\bwget\b");
 re!(
     PY_URLLIB_URL,
-    r#"urllib\.request\.urlopen\s*\(\s*["']https?://"#
+    r#"urllib\.request\.urlopen\s*\(\s*["'](?i:https?)://"#
 );
 re!(
     PY_REQUESTS_URL,
-    r#"requests\.(get|post|head)\s*\(\s*["']https?://"#
+    r#"requests\.(get|post|head)\s*\(\s*["'](?i:https?)://"#
 );
 
 pub static PY_PATTERNS: LazyLock<Vec<Pattern>> = LazyLock::new(|| {
@@ -562,17 +562,49 @@ static VERSION_SEGMENT: LazyLock<Regex> =
 /// versioned-looking host or inert parameter whitelist an otherwise unpinned
 /// fetch, which is a detection bypass.
 pub fn url_has_version(s: &str) -> bool {
-    VERSION_SEGMENT.is_match(url_path(s))
+    let mut parts = Vec::new();
+    for part in url_path(s).split('/') {
+        match part.to_ascii_lowercase().as_str() {
+            "." | "%2e" => {}
+            ".." | ".%2e" | "%2e." | "%2e%2e" => {
+                parts.pop();
+            }
+            _ => parts.push(part),
+        }
+    }
+    VERSION_SEGMENT.is_match(&parts.join("/"))
+}
+
+fn http_url_rest(url: &str) -> Option<&str> {
+    let (scheme, rest) = url.split_once("://")?;
+    (scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")).then_some(rest)
+}
+
+pub(crate) fn is_http_url(url: &str) -> bool {
+    http_url_rest(url).is_some()
+}
+
+pub(crate) fn url_is_latest(url: &str) -> bool {
+    url_path(url).split('/').any(|part| part == "latest")
+        || url.split_once('?').is_some_and(|(_, query)| {
+            query
+                .split('#')
+                .next()
+                .unwrap_or_default()
+                .split('&')
+                .any(|parameter| {
+                    parameter
+                        .split_once('=')
+                        .is_some_and(|(_, value)| value == "latest")
+                })
+        })
 }
 
 /// Return the path of an `http(s)://` URL (everything from the first `/` after
 /// the authority until `?` or `#`). Returns `""` for a URL with no path, and
 /// the input unchanged for a string that is not an `http(s)://` URL.
 fn url_path(url: &str) -> &str {
-    let Some(rest) = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))
-    else {
+    let Some(rest) = http_url_rest(url) else {
         return url;
     };
     if url.contains('\\') {
@@ -613,9 +645,7 @@ pub fn url_host(url: &str) -> Option<&str> {
     if url.contains('\\') {
         return None;
     }
-    let rest = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))?;
+    let rest = http_url_rest(url)?;
     let authority = rest.split(['/', '?', '#']).next()?;
     let after_userinfo = authority
         .rsplit_once('@')
@@ -640,7 +670,7 @@ pub fn url_is_data_format(url: &str) -> bool {
 // URLs end at whitespace, quotes, backticks, `)`, or `>` so string-literal and
 // markdown-link syntax never rides into the version/extension/host checks.
 pub(crate) static URL_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#"https?://[^\s"'`)>]+"#).unwrap());
+    LazyLock::new(|| Regex::new(r#"(?i:https?)://[^\s"'`)>]+"#).unwrap());
 
 /// Extract every URL from a line, in order of appearance.
 pub fn extract_urls(line: &str) -> impl Iterator<Item = &str> {
@@ -809,7 +839,7 @@ pub fn ps_install_has_required_version(line: &str) -> bool {
 /// the last `@`, so a `user@host` prefix isn't mistaken for the ref.
 pub fn pip_git_url_has_ref(line: &str) -> bool {
     static GIT_URL_REF: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"\bgit\+https?://\S+@([^@#\s]+)").unwrap());
+        LazyLock::new(|| Regex::new(r"\bgit\+(?i:https?)://\S+@([^@#\s]+)").unwrap());
     let Some(caps) = GIT_URL_REF.captures(line) else {
         return false;
     };
@@ -1743,6 +1773,29 @@ mod tests {
     #[test]
     fn iex_without_fetch_not_matched() {
         assert!(!SH_IEX_FETCH.is_match("iex $scriptBlock"));
+    }
+
+    #[test]
+    fn scriptblock_create_on_fetched_content_matched() {
+        assert!(
+            SH_IEX_FETCH.is_match("& ([scriptblock]::Create((irm 'https://example.com/x.ps1')))")
+        );
+        assert!(!SH_IEX_FETCH.is_match("& ([scriptblock]::Create($localScript))"));
+    }
+
+    #[test]
+    fn backtick_and_stdin_substitutions_execute_fetched_content() {
+        for line in [
+            "eval `curl -fsSL https://example.com/x.sh`",
+            "source /dev/stdin <<< \"$(curl -fsSL https://example.com/x.sh)\"",
+            ". /dev/stdin <<< \"$(wget -qO- https://example.com/x.sh)\"",
+        ] {
+            assert!(SH_CMD_SUB_FETCH.is_match(line), "{line}");
+        }
+        assert!(
+            !SH_CMD_SUB_FETCH
+                .is_match("cat /dev/stdin <<< \"$(curl -fsSL https://example.com/x.json)\"")
+        );
     }
 
     // ── Checksum verification ──────────────────────────────────────────

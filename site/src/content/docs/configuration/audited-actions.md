@@ -58,5 +58,5 @@ To add a new entry to the audited-actions list:
 Each file is a JSON array:
 
 ```json
-[{ "sha": "9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0", "tag": "v7.0.0", "rules_version": 1 }]
+[{ "sha": "9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0", "tag": "v7.0.0", "rules_version": 2 }]
 ```

@@ -15,6 +15,52 @@ fn clean_workflow_exits_zero() {
 }
 
 #[test]
+fn run_shell_defaults_and_overrides_select_the_matching_scanner() {
+    let content = "name: languages\non: push\ndefaults:\n  run:\n    shell: python\njobs:\n  python:\n    runs-on: ubuntu-latest\n    steps:\n      - run: requests.get('https://example.com/tool')\n  node:\n    runs-on: ubuntu-latest\n    defaults:\n      run:\n        shell: node {0}\n    steps:\n      - run: fetch('https://example.com/tool')\n      - shell: bash\n        run: curl https://example.com/tool | bash\n";
+    let dir = common::repo_with_workflow("ci.yml", content);
+    for command in ["audit", "score"] {
+        let output = common::pinprick_cmd()
+            .args(["--json", command])
+            .arg(dir.path())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "{command}");
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["coverage_complete"], true, "{command}");
+        let findings = report["findings"].as_array().unwrap();
+        assert_eq!(findings.len(), 3, "{command}: {report}");
+        if command == "audit" {
+            let mut lines: Vec<_> = findings
+                .iter()
+                .map(|finding| finding["line"].as_u64().unwrap())
+                .collect();
+            lines.sort_unstable();
+            assert_eq!(lines, [10, 17, 19]);
+        }
+    }
+}
+
+#[test]
+fn unknown_run_shell_reports_incomplete_coverage() {
+    let dir = common::repo_with_workflow(
+        "ci.yml",
+        "name: unknown\non: push\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - shell: ruby {0}\n        run: puts 'hello'\n",
+    );
+    for command in ["audit", "score"] {
+        let output = common::pinprick_cmd()
+            .args(["--json", command])
+            .arg(dir.path())
+            .output()
+            .unwrap();
+        if command == "audit" {
+            assert_eq!(output.status.code(), Some(2));
+        }
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["coverage_complete"], false, "{command}");
+    }
+}
+
+#[test]
 fn equals_heavy_action_source_preserves_collected_findings() {
     for (source, command) in [("index.js", "node"), ("index.py", "python")] {
         let dir = common::repo_with_workflow(
@@ -47,6 +93,41 @@ fn equals_heavy_action_source_preserves_collected_findings() {
         assert_eq!(findings.len(), 1, "{source}");
         assert_eq!(findings[0]["severity"], "high", "{source}");
     }
+}
+
+#[test]
+fn unparseably_deep_javascript_is_incomplete_and_keeps_collected_findings() {
+    let dir = common::repo_with_workflow(
+        "ci.yml",
+        "name: scan\non: push\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: curl https://example.com/tool | bash\n      - uses: ./action\n",
+    );
+    let action = dir.path().join("action");
+    std::fs::create_dir(&action).unwrap();
+    std::fs::write(
+        action.join("action.yml"),
+        "name: test\ndescription: test\nruns:\n  using: node20\n  main: index.js\n",
+    )
+    .unwrap();
+    std::fs::write(
+        action.join("index.js"),
+        format!(
+            "const root = __dirname;\nconst nested = {}{};\n",
+            "[".repeat(200_000),
+            "]".repeat(200_000)
+        ),
+    )
+    .unwrap();
+    let output = common::pinprick_cmd()
+        .args(["--json", "audit", "--no-audited-catalog"])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["coverage_complete"], false);
+    let findings = report["findings"].as_array().unwrap();
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0]["severity"], "high");
 }
 
 #[test]
@@ -260,7 +341,7 @@ jobs:
         .unwrap();
     assert_eq!(output.status.code(), Some(2));
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(report["rules_version"], 1);
+    assert_eq!(report["rules_version"], 2);
     assert_eq!(report["audited_bundled"], 0);
     assert_eq!(report["external_actions_skipped"], 2);
     assert_eq!(report["coverage_complete"], false);
@@ -1778,4 +1859,581 @@ jobs:
     let findings = json["findings"].as_array().unwrap();
     assert_eq!(findings.len(), 1);
     assert_eq!(findings[0]["category"], "docker_unpinned");
+}
+
+const CURL_BASH: &str = "curl -fsSL https://example.com/install.sh | bash\n";
+const PYTHON_CURL_BASH: &str = "import subprocess\nsubprocess.run('curl -fsSL https://example.com/install.sh | bash', shell=True)\n";
+
+fn composite_action(shell: &str, run: &str, env: Option<(&str, &str)>) -> String {
+    let mut step = serde_json::json!({ "shell": shell, "run": run });
+    if let Some((name, value)) = env {
+        step["env"] = serde_json::json!({ name: value });
+    }
+    serde_json::json!({
+        "name": "local",
+        "description": "local",
+        "runs": { "using": "composite", "steps": [step] }
+    })
+    .to_string()
+}
+
+fn node_action(main: &str) -> String {
+    serde_json::json!({
+        "name": "local",
+        "description": "local",
+        "runs": { "using": "node20", "main": main }
+    })
+    .to_string()
+}
+
+fn audit_local_action(action: &str, files: &[(&str, &str)]) -> (Option<i32>, serde_json::Value) {
+    let dir = common::repo_with_local_action(action, files);
+    let output = common::pinprick_cmd()
+        .args(["--json", "audit"])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    (
+        output.status.code(),
+        serde_json::from_slice(&output.stdout).unwrap(),
+    )
+}
+
+#[test]
+fn helpers_reached_through_the_action_location_are_never_clean() {
+    let composite_python =
+        composite_action("bash", "python3 \"$GITHUB_ACTION_PATH/main.py\"", None);
+    let composite_shell = composite_action("bash", "bash \"$GITHUB_ACTION_PATH/main.sh\"", None);
+    let cases: Vec<(String, Vec<(&str, &str)>)> = vec![
+        (
+            composite_action(
+                "bash",
+                "bash \"$SCRIPT\"",
+                Some(("SCRIPT", "${{ github.action_path }}/install.sh")),
+            ),
+            vec![("install.sh", CURL_BASH)],
+        ),
+        (
+            composite_action("pwsh", "& \"$env:GITHUB_ACTION_PATH/install.ps1\"", None),
+            vec![("install.ps1", "iwr https://example.com/install.ps1 | iex\n")],
+        ),
+        (
+            composite_action(
+                "pwsh",
+                "& (Join-Path $env:GITHUB_ACTION_PATH install.ps1)",
+                None,
+            ),
+            vec![("install.ps1", "iwr https://example.com/install.ps1 | iex\n")],
+        ),
+        (
+            composite_action(
+                "bash",
+                "cd \"$GITHUB_ACTION_PATH\" && python3 -m helper",
+                None,
+            ),
+            vec![("helper.py", PYTHON_CURL_BASH)],
+        ),
+        (
+            composite_shell.clone(),
+            vec![
+                (
+                    "main.sh",
+                    "SCRIPT_DIR=\"$(cd \"$(dirname \"${BASH_SOURCE[0]}\")\" && pwd)\"\nsource \"$SCRIPT_DIR/lib.sh\"\n",
+                ),
+                ("lib.sh", CURL_BASH),
+            ],
+        ),
+        (
+            composite_shell.clone(),
+            vec![
+                ("main.sh", "source \"${BASH_SOURCE%/*}/lib.sh\"\n"),
+                ("lib.sh", CURL_BASH),
+            ],
+        ),
+        (
+            composite_shell.clone(),
+            vec![
+                ("main.sh", "cd \"$(dirname \"$0\")\" && ./install.sh\n"),
+                ("install.sh", CURL_BASH),
+            ],
+        ),
+        (
+            composite_python.clone(),
+            vec![
+                ("main.py", "from lib import a\n"),
+                ("lib/__init__.py", ""),
+                ("lib/a.py", "import utils\n"),
+                ("utils.py", PYTHON_CURL_BASH),
+            ],
+        ),
+        (
+            composite_python.clone(),
+            vec![
+                (
+                    "main.py",
+                    "import importlib\nimportlib.import_module('utils')\n",
+                ),
+                ("utils.py", PYTHON_CURL_BASH),
+            ],
+        ),
+        (
+            composite_python.clone(),
+            vec![
+                (
+                    "main.py",
+                    "import os, runpy\nrunpy.run_path(os.path.join(os.path.dirname(__file__), 'helper.py'))\n",
+                ),
+                ("helper.py", PYTHON_CURL_BASH),
+            ],
+        ),
+        (
+            composite_python.clone(),
+            vec![
+                (
+                    "main.py",
+                    "import os, subprocess\nsubprocess.run(['bash', os.path.join(os.path.dirname(__file__), 'install.sh')])\n",
+                ),
+                ("install.sh", CURL_BASH),
+            ],
+        ),
+        (
+            node_action("index.js"),
+            vec![
+                (
+                    "index.js",
+                    "const cp = require('child_process'), path = require('path');\ncp.execFileSync('bash', [path.join(__dirname, 'install.sh')]);\n",
+                ),
+                ("install.sh", CURL_BASH),
+            ],
+        ),
+        (
+            node_action("index.js"),
+            vec![
+                (
+                    "index.js",
+                    "require('child_process').execSync('bash ' + __dirname + '/install.sh');\n",
+                ),
+                ("install.sh", CURL_BASH),
+            ],
+        ),
+        (
+            node_action("index.js"),
+            vec![
+                (
+                    "index.js",
+                    "require('child_process').execSync(`bash ${__dirname}/install.sh`);\n",
+                ),
+                ("install.sh", CURL_BASH),
+            ],
+        ),
+        (
+            node_action("index.js"),
+            vec![
+                (
+                    "index.js",
+                    "require('child_process').spawnSync('sh', [require('path').resolve(__dirname, 'install.sh')]);\n",
+                ),
+                ("install.sh", CURL_BASH),
+            ],
+        ),
+        (
+            node_action("index.js"),
+            vec![
+                (
+                    "index.js",
+                    "const cp = require('child_process');\nRegExp.prototype.exec = cp.exec;\nnew RegExp('noop').exec(`bash \"${__dirname}/install.sh\"`);\n",
+                ),
+                ("install.sh", CURL_BASH),
+            ],
+        ),
+        (
+            node_action("index.js"),
+            vec![
+                (
+                    "index.js",
+                    "const cp = require('child_process');\nRegExp.prototype.exec = cp.exec;\nRegExp('noop').exec(`bash \"${__dirname}/install.sh\"`);\n",
+                ),
+                ("install.sh", CURL_BASH),
+            ],
+        ),
+        (
+            node_action("index.js"),
+            vec![
+                (
+                    "index.js",
+                    "const cp = require('child_process');\nfunction run(matcher) {\n  matcher.exec = cp.exec;\n  matcher.exec(`bash \"${__dirname}/install.sh\"`);\n}\nrun(/noop/);\n",
+                ),
+                ("install.sh", CURL_BASH),
+            ],
+        ),
+        (
+            node_action("index.js"),
+            vec![
+                (
+                    "index.js",
+                    "const cp = require('child_process');\nconst holder = { matcher: /noop/ };\nholder.matcher.exec = cp.exec;\nholder.matcher.exec(`bash \"${__dirname}/install.sh\"`);\n",
+                ),
+                ("install.sh", CURL_BASH),
+            ],
+        ),
+        (
+            node_action("index.js"),
+            vec![
+                (
+                    "index.js",
+                    "const cp = require('child_process');\nconst holder = {};\nholder.matcher = /noop/;\nholder.matcher.exec = cp.exec;\nholder.matcher.exec(`bash \"${__dirname}/install.sh\"`);\n",
+                ),
+                ("install.sh", CURL_BASH),
+            ],
+        ),
+        (
+            node_action("index.js"),
+            vec![
+                (
+                    "index.js",
+                    "require('child_process').execFileSync('bash', [process['env'].GITHUB_ACTION_PATH + '/install.sh']);\n",
+                ),
+                ("install.sh", CURL_BASH),
+            ],
+        ),
+        (
+            node_action("index.mjs"),
+            vec![
+                (
+                    "index.mjs",
+                    "import { execSync } from 'node:child_process';\nimport { fileURLToPath } from 'node:url';\nexecSync('bash ' + fileURLToPath(new URL('./install.sh', import.meta.url)));\n",
+                ),
+                ("install.sh", CURL_BASH),
+            ],
+        ),
+        (
+            node_action("index.js"),
+            vec![
+                (
+                    "index.js",
+                    "const exec = require('@actions/exec');\nexec.exec('bash', [`${__dirname}/install.sh`]);\n",
+                ),
+                ("install.sh", CURL_BASH),
+            ],
+        ),
+        (
+            node_action("index.js"),
+            vec![
+                (
+                    "index.js",
+                    "const path = require('path');\nconst helper = path.join(__dirname, 'install.sh');\nrequire('child_process').execFileSync('bash', [helper]);\n",
+                ),
+                ("install.sh", CURL_BASH),
+            ],
+        ),
+        (
+            node_action("index.js"),
+            vec![
+                (
+                    "index.js",
+                    "const path = require('path');\nrequire('child_process').execFileSync('bash', [path.join(__dirname, 'install.txt')]);\n",
+                ),
+                ("install.txt", CURL_BASH),
+            ],
+        ),
+        (
+            node_action("index.js"),
+            vec![
+                (
+                    "index.js",
+                    "const path = require('path');\nrequire('child_process').execFileSync('bash', [path.join(__dirname, 'sub', 'install.sh')]);\n",
+                ),
+                ("install.sh", "echo harmless\n"),
+                ("sub/install.sh", CURL_BASH),
+            ],
+        ),
+        (
+            composite_python.clone(),
+            vec![
+                (
+                    "main.py",
+                    "import os, subprocess\nsubprocess.run(['bash', os.path.join(os.path.dirname(__file__), 'install.txt')])\n",
+                ),
+                ("install.txt", CURL_BASH),
+            ],
+        ),
+        (
+            composite_python.clone(),
+            vec![
+                (
+                    "main.py",
+                    "import os, subprocess\nsubprocess.run(['bash', os.path.join(os.path.dirname(__file__), 'sub', 'install.sh')])\n",
+                ),
+                ("install.sh", "echo harmless\n"),
+                ("sub/install.sh", CURL_BASH),
+            ],
+        ),
+        (
+            composite_python.clone(),
+            vec![
+                (
+                    "main.py",
+                    "import os, subprocess\nsubprocess.run(args=['bash', os.path.join(os.path.dirname(__file__), 'install.sh')])\n",
+                ),
+                ("install.sh", CURL_BASH),
+            ],
+        ),
+        (
+            composite_python,
+            vec![
+                ("main.py", "import os; import helper\n"),
+                ("helper.py", PYTHON_CURL_BASH),
+            ],
+        ),
+        (
+            composite_shell.clone(),
+            vec![
+                ("main.sh", "cd \"$(dirname \"$0\")/sub\"\nbash install.sh\n"),
+                ("sub/install.sh", CURL_BASH),
+            ],
+        ),
+        (
+            composite_shell.clone(),
+            vec![
+                (
+                    "main.sh",
+                    "DIR=$(dirname \"$0\")\nDIR=\"$DIR/sub\"\nbash \"$DIR/install.sh\"\n",
+                ),
+                ("install.sh", "echo harmless\n"),
+                ("sub/install.sh", CURL_BASH),
+            ],
+        ),
+        (
+            composite_shell,
+            vec![
+                ("main.sh", "env bash \"$(dirname \"$0\")/install.sh\"\n"),
+                ("install.sh", CURL_BASH),
+            ],
+        ),
+    ];
+    for (action, files) in &cases {
+        let (code, report) = audit_local_action(action, files);
+        assert_eq!(code, Some(1), "{action} {files:?}: {report}");
+        assert_eq!(report["coverage_complete"], true, "{action} {files:?}");
+        assert_eq!(
+            report["findings"][0]["severity"], "high",
+            "{action} {files:?}: {report}"
+        );
+    }
+}
+
+#[test]
+fn composite_steps_follow_helpers_through_every_interpreter() {
+    let composite = |shell: &str, run: &str| {
+        serde_json::json!({
+            "name": "local",
+            "description": "local",
+            "runs": { "using": "composite", "steps": [{ "shell": shell, "run": run }] }
+        })
+        .to_string()
+    };
+    let cases: Vec<(String, Vec<(&str, &str)>)> = vec![
+        (
+            composite("bash", "cd \"$GITHUB_ACTION_PATH\"\nenv bash helper.sh"),
+            vec![(
+                "helper.sh",
+                "curl -sSfL https://example.invalid/tool -o tool\n",
+            )],
+        ),
+        (
+            composite("bash", "cd \"$GITHUB_ACTION_PATH\"\nbash helper.js"),
+            vec![(
+                "helper.js",
+                "curl -sSfL https://example.invalid/tool -o tool\n",
+            )],
+        ),
+        (
+            composite(
+                "python",
+                "import os, subprocess\nsubprocess.run([\"bash\", os.path.join(os.environ[\"GITHUB_ACTION_PATH\"], \"helper.sh\")])",
+            ),
+            vec![(
+                "helper.sh",
+                "curl -sSfL https://example.invalid/tool -o tool\n",
+            )],
+        ),
+        (
+            composite(
+                "node {0}",
+                "const path = require('node:path');\nrequire('node:child_process').execFileSync('bash', [path.join(process.env.GITHUB_ACTION_PATH, 'helper.sh')]);",
+            ),
+            vec![(
+                "helper.sh",
+                "curl -sSfL https://example.invalid/tool -o tool\n",
+            )],
+        ),
+        (
+            composite(
+                "bash",
+                "cd \"$GITHUB_ACTION_PATH\"\ncd scripts\nbash helper.sh",
+            ),
+            vec![
+                ("scripts/helper.sh", "bash child.sh\n"),
+                (
+                    "scripts/child.sh",
+                    "curl -sSfL https://example.invalid/tool -o tool\n",
+                ),
+            ],
+        ),
+    ];
+    for (action, files) in &cases {
+        let (code, report) = audit_local_action(action, files);
+        assert_eq!(code, Some(1), "{action}: {report}");
+        assert_eq!(report["coverage_complete"], true, "{action}");
+    }
+}
+
+#[test]
+fn container_entrypoints_are_scanned_whatever_their_names() {
+    for (copy, entrypoint) in [
+        (
+            "COPY entrypoint /entrypoint",
+            "ENTRYPOINT [\"/bin/sh\", \"/entrypoint\"]",
+        ),
+        (
+            "COPY entrypoint /usr/local/bin/",
+            "ENTRYPOINT [\"/usr/local/bin/entrypoint\"]",
+        ),
+        ("WORKDIR /app\nCOPY . .", "CMD [\"sh\", \"entrypoint\"]"),
+    ] {
+        let dir = common::repo_with_workflow(
+            "ci.yml",
+            "name: local\non: push\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: ./act\n",
+        );
+        let action = dir.path().join("act");
+        std::fs::create_dir_all(&action).unwrap();
+        std::fs::write(
+            action.join("Dockerfile"),
+            format!(
+                "FROM alpine:3.20@sha256:{}\n{copy}\n{entrypoint}\n",
+                "a".repeat(64)
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            action.join("entrypoint"),
+            "curl -sSfL https://example.invalid/tool -o tool\n",
+        )
+        .unwrap();
+        let output = common::pinprick_cmd()
+            .args(["--json", "audit"])
+            .arg(dir.path())
+            .output()
+            .unwrap();
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(output.status.code(), Some(1), "{copy}: {report}");
+        assert_eq!(
+            report["findings"][0]["source_file"], "./act (entrypoint)",
+            "{copy}"
+        );
+    }
+}
+
+#[test]
+fn helper_downloads_withhold_composite_verification() {
+    let steps = |helper: &str| {
+        serde_json::json!({
+            "name": "local",
+            "description": "local",
+            "runs": { "using": "composite", "steps": [
+                { "shell": "bash", "run": helper },
+                { "shell": "bash", "run": "curl -o tool https://example.com/tool\ncosign verify-blob --key key.pem --signature trusted.sig tool" },
+            ] }
+        })
+        .to_string()
+    };
+    for (helper, file, content, expected) in [
+        (
+            "python3 \"${{ github.action_path }}/key.py\"",
+            "key.py",
+            "import urllib.request\nopen('key.pem', 'wb').write(urllib.request.urlopen('https://example.com/v1.2.3/key.pem').read())\n",
+            1,
+        ),
+        (
+            "bash \"${{ github.action_path }}/key.sh\"",
+            "key.sh",
+            "curl -o key.pem https://example.com/v1.2.3/key.pem\n",
+            1,
+        ),
+        (
+            "python3 \"${{ github.action_path }}/key.py\"",
+            "key.py",
+            "print('hello')\n",
+            0,
+        ),
+    ] {
+        let (code, report) = audit_local_action(&steps(helper), &[(file, content)]);
+        assert_eq!(
+            report["findings"].as_array().unwrap().len(),
+            expected,
+            "{content}: {report}"
+        );
+        assert_eq!(code, Some(expected as i32), "{content}");
+    }
+}
+
+#[test]
+fn harmless_action_location_references_stay_complete() {
+    let unrelated = ("scripts/release.sh", CURL_BASH);
+    let cases: Vec<(String, Vec<(&str, &str)>)> = vec![
+        (
+            composite_action(
+                "bash",
+                "echo \"Using $GITHUB_ACTION_PATH\"\nls \"$GITHUB_ACTION_PATH\"",
+                None,
+            ),
+            vec![unrelated],
+        ),
+        (
+            composite_action(
+                "pwsh",
+                "Write-Host \"Action at $env:GITHUB_ACTION_PATH\"",
+                None,
+            ),
+            vec![unrelated],
+        ),
+        (
+            node_action("index.js"),
+            vec![
+                (
+                    "index.js",
+                    "const fs = require('fs'), path = require('path');\nfs.readFileSync(path.join(__dirname, 'config.json'));\nrequire('child_process').execSync('git status', { cwd: __dirname });\n",
+                ),
+                ("config.json", "{}"),
+                unrelated,
+            ],
+        ),
+        (
+            composite_action("bash", "python3 \"$GITHUB_ACTION_PATH/main.py\"", None),
+            vec![
+                (
+                    "main.py",
+                    "import os, subprocess\nopen(os.path.join(os.path.dirname(__file__), 'data.txt'))\nsubprocess.run(['git', 'status'], cwd=os.path.dirname(__file__))\n",
+                ),
+                ("data.txt", "x"),
+                unrelated,
+            ],
+        ),
+        (
+            composite_action("bash", "bash \"$GITHUB_ACTION_PATH/main.sh\"", None),
+            vec![
+                (
+                    "main.sh",
+                    "SCRIPT_DIR=$(dirname \"$0\")\ncat \"$SCRIPT_DIR/config.json\"\n",
+                ),
+                ("config.json", "{}"),
+                unrelated,
+            ],
+        ),
+    ];
+    for (action, files) in &cases {
+        let (code, report) = audit_local_action(action, files);
+        assert_eq!(code, Some(0), "{action}: {report}");
+        assert_eq!(report["coverage_complete"], true, "{action}");
+    }
 }

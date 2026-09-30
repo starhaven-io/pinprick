@@ -1,4 +1,5 @@
 mod audit;
+mod audit_javascript;
 mod audit_patterns;
 mod audit_shell;
 mod audit_source;
@@ -130,6 +131,12 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|argument| argument == audit_javascript::WORKER_ARGUMENT)
+    {
+        return audit_javascript::run_worker();
+    }
     let cli = Cli::parse();
 
     match cli.color {

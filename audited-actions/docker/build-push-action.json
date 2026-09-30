@@ -1,10 +1,5 @@
 [
-  { "sha": "c3c9e263c25d99ce0380d002d59b67737d91b0dc", "tag": "v7.4.0", "rules_version": 1 },
-  { "sha": "53b7df96c91f9c12dcc8a07bcb9ccacbed38856a", "tag": "v7.3.0", "rules_version": 1 },
-  { "sha": "f9f3042f7e2789586610d6e8b85c8f03e5195baf", "tag": "v7.2.0", "rules_version": 1 },
-  { "sha": "263435318d21b8e681c14492fe198d362a7d2c83", "tag": "v6.18.0", "rules_version": 1 },
-  { "sha": "1dc73863535b631f98b2378be8619f83b136f4a0", "tag": "v6.17.0", "rules_version": 1 },
-  { "sha": "14487ce63c7a62a4a324b0bfb37086795e31c6c1", "tag": "v6.16.0", "rules_version": 1 },
-  { "sha": "471d1dc4e07e5cdedd4c2171150001c434f0b7a4", "tag": "v6.15.0", "rules_version": 1 },
-  { "sha": "0adf9959216b96bec444f325f1e493d4aa344497", "tag": "v6.14.0", "rules_version": 1 }
+  { "sha": "c3c9e263c25d99ce0380d002d59b67737d91b0dc", "tag": "v7.4.0", "rules_version": 2 },
+  { "sha": "53b7df96c91f9c12dcc8a07bcb9ccacbed38856a", "tag": "v7.3.0", "rules_version": 2 },
+  { "sha": "f9f3042f7e2789586610d6e8b85c8f03e5195baf", "tag": "v7.2.0", "rules_version": 2 }
 ]

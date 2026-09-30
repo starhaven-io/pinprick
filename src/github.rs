@@ -607,7 +607,8 @@ impl GitHubClient {
 
         let mut resp = resp;
         let bytes = read_capped_to(&mut resp, MAX_RAW_FILE_BYTES).await?;
-        Ok(String::from_utf8_lossy(&bytes).into_owned())
+        String::from_utf8(bytes)
+            .with_context(|| format!("File {path} in {owner}/{repo} at {git_ref} is not UTF-8"))
     }
 }
 
@@ -1150,6 +1151,21 @@ mod tests {
             assert!(!tree.truncated);
             let body = c.fetch_file("o", "r", "action.yml", "sha").await.unwrap();
             assert!(body.contains("using: node20"));
+        }
+
+        #[tokio::test]
+        async fn fetch_file_rejects_non_utf8_source() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/repos/o/r/contents/index.js"))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0xff, b'\n']))
+                .mount(&server)
+                .await;
+            let result = client_for(&server)
+                .await
+                .fetch_file("o", "r", "index.js", "sha")
+                .await;
+            assert!(result.unwrap_err().to_string().contains("not UTF-8"));
         }
 
         #[tokio::test]

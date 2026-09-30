@@ -9,8 +9,8 @@
 #
 # Requires a GITHUB_TOKEN (public repo read): a fresh scan fetches action
 # source through the GitHub API. Each entry costs one tree call plus one call
-# per scanned source file, so scheduled runs use stable shards. Full-catalog
-# mode is available for manual diagnosis but may exhaust the API budget.
+# per scanned source file, so scheduled runs use stable shards. A run larger
+# than the hourly GITHUB_TOKEN budget waits for the budget to reset.
 #
 # Usage:
 #   verify-audited-actions.sh <pinprick-binary> all
@@ -95,6 +95,54 @@ if [[ ! -r "${NORMALIZER}" ]]; then
   exit 2
 fi
 
+# A scan that exhausts the API budget part-way reports incomplete coverage, so
+# wait for the reset before starting an entry the remaining budget may not
+# cover. The reserve is well above the costliest entry measured. pinprick
+# prefers GITHUB_TOKEN, so its budget is the one the scans spend; without it
+# nothing waits. A scan that still runs out fails closed, so an unreadable
+# budget only skips the wait.
+#
+# /rate_limit has reported an unspent budget while real responses showed it
+# spent, so read the budget from a real response's headers. Revalidating the
+# API root's ETag answers 304, which carries them without spending budget.
+API_RESERVE=100
+API_BUDGET_READABLE=1
+API_ROOT_ETAG=""
+api_header() {
+  awk -v name="$2:" 'tolower($1) == name { value = $2 } END { print value }' <<< "$1"
+}
+wait_for_api_budget() {
+  [[ -n "${GITHUB_TOKEN:-}" && "${API_BUDGET_READABLE}" -eq 1 ]] || return 0
+  local REQUEST HEADERS REMAINING RESET ETAG DELAY
+  # Headers travel on stdin to keep the token out of the process list.
+  REQUEST="Authorization: Bearer ${GITHUB_TOKEN}"
+  if [[ -n "${API_ROOT_ETAG}" ]]; then
+    REQUEST+=$'\n'"If-None-Match: ${API_ROOT_ETAG}"
+  fi
+  HEADERS=$(curl -sS --max-time 30 -o /dev/null -D - -H @- https://api.github.com/ \
+    <<< "${REQUEST}" | tr -d '\r') || HEADERS=""
+  REMAINING=$(api_header "${HEADERS}" x-ratelimit-remaining)
+  RESET=$(api_header "${HEADERS}" x-ratelimit-reset)
+  if [[ ! "${REMAINING}" =~ ^[0-9]+$ || ! "${RESET}" =~ ^[0-9]+$ ]]; then
+    echo "::warning::could not read the GitHub API budget; verifying without waiting for resets"
+    API_BUDGET_READABLE=0
+    return 0
+  fi
+  ETAG=$(api_header "${HEADERS}" etag)
+  if [[ -n "${ETAG}" ]]; then
+    API_ROOT_ETAG="${ETAG}"
+  fi
+  DELAY=$((RESET - $(date +%s) + 5))
+  if ((REMAINING >= API_RESERVE || DELAY <= 0)); then
+    return 0
+  fi
+  if ((DELAY > 3660)); then
+    DELAY=3660
+  fi
+  echo "  API budget low (${REMAINING} requests left); waiting ${DELAY}s for its reset..."
+  sleep "${DELAY}"
+}
+
 SELECT='.[]'
 if [[ "${MODE}" == "latest" ]]; then
   SELECT='.[0] // empty'
@@ -148,6 +196,7 @@ for JSON_FILE in "${FILES[@]}"; do
       fi
     fi
 
+    wait_for_api_budget
     echo "  Verifying ${TAG} (${SHA:0:7})..."
     CHECKED=$((CHECKED + 1))
 
