@@ -1924,6 +1924,7 @@ jobs:
                 workflow_file: None,
                 workflow_line: None,
                 finding_kind: pattern.finding_kind,
+                origin: None,
             };
             assert_eq!(
                 pattern.finding_kind.as_ref(),
@@ -1950,6 +1951,7 @@ jobs:
             workflow_file: None,
             workflow_line: None,
             finding_kind: None,
+            origin: None,
         };
         assert_eq!(runtime_rule_for(&phrase_only), RuleId::RuntimeFetchHigh);
     }

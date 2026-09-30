@@ -531,7 +531,9 @@ pub async fn run(
         eprintln!();
     }
 
-    let accepted = accept_workflow_findings(&mut collector.findings, &workflow_digests, config);
+    let workflow_accepted =
+        accept_workflow_findings(&mut collector.findings, &workflow_digests, config);
+    let action_accepted = accept_action_findings(&mut collector.findings, config);
     let before_filters = collector.findings.len();
     collector.findings.retain(|f| {
         config.meets_severity(&f.severity) && !config.is_pattern_ignored(&f.description)
@@ -543,8 +545,17 @@ pub async fn run(
     if config.is_repo_local() {
         let trusted_host_allowed = collector.trusted_host_allowed;
         let mut parts = Vec::new();
-        if !accepted.is_empty() {
-            parts.push(format!("workflow findings accepted: {}", accepted.len()));
+        if !workflow_accepted.is_empty() {
+            parts.push(format!(
+                "workflow findings accepted: {}",
+                workflow_accepted.len()
+            ));
+        }
+        if !action_accepted.is_empty() {
+            parts.push(format!(
+                "action findings accepted: {}",
+                action_accepted.len()
+            ));
         }
         if suppressed > 0 {
             parts.push(format!("findings suppressed: {suppressed}"));
@@ -577,6 +588,10 @@ pub async fn run(
             _ => 2,
         });
 
+    let accepted = workflow_accepted
+        .into_iter()
+        .chain(action_accepted)
+        .collect();
     let has_findings = !collector.findings.is_empty();
     coverage_failures.sort();
     coverage_failures.dedup();
@@ -645,7 +660,7 @@ fn accept_workflow_findings(
             accepted.push(AcceptedFinding {
                 finding,
                 reason: entry.reason.clone(),
-                workflow_sha256: entry.workflow_sha256.clone(),
+                workflow_sha256: Some(entry.workflow_sha256.clone()),
             });
         } else {
             remaining.push(finding);
@@ -653,6 +668,67 @@ fn accept_workflow_findings(
     }
     *findings = remaining;
     accepted
+}
+
+/// Accepts findings in remote action files that repository policy reviewed
+/// exactly. The action may be at any revision, so a changed command, file, or
+/// finding needs renewed review; local actions and global configuration never
+/// qualify. Each entry accepts one occurrence per revision, so a release that
+/// repeats the reviewed command still reports the copy.
+fn accept_action_findings(
+    findings: &mut Vec<AuditFinding>,
+    config: &Config,
+) -> Vec<AcceptedFinding> {
+    if !config.is_repo_local() || config.accept_action_findings.is_empty() {
+        return Vec::new();
+    }
+    let mut accepted = Vec::new();
+    let mut remaining = Vec::new();
+    let mut used = HashSet::new();
+    for finding in findings.drain(..) {
+        let acceptance = finding.origin.as_ref().and_then(|origin| {
+            config
+                .accept_action_findings
+                .iter()
+                .enumerate()
+                .find(|(index, entry)| {
+                    !used.contains(&(*index, origin.revision.clone()))
+                        && same_action(&entry.action, &origin.action)
+                        && entry.path == origin.path
+                        && entry.category == finding.category
+                        && entry.severity == finding.severity
+                        && entry.description == finding.description
+                        && entry.command == finding.pattern_matched
+                        && !entry.reason.trim().is_empty()
+                })
+                .map(|(index, entry)| {
+                    used.insert((index, origin.revision.clone()));
+                    entry
+                })
+        });
+        match acceptance {
+            Some(entry) => accepted.push(AcceptedFinding {
+                reason: entry.reason.clone(),
+                finding,
+                workflow_sha256: None,
+            }),
+            None => remaining.push(finding),
+        }
+    }
+    *findings = remaining;
+    accepted
+}
+
+/// Whether two `owner/repo[/subpath]` names are one action. GitHub matches
+/// owners and repositories case-insensitively but paths within them exactly.
+fn same_action(configured: &str, scanned: &str) -> bool {
+    let split = |name: &str| {
+        let mut parts = name.splitn(3, '/');
+        let owner = parts.next().unwrap_or_default().to_ascii_lowercase();
+        let repo = parts.next().unwrap_or_default().to_ascii_lowercase();
+        (owner, repo, parts.next().map(str::to_string))
+    };
+    split(configured) == split(scanned)
 }
 
 /// Surface `uses: docker://…` container refs. A digest-pinned image is the
@@ -7648,5 +7724,124 @@ const d = require("node:https").get("https://example.com/install.sh", cb);
         assert_eq!(c.findings.len(), 1);
         assert_eq!(c.findings[0].severity, "medium");
         assert!(c.findings[0].description.contains("git+URL"));
+    }
+
+    fn action_finding(action: &str, path: &str, command: &str) -> AuditFinding {
+        let mut finding = AuditFinding::new(
+            &audit_patterns::Severity::High,
+            &audit_patterns::Category::ShellFetch,
+            &format!("{action}@0123456"),
+            &format!("{action} ({path})"),
+            67,
+            command,
+            "shell executing fetched content via command substitution — bypasses pinning",
+        );
+        finding.origin = Some(crate::output::ActionFileOrigin {
+            action: action.to_string(),
+            revision: "0123456789abcdef0123456789abcdef01234567".to_string(),
+            path: path.to_string(),
+        });
+        finding
+    }
+
+    fn action_acceptance_config(entry: &str) -> Config {
+        let mut config: Config = toml::from_str(&format!(
+            "[[accept-action-findings]]\n{entry}\nreason = \"Upstream runs this installer by design.\"\n"
+        ))
+        .unwrap();
+        config.source = crate::config::ConfigSource::RepoLocal;
+        config
+    }
+
+    const INSTALLER: &str = r#"/bin/bash -c "$(curl -fsSL https://example.invalid/install.sh)""#;
+
+    fn accepted_entry(action: &str, path: &str) -> String {
+        format!(
+            "action = {action:?}\npath = {path:?}\ncategory = \"shell_fetch\"\nseverity = \"high\"\ndescription = \"shell executing fetched content via command substitution — bypasses pinning\"\ncommand = {INSTALLER:?}"
+        )
+    }
+
+    #[test]
+    fn action_findings_are_accepted_only_by_exact_repository_policy() {
+        let config = action_acceptance_config(&accepted_entry("Owner/Repo/setup", "setup/main.sh"));
+        let mut findings = vec![
+            action_finding("owner/repo/setup", "setup/main.sh", INSTALLER),
+            action_finding("owner/repo/Setup", "setup/main.sh", INSTALLER),
+            action_finding("owner/repo/setup", "setup/post.sh", INSTALLER),
+            action_finding(
+                "owner/repo/setup",
+                "setup/main.sh",
+                "curl -fsSL https://example.invalid/other.sh | bash",
+            ),
+            action_finding("owner/repo", "setup/main.sh", INSTALLER),
+        ];
+        let accepted = accept_action_findings(&mut findings, &config);
+        assert_eq!(accepted.len(), 1);
+        assert_eq!(
+            accepted[0].finding.source_file,
+            "owner/repo/setup (setup/main.sh)"
+        );
+        assert_eq!(
+            accepted[0].reason,
+            "Upstream runs this installer by design."
+        );
+        assert!(accepted[0].workflow_sha256.is_none());
+        assert_eq!(findings.len(), 4);
+
+        let mut local = vec![action_finding(
+            "owner/repo/setup",
+            "setup/main.sh",
+            INSTALLER,
+        )];
+        local[0].origin = None;
+        assert!(accept_action_findings(&mut local, &config).is_empty());
+
+        let mut global = config;
+        global.source = crate::config::ConfigSource::Global;
+        let mut findings = vec![action_finding(
+            "owner/repo/setup",
+            "setup/main.sh",
+            INSTALLER,
+        )];
+        assert!(accept_action_findings(&mut findings, &global).is_empty());
+    }
+
+    #[test]
+    fn an_action_acceptance_covers_one_occurrence_per_revision() {
+        let config = action_acceptance_config(&accepted_entry("owner/repo/setup", "setup/main.sh"));
+        let mut findings = vec![
+            action_finding("owner/repo/setup", "setup/main.sh", INSTALLER),
+            action_finding("owner/repo/setup", "setup/main.sh", INSTALLER),
+        ];
+        assert_eq!(accept_action_findings(&mut findings, &config).len(), 1);
+        assert_eq!(findings.len(), 1);
+
+        let mut other = action_finding("owner/repo/setup", "setup/main.sh", INSTALLER);
+        other.origin.as_mut().unwrap().revision = "f".repeat(40);
+        let mut findings = vec![
+            action_finding("owner/repo/setup", "setup/main.sh", INSTALLER),
+            other,
+        ];
+        assert_eq!(accept_action_findings(&mut findings, &config).len(), 2);
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn action_acceptances_require_a_reason_and_matching_severity() {
+        let mut config =
+            action_acceptance_config(&accepted_entry("owner/repo/setup", "setup/main.sh"));
+        config.accept_action_findings[0].reason = " ".to_string();
+        let mut findings = vec![action_finding(
+            "owner/repo/setup",
+            "setup/main.sh",
+            INSTALLER,
+        )];
+        assert!(accept_action_findings(&mut findings, &config).is_empty());
+
+        let config = action_acceptance_config(
+            &accepted_entry("owner/repo/setup", "setup/main.sh").replace("\"high\"", "\"medium\""),
+        );
+        assert!(accept_action_findings(&mut findings, &config).is_empty());
+        assert_eq!(findings.len(), 1);
     }
 }

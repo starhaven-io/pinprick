@@ -40,6 +40,11 @@ pub struct Config {
     #[serde(default)]
     pub accept_workflow_findings: Vec<WorkflowAcceptance>,
 
+    /// Exact, reviewed findings in remote action files, accepted by
+    /// repository policy at any revision of the action.
+    #[serde(default)]
+    pub accept_action_findings: Vec<ActionAcceptance>,
+
     /// Where this configuration was loaded from. Not part of the file format —
     /// used to attribute suppressions to the scanned repo's own config, which
     /// matters when auditing a repository you don't control.
@@ -85,6 +90,18 @@ pub struct IgnoreConfig {
 pub struct WorkflowAcceptance {
     pub workflow: String,
     pub workflow_sha256: String,
+    pub category: String,
+    pub severity: String,
+    pub description: String,
+    pub command: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct ActionAcceptance {
+    pub action: String,
+    pub path: String,
     pub category: String,
     pub severity: String,
     pub description: String,
@@ -698,5 +715,15 @@ trusted-hosts = ["artifacts.example.com", "releases.example.org"]
             ..Config::default()
         };
         assert!(!cfg.is_pattern_ignored("curl fetching unversioned URL"));
+    }
+
+    #[test]
+    fn accept_action_findings_parse_exactly() {
+        let entry = "[[accept-action-findings]]\naction = \"Homebrew/actions/setup-homebrew\"\npath = \"setup-homebrew/main.sh\"\ncategory = \"shell_fetch\"\nseverity = \"high\"\ndescription = \"d\"\ncommand = \"c\"\nreason = \"r\"\n";
+        let cfg: Config = toml::from_str(entry).unwrap();
+        assert_eq!(cfg.accept_action_findings.len(), 1);
+        assert_eq!(cfg.accept_action_findings[0].path, "setup-homebrew/main.sh");
+        assert!(toml::from_str::<Config>(&entry.replace("path =", "file =")).is_err());
+        assert!(toml::from_str::<Config>(&entry.replace("reason = \"r\"\n", "")).is_err());
     }
 }

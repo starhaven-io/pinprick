@@ -23,6 +23,7 @@ use crate::audit::{
 use crate::audit_shell::shell_words;
 use crate::config::Config;
 use crate::github::GitHubClient;
+use crate::output::ActionFileOrigin;
 use crate::workflow::{self, ActionRef, LocalActionRef};
 
 pub(crate) fn remote_action_scan_key(action: &ActionRef) -> String {
@@ -5183,6 +5184,7 @@ async fn scan_one_action_source(
             _ => continue,
         };
         let source_label = format!("{} ({path})", action.full_name());
+        let findings_before = collector.findings.len();
         match kind {
             SourceFileKind::ActionYml => match serde_norway::from_str::<Value>(&content) {
                 Ok(yaml) => {
@@ -5226,6 +5228,14 @@ async fn scan_one_action_source(
             SourceFileKind::Dockerfile => {
                 scan_dockerfile_content(&content, &source_label, &action_name, collector, config);
             }
+        }
+        let origin = ActionFileOrigin {
+            action: action.full_name(),
+            revision: action.ref_string.clone(),
+            path: path.clone(),
+        };
+        for finding in &mut collector.findings[findings_before..] {
+            finding.origin = Some(origin.clone());
         }
     }
 
@@ -9160,5 +9170,70 @@ runs:
         assert_eq!(status, ActionScanStatus::Complete);
         assert_eq!(collector.findings.len(), 1);
         assert_eq!(collector.findings[0].source_file, "o/r/sub (lib/runner)");
+    }
+
+    #[tokio::test]
+    async fn remote_action_findings_record_their_action_and_file() {
+        use serde_json::json;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/repos/o/r/git/trees/{sha}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "tree": [
+                    { "path": "sub/action.yml", "type": "blob" },
+                    { "path": "sub/install.sh", "type": "blob" }
+                ],
+                "truncated": false
+            })))
+            .mount(&server)
+            .await;
+        for (file, body) in [
+            (
+                "sub/action.yml",
+                "runs:\n  using: composite\n  steps:\n    - shell: bash\n      run: bash \"${{ github.action_path }}/install.sh\"\n",
+            ),
+            (
+                "sub/install.sh",
+                "#!/bin/bash\ncurl -fsSL https://example.invalid/install.sh | bash\n",
+            ),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(format!("/repos/o/r/contents/{file}")))
+                .respond_with(ResponseTemplate::new(200).set_body_string(body))
+                .mount(&server)
+                .await;
+        }
+        let client = GitHubClient::with_base("t".into(), server.uri());
+        let action = ActionRef {
+            owner: "o".into(),
+            repo: "r".into(),
+            subpath: Some("sub".into()),
+            ref_string: sha.into(),
+            ref_type: workflow::RefType::Sha,
+            tag_comment: None,
+            line_number: 1,
+            raw_line: String::new(),
+            value_start: 0,
+            value_end: 0,
+            block_style: true,
+        };
+        let mut collector = AuditCollector::new(false);
+        let status = scan_action_source(&client, &action, &mut collector, &DEFAULT_CONFIG)
+            .await
+            .unwrap();
+        assert_eq!(status, ActionScanStatus::Complete);
+        assert_eq!(collector.findings.len(), 1);
+        assert_eq!(
+            collector.findings[0].origin,
+            Some(ActionFileOrigin {
+                action: "o/r/sub".into(),
+                revision: sha.into(),
+                path: "sub/install.sh".into(),
+            })
+        );
     }
 }
