@@ -311,6 +311,19 @@ pub struct AuditFinding {
     pub workflow_line: Option<usize>,
     #[serde(skip)]
     pub(crate) finding_kind: Option<FindingKind>,
+    /// The remote action and file this finding came from, recorded where the
+    /// action was fetched so acceptances need not parse display labels.
+    #[serde(skip)]
+    pub(crate) origin: Option<ActionFileOrigin>,
+}
+
+/// A file inside a remote action, by the action's `owner/repo[/subpath]`, the
+/// revision scanned, and the file's path in that repository.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ActionFileOrigin {
+    pub(crate) action: String,
+    pub(crate) revision: String,
+    pub(crate) path: String,
 }
 
 impl AuditFinding {
@@ -334,6 +347,7 @@ impl AuditFinding {
             workflow_file: None,
             workflow_line: None,
             finding_kind: None,
+            origin: None,
         }
     }
 
@@ -427,7 +441,9 @@ pub struct AcceptedFinding {
     #[serde(flatten)]
     pub finding: AuditFinding,
     pub reason: String,
-    pub workflow_sha256: String,
+    /// The reviewed workflow's digest, for a workflow acceptance.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workflow_sha256: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -492,7 +508,9 @@ impl AuditReport {
             println!("      {}", sanitize_for_terminal(&f.description));
             println!("      {}", sanitize_for_terminal(&f.pattern_matched));
             println!("      reason: {}", sanitize_for_terminal(&accepted.reason));
-            println!("      workflow SHA-256: {}", accepted.workflow_sha256);
+            if let Some(digest) = &accepted.workflow_sha256 {
+                println!("      workflow SHA-256: {digest}");
+            }
             println!();
         }
         for f in &self.findings {
@@ -992,6 +1010,7 @@ mod sarif_tests {
             workflow_file: None,
             workflow_line: None,
             finding_kind: None,
+            origin: None,
         }
     }
 

@@ -97,13 +97,30 @@ command = '<exact pattern_matched from the audit JSON>'
 reason = "<owner, justification, compensating controls, and review conditions>"
 ```
 
-Only repository-local configuration can accept workflow findings. Entries do not apply to remote or local action findings, do not skip any source reads, and do not make incomplete coverage successful. Any workflow byte change invalidates its acceptances; review the changed workflow before updating its hash. An invalid or stale entry accepts nothing. Use `shasum -a 256 .github/workflows/scan.yml` to compute the hash after review.
+Only repository-local configuration can accept workflow findings. Entries do not apply to remote or local action findings (see [`accept-action-findings`](#accept-action-findings) for remote actions), do not skip any source reads, and do not make incomplete coverage successful. Any workflow byte change invalidates its acceptances; review the changed workflow before updating its hash. An invalid or stale entry accepts nothing. Use `shasum -a 256 .github/workflows/scan.yml` to compute the hash after review.
 
 Accepted findings remain visible in ordinary human output and the JSON `accepted` array. SARIF retains the original result with an external, accepted suppression and its justification. The audit exits zero only when coverage is complete and no unaccepted findings remain. `--no-repo-config` restores the findings. Acceptance changes audit policy only: it does not improve posture scores or create reusable clean action catalog verdicts.
 
+### `accept-action-findings`
+
+Accept a reviewed finding in a remote action's source without skipping that action or hiding its other findings. Each entry matches the action's exact `owner/repo[/subpath]`, the file's path in that repository (shown in parentheses in the finding's `source_file`), and the finding's category, severity, description, and logical command from `pinprick audit --json`. Owner and repository names match case-insensitively; paths match exactly. A nonempty reason is required. Wildcards and substring matching are not supported.
+
+```toml
+[[accept-action-findings]]
+action = "Homebrew/actions/setup-homebrew"
+path = "setup-homebrew/main.sh"
+category = "shell_fetch"
+severity = "high"
+description = "<exact finding description>"
+command = '<exact pattern_matched from the audit JSON>'
+reason = "<owner, justification, compensating controls, and review conditions>"
+```
+
+An entry applies at any revision of the action, so a release that keeps the reviewed line stays accepted, while a changed command, file, or finding is reported again. Each entry accepts one occurrence per revision, so a release that repeats the reviewed command reports the copy. Every other finding in the action is still reported, and an incomplete scan still fails. Only repository-local configuration can accept action findings, and entries never apply to local actions, whose source the repository controls. Accepted action findings appear with the accepted workflow findings, without a workflow hash, and an action with an accepted finding never receives a cached clean verdict.
+
 ### `ignore.actions`
 
-Skip scanning specific actions entirely. Useful for actions you've reviewed manually or that produce known false positives. Matching is case-insensitive and respects path boundaries: `"actions/checkout"` matches that repository at any SHA, while `"actions"` or `"actions/"` matches the owner. Partial repository names do not match.
+Skip scanning specific actions entirely. Useful for actions you've reviewed manually or that produce known false positives. Entries match an action's `owner/repo`, case-insensitively and at path boundaries: `"actions/checkout"` skips every action in that repository at any SHA, while `"actions"` or `"actions/"` skips the owner. Partial repository names and subpaths do not match; to accept one finding in a subpath action, use [`accept-action-findings`](#accept-action-findings).
 
 ### `ignore.patterns`
 
