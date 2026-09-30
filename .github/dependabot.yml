@@ -26,6 +26,10 @@ updates:
     ignore:
       # Fleet pins are owned by the sync; Dependabot never writes them.
       - dependency-name: "starhaven-io/.github/*"
+      # pinprick's source scan does not yet cover setup-node v7; reassess when it does
+      - dependency-name: "actions/setup-node"
+        versions:
+          - ">=7.0.0"
     groups:
       "github-actions":
         patterns:
