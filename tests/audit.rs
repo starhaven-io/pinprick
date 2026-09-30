@@ -15,6 +15,41 @@ fn clean_workflow_exits_zero() {
 }
 
 #[test]
+fn equals_heavy_action_source_preserves_collected_findings() {
+    for (source, command) in [("index.js", "node"), ("index.py", "python")] {
+        let dir = common::repo_with_workflow(
+            "ci.yml",
+            "name: scan\non: push\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: curl https://example.com/tool | bash\n      - uses: ./action\n",
+        );
+        let action = dir.path().join("action");
+        std::fs::create_dir(&action).unwrap();
+        std::fs::write(
+            action.join("action.yml"),
+            format!(
+                "name: test\ndescription: test\nruns:\n  using: composite\n  steps:\n    - shell: bash\n      run: {command} \"$GITHUB_ACTION_PATH/{source}\"\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            action.join(source),
+            format!("note = \"{}\"\n", "a=".repeat(100_000)),
+        )
+        .unwrap();
+        let output = common::pinprick_cmd()
+            .args(["--json", "audit", "--no-audited-catalog"])
+            .arg(dir.path())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "{source}");
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["coverage_complete"], true, "{source}");
+        let findings = report["findings"].as_array().unwrap();
+        assert_eq!(findings.len(), 1, "{source}");
+        assert_eq!(findings[0]["severity"], "high", "{source}");
+    }
+}
+
+#[test]
 fn clean_workflow_human_output() {
     let dir = common::repo_with_workflow("ci.yml", common::WORKFLOW_CLEAN);
     common::pinprick_cmd()

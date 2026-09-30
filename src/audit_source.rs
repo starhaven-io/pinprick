@@ -900,6 +900,7 @@ fn force_include_remote_source_dependencies(
         match kind {
             SourceFileKind::JavaScript => {
                 let code = strip_javascript_comments(&content);
+                let quotes = crate::audit::JavaScriptQuoteIndex::new(&code);
                 for captures in JS_LOCAL_DEPENDENCY_RE.captures_iter(&code) {
                     let Some(dependency) = captures.name("path") else {
                         complete = false;
@@ -913,9 +914,10 @@ fn force_include_remote_source_dependencies(
                     );
                 }
                 for captures in JS_LOADER_CALL_RE.captures_iter(&code) {
-                    if captures.get(0).is_some_and(|matched| {
-                        crate::audit::javascript_position_is_quoted(&code, matched.start())
-                    }) {
+                    if captures
+                        .get(0)
+                        .is_some_and(|matched| quotes.is_quoted(matched.start()))
+                    {
                         continue;
                     }
                     let Some(argument) = captures.name("argument") else {
@@ -934,7 +936,7 @@ fn force_include_remote_source_dependencies(
                     }
                 }
                 let (executed_strings, executed_strings_complete) =
-                    executed_javascript_string_literals(&code);
+                    executed_javascript_string_literals(&code, &quotes);
                 complete &= executed_strings_complete;
                 for executed in executed_strings {
                     for captures in JS_LOADER_CALL_RE.captures_iter(executed) {
@@ -1026,14 +1028,20 @@ fn exact_javascript_loader_specifier(argument: &str) -> Option<&str> {
     Some(&body[..end])
 }
 
-fn executed_javascript_string_literals(code: &str) -> (Vec<&str>, bool) {
+fn executed_javascript_string_literals<'a>(
+    code: &'a str,
+    quotes: &crate::audit::JavaScriptQuoteIndex,
+) -> (Vec<&'a str>, bool) {
     let mut literals = Vec::new();
     let mut complete = true;
+    let delimiter_index = std::cell::OnceCell::new();
+    let delimiters =
+        || delimiter_index.get_or_init(|| crate::audit::JavaScriptDelimiterIndex::new(code));
     for marker in ["eval", "Function", "setTimeout", "setInterval"] {
         for (index, _) in code.match_indices(marker) {
             let before = code[..index].chars().next_back();
             let after = code[index + marker.len()..].chars().next();
-            if crate::audit::javascript_position_is_quoted(code, index)
+            if quotes.is_quoted(index)
                 || before.is_some_and(|character| {
                     character == '_' || character == '$' || character.is_ascii_alphanumeric()
                 })
@@ -1066,7 +1074,7 @@ fn executed_javascript_string_literals(code: &str) -> (Vec<&str>, bool) {
                     complete = false;
                     continue;
                 } else if let Some(bind_tail) = optional.strip_prefix("bind") {
-                    match immediate_bound_javascript_argument(marker, bind_tail) {
+                    match immediate_bound_javascript_argument(marker, bind_tail, delimiters()) {
                         Ok(Some(argument)) => bound_argument = Some(argument),
                         Ok(None) if marker == "eval" => complete = false,
                         Ok(None) => {}
@@ -1094,7 +1102,7 @@ fn executed_javascript_string_literals(code: &str) -> (Vec<&str>, bool) {
                 complete = false;
                 continue;
             } else if let Some(bind_tail) = remaining.strip_prefix(".bind") {
-                match immediate_bound_javascript_argument(marker, bind_tail) {
+                match immediate_bound_javascript_argument(marker, bind_tail, delimiters()) {
                     Ok(Some(argument)) => bound_argument = Some(argument),
                     Ok(None) if marker == "eval" => complete = false,
                     Ok(None) => {}
@@ -1139,7 +1147,7 @@ fn executed_javascript_string_literals(code: &str) -> (Vec<&str>, bool) {
                     } else if let Some(bind_tail) = tail.strip_prefix(".bind").or_else(|| {
                         optional_tail.and_then(|optional| optional.strip_prefix("bind"))
                     }) {
-                        match immediate_bound_javascript_argument(marker, bind_tail) {
+                        match immediate_bound_javascript_argument(marker, bind_tail, delimiters()) {
                             Ok(Some(argument)) => bound_argument = Some(argument),
                             Ok(None) if marker == "eval" => complete = false,
                             Ok(None) => {}
@@ -1160,8 +1168,9 @@ fn executed_javascript_string_literals(code: &str) -> (Vec<&str>, bool) {
             };
             let argument = if bound_argument.is_some() {
                 bound_argument
-            } else if let Some(arguments) = call.and_then(javascript_call_arguments) {
-                let arguments = split_javascript_arguments(arguments);
+            } else if let Some((arguments, _)) = call.and_then(|call| delimiters().call_parts(call))
+            {
+                let arguments = delimiters().arguments(arguments);
                 if marker == "Function" {
                     arguments.last().copied()
                 } else if method_call {
@@ -1208,20 +1217,21 @@ fn has_escaped_javascript_method_call(value: &str) -> bool {
 fn immediate_bound_javascript_argument<'a>(
     marker: &str,
     bind_tail: &'a str,
+    delimiters: &crate::audit::JavaScriptDelimiterIndex<'a>,
 ) -> Result<Option<&'a str>, ()> {
     if !bind_tail.trim_start().starts_with('(') {
         return Ok(None);
     }
-    let Some((bound, after_bind)) = javascript_call_parts(bind_tail) else {
+    let Some((bound, after_bind)) = delimiters.call_parts(bind_tail) else {
         return Err(());
     };
     let after_bind = after_bind.trim_start();
     let invocation = after_bind.strip_prefix("?.").unwrap_or(after_bind);
-    let Some((invoked, _)) = javascript_call_parts(invocation) else {
+    let Some((invoked, _)) = delimiters.call_parts(invocation) else {
         return Ok(None);
     };
-    let bound = split_javascript_arguments(bound);
-    let invoked = split_javascript_arguments(invoked);
+    let bound = delimiters.arguments(bound);
+    let invoked = delimiters.arguments(invoked);
     Ok(if marker == "Function" {
         invoked.last().copied().or_else(|| {
             bound
@@ -1233,6 +1243,7 @@ fn immediate_bound_javascript_argument<'a>(
     })
 }
 
+#[cfg(test)]
 fn javascript_call_parts(value: &str) -> Option<(&str, &str)> {
     let value = value.trim_start();
     let body = value.strip_prefix('(')?;
@@ -1266,10 +1277,7 @@ fn javascript_call_parts(value: &str) -> Option<(&str, &str)> {
     None
 }
 
-fn javascript_call_arguments(value: &str) -> Option<&str> {
-    javascript_call_parts(value).map(|(arguments, _)| arguments)
-}
-
+#[cfg(test)]
 fn split_javascript_arguments(arguments: &str) -> Vec<&str> {
     let mut result = Vec::new();
     let mut start = 0usize;
@@ -2236,9 +2244,58 @@ pub(crate) fn short_sha(sha: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use std::sync::LazyLock;
 
     static DEFAULT_CONFIG: LazyLock<Config> = LazyLock::new(Config::default);
+
+    #[test]
+    fn javascript_delimiter_index_preserves_calls_and_arguments() {
+        let alphabet = ['a', '\'', '"', '`', '\\', '(', ')', '[', ']', '{', '}', ','];
+        for mut encoded in 0..alphabet.len().pow(4) {
+            let mut source = String::new();
+            for _ in 0..4 {
+                source.push(alphabet[encoded % alphabet.len()]);
+                encoded /= alphabet.len();
+            }
+            let index = crate::audit::JavaScriptDelimiterIndex::new(&source);
+            for start in 0..=source.len() {
+                for end in start..=source.len() {
+                    let value = &source[start..end];
+                    assert_eq!(
+                        index.call_parts(value),
+                        javascript_call_parts(value),
+                        "{source:?}: {start}..{end}"
+                    );
+                    assert_eq!(
+                        index.arguments(value),
+                        split_javascript_arguments(value),
+                        "{source:?}: {start}..{end}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn deeply_nested_timer_calls_preserve_coverage() {
+        let code = format!(
+            "{}() => null{}",
+            "setTimeout(() => ".repeat(5000),
+            ")".repeat(5000)
+        );
+        let quotes = crate::audit::JavaScriptQuoteIndex::new(&code);
+        assert_eq!(
+            executed_javascript_string_literals(&code, &quotes),
+            (vec![], true)
+        );
+        let code = "`outside ${eval('require(\"./inside.js\")')}`";
+        let quotes = crate::audit::JavaScriptQuoteIndex::new(code);
+        assert_eq!(
+            executed_javascript_string_literals(code, &quotes),
+            (vec!["require(\"./inside.js\")"], true)
+        );
+    }
 
     #[test]
     fn dependency_detection_ignores_comments_and_absolute_python_imports() {
