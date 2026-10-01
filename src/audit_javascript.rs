@@ -27,8 +27,8 @@ use crate::audit_source::{
     ACTION_LOCATION, DYNAMIC_VALUE, LocatedDirectory, LocatedExecution, MAX_LOCATION_DEPTH,
     MAX_LOCATION_VALUE_BYTES, MAX_LOCATION_WORDS, SELF_FILE, SELF_LOCATION, ShellLocationState,
     ShellScan, SourceContext, SourceFileKind, UNRESOLVED_LOCATION, command_located_executions,
-    dirname_location, is_location_derived, join_location, merge_location_values,
-    shell_script_executions,
+    dirname_location, executable_source_kind, is_copied_data_path, is_location_derived,
+    join_location, merge_location_values, shell_script_executions,
 };
 
 const EXECUTION_CALLS: &[&str] = &[
@@ -46,6 +46,25 @@ const EXECUTION_CALLS: &[&str] = &[
     "execaCommandSync",
     "execaNode",
 ];
+
+const COPY_CALLS: &[&str] = &[
+    "cp",
+    "cpSync",
+    "io_cp",
+    "copyFile",
+    "copyFileSync",
+    "copySync",
+    "rename",
+    "renameSync",
+    "move",
+    "mv",
+    "link",
+    "linkSync",
+    "symlink",
+    "symlinkSync",
+];
+
+const MODULE_COPY_CALLS: &[&str] = &["copy", "moveSync"];
 
 /// Methods that store their arguments in the receiver.
 const MUTATING_METHODS: &[&str] = &[
@@ -4777,6 +4796,33 @@ impl<'s, 'a> Analysis<'s, 'a> {
             let Some((receiver, name)) = self.callee_name(callee) else {
                 continue;
             };
+            if !constructor && self.copy_callee(callee) {
+                self.record_copy(arguments, &mut executions);
+            }
+            if !constructor
+                && name == "writeFileSync"
+                && let Some(Expression::CallExpression(read)) = arguments
+                    .get(1)
+                    .and_then(Argument::as_expression)
+                    .map(inner)
+                && self
+                    .callee_name(&read.callee)
+                    .is_some_and(|(_, name)| name == "readFileSync")
+            {
+                self.record_copy(&read.arguments, &mut executions);
+            }
+            if !constructor && name == "pipe"
+                && let Some(Expression::CallExpression(read)) = receiver.map(inner)
+                && self
+                    .callee_name(&read.callee)
+                    .is_some_and(|(_, name)| name == "createReadStream")
+                && arguments.first().and_then(Argument::as_expression).is_some_and(|argument| {
+                    matches!(inner(argument), Expression::CallExpression(write)
+                        if self.callee_name(&write.callee).is_some_and(|(_, name)| name == "createWriteStream"))
+                })
+            {
+                self.record_copy(&read.arguments, &mut executions);
+            }
             let runs = if constructor {
                 name == "Worker"
             } else {
@@ -4803,6 +4849,139 @@ impl<'s, 'a> Analysis<'s, 'a> {
             self.record_execution(name, arguments, default_directory, &mut executions);
         }
         executions
+    }
+
+    fn copy_callee(&self, callee: &'a Expression<'a>) -> bool {
+        let mut current = Some(callee);
+        let mut seen = HashSet::new();
+        for _ in 0..MAX_LOCATION_DEPTH {
+            let Some(expression) = current.take() else {
+                break;
+            };
+            if self
+                .callee_name(expression)
+                .is_some_and(|(receiver, name)| {
+                    COPY_CALLS.contains(&name)
+                        || MODULE_COPY_CALLS.contains(&name)
+                            && self.module_copy_callee(expression, receiver)
+                })
+            {
+                return true;
+            }
+            let Expression::Identifier(identifier) = inner(expression) else {
+                break;
+            };
+            let Some(symbol) = self.resolved(identifier) else {
+                break;
+            };
+            if !seen.insert(symbol) {
+                break;
+            }
+            current = self.initializer(symbol);
+        }
+        false
+    }
+
+    fn module_copy_callee(
+        &self,
+        callee: &'a Expression<'a>,
+        receiver: Option<&'a Expression<'a>>,
+    ) -> bool {
+        if let Some(receiver) = receiver {
+            return self.module_value(receiver, 0);
+        }
+        let Expression::Identifier(identifier) = inner(callee) else {
+            return false;
+        };
+        let Some(symbol) = self.resolved(identifier) else {
+            return false;
+        };
+        let declaration = self.scoping.symbol_declaration(symbol);
+        match self.nodes.kind(declaration) {
+            AstKind::ImportSpecifier(_) => true,
+            AstKind::VariableDeclarator(declarator)
+                if !matches!(declarator.id, BindingPattern::BindingIdentifier(_)) =>
+            {
+                declarator
+                    .init
+                    .as_ref()
+                    .is_some_and(|init| self.module_value(init, 0))
+            }
+            _ => false,
+        }
+    }
+
+    fn module_value(&self, expression: &'a Expression<'a>, depth: usize) -> bool {
+        if depth >= MAX_LOCATION_DEPTH {
+            return false;
+        }
+        match inner(expression) {
+            Expression::CallExpression(call) => {
+                self.is_global(&call.callee, "require")
+                    || self.loads_natively(call)
+                    || matches!(inner(&call.callee), Expression::Identifier(loader)
+                        if matches!(loader.name.as_str(), "__nccwpck_require__" | "__webpack_require__")
+                            && matches!(call.arguments.first().and_then(Argument::as_expression).map(inner),
+                                Some(Expression::NumericLiteral(_) | Expression::StringLiteral(_))))
+                    || self.guard.wrapper(call)
+                        && call
+                            .arguments
+                            .first()
+                            .and_then(Argument::as_expression)
+                            .is_some_and(|value| self.module_value(value, depth + 1))
+            }
+            Expression::Identifier(identifier) => {
+                let Some(symbol) = self.resolved(identifier) else {
+                    return false;
+                };
+                let declaration = self.scoping.symbol_declaration(symbol);
+                matches!(
+                    self.nodes.kind(declaration),
+                    AstKind::ImportDefaultSpecifier(_) | AstKind::ImportNamespaceSpecifier(_)
+                ) || self
+                    .initializer(symbol)
+                    .is_some_and(|init| self.module_value(init, depth + 1))
+            }
+            expression => expression_property(expression).is_some_and(|(object, name)| {
+                name == "default" && self.module_value(object, depth + 1)
+            }),
+        }
+    }
+
+    fn record_copy(&self, arguments: &'a [Argument<'a>], executions: &mut Vec<LocatedExecution>) {
+        let Some(first) = arguments.first() else {
+            return;
+        };
+        let Some(source) = first.as_expression() else {
+            if self.is_tainted(first.span()) {
+                executions.push(LocatedExecution::unresolved(SourceFileKind::JavaScript));
+            }
+            return;
+        };
+        let value = self.evaluate(source, 0);
+        if !is_location_derived(&value) {
+            return;
+        }
+        if value.contains(UNRESOLVED_LOCATION)
+            && let Expression::BinaryExpression(binary) = inner(source)
+            && binary.operator == BinaryOperator::Addition
+            && let Some(suffix) = literal_text(&binary.right)
+            && let Some(kind) = executable_source_kind(suffix)
+        {
+            executions.push(LocatedExecution::copied(
+                &format!("{SELF_LOCATION}/{}", suffix.trim_start_matches("./")),
+                kind,
+            ));
+        }
+        match executable_source_kind(&value) {
+            Some(kind) => {
+                executions.push(LocatedExecution::copied(&value, kind));
+            }
+            None if !is_copied_data_path(&value) => {
+                executions.push(LocatedExecution::unresolved(SourceFileKind::JavaScript));
+            }
+            None => {}
+        }
     }
 
     /// Whether an options argument may choose a located program, shell,

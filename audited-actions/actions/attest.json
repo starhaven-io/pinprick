@@ -1,7 +1,7 @@
 [
-  { "sha": "1e69f48acb82d1966a394da916b4c1698aa569d6", "tag": "v4.2.2", "rules_version": 2 },
-  { "sha": "508db95dd578ae2727ebd6217d5ba78e4fbda05d", "tag": "v4.2.1", "rules_version": 2 },
-  { "sha": "f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6", "tag": "v4.2.0", "rules_version": 2 },
-  { "sha": "a1948c3f048ba23858d222213b7c278aabede763", "tag": "v4.1.1", "rules_version": 2 },
-  { "sha": "e59cbc1ad1ac2d59339667419eb8cdde6eb61e3d", "tag": "v3.2.0", "rules_version": 2 }
+  { "sha": "1e69f48acb82d1966a394da916b4c1698aa569d6", "tag": "v4.2.2", "rules_version": 3 },
+  { "sha": "508db95dd578ae2727ebd6217d5ba78e4fbda05d", "tag": "v4.2.1", "rules_version": 3 },
+  { "sha": "f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6", "tag": "v4.2.0", "rules_version": 3 },
+  { "sha": "a1948c3f048ba23858d222213b7c278aabede763", "tag": "v4.1.1", "rules_version": 3 },
+  { "sha": "e59cbc1ad1ac2d59339667419eb8cdde6eb61e3d", "tag": "v3.2.0", "rules_version": 3 }
 ]
