@@ -17,14 +17,14 @@
   },
   "dependencies": {
     "@astrojs/cloudflare": "^14.3.3",
-    "@astrojs/starlight": "^0.42.3",
-    "astro": "^7.3.4",
+    "@astrojs/starlight": "^0.42.4",
+    "astro": "^7.3.5",
     "sharp": "^0.35.5"
   },
   "devDependencies": {
     "prettier": "^3.9.9",
-    "prettier-plugin-astro": "^1.0.1",
-    "wrangler": "4.137.0"
+    "prettier-plugin-astro": "^1.1.0",
+    "wrangler": "4.140.0"
   },
   "allowScripts": {
     "esbuild": false,
