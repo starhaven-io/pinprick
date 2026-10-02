@@ -40,7 +40,7 @@ jobs:
           persist-credentials: false
 
       - name: Run pinprick
-        uses: starhaven-io/pinprick-action@c97704c6d51181f640c10ee30caf044e9038d976 # v0.6.7
+        uses: starhaven-io/pinprick-action@d1ad02330903473ce59ddb88b88ae36f4a4e0bf5 # v0.6.8
 ```
 
 ## Usage without GitHub Advanced Security
@@ -72,7 +72,7 @@ jobs:
           persist-credentials: false
 
       - name: Run pinprick
-        uses: starhaven-io/pinprick-action@c97704c6d51181f640c10ee30caf044e9038d976 # v0.6.7
+        uses: starhaven-io/pinprick-action@d1ad02330903473ce59ddb88b88ae36f4a4e0bf5 # v0.6.8
         with:
           advanced-security: false
 ```
@@ -83,7 +83,7 @@ Each example pins `pinprick-action` to a full commit SHA with the release tag in
 
 ```yaml
 - name: Run pinprick
-  uses: starhaven-io/pinprick-action@c97704c6d51181f640c10ee30caf044e9038d976 # v0.6.7
+  uses: starhaven-io/pinprick-action@d1ad02330903473ce59ddb88b88ae36f4a4e0bf5 # v0.6.8
   with:
     fail-on-findings: true
 ```
@@ -92,7 +92,7 @@ Each example pins `pinprick-action` to a full commit SHA with the release tag in
 
 | Input               | Default    | Meaning                                                                                                                                                                                                                                                |
 | ------------------- | ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `version`           | `0.27.0`   | pinprick version to install. The `v0.6.7` action release pins this default for deterministic runs. Use `latest` for the newest pinprick release, or an exact version like `v0.27.0`.                                                                   |
+| `version`           | `0.28.0`   | pinprick version to install. The `v0.6.8` action release pins this default for deterministic runs. Use `latest` for the newest pinprick release, or an exact version like `v0.28.0`.                                                                   |
 | `path`              | `.`        | Repository path to scan.                                                                                                                                                                                                                               |
 | `advanced-security` | `true`     | Upload SARIF results to GitHub code scanning. When `false`, the action prints normal console output.                                                                                                                                                   |
 | `sarif-category`    | `pinprick` | Code scanning category for this upload. Set a unique value for each invocation in the same workflow.                                                                                                                                                   |
