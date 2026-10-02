@@ -44,7 +44,7 @@ Missing entrypoints, symlinked source, truncated trees that omit the selected ac
 
 - Default: colored human-readable output with severity buckets
 - `--json`: machine-readable JSON for CI integration, including `rules_version`, the detection semantics used for the report
-- `--sarif`: SARIF 2.1.0 for upload to GitHub code scanning
+- `--sarif`: SARIF 2.1.0 for upload to GitHub code scanning; excludes accepted findings, which remain visible with their reasons in human and JSON reports
 - `--verbose`: also report _allowed_ matches (fetches that fired a rule but were dropped because the URL is versioned, data-shaped, piped to `jq`, checksum-verified, or matched by `trusted-hosts`)
 - `--no-repo-config`: ignore the scanned repository's `.pinprick.toml` and use the global config (or defaults)
 - `--no-audited-catalog`: ignore the audited-actions catalog (bundled, local cache, and remote) and scan every action fresh — pinprick's own CI uses this to re-verify catalog entries against the current detection rules

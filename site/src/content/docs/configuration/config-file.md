@@ -99,7 +99,7 @@ reason = "<owner, justification, compensating controls, and review conditions>"
 
 Only repository-local configuration can accept workflow findings. Entries do not apply to remote or local action findings (see [`accept-action-findings`](#accept-action-findings) for remote actions), do not skip any source reads, and do not make incomplete coverage successful. Any workflow byte change invalidates its acceptances; review the changed workflow before updating its hash. An invalid or stale entry accepts nothing. Use `shasum -a 256 .github/workflows/scan.yml` to compute the hash after review.
 
-Accepted findings remain visible in ordinary human output and the JSON `accepted` array. SARIF retains the original result with an external, accepted suppression and its justification. The audit exits zero only when coverage is complete and no unaccepted findings remain. `--no-repo-config` restores the findings. Acceptance changes audit policy only: it does not improve posture scores or create reusable clean action catalog verdicts.
+Accepted findings and their reasons remain visible in ordinary human output and the JSON `accepted` array. SARIF excludes accepted findings from its results so they do not become GitHub code-scanning alerts; GitHub's [supported SARIF properties](https://docs.github.com/en/code-security/reference/code-scanning/sarif-files/sarif-support#result-object) do not include result suppressions. The audit exits zero only when coverage is complete and no unaccepted findings remain. `--no-repo-config` restores the findings, including in SARIF. Acceptance changes audit policy only: it does not improve posture scores or create reusable clean action catalog verdicts.
 
 ### `accept-action-findings`
 

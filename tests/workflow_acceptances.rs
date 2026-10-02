@@ -47,7 +47,7 @@ fn audit(path: &std::path::Path, options: &[&str]) -> (i32, Value) {
 }
 
 #[test]
-fn reviewed_workflow_finding_remains_visible_in_every_format() {
+fn reviewed_workflow_finding_remains_in_audit_reports_but_not_sarif_alerts() {
     let source = workflow("# reviewed\n");
     let dir = common::repo_with_config("scan.yml", &source, &acceptance(&source));
     let (status, report) = audit(dir.path(), &["--json"]);
@@ -80,16 +80,16 @@ fn reviewed_workflow_finding_remains_visible_in_every_format() {
             "No unaccepted runtime fetch risks found; 1 explicitly accepted.",
         ))
         .stderr(predicate::str::contains("workflow findings accepted: 1"));
-    let (status, sarif) = audit(dir.path(), &["--sarif"]);
-    assert_eq!(status, 0);
-    assert_eq!(
-        sarif["runs"][0]["results"][0]["suppressions"][0]["kind"],
-        "external"
-    );
-    assert_eq!(
-        sarif["runs"][0]["results"][0]["suppressions"][0]["status"],
-        "accepted"
-    );
+    let output = common::pinprick_cmd()
+        .arg("audit")
+        .arg(dir.path())
+        .arg("--sarif")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("workflow findings accepted: 1"))
+        .stderr(predicate::str::contains("--no-repo-config"));
+    let sarif: Value = serde_json::from_slice(&output.get_output().stdout).unwrap();
+    assert!(sarif["runs"][0]["results"].as_array().unwrap().is_empty());
     assert_eq!(
         sarif["runs"][0]["properties"]["pinprickCoverageComplete"],
         true
@@ -99,6 +99,13 @@ fn reviewed_workflow_finding_remains_visible_in_every_format() {
     assert_eq!(status, 1);
     assert_eq!(report["findings"].as_array().unwrap().len(), 1);
     assert!(report.get("accepted").is_none());
+
+    let (status, sarif) = audit(dir.path(), &["--sarif", "--no-repo-config"]);
+    assert_eq!(status, 1);
+    let results = sarif["runs"][0]["results"].as_array().unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0]["ruleId"], "pinprick/shell_fetch");
+    assert_eq!(results[0]["message"]["text"], DESCRIPTION);
 }
 
 #[test]
@@ -149,9 +156,16 @@ fn acceptance_never_makes_missing_source_coverage_successful() {
             assert_eq!(report["accepted"].as_array().unwrap().len(), 1);
             assert!(!report["coverage_failures"].as_array().unwrap().is_empty());
         } else {
+            assert!(report["runs"][0]["results"].as_array().unwrap().is_empty());
             assert_eq!(
                 report["runs"][0]["properties"]["pinprickCoverageComplete"],
                 false
+            );
+            assert!(
+                !report["runs"][0]["properties"]["pinprickCoverageFailures"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
             );
         }
     }
@@ -168,6 +182,16 @@ fn sibling_workflow_findings_are_not_accepted() {
     assert_eq!(report["findings"].as_array().unwrap().len(), 1);
     assert_eq!(
         report["findings"][0]["source_file"],
+        ".github/workflows/other.yml"
+    );
+
+    let (status, sarif) = audit(dir.path(), &["--sarif"]);
+    assert_eq!(status, 1);
+    let results = sarif["runs"][0]["results"].as_array().unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0]["message"]["text"], DESCRIPTION);
+    assert_eq!(
+        results[0]["locations"][0]["physicalLocation"]["artifactLocation"]["uri"],
         ".github/workflows/other.yml"
     );
 }

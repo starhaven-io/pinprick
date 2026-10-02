@@ -739,16 +739,12 @@ impl AuditReport {
     }
 
     fn build_sarif(&self) -> SarifDocument {
+        // GitHub's supported SARIF result fields exclude suppressions; accepted
+        // findings stay in the human and JSON reports instead of alert results.
         let results = self
             .findings
             .iter()
-            .map(|finding| (finding, None))
-            .chain(
-                self.accepted
-                    .iter()
-                    .map(|entry| (&entry.finding, Some(&entry.reason))),
-            )
-            .map(|(f, reason)| {
+            .map(|f| {
                 let (uri, start_line) =
                     if let (Some(wf), Some(wl)) = (f.workflow_file.as_ref(), f.workflow_line) {
                         (wf.clone(), wl)
@@ -762,15 +758,6 @@ impl AuditReport {
                 }
 
                 SarifResult {
-                    suppressions: reason
-                        .map(|reason| {
-                            vec![SarifSuppression {
-                                kind: "external",
-                                status: "accepted",
-                                justification: reason.clone(),
-                            }]
-                        })
-                        .unwrap_or_default(),
                     rule_id: format!("pinprick/{}", f.category),
                     level: sarif_level(&f.severity).to_string(),
                     message: SarifText { text },
@@ -948,20 +935,11 @@ struct SarifConfig {
 
 #[derive(Serialize)]
 struct SarifResult {
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    suppressions: Vec<SarifSuppression>,
     #[serde(rename = "ruleId")]
     rule_id: String,
     level: String,
     message: SarifText,
     locations: Vec<SarifLocation>,
-}
-
-#[derive(Serialize)]
-struct SarifSuppression {
-    kind: &'static str,
-    status: &'static str,
-    justification: String,
 }
 
 #[derive(Serialize)]
@@ -1080,6 +1058,36 @@ mod sarif_tests {
             json["runs"][0]["properties"]["pinprickCoverageFailures"][0],
             "source fetch failed"
         );
+    }
+
+    #[test]
+    fn accepted_action_findings_stay_in_json_but_not_sarif_results() {
+        let mut accepted = finding("high", "shell_fetch");
+        accepted.action = "owner/repo/setup@v1".into();
+        accepted.source_file = "owner/repo/setup@v1 (setup/main.sh)".into();
+        accepted.workflow_file = Some(".github/workflows/ci.yml".into());
+        accepted.workflow_line = Some(10);
+        let mut report = report(vec![]);
+        report.accepted.push(AcceptedFinding {
+            finding: accepted,
+            reason: "Upstream runs this installer by design.".into(),
+            workflow_sha256: None,
+        });
+
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["accepted"].as_array().unwrap().len(), 1);
+        assert_eq!(json["accepted"][0]["severity"], "high");
+        assert_eq!(
+            json["accepted"][0]["reason"],
+            "Upstream runs this installer by design."
+        );
+        let sarif = serde_json::to_value(report.build_sarif()).unwrap();
+        assert!(sarif["runs"][0]["results"].as_array().unwrap().is_empty());
+
+        report.findings.push(finding("high", "shell_fetch"));
+        let expected = self::sarif(vec![finding("high", "shell_fetch")]);
+        let sarif = serde_json::to_value(report.build_sarif()).unwrap();
+        assert_eq!(sarif, expected);
     }
 
     #[test]
