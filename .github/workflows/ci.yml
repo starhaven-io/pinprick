@@ -184,12 +184,12 @@ jobs:
       - name: Install typos-cli
         if: matrix.check == 'lint'
         env:
-          TYPOS_SHA256: "abcb3e257c7c2abeff4d903f7fe68071357637605bdb283ce2251f44bc70dc09"
+          TYPOS_SHA256: "aca6b5d546307092b8d0a8e0a89dd80f9da51f2f7617c5e45c5607c1684ffbf2"
         run: |
           archive="${RUNNER_TEMP}/typos.tar.gz"
           curl --fail --location --proto '=https' --proto-redir '=https' \
             --output "${archive}" \
-            "https://github.com/crate-ci/typos/releases/download/v1.50.2/typos-v1.50.2-x86_64-unknown-linux-musl.tar.gz"
+            "https://github.com/crate-ci/typos/releases/download/v1.50.3/typos-v1.50.3-x86_64-unknown-linux-musl.tar.gz"
           echo "${TYPOS_SHA256}  ${archive}" | sha256sum --check --strict
           tar --extract --gzip --file "${archive}" --directory "${RUNNER_TEMP}" ./typos
           echo "${RUNNER_TEMP}" >> "${GITHUB_PATH}"
