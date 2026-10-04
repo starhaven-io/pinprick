@@ -8,6 +8,7 @@
   "scripts": {
     "dev": "astro dev",
     "build": "astro build",
+    "check": "astro check",
     "preview": "astro preview",
     "astro": "astro",
     "deploy": "wrangler deploy --config wrangler.jsonc",
@@ -22,8 +23,10 @@
     "sharp": "^0.35.5"
   },
   "devDependencies": {
+    "@astrojs/check": "^0.9.10",
     "prettier": "^3.9.9",
     "prettier-plugin-astro": "^1.1.0",
+    "typescript": "^6.0.3",
     "wrangler": "4.147.0"
   },
   "allowScripts": {

@@ -142,6 +142,10 @@ site-format:
 site-format-check:
     cd site && npm run format:check
 
+# Type-check the site
+site-check:
+    cd site && npm run check
+
 # Install site dependencies
 site-install:
     cd site && npm ci --strict-allow-scripts
@@ -200,6 +204,8 @@ check:
     run python3 -B -m unittest discover -s scripts -p 'test_*.py'
     echo "--- site-format-check ---"
     (cd site && npm run format:check) || failed=1
+    echo "--- site-type-check ---"
+    (cd site && npm run check) || failed=1
     echo "--- site-build ---"
     (cd site && npm run build) || failed=1
     echo "--- site-deploy-dry ---"
