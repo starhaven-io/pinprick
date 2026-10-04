@@ -16,7 +16,7 @@ use oxc_ast::ast::{
     Argument, ArrayExpressionElement, AssignmentOperator, AssignmentTarget, BinaryOperator,
     BindingPattern, CallExpression, ClassElement, Expression, FormalParameters,
     IdentifierReference, ImportDeclarationSpecifier, MethodDefinitionKind, NumericLiteral,
-    ObjectExpression, ObjectPropertyKind, PropertyKey, PropertyKind, UnaryOperator,
+    ObjectExpression, ObjectPropertyKind, PropertyKey, PropertyKind, Statement, UnaryOperator,
 };
 use oxc_parser::Parser;
 use oxc_semantic::{AstNodes, NodeId, Scoping, SemanticBuilder, SymbolFlags, SymbolId};
@@ -2612,6 +2612,9 @@ impl<'s, 'a> Analysis<'s, 'a> {
     /// holds the function that returns it, since calling that one's result
     /// yields the located value.
     fn returned(&self, function: NodeId, taints: &mut Vec<Taint<'a>>) {
+        if self.identity_parameter(function).is_some() {
+            return;
+        }
         let mut current = Some(function);
         let mut depth = 0;
         while let Some(function) = current.take()
@@ -2651,6 +2654,60 @@ impl<'s, 'a> Analysis<'s, 'a> {
                 }
             }
         }
+    }
+
+    /// A function with no work other than returning one unchanged parameter.
+    /// Each call's return can then be tracked from that call's argument.
+    fn identity_parameter(&self, function: NodeId) -> Option<usize> {
+        let AstKind::Function(definition) = self.nodes.kind(function) else {
+            return None;
+        };
+        if definition.r#async || definition.generator || definition.params.rest.is_some() {
+            return None;
+        }
+        let body = definition.body.as_ref()?;
+        let [Statement::ReturnStatement(statement)] = body.statements.as_slice() else {
+            return None;
+        };
+        let Expression::Identifier(returned) = inner(statement.argument.as_ref()?) else {
+            return None;
+        };
+        let symbol = self.resolved(returned)?;
+        definition
+            .params
+            .items
+            .iter()
+            .enumerate()
+            .find_map(|(index, parameter)| {
+                let BindingPattern::BindingIdentifier(binding) = &parameter.pattern else {
+                    return None;
+                };
+                (parameter.initializer.is_none()
+                    && binding.symbol_id.get() == Some(symbol)
+                    && !self.is_written(symbol)
+                    && self.parameter_arguments(parameter.node_id.get()).is_some())
+                .then_some(index)
+            })
+    }
+
+    fn identity_call_argument(&self, call: &'a CallExpression<'a>) -> Option<&'a Expression<'a>> {
+        if !self.is_known_function(&call.callee) {
+            return None;
+        }
+        let functions = match inner(&call.callee) {
+            Expression::Identifier(identifier) => self
+                .resolved(identifier)
+                .map(|symbol| self.callee_functions(symbol))
+                .unwrap_or_default(),
+            Expression::FunctionExpression(function) => vec![function.node_id.get()],
+            _ => Vec::new(),
+        };
+        let [function] = functions.as_slice() else {
+            return None;
+        };
+        call.arguments
+            .get(self.identity_parameter(*function)?)?
+            .as_expression()
     }
 
     /// Symbols bound or referenced within `span`.
@@ -3278,6 +3335,12 @@ impl<'s, 'a> Analysis<'s, 'a> {
                 }
                 AstKind::CallExpression(call) => {
                     self.call_flow(&call.callee, &call.arguments, child, taints);
+                    if self
+                        .identity_call_argument(call)
+                        .is_some_and(|argument| within(argument.span()))
+                    {
+                        taints.push(Taint::Node(current));
+                    }
                     within(call.callee.span()) || !self.is_known_function(&call.callee)
                 }
                 // Numbers and booleans are not paths.
@@ -4436,6 +4499,9 @@ impl<'s, 'a> Analysis<'s, 'a> {
     }
 
     fn evaluate_call(&self, call: &'a CallExpression<'a>, depth: usize) -> String {
+        if let Some(argument) = self.identity_call_argument(call) {
+            return self.evaluate(argument, depth + 1);
+        }
         let span = call.span;
         let Some((receiver, function)) = self.callee_name(&call.callee) else {
             return self.opaque(span);

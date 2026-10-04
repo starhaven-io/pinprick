@@ -6830,10 +6830,6 @@ mod tests {
             ),
             (
                 "action/index.js",
-                "function parseInt(p) { return p; }\nconst file = parseInt(path.join(__dirname, 'install.sh'));\nexecFileSync('bash', [file]);",
-            ),
-            (
-                "action/index.js",
                 "const o = { includes() { return __dirname + '/install.sh'; } };\nconst file = o.includes();\nexecFileSync('bash', [file]);",
             ),
             (
@@ -6951,10 +6947,6 @@ mod tests {
             (
                 "action/index.js",
                 "const args = [__dirname + '/install.sh'];\nargs.push(extra);\nexecFileSync('bash', [...args]);",
-            ),
-            (
-                "action/index.js",
-                "function identity(p) { return p; }\nconst root = __dirname;\nexecFileSync('bash', [identity(root) + '/install.sh']);",
             ),
             (
                 "action/index.js",
@@ -7582,6 +7574,41 @@ io_cp(__nccwpck_require__.ab + 'index1.js', '/opt/tofu');"#
             }
         }
         assert!(!complete, "relocated module lookup must be unresolved");
+    }
+
+    #[test]
+    fn javascript_return_from_one_call_does_not_taint_other_calls() {
+        let tree = ["action/index.js", "action/install.sh"];
+        let source = "function identity(value) { return value; }\nconst located = identity(__dirname + '/install.sh');\nconst safe = identity('safe.sh');\nexecFileSync('bash', [safe]);\n";
+        assert_eq!(follow(&tree, "action/index.js", source), (true, vec![]));
+        let source = "function identity(value) { return value; }\nconst located = identity(__dirname + '/install.sh');\nconst safe = identity('safe.sh');\nexecFileSync('bash', [located]);\n";
+        assert_eq!(
+            follow(&tree, "action/index.js", source),
+            (true, vec!["action/install.sh".to_string()])
+        );
+        for source in [
+            "function parseInt(p) { return p; }\nconst file = parseInt(path.join(__dirname, 'install.sh'));\nexecFileSync('bash', [file]);",
+            "function identity(p) { return p; }\nconst root = __dirname;\nexecFileSync('bash', [identity(root) + '/install.sh']);",
+        ] {
+            assert_eq!(
+                follow(&tree, "action/index.js", source),
+                (true, vec!["action/install.sh".to_string()]),
+                "{source}"
+            );
+        }
+        for source in [
+            "function identity(value) { value = __dirname + '/install.sh'; return value; }\nexecFileSync('bash', [identity('safe.sh')]);\n",
+            "function identity(value) { return __dirname + '/install.sh'; }\nexecFileSync('bash', [identity('safe.sh')]);\n",
+            "function identity(value = __dirname + '/install.sh') { return value; }\nexecFileSync('bash', [identity()]);\n",
+            "function identity(value) { return value; }\nconst located = __dirname + '/install.sh';\nexecFileSync('bash', [identity(...[located])]);\n",
+            "function identity(value) { return value; }\nconst located = __dirname + '/install.sh';\nexecFileSync('bash', [identity.call(null, located)]);\n",
+        ] {
+            let (complete, targets) = follow(&tree, "action/index.js", source);
+            assert!(
+                !complete || targets.contains(&"action/install.sh".to_string()),
+                "{source}"
+            );
+        }
     }
 
     #[test]
