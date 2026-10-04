@@ -40,6 +40,11 @@ updates:
       interval: "daily"
     cooldown:
       default-days: 7
+    ignore:
+      # TypeScript 7.0 lacks Astro's required API; reassess with 7.1: https://github.com/withastro/astro/issues/17268
+      - dependency-name: "typescript"
+        versions:
+          - ">=7.0.0 <7.1.0"
     groups:
       "npm-dependencies":
         patterns:

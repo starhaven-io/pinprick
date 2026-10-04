@@ -25,6 +25,10 @@ params:
     - package-ecosystem: "npm"
       group: "npm-dependencies"
       directory: "/site"
+      ignore:
+        - dependency-name: "typescript"
+          reason: "TypeScript 7.0 lacks Astro's required API; reassess with 7.1: https://github.com/withastro/astro/issues/17268"
+          versions: [">=7.0.0 <7.1.0"]
   npm-policy:
     strict-allow-scripts: true
     projects: ["site"]
