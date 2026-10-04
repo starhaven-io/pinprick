@@ -332,6 +332,11 @@ jobs:
         working-directory: site
         run: npm run format:check
 
+      - name: Type-check site
+        if: matrix.check == 'site'
+        working-directory: site
+        run: npm run check
+
       - name: Build site
         if: matrix.check == 'site'
         working-directory: site
