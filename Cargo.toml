@@ -47,11 +47,11 @@ toml = "1"
 semver = "1"
 sha2 = "0.11"
 minisign-verify = "0.3.0"
-oxc_allocator = "0.151"
-oxc_ast = "0.151"
-oxc_parser = { version = "0.151", default-features = false }
-oxc_semantic = "0.151"
-oxc_span = "0.151"
+oxc_allocator = "0.152"
+oxc_ast = "0.152"
+oxc_parser = { version = "0.152", default-features = false }
+oxc_semantic = "0.152"
+oxc_span = "0.152"
 rustix = { version = "1", features = ["fs"] }
 
 [build-dependencies]
