@@ -1,6 +1,7 @@
 mod audit;
 mod audit_javascript;
 mod audit_patterns;
+mod audit_python;
 mod audit_shell;
 mod audit_source;
 mod audited_actions;
@@ -136,6 +137,12 @@ async fn main() -> ExitCode {
         .is_some_and(|argument| argument == audit_javascript::WORKER_ARGUMENT)
     {
         return audit_javascript::run_worker();
+    }
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|argument| argument == audit_python::WORKER_ARGUMENT)
+    {
+        return audit_python::run_worker();
     }
     let cli = Cli::parse();
 
