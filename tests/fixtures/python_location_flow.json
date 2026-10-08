@@ -1,0 +1,413 @@
+[
+  {
+    "name": "direct_call",
+    "executes_helper": true,
+    "main": "import os\nimport subprocess\nimport sys\nimport functools\nimport threading\nimport atexit\nlocated = os.path.join(os.path.dirname(__file__), 'install.sh')\ndef go(p):\n    subprocess.run(['bash', p])\ngo(located)\n",
+    "extra": {}
+  },
+  {
+    "name": "direct_inline_arg",
+    "executes_helper": true,
+    "main": "import os\nimport subprocess\nimport sys\nimport functools\nimport threading\nimport atexit\ndef go(p):\n    subprocess.run(['bash', p])\ngo(os.path.join(os.path.dirname(__file__), 'install.sh'))\n",
+    "extra": {}
+  },
+  {
+    "name": "alias_call",
+    "executes_helper": true,
+    "main": "import os\nimport subprocess\nimport sys\nimport functools\nimport threading\nimport atexit\nlocated = os.path.join(os.path.dirname(__file__), 'install.sh')\ndef go(p):\n    subprocess.run(['bash', p])\ng = go\ng(located)\n",
+    "extra": {}
+  },
+  {
+    "name": "keyword_arg",
+    "executes_helper": true,
+    "main": "import os\nimport subprocess\nimport sys\nimport functools\nimport threading\nimport atexit\nlocated = os.path.join(os.path.dirname(__file__), 'install.sh')\ndef go(p):\n    subprocess.run(['bash', p])\ngo(p=located)\n",
+    "extra": {}
+  },
+  {
+    "name": "default_located",
+    "executes_helper": true,
+    "main": "import os\nimport subprocess\nimport sys\nimport functools\nimport threading\nimport atexit\ndef go(p=os.path.join(os.path.dirname(__file__), 'install.sh')):\n    subprocess.run(['bash', p])\ngo()\n",
+    "extra": {}
+  },
+  {
+    "name": "default_overridden_safe",
+    "executes_helper": false,
+    "main": "import os\nimport subprocess\nimport sys\nimport functools\nimport threading\nimport atexit\ndef go(p=os.path.join(os.path.dirname(__file__), 'install.sh')):\n    subprocess.run(['bash', p])\ngo('safe.sh')\n",
+    "extra": {}
+  },
+  {
+    "name": "varargs",
+    "executes_helper": true,
+    "main": "import os\nimport subprocess\nimport sys\nimport functools\nimport threading\nimport atexit\nlocated = os.path.join(os.path.dirname(__file__), 'install.sh')\ndef go(*a):\n    subprocess.run(['bash', a[0]])\ngo(located)\n",
+    "extra": {}
+  },
+  {
+    "name": "kwargs",
+    "executes_helper": true,
+    "main": "import os\nimport subprocess\nimport sys\nimport functools\nimport threading\nimport atexit\nlocated = os.path.join(os.path.dirname(__file__), 'install.sh')\ndef go(**k):\n    subprocess.run(['bash', k['p']])\ngo(p=located)\n",
+    "extra": {}
+  },
+  {
+    "name": "star_call",
+    "executes_helper": true,
+    "main": "import os\nimport subprocess\nimport sys\nimport functools\nimport threading\nimport atexit\nlocated = os.path.join(os.path.dirname(__file__), 'install.sh')\ndef go(p):\n    subprocess.run(['bash', p])\nargs = [located]\ngo(*args)\n",
+    "extra": {}
+  },
+  {
+    "name": "safe_call_beside_located",
+    "executes_helper": false,
+    "main": "import os\nimport subprocess\nimport sys\nimport functools\nimport threading\nimport atexit\nlocated = os.path.join(os.path.dirname(__file__), 'install.sh')\ndef go(p):\n    subprocess.run(['bash', p])\ngo('safe.sh')\nprint(located)\n",
+    "extra": {}
+  },
+  {
+    "name": "nested_closure",
+    "executes_helper": true,
+    "main": "import os\nimport subprocess\nimport sys\nimport functools\nimport threading\nimport atexit\ndef outer():\n    q = os.path.join(os.path.dirname(__file__), 'install.sh')\n    def inner():\n        subprocess.run(['bash', q])\n    inner()\nouter()\n",
+    "extra": {}
+  },
+  {
+    "name": "closure_param_returned",
+    "executes_helper": true,
+    "main": "import os\nimport subprocess\nimport sys\nimport functools\nimport threading\nimport atexit\nlocated = os.path.join(os.path.dirname(__file__), 'install.sh')\ndef outer(p):\n    def inner():\n        subprocess.run(['bash', p])\n    return inner\nouter(located)()\n",
+    "extra": {}
+  },
+  {
+    "name": "global_statement",
+    "executes_helper": true,
+    "main": "import os\nimport subprocess\nimport sys\nimport functools\nimport threading\nimport atexit\ntarget = None\ndef setup():\n    global target\n    target = os.path.join(os.path.dirname(__file__), 'install.sh')\nsetup()\nsubprocess.run(['bash', target])\n",
+    "extra": {}
+  },
+  {
+    "name": "nonlocal_statement",
+    "executes_helper": true,
+    "main": "import os\nimport subprocess\nimport sys\nimport functools\nimport threading\nimport atexit\ndef outer():\n    t = None\n    def setup():\n        nonlocal t\n        t = os.path.join(os.path.dirname(__file__), 'install.sh')\n    setup()\n    subprocess.run(['bash', t])\nouter()\n",
+    "extra": {}
+  },
+  {
+    "name": "comprehension",
+    "executes_helper": true,
+    "main": "import os\nimport subprocess\nimport sys\nimport functools\nimport threading\nimport atexit\n[subprocess.run(['bash', p]) for p in [os.path.join(os.path.dirname(__file__), 'install.sh')]]\n",
+    "extra": {}
+  },
+  {
+    "name": "class_attribute",
+    "executes_helper": true,
+    "main": "import os\nimport subprocess\nimport sys\nimport functools\nimport threading\nimport atexit\nclass C:\n    path = os.path.join(os.path.dirname(__file__), 'install.sh')\nsubprocess.run(['bash', C.path])\n",
+    "extra": {}
+  },
+  {
+    "name": "method_self",
+    "executes_helper": true,
+    "main": "import os\nimport subprocess\nimport sys\nimport functools\nimport threading\nimport atexit\nlocated = os.path.join(os.path.dirname(__file__), 'install.sh')\nclass T:\n    def go(self, p):\n        subprocess.run(['bash', p])\nT().go(located)\n",
+    "extra": {}
+  },
+  {
+    "name": "staticmethod",
+    "executes_helper": true,
+    "main": "import os\nimport subprocess\nimport sys\nimport functools\nimport threading\nimport atexit\nlocated = os.path.join(os.path.dirname(__file__), 'install.sh')\nclass T:\n    @staticmethod\n    def go(p):\n        subprocess.run(['bash', p])\nT.go(located)\n",
+    "extra": {}
+  },
+  {
+    "name": "classmethod",
+    "executes_helper": true,
+    "main": "import os\nimport subprocess\nimport sys\nimport functools\nimport threading\nimport atexit\nlocated = os.path.join(os.path.dirname(__file__), 'install.sh')\nclass T:\n    @classmethod\n    def go(cls, p):\n        subprocess.run(['bash', p])\nT.go(located)\n",
+    "extra": {}
+  },
+  {
+    "name": "bound_method_ref",
+    "executes_helper": true,
+    "main": "import os\nimport subprocess\nimport sys\nimport functools\nimport threading\nimport atexit\nlocated = os.path.join(os.path.dirname(__file__), 'install.sh')\nclass T:\n    def go(self, p):\n        subprocess.run(['bash', p])\nf = T().go\nf(located)\n",
+    "extra": {}
+  },
+  {
+    "name": "self_attribute",
+    "executes_helper": true,
+    "main": "import os\nimport subprocess\nimport sys\nimport functools\nimport threading\nimport atexit\nclass T:\n    def __init__(self):\n        self.path = os.path.join(os.path.dirname(__file__), 'install.sh')\n    def go(self):\n        subprocess.run(['bash', self.path])\nT().go()\n",
+    "extra": {}
+  },
+  {
+    "name": "callback_invoke",
+    "executes_helper": true,
+    "main": "import os\nimport subprocess\nimport sys\nimport functools\nimport threading\nimport atexit\nlocated = os.path.join(os.path.dirname(__file__), 'install.sh')\ndef go(p):\n    subprocess.run(['bash', p])\ndef invoke(fn, v):\n    fn(v)\ninvoke(go, located)\n",
+    "extra": {}
+  },
+  {
+    "name": "map_callback",
+    "executes_helper": true,
+    "main": "import os\nimport subprocess\nimport sys\nimport functools\nimport threading\nimport atexit\nlocated = os.path.join(os.path.dirname(__file__), 'install.sh')\ndef go(p):\n    subprocess.run(['bash', p])\nlist(map(go, [located]))\n",
+    "extra": {}
+  },
+  {
+    "name": "sorted_key",
+    "executes_helper": true,
+    "main": "import os\nimport subprocess\nimport sys\nimport functools\nimport threading\nimport atexit\nlocated = os.path.join(os.path.dirname(__file__), 'install.sh')\ndef go(p):\n    subprocess.run(['bash', p])\n    return 0\nsorted([located], key=go)\n",
+    "extra": {}
+  },
+  {
+    "name": "functools_partial",
+    "executes_helper": true,
+    "main": "import os\nimport subprocess\nimport sys\nimport functools\nimport threading\nimport atexit\nlocated = os.path.join(os.path.dirname(__file__), 'install.sh')\ndef go(p):\n    subprocess.run(['bash', p])\nfunctools.partial(go, located)()\n",
+    "extra": {}
+  },
+  {
+    "name": "thread_target",
+    "executes_helper": true,
+    "main": "import os\nimport subprocess\nimport sys\nimport functools\nimport threading\nimport atexit\nlocated = os.path.join(os.path.dirname(__file__), 'install.sh')\ndef go(p):\n    subprocess.run(['bash', p])\nt = threading.Thread(target=go, args=(located,))\nt.start()\nt.join()\n",
+    "extra": {}
+  },
+  {
+    "name": "atexit_register",
+    "executes_helper": true,
+    "main": "import os\nimport subprocess\nimport sys\nimport functools\nimport threading\nimport atexit\nlocated = os.path.join(os.path.dirname(__file__), 'install.sh')\ndef go(p):\n    subprocess.run(['bash', p])\natexit.register(go, located)\n",
+    "extra": {}
+  },
+  {
+    "name": "dict_dispatch",
+    "executes_helper": true,
+    "main": "import os\nimport subprocess\nimport sys\nimport functools\nimport threading\nimport atexit\nlocated = os.path.join(os.path.dirname(__file__), 'install.sh')\ndef go(p):\n    subprocess.run(['bash', p])\nhandlers = {'x': go}\nhandlers['x'](located)\n",
+    "extra": {}
+  },
+  {
+    "name": "getattr_module",
+    "executes_helper": true,
+    "main": "import os\nimport subprocess\nimport sys\nimport functools\nimport threading\nimport atexit\nlocated = os.path.join(os.path.dirname(__file__), 'install.sh')\ndef go(p):\n    subprocess.run(['bash', p])\ngetattr(sys.modules[__name__], 'go')(located)\n",
+    "extra": {}
+  },
+  {
+    "name": "globals_lookup",
+    "executes_helper": true,
+    "main": "import os\nimport subprocess\nimport sys\nimport functools\nimport threading\nimport atexit\nlocated = os.path.join(os.path.dirname(__file__), 'install.sh')\ndef go(p):\n    subprocess.run(['bash', p])\nglobals()['go'](located)\n",
+    "extra": {}
+  },
+  {
+    "name": "attribute_store",
+    "executes_helper": true,
+    "main": "import os\nimport subprocess\nimport sys\nimport functools\nimport threading\nimport atexit\nlocated = os.path.join(os.path.dirname(__file__), 'install.sh')\ndef go(p):\n    subprocess.run(['bash', p])\nclass H:\n    pass\nh = H()\nh.fn = go\nh.fn(located)\n",
+    "extra": {}
+  },
+  {
+    "name": "decorator_wrapper",
+    "executes_helper": true,
+    "main": "import os\nimport subprocess\nimport sys\nimport functools\nimport threading\nimport atexit\nlocated = os.path.join(os.path.dirname(__file__), 'install.sh')\ndef deco(fn):\n    def w(p):\n        subprocess.run(['bash', p])\n    return w\n@deco\ndef noop(p):\n    return p\nnoop(located)\n",
+    "extra": {}
+  },
+  {
+    "name": "decorator_wraps",
+    "executes_helper": true,
+    "main": "import os\nimport subprocess\nimport sys\nimport functools\nimport threading\nimport atexit\nlocated = os.path.join(os.path.dirname(__file__), 'install.sh')\ndef deco(fn):\n    @functools.wraps(fn)\n    def w(*a):\n        return fn(*a)\n    return w\n@deco\ndef go(p):\n    subprocess.run(['bash', p])\ngo(located)\n",
+    "extra": {}
+  },
+  {
+    "name": "decorator_with_args",
+    "executes_helper": true,
+    "main": "import os\nimport subprocess\nimport sys\nimport functools\nimport threading\nimport atexit\nlocated = os.path.join(os.path.dirname(__file__), 'install.sh')\ndef deco(tag):\n    def d(fn):\n        def w(p):\n            subprocess.run(['bash', p])\n        return w\n    return d\n@deco('x')\ndef noop(p):\n    return p\nnoop(located)\n",
+    "extra": {}
+  },
+  {
+    "name": "decorator_registry",
+    "executes_helper": true,
+    "main": "import os\nimport subprocess\nimport sys\nimport functools\nimport threading\nimport atexit\nlocated = os.path.join(os.path.dirname(__file__), 'install.sh')\nregistry = []\ndef register(fn):\n    registry.append(fn)\n    return fn\n@register\ndef go(p):\n    subprocess.run(['bash', p])\nfor f in registry:\n    f(located)\n",
+    "extra": {}
+  },
+  {
+    "name": "decorator_stacked",
+    "executes_helper": true,
+    "main": "import os\nimport subprocess\nimport sys\nimport functools\nimport threading\nimport atexit\nlocated = os.path.join(os.path.dirname(__file__), 'install.sh')\ndef a(fn):\n    return fn\ndef b(fn):\n    def w(p):\n        return fn(p)\n    return w\n@a\n@b\ndef go(p):\n    subprocess.run(['bash', p])\ngo(located)\n",
+    "extra": {}
+  },
+  {
+    "name": "return_located",
+    "executes_helper": true,
+    "main": "import os\nimport subprocess\nimport sys\nimport functools\nimport threading\nimport atexit\ndef setup():\n    s = os.path.join(os.path.dirname(__file__), 'install.sh')\n    return s\ndef go(p):\n    subprocess.run(['bash', p])\ngo(setup())\n",
+    "extra": {}
+  },
+  {
+    "name": "return_into_exec",
+    "executes_helper": true,
+    "main": "import os\nimport subprocess\nimport sys\nimport functools\nimport threading\nimport atexit\ndef path():\n    return os.path.join(os.path.dirname(__file__), 'install.sh')\nsubprocess.run(['bash', path()])\n",
+    "extra": {}
+  },
+  {
+    "name": "return_via_variable",
+    "executes_helper": true,
+    "main": "import os\nimport subprocess\nimport sys\nimport functools\nimport threading\nimport atexit\ndef setup():\n    s = os.path.join(os.path.dirname(__file__), 'install.sh')\n    return s\nvalue = setup()\ndef go(p):\n    subprocess.run(['bash', p])\ngo(value)\n",
+    "extra": {}
+  },
+  {
+    "name": "returned_function",
+    "executes_helper": true,
+    "main": "import os\nimport subprocess\nimport sys\nimport functools\nimport threading\nimport atexit\nlocated = os.path.join(os.path.dirname(__file__), 'install.sh')\ndef factory():\n    def r(p):\n        subprocess.run(['bash', p])\n    return r\nfactory()(located)\n",
+    "extra": {}
+  },
+  {
+    "name": "lambda_bound",
+    "executes_helper": true,
+    "main": "import os\nimport subprocess\nimport sys\nimport functools\nimport threading\nimport atexit\nlocated = os.path.join(os.path.dirname(__file__), 'install.sh')\ngo = lambda p: subprocess.run(['bash', p])\ngo(located)\n",
+    "extra": {}
+  },
+  {
+    "name": "lambda_inline_map",
+    "executes_helper": true,
+    "main": "import os\nimport subprocess\nimport sys\nimport functools\nimport threading\nimport atexit\nlocated = os.path.join(os.path.dirname(__file__), 'install.sh')\nlist(map(lambda p: subprocess.run(['bash', p]), [located]))\n",
+    "extra": {}
+  },
+  {
+    "name": "collision_located",
+    "executes_helper": true,
+    "main": "import os\nimport subprocess\nimport sys\nimport functools\nimport threading\nimport atexit\nscript = os.path.join(os.path.dirname(__file__), 'install.sh')\ndef go(script):\n    subprocess.run(['bash', script])\ngo(script)\n",
+    "extra": {}
+  },
+  {
+    "name": "collision_safe",
+    "executes_helper": false,
+    "main": "import os\nimport subprocess\nimport sys\nimport functools\nimport threading\nimport atexit\nscript = os.path.join(os.path.dirname(__file__), 'install.sh')\nprint(script)\ndef go(script):\n    subprocess.run(['bash', script])\ngo('safe.sh')\n",
+    "extra": {}
+  },
+  {
+    "name": "collision_callback",
+    "executes_helper": true,
+    "main": "import os\nimport subprocess\nimport sys\nimport functools\nimport threading\nimport atexit\nscript = os.path.join(os.path.dirname(__file__), 'install.sh')\ndef go(script):\n    subprocess.run(['bash', script])\ndef invoke(fn, value):\n    fn(value)\ninvoke(go, script)\n",
+    "extra": {}
+  },
+  {
+    "name": "collision_decorator",
+    "executes_helper": true,
+    "main": "import os\nimport subprocess\nimport sys\nimport functools\nimport threading\nimport atexit\nscript = os.path.join(os.path.dirname(__file__), 'install.sh')\ndef deco(fn):\n    def w(script):\n        subprocess.run(['bash', script])\n    return w\n@deco\ndef noop(script):\n    return script\nnoop(script)\n",
+    "extra": {}
+  },
+  {
+    "name": "collision_returned_function",
+    "executes_helper": true,
+    "main": "import os\nimport subprocess\nimport sys\nimport functools\nimport threading\nimport atexit\nscript = os.path.join(os.path.dirname(__file__), 'install.sh')\ndef factory():\n    def r(script):\n        subprocess.run(['bash', script])\n    return r\nfactory()(script)\n",
+    "extra": {}
+  },
+  {
+    "name": "collision_return_value",
+    "executes_helper": true,
+    "main": "import os\nimport subprocess\nimport sys\nimport functools\nimport threading\nimport atexit\ndef setup():\n    script = os.path.join(os.path.dirname(__file__), 'install.sh')\n    return script\ndef go(script):\n    subprocess.run(['bash', script])\nvalue = setup()\ngo(value)\n",
+    "extra": {}
+  },
+  {
+    "name": "executor_name_noop",
+    "executes_helper": false,
+    "main": "import os\nimport subprocess\nimport sys\nimport functools\nimport threading\nimport atexit\nlocated = os.path.join(os.path.dirname(__file__), 'install.sh')\ndef run(p):\n    pass\nrun(located)\n",
+    "extra": {}
+  },
+  {
+    "name": "executor_name_real",
+    "executes_helper": true,
+    "main": "import os\nimport subprocess\nimport sys\nimport functools\nimport threading\nimport atexit\nlocated = os.path.join(os.path.dirname(__file__), 'install.sh')\ndef call(p):\n    subprocess.run(['bash', p])\ncall(located)\n",
+    "extra": {}
+  },
+  {
+    "name": "chdir_in_called_function",
+    "executes_helper": true,
+    "main": "import os\nimport subprocess\nimport sys\nimport functools\nimport threading\nimport atexit\ndef go():\n    os.chdir(os.path.dirname(__file__))\n    subprocess.run(['bash', 'install.sh'])\ngo()\n",
+    "extra": {}
+  },
+  {
+    "name": "chdir_in_uncalled_function",
+    "executes_helper": false,
+    "main": "import os\nimport subprocess\nimport sys\nimport functools\nimport threading\nimport atexit\ndef a():\n    os.chdir(os.path.dirname(__file__))\ndef b():\n    subprocess.run(['bash', 'install.sh'])\nb()\n",
+    "extra": {}
+  },
+  {
+    "name": "sibling_function",
+    "executes_helper": true,
+    "main": "import os\nimport subprocess\nimport sys\nimport functools\nimport threading\nimport atexit\nsys.path.insert(0, os.path.dirname(__file__))\nfrom helpers import go\ngo(os.path.join(os.path.dirname(__file__), 'install.sh'))\n",
+    "extra": {
+      "helpers.py": "import subprocess\ndef go(p):\n    subprocess.run(['bash', p])\n"
+    }
+  },
+  {
+    "name": "sibling_callback",
+    "executes_helper": true,
+    "main": "import os\nimport subprocess\nimport sys\nimport functools\nimport threading\nimport atexit\nsys.path.insert(0, os.path.dirname(__file__))\nimport helpers\ndef go(p):\n    subprocess.run(['bash', p])\nhelpers.invoke(go, os.path.join(os.path.dirname(__file__), 'install.sh'))\n",
+    "extra": {
+      "helpers.py": "def invoke(fn, v):\n    fn(v)\n"
+    }
+  },
+  {
+    "name": "sibling_returns_location",
+    "executes_helper": true,
+    "main": "import os\nimport subprocess\nimport sys\nimport functools\nimport threading\nimport atexit\nsys.path.insert(0, os.path.dirname(__file__))\nfrom helpers import path\nsubprocess.run(['bash', path()])\n",
+    "extra": {
+      "helpers.py": "import os\ndef path():\n    return os.path.join(os.path.dirname(__file__), 'install.sh')\n"
+    }
+  },
+  {
+    "name": "r2_cross_scope_local",
+    "executes_helper": true,
+    "main": "import os, subprocess\ndef go(q):\n    subprocess.run(['bash', q])\nbase = os.path.dirname(__file__)\ndef outer():\n    p = os.path.join(base, 'install.sh')\n    go(p)\nouter()\n",
+    "extra": {}
+  },
+  {
+    "name": "r2_path_strip",
+    "executes_helper": true,
+    "main": "import os, subprocess\ndef go(q):\n    subprocess.run(['bash', q])\nbase = os.path.dirname(__file__)\np = os.path.join(base, 'install.sh').strip()\ngo(p)\n",
+    "extra": {}
+  },
+  {
+    "name": "r2_attribute_field",
+    "executes_helper": true,
+    "main": "import os, subprocess\ndef go(q):\n    subprocess.run(['bash', q])\nclass C:\n    pass\nc = C()\nc.p = os.path.join(os.path.dirname(__file__), 'install.sh')\ngo(c.p)\n",
+    "extra": {}
+  },
+  {
+    "name": "r2_subscript_store",
+    "executes_helper": true,
+    "main": "import os, subprocess\ndef go(q):\n    subprocess.run(['bash', q])\npaths = {}\npaths['x'] = os.path.join(os.path.dirname(__file__), 'install.sh')\ngo(paths['x'])\n",
+    "extra": {}
+  },
+  {
+    "name": "r2_tuple_unpacking",
+    "executes_helper": true,
+    "main": "import os, subprocess\ndef go(q):\n    subprocess.run(['bash', q])\na, b = os.path.join(os.path.dirname(__file__), 'install.sh'), 'x'\ngo(a)\n",
+    "extra": {}
+  },
+  {
+    "name": "r2_for_loop",
+    "executes_helper": true,
+    "main": "import os, subprocess\ndef go(q):\n    subprocess.run(['bash', q])\nfor p in [os.path.join(os.path.dirname(__file__), 'install.sh')]:\n    go(p)\n",
+    "extra": {}
+  },
+  {
+    "name": "r2_walrus",
+    "executes_helper": true,
+    "main": "import os, subprocess\ndef go(q):\n    subprocess.run(['bash', q])\nif (p := os.path.join(os.path.dirname(__file__), 'install.sh')):\n    go(p)\n",
+    "extra": {}
+  },
+  {
+    "name": "r2_return_from_module_name",
+    "executes_helper": true,
+    "main": "import os, subprocess\nbase = os.path.dirname(__file__)\ndef path():\n    return os.path.join(base, 'install.sh')\nsubprocess.run(['bash', path()])\n",
+    "extra": {}
+  },
+  {
+    "name": "r2_returned_path_through_strip",
+    "executes_helper": true,
+    "main": "import os, subprocess\nbase = os.path.dirname(__file__)\ndef path():\n    p = os.path.join(base, 'install.sh').strip()\n    return p\nsubprocess.run(['bash', path()])\n",
+    "extra": {}
+  },
+  {
+    "name": "scope_function_local_not_leaked",
+    "executes_helper": false,
+    "expect_clean": true,
+    "main": "import os, subprocess\ndef a():\n    p = os.path.join(os.path.dirname(__file__), 'install.sh')\n    return 0\ndef b():\n    p = 'safe.sh'\n    subprocess.run(['bash', p])\na()\nb()\n",
+    "extra": {}
+  },
+  {
+    "name": "scope_class_body_not_leaked",
+    "executes_helper": false,
+    "expect_clean": true,
+    "main": "import os, subprocess\npath = 'safe.sh'\nclass C:\n    path = os.path.join(os.path.dirname(__file__), 'install.sh')\nsubprocess.run(['bash', path])\n",
+    "extra": {}
+  },
+  {
+    "name": "scope_uncalled_function_not_leaked",
+    "executes_helper": false,
+    "expect_clean": true,
+    "main": "import os, subprocess\ndef setup():\n    target = os.path.join(os.path.dirname(__file__), 'install.sh')\ntarget = 'safe.sh'\nsubprocess.run(['bash', target])\n",
+    "extra": {}
+  }
+]

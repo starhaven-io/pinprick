@@ -2,7 +2,7 @@
 name = "pinprick"
 version = "0.28.0"
 edition = "2024"
-rust-version = "1.96.0"
+rust-version = "1.97.0"
 description = "GitHub Actions supply chain security tool"
 license = "AGPL-3.0-only"
 repository = "https://github.com/starhaven-io/pinprick"
@@ -52,6 +52,9 @@ oxc_ast = "0.152"
 oxc_parser = { version = "0.152", default-features = false }
 oxc_semantic = "0.152"
 oxc_span = "0.152"
+ruff_python_ast = "=0.0.16"
+ruff_python_parser = "=0.0.16"
+ruff_text_size = "=0.0.16"
 rustix = { version = "1", features = ["fs"] }
 
 [build-dependencies]

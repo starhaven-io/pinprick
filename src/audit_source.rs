@@ -2727,47 +2727,77 @@ impl<'a> LocationBindings<'a> {
         }
     }
 
-    fn python(source: &'a str, environment: &'a [(String, String)]) -> Self {
+    fn python(
+        source: &'a str,
+        environment: &'a [(String, String)],
+        shape: &crate::audit_python::Shape,
+        scope: usize,
+    ) -> Self {
         let mut bindings = Self::new(ScriptLanguage::Python, source, None, environment);
-        for captures in PY_ASSIGNMENT_RE.captures_iter(source) {
-            let (Some(name), Some(operator)) = (captures.name("name"), captures.name("operator"))
-            else {
-                continue;
-            };
-            if !python_in_code(source, name.start()) {
-                continue;
+        let mut ancestry = Vec::new();
+        let mut current = scope;
+        loop {
+            ancestry.push(current);
+            if current == 0 {
+                break;
             }
-            let value = bindings.extent(operator.end());
-            bindings.bind(name.as_str(), value, operator.as_str() == "=");
+            current = shape.scopes[current].parent;
         }
-        for captures in PY_REBINDING_RE.captures_iter(source) {
-            let (Some(matched), Some((group, targets))) = (
-                captures.get(0),
-                ["loop", "unpack", "alias", "walrus"]
-                    .iter()
-                    .find_map(|group| captures.name(group).map(|targets| (*group, targets))),
-            ) else {
-                continue;
-            };
-            if !python_in_code(source, targets.start()) {
+        for current in ancestry.into_iter().rev() {
+            let lexical_scope = &shape.scopes[current];
+            if current != scope && lexical_scope.class_name.is_some() {
                 continue;
             }
-            let line_start = source[..targets.start()]
-                .rfind('\n')
-                .map_or(0, |index| index + 1);
-            let value = match group {
-                "loop" => bindings.extent(matched.end()).trim_end_matches(':'),
-                "unpack" => bindings.extent(matched.end() - 1),
-                "walrus" => bindings.extent(matched.end()),
-                // `with EXPRESSION as NAME`
-                _ => source[line_start..matched.start()]
-                    .trim()
-                    .trim_start_matches("async ")
-                    .trim_start_matches("with ")
-                    .trim_start_matches("except "),
-            };
-            for name in IDENTIFIER_RE.find_iter(targets.as_str()) {
-                bindings.bind(name.as_str(), value, false);
+            for parameter in &lexical_scope.parameters {
+                bindings.bindings.remove(parameter.as_str());
+            }
+            for captures in PY_ASSIGNMENT_RE.captures_iter(source) {
+                let (Some(name), Some(operator)) =
+                    (captures.name("name"), captures.name("operator"))
+                else {
+                    continue;
+                };
+                if !python_in_code(source, name.start())
+                    || shape.inside_header(name.start())
+                    || shape.scope_at(name.start()) != current
+                {
+                    continue;
+                }
+                let value = bindings.extent(operator.end());
+                bindings.bind(name.as_str(), value, operator.as_str() == "=");
+            }
+            for captures in PY_REBINDING_RE.captures_iter(source) {
+                let (Some(matched), Some((group, targets))) = (
+                    captures.get(0),
+                    ["loop", "unpack", "alias", "walrus"]
+                        .iter()
+                        .find_map(|group| captures.name(group).map(|targets| (*group, targets))),
+                ) else {
+                    continue;
+                };
+                if !python_in_code(source, targets.start())
+                    || shape.inside_header(targets.start())
+                    || shape.scope_at(targets.start()) != current
+                {
+                    continue;
+                }
+                let line_start = source[..targets.start()]
+                    .rfind('\n')
+                    .map_or(0, |index| index + 1);
+                let value = match group {
+                    "loop" => bindings.extent(matched.end()).trim_end_matches(':'),
+                    "unpack" => bindings.extent(matched.end() - 1),
+                    "walrus" => bindings.extent(matched.end()),
+                    // `with EXPRESSION as NAME`
+                    _ => source[line_start..matched.start()]
+                        .trim()
+                        .trim_start_matches("async ")
+                        .trim_start_matches("with ")
+                        .trim_start_matches("except "),
+                };
+                for name in IDENTIFIER_RE.find_iter(targets.as_str()) {
+                    bindings.bind(name.as_str(), value, false);
+                }
             }
         }
         bindings.trace_taint();
@@ -3746,14 +3776,51 @@ fn python_in_code(source: &str, position: usize) -> bool {
     true
 }
 
-/// Executions located through `__file__` or the action path, plus modules
-/// loaded by name. A `None` module was named dynamically.
+pub(crate) fn python_mentions_location(content: &str) -> bool {
+    PYTHON_LOCATION_TOKENS
+        .iter()
+        .any(|token| content.contains(token))
+}
+
+pub(crate) fn python_execution_name(callee: &str) -> bool {
+    let terminal = callee.rsplit('.').next().unwrap_or(callee);
+    PY_EXECUTION_CALL_RE.is_match(&format!("{terminal}("))
+}
+
+pub(crate) fn python_contains_execution_call(source: &str) -> bool {
+    PY_EXECUTION_CALL_RE.is_match(source)
+}
+
 /// Python's executions through a location, plus modules loaded by name. A
 /// `None` module was named dynamically.
 fn python_located_executions(
     content: &str,
     context: &SourceContext,
 ) -> (Vec<LocatedExecution>, Vec<Option<String>>) {
+    let (mut executions, modules, parsed_shape) =
+        python_located_executions_mode(content, context, false, None);
+    if executions.iter().any(|execution| execution.path.is_none()) {
+        let (whole_file, _, _) =
+            python_located_executions_mode(content, context, true, parsed_shape.as_ref());
+        for execution in whole_file {
+            if execution.path.is_some() && !executions.contains(&execution) {
+                executions.push(execution);
+            }
+        }
+    }
+    (executions, modules)
+}
+
+fn python_located_executions_mode(
+    content: &str,
+    context: &SourceContext,
+    whole_file: bool,
+    shadow_shape: Option<&crate::audit_python::Shape>,
+) -> (
+    Vec<LocatedExecution>,
+    Vec<Option<String>>,
+    Option<crate::audit_python::Shape>,
+) {
     let initial = &context.directory;
     let modules = PY_MODULE_LOADER_RE
         .captures_iter(content)
@@ -3763,23 +3830,46 @@ fn python_located_executions(
                 .map(|module| module.as_str().to_string())
         })
         .collect();
-    if *initial == LocatedDirectory::Caller
-        && !PYTHON_LOCATION_TOKENS
+    let mentions_location = python_mentions_location(content)
+        || context
+            .environment
             .iter()
-            .copied()
-            .chain(context.environment.iter().map(|(name, _)| name.as_str()))
-            .any(|token| content.contains(token))
-    {
-        return (Vec::new(), modules);
+            .any(|(name, _)| content.contains(name.as_str()));
+    if *initial == LocatedDirectory::Caller && !mentions_location {
+        return (Vec::new(), modules, None);
     }
-    let bindings = LocationBindings::python(content, &context.environment);
+    let parsed = if whole_file {
+        None
+    } else {
+        crate::audit_python::shape(content)
+    };
+    let analysis_incomplete = whole_file
+        || parsed.as_ref().is_none_or(|shape| {
+            shape.scopes.len() > 256
+                || shape.calls.len() > 16_384
+                || shape.scopes.len().saturating_mul(content.len()) > 64 * 1024 * 1024
+        });
+    // A failed or over-budget parse must not discard findings the whole-file
+    // scanner can still resolve.
+    let shape = if analysis_incomplete {
+        crate::audit_python::Shape::unscoped(content.len())
+    } else {
+        parsed.unwrap()
+    };
+    let mut scope_bindings = HashMap::new();
+    let mut handled_execution_calls = HashSet::new();
     let mut directories = Vec::new();
     for call in PY_CHDIR_RE.find_iter(content) {
         if python_in_code(content, call.start())
             && let Some(argument) = python_call_arguments(content, call.end() - 1)
         {
+            let scope = shape.scope_at(call.start());
+            let bindings = scope_bindings.entry(scope).or_insert_with(|| {
+                LocationBindings::python(content, &context.environment, &shape, scope)
+            });
             directories.push((
                 call.start(),
+                scope,
                 LocatedDirectory::from_value(&bindings.evaluate(argument, 0)),
             ));
         }
@@ -3794,14 +3884,38 @@ fn python_located_executions(
         {
             continue;
         }
+        if !content[..matched.start()].ends_with('.')
+            && shadow_shape.is_some_and(|shadow| {
+                shadow
+                    .function(
+                        name.as_str(),
+                        shadow.scope_at(matched.start()),
+                        matched.start(),
+                    )
+                    .is_some_and(|(index, _)| !shadow.function_may_execute(index, content))
+            })
+        {
+            continue;
+        }
+        let scope = shape.scope_at(matched.start());
+        if !content[..matched.start()].ends_with('.')
+            && shape.defines_function(name.as_str(), scope, matched.start())
+        {
+            continue;
+        }
         let Some(arguments) = python_call_arguments(content, matched.end() - 1) else {
             continue;
         };
+        let bindings = scope_bindings.entry(scope).or_insert_with(|| {
+            LocationBindings::python(content, &context.environment, &shape, scope)
+        });
         let default_directory = directories
             .iter()
             .rev()
-            .find(|(position, _)| *position < matched.start())
-            .map_or_else(|| initial.clone(), |(_, directory)| directory.clone());
+            .find(|(position, directory_scope, _)| {
+                *position < matched.start() && shape.is_ancestor(*directory_scope, scope)
+            })
+            .map_or_else(|| initial.clone(), |(_, _, directory)| directory.clone());
         if default_directory == LocatedDirectory::Caller && !bindings.is_tainted(arguments) {
             continue;
         }
@@ -3831,6 +3945,7 @@ fn python_located_executions(
             depth: 0,
             composite: false,
         };
+        let prior_executions = executions.len();
         let words: Vec<String> = match name.as_str() {
             "system" | "popen" | "getoutput" | "getstatusoutput" => {
                 if let Some(command) = positional.first() {
@@ -3841,6 +3956,9 @@ fn python_located_executions(
                         ShellLocationState::starting_in(directory),
                         &mut executions,
                     );
+                }
+                if executions.len() > prior_executions {
+                    handled_execution_calls.insert(matched.start());
                 }
                 continue;
             }
@@ -3856,6 +3974,9 @@ fn python_located_executions(
                         ShellLocationState::starting_in(directory),
                         &mut executions,
                     );
+                    if executions.len() > prior_executions {
+                        handled_execution_calls.insert(matched.start());
+                    }
                     continue;
                 }
                 let mut words = bindings.evaluate_words(argv, 0);
@@ -3870,6 +3991,9 @@ fn python_located_executions(
             }
             "run_path" => {
                 python_file(positional.first(), &mut executions);
+                if executions.len() > prior_executions {
+                    handled_execution_calls.insert(matched.start());
+                }
                 continue;
             }
             "load_source" | "spec_from_file_location" => {
@@ -3880,6 +4004,9 @@ fn python_located_executions(
                         .or(positional.get(1)),
                     &mut executions,
                 );
+                if executions.len() > prior_executions {
+                    handled_execution_calls.insert(matched.start());
+                }
                 continue;
             }
             "exec" => {
@@ -3900,6 +4027,9 @@ fn python_located_executions(
                         executions.push(LocatedExecution::unresolved(SourceFileKind::Python));
                     }
                     None => {}
+                }
+                if executions.len() > prior_executions {
+                    handled_execution_calls.insert(matched.start());
                 }
                 continue;
             }
@@ -3956,8 +4086,126 @@ fn python_located_executions(
             }
         };
         command_located_executions(&words, &directory, scan, &mut executions);
+        if executions.len() > prior_executions {
+            handled_execution_calls.insert(matched.start());
+        }
     }
-    (executions, modules)
+    let mut unresolved = analysis_incomplete
+        || shape.location_return
+        || shape.location_global
+        || shape.location_comprehension
+        || (mentions_location && content.contains("nonlocal "));
+    for &(scope, start, end) in &shape.returns {
+        let bindings = scope_bindings.entry(scope).or_insert_with(|| {
+            LocationBindings::python(content, &context.environment, &shape, scope)
+        });
+        let expression = &content[start..end];
+        unresolved |= bindings.is_tainted(expression)
+            && shape
+                .argument_has_path(scope, &code_identifiers(expression, ScriptLanguage::Python));
+    }
+    for call in &shape.calls {
+        let callee = &content[call.callee_start..call.callee_end];
+        let terminal = callee.rsplit('.').next().unwrap_or(callee);
+        if !shape.defines_function(terminal, call.scope, call.callee_start)
+            && python_execution_name(callee)
+        {
+            continue;
+        }
+        let mut local_may_execute = false;
+        if let Some((index, function)) = shape.function(callee, call.scope, call.callee_start) {
+            if !shape.function_may_execute(index, content) {
+                continue;
+            }
+            local_may_execute = true;
+            if function.default_location && call.arguments.is_empty() {
+                unresolved = true;
+            }
+        }
+        if shape.call_is_inert(callee) {
+            continue;
+        }
+        if local_may_execute {
+            let bindings = scope_bindings.entry(call.scope).or_insert_with(|| {
+                LocationBindings::python(content, &context.environment, &shape, call.scope)
+            });
+            unresolved |= call
+                .arguments
+                .iter()
+                .any(|&(start, end)| bindings.is_tainted(&content[start..end]));
+        }
+        unresolved |= call.arguments.iter().any(|&(start, end)| {
+            let argument = &content[start..end];
+            python_mentions_location(argument)
+                || context
+                    .environment
+                    .iter()
+                    .any(|(name, _)| argument.contains(name))
+                || shape.argument_has_path(
+                    call.scope,
+                    &code_identifiers(argument, ScriptLanguage::Python),
+                )
+        });
+    }
+    if mentions_location {
+        for call in PY_EXECUTION_CALL_RE.captures_iter(content) {
+            let Some(matched) = call.get(0) else {
+                continue;
+            };
+            if !python_in_code(content, matched.start()) {
+                continue;
+            }
+            if handled_execution_calls.contains(&matched.start()) {
+                continue;
+            }
+            let scope = shape.scope_at(matched.start());
+            let Some(arguments) = python_call_arguments(content, matched.end() - 1) else {
+                unresolved = true;
+                continue;
+            };
+            let argv = python_top_level_arguments(arguments)
+                .into_iter()
+                .find(|argument| {
+                    !PY_KEYWORD_ARGUMENT_RE.is_match(argument)
+                        || argument.trim().starts_with("args=")
+                })
+                .unwrap_or_default()
+                .trim_start_matches("args=");
+            let bindings = scope_bindings.entry(scope).or_insert_with(|| {
+                LocationBindings::python(content, &context.environment, &shape, scope)
+            });
+            let words = bindings.evaluate_words(argv, 0);
+            let dynamic_program = words.first().is_some_and(|word| is_dynamic_word(word));
+            let dynamic_script = words.first().is_some_and(|program| {
+                matches!(script_interpreter(program), Interpreter::Script(..))
+                    && words.get(1).is_some_and(|word| is_dynamic_word(word))
+            });
+            let located_program = words.first().is_some_and(|word| is_location_derived(word));
+            let located_script = words.first().is_some_and(|program| {
+                matches!(script_interpreter(program), Interpreter::Script(..))
+                    && words.get(1).is_some_and(|word| is_location_derived(word))
+            });
+            let directory = directories
+                .iter()
+                .rev()
+                .find(|(position, directory_scope, _)| {
+                    *position < matched.start() && shape.is_ancestor(*directory_scope, scope)
+                })
+                .map_or(initial, |(_, _, directory)| directory);
+            unresolved |= located_program
+                || located_script
+                || (bindings.is_tainted(argv) && (dynamic_program || dynamic_script))
+                || shape
+                    .located_fields
+                    .iter()
+                    .any(|field| argv.contains(&format!(".{field}")))
+                || (*directory != LocatedDirectory::Caller && (dynamic_program || dynamic_script));
+        }
+    }
+    if unresolved {
+        executions.push(LocatedExecution::unresolved(SourceFileKind::Python));
+    }
+    (executions, modules, Some(shape))
 }
 
 fn python_call_arguments(content: &str, open: usize) -> Option<&str> {
