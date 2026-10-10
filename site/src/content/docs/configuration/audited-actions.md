@@ -52,7 +52,7 @@ To add a new entry to the audited-actions list:
 
 1. In a Pinprick checkout, run `just add-action owner/repo` (include the subpath for a subpath action).
 2. The recipe resolves a full SHA and requires a fresh, complete scan with zero ignored actions under isolated default configuration, then copies the report's detection-rules version into the entry.
-3. Inspect the generated exact-identity entry and build the current scanner with `cargo build --locked --release`, then run `scripts/verify-audited-actions.sh target/release/pinprick files <entry-file>` with a GitHub token.
+3. Inspect the generated exact-identity entry and build the current scanner with `cargo build --locked --release`, then run `ruby scripts/verify-audited-actions.rb target/release/pinprick files <entry-file>` with a GitHub token.
 4. Open a PR with the verification result.
 
 Each file is a JSON array:

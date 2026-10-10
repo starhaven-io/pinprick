@@ -22,7 +22,7 @@ test:
 
 # Check release tooling using local stubs
 script-tests:
-    python3 -B -m unittest discover -s scripts -p 'test_*.py'
+    bundle exec ruby scripts/test.rb
 
 # Lint
 
@@ -201,7 +201,7 @@ check:
         skip audit zizmor zizmor
     fi
     run cargo test --locked
-    run python3 -B -m unittest discover -s scripts -p 'test_*.py'
+    run bundle exec ruby scripts/test.rb
     echo "--- site-format-check ---"
     (cd site && npm run format:check) || failed=1
     echo "--- site-type-check ---"

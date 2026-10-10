@@ -73,10 +73,32 @@ jobs:
           # certify every relevant leg for the current commit. Collapsing to a
           # commits-only matrix on `edited` lets a green run overwrite a prior failing
           # one on the same SHA, bypassing tests, coverage, site checks and the rest.
-          CHANGED=$(git diff --name-only "${BASE_SHA}...HEAD")
+          CHANGED_PATHS=$(mktemp)
+          trap 'rm -f "${CHANGED_PATHS}"' EXIT
+          git diff --no-renames --name-only -z "${BASE_SHA}...HEAD" -- > "${CHANGED_PATHS}"
+          readarray -d '' -t CHANGED < "${CHANGED_PATHS}"
+          # Filenames can contain newlines and runner command syntax. Keep
+          # their values out of xtrace while retaining tracing for routing.
+          any_path_matches() (
+            set +x
+            local pattern="$1" path
+            for path in "${CHANGED[@]}"; do
+              if [[ "${path}" =~ ${pattern} ]]; then return 0; fi
+            done
+            return 1
+          )
+          any_path_outside() (
+            set +x
+            local pattern="$1" path
+            for path in "${CHANGED[@]}"; do
+              # A documentation suffix cannot classify a multiline filename.
+              if [[ "${path}" == *$'\n'* || "${path}" == *$'\r'* || ! "${path}" =~ ${pattern} ]]; then return 0; fi
+            done
+            return 1
+          )
 
           # Rust or build workflow changes: lint + test + MSRV
-          if echo "${CHANGED}" | grep -qE '\.rs$|^Cargo\.(toml|lock)$|^build\.rs$|^deny\.toml$|^justfile$|^rust-toolchain\.toml$|^clippy\.toml$|^rustfmt\.toml$|^\.config/|^\.githooks/|^scripts/|^\.github/workflows/(ci|cargo-deny|release)\.yml$'; then
+          if any_path_matches '\.rs$|^Cargo\.(toml|lock)$|^build\.rs$|^deny\.toml$|^justfile$|^Gemfile(\.lock)?$|^\.ruby-version$|^rust-toolchain\.toml$|^clippy\.toml$|^rustfmt\.toml$|^\.config/|^\.githooks/|^scripts/|^\.github/workflows/(ci|cargo-deny|release)\.yml$'; then
             add_check '{"name":"Lint","check":"lint","runner":"ubuntu-24.04","fetch_depth":1}'
             add_check '{"name":"Test (Linux)","check":"test","runner":"ubuntu-24.04","fetch_depth":1}'
             add_check '{"name":"Test (Linux ARM)","check":"test","runner":"ubuntu-24.04-arm","fetch_depth":1}'
@@ -93,10 +115,10 @@ jobs:
           # history in shards.
           VERIFY_CHANGED=false
           VERIFY_LATEST=false
-          if echo "${CHANGED}" | grep -qE '^audited-actions/.+\.json$'; then
+          if any_path_matches '^audited-actions/.+\.json$'; then
             VERIFY_CHANGED=true
           fi
-          if echo "${CHANGED}" | grep -qE '^src/|^build\.rs$|^Cargo\.(toml|lock)$|^rust-toolchain\.toml$|^scripts/(verify-audited-actions\.sh|normalize-audit-json\.py)$'; then
+          if any_path_matches '^src/|^build\.rs$|^Cargo\.(toml|lock)$|^rust-toolchain\.toml$|^scripts/(verify-audited-actions\.rb|normalize-audit-json\.rb)$'; then
             VERIFY_LATEST=true
           fi
           if [[ "${VERIFY_CHANGED}" == "true" || "${VERIFY_LATEST}" == "true" ]]; then
@@ -104,22 +126,22 @@ jobs:
           fi
 
           # Site or audited-actions changes: format check + build
-          if echo "${CHANGED}" | grep -qE '^site/|^audited-actions/|^catalog-minisign\.pub$|^Cargo\.toml$|^\.github/workflows/deploy-site\.yml$'; then
-            add_check '{"name":"Site","check":"site","runner":"ubuntu-slim","fetch_depth":1}'
+          if any_path_matches '^site/|^audited-actions/|^catalog-minisign\.pub$|^Cargo\.toml$|^\.github/workflows/deploy-site\.yml$'; then
+            add_check '{"name":"Site","check":"site","runner":"ubuntu-24.04","fetch_depth":1}'
           fi
 
           # Workflow changes: Actions security audit
-          if echo "${CHANGED}" | grep -qE '^\.github/workflows/'; then
+          if any_path_matches '^\.github/workflows/'; then
             RUN_ZIZMOR=true
           fi
-          if echo "${CHANGED}" | grep -qE '^src/|^Cargo\.(toml|lock)$|^rust-toolchain\.toml$|^\.github/workflows/'; then
+          if any_path_matches '^src/|^Cargo\.(toml|lock)$|^rust-toolchain\.toml$|^\.github/workflows/'; then
             RUN_PINPRICK=true
           fi
 
           # Fail safe for unclassified project inputs. Documentation-only
           # changes may skip the expensive matrix; every other unknown path
           # gets the full Rust gate instead of silently receiving no tests.
-          if [[ "${MATRIX}" == "[]" ]] && echo "${CHANGED}" | grep -qvE '(^|/)(README|CHANGELOG|CONTRIBUTING|SECURITY)(\.[^/]*)?$|^docs/|\.md$|^LICENSE$'; then
+          if [[ "${MATRIX}" == "[]" ]] && any_path_outside '(^|/)(README|CHANGELOG|CONTRIBUTING|SECURITY)(\.[^/]*)?$|^docs/|\.md$|^LICENSE$'; then
             add_check '{"name":"Lint","check":"lint","runner":"ubuntu-24.04","fetch_depth":1}'
             add_check '{"name":"Test (Linux)","check":"test","runner":"ubuntu-24.04","fetch_depth":1}'
             add_check '{"name":"Test (Linux ARM)","check":"test","runner":"ubuntu-24.04-arm","fetch_depth":1}'
@@ -164,10 +186,21 @@ jobs:
           fetch-depth: ${{ matrix.fetch_depth }}
           persist-credentials: false
 
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@14594264cd68ce8a2345dd349bc3d138a4ef85c8 # v1.327.0
+        if: matrix.check == 'lint' || matrix.check == 'site' || matrix.check == 'verify-audited'
+        with:
+          bundler: ${{ matrix.check == 'verify-audited' && 'none' || 'Gemfile.lock' }}
+
+      - name: Install tooling test dependencies
+        if: matrix.check == 'lint' || matrix.check == 'site'
+        env:
+          BUNDLE_FROZEN: "true"
+        run: bundle install
 
       - name: Test workflow tooling
         if: matrix.check == 'lint' || matrix.check == 'site'
-        run: python3 -B -m unittest discover -s scripts -p 'test_*.py'
+        run: bundle exec ruby scripts/test.rb
 
       - name: Restore cargo build cache
         id: cargo-build-cache
@@ -354,7 +387,11 @@ jobs:
         if: matrix.check == 'verify-audited'
         run: |
           FAILED=0
+          TRACE_FLAGS=$-
+          set +x
           while IFS= read -r -d '' JSON_FILE; do
+            # Quote newlines and neutralize legacy runner commands for logs.
+            printf -v DISPLAY_FILE '%q' "${JSON_FILE//'##['/'## ['}"
             if ! jq -e -L scripts '
               include "audited-actions";
               type == "array" and
@@ -366,17 +403,18 @@ jobs:
                 (.rules_version |
                   type == "number" and . >= 1 and . <= 4294967295 and . == floor))
             ' "${JSON_FILE}" > /dev/null; then
-              echo "::error::${JSON_FILE} has a non-canonical or unstamped entry"
+              printf '::error::%s has a non-canonical or unstamped entry\n' "${DISPLAY_FILE}"
               FAILED=1
               continue
             fi
             SORTED=$(jq -L scripts 'include "audited-actions"; sort_catalog' "${JSON_FILE}")
             ACTUAL=$(jq '.' "${JSON_FILE}")
             if [[ "${SORTED}" != "${ACTUAL}" ]]; then
-              echo "::error::${JSON_FILE} is not sorted by version"
+              printf '::error::%s is not sorted by version\n' "${DISPLAY_FILE}"
               FAILED=1
             fi
           done < <(find audited-actions -type f -name '*.json' -print0)
+          if [[ "${TRACE_FLAGS}" == *x* ]]; then set -x; fi
           exit "${FAILED}"
 
       - name: Build pinprick
@@ -401,26 +439,37 @@ jobs:
             # An empty result with no deletions means this selection and
             # generate-matrix's disagree.
             DIFF_OK=1
-            CHANGED=$(git diff --name-only "${BASE_SHA}...HEAD" -- audited-actions/) || DIFF_OK=0
-            PRESENT=$(git diff --name-only --diff-filter=d "${BASE_SHA}...HEAD" -- audited-actions/) || DIFF_OK=0
+            DIFF_DIR=$(mktemp -d)
+            trap 'rm -rf "${DIFF_DIR}"' EXIT
+            git diff --no-renames --name-only -z "${BASE_SHA}...HEAD" -- audited-actions/ > "${DIFF_DIR}/changed" || DIFF_OK=0
+            git diff --no-renames --name-only -z --diff-filter=d "${BASE_SHA}...HEAD" -- audited-actions/ > "${DIFF_DIR}/present" || DIFF_OK=0
             if [[ "${DIFF_OK}" -eq 0 ]]; then
               echo "::error::could not diff audited-actions against ${BASE_SHA}; changed entries NOT verified"
               FAILED=1
             else
-              readarray -t CHANGED_FILES < <(grep -E '\.json$' <<< "${CHANGED}" || true)
-              readarray -t CATALOG_FILES < <(grep -E '\.json$' <<< "${PRESENT}" || true)
+              TRACE_FLAGS=$-
+              set +x
+              CHANGED_FILES=()
+              CATALOG_FILES=()
+              while IFS= read -r -d '' PATH_NAME; do
+                if [[ "${PATH_NAME}" == *.json ]]; then CHANGED_FILES+=("${PATH_NAME}"); fi
+              done < "${DIFF_DIR}/changed"
+              while IFS= read -r -d '' PATH_NAME; do
+                if [[ "${PATH_NAME}" == *.json ]]; then CATALOG_FILES+=("${PATH_NAME}"); fi
+              done < "${DIFF_DIR}/present"
               if [[ ${#CATALOG_FILES[@]} -gt 0 ]]; then
-                scripts/verify-audited-actions.sh target/release/pinprick files "${CATALOG_FILES[@]}" || FAILED=1
+                ruby scripts/verify-audited-actions.rb target/release/pinprick files "${CATALOG_FILES[@]}" || FAILED=1
               elif [[ ${#CHANGED_FILES[@]} -gt 0 ]]; then
                 echo "Catalog change only removes entries; no surviving files to re-verify."
               else
                 echo "::error::catalog changes were detected but no catalog files resolved; changed entries NOT verified"
                 FAILED=1
               fi
+              if [[ "${TRACE_FLAGS}" == *x* ]]; then set -x; fi
             fi
           fi
           if [[ "${VERIFY_LATEST}" == "true" ]]; then
-            scripts/verify-audited-actions.sh target/release/pinprick latest || FAILED=1
+            ruby scripts/verify-audited-actions.rb target/release/pinprick latest || FAILED=1
           fi
           exit "${FAILED}"
 

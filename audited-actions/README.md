@@ -68,5 +68,5 @@ To add a new entry:
 
 1. Run `just add-action owner/repo` from a Pinprick checkout (include the subpath when applicable).
 2. The recipe resolves a full SHA and requires a fresh, complete scan with zero ignored actions under isolated default configuration. It stamps the entry with the detection-rules version reported by that scan.
-3. Inspect the generated entry and build the current scanner with `cargo build --locked --release`, then run `scripts/verify-audited-actions.sh target/release/pinprick files <entry-file>` with a GitHub token.
+3. Inspect the generated entry and build the current scanner with `cargo build --locked --release`, then run `ruby scripts/verify-audited-actions.rb target/release/pinprick files <entry-file>` with a GitHub token.
 4. Open a PR with the verification result.

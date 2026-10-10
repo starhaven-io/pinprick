@@ -296,7 +296,7 @@ jobs:
   release:
     name: Release
     needs: [attest, verify-crate]
-    runs-on: ubuntu-slim
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     environment:
       name: release
@@ -306,10 +306,16 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
       tag: ${{ steps.version.outputs.tag }}
+      ruby_version: ${{ steps.version.outputs.ruby_version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@14594264cd68ce8a2345dd349bc3d138a4ef85c8 # v1.327.0
+        with:
+          bundler: none
 
       - name: Extract version
         id: version
@@ -321,6 +327,7 @@ jobs:
           fi
           echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
           echo "tag=v${VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "ruby_version=$(cat .ruby-version)" >> "${GITHUB_OUTPUT}"
 
       - name: Mint release token
         id: release-token
@@ -379,7 +386,7 @@ jobs:
             --repo "${REPOSITORY}" \
             --json body \
             --jq '.body' > "${RUNNER_TEMP}/raw_notes.md"
-          python3 scripts/format-release-notes.py \
+          env -u GH_TOKEN -u GITHUB_TOKEN ruby scripts/format-release-notes.rb \
             "${RUNNER_TEMP}/raw_notes.md" "${TAG}" \
             > "${RUNNER_TEMP}/formatted_notes.md"
           gh release edit "${TAG}" \
@@ -495,7 +502,7 @@ jobs:
   bump-action:
     name: Bump pinprick-action
     needs: [release, finalize-release]
-    runs-on: ubuntu-slim
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     environment:
       name: release
@@ -505,6 +512,12 @@ jobs:
       TARGET_REPOSITORY: starhaven-io/pinprick-action
       VERSION: ${{ needs.release.outputs.version }}
     steps:
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@14594264cd68ce8a2345dd349bc3d138a4ef85c8 # v1.327.0
+        with:
+          ruby-version: ${{ needs.release.outputs.ruby_version }}
+          bundler: none
+
       - name: Mint bot token for pinprick-action
         id: action-token
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
@@ -529,44 +542,24 @@ jobs:
         id: update
         working-directory: pinprick-action
         run: |
-          python3 - <<'PY'
-          import os
-          import re
-          from pathlib import Path
-
-          version = os.environ["VERSION"]
-          action_path = Path("action.yml")
-          readme_path = Path("README.md")
-          action = action_path.read_text(encoding="utf-8")
-          readme = readme_path.read_text(encoding="utf-8")
-
-          match = re.search(
-              r'(?ms)^inputs:\n(?:(?!^\S).)*?^  version:\n'
-              r'(?:    [^\n]*\n)*?^    default: "('
-              r'[0-9]+\.[0-9]+\.[0-9]+'
-              r'(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?'
-              r')"$',
-              action,
-          )
-          if not match:
-              raise SystemExit("could not find the action.yml version default")
-          current = match.group(1)
-          if current == version:
-              print(f"pinprick-action already defaults to {version}")
-              raise SystemExit(0)
-
-          if action.count(current) != 3:
-              raise SystemExit(
-                  f"expected three {current} references in action.yml, found {action.count(current)}"
-              )
-          if readme.count(current) != 2:
-              raise SystemExit(
-                  f"expected two {current} references in README.md, found {readme.count(current)}"
-              )
-
-          action_path.write_text(action.replace(current, version), encoding="utf-8")
-          readme_path.write_text(readme.replace(current, version), encoding="utf-8")
-          PY
+          ruby - <<'RUBY'
+          version = ENV.fetch('VERSION')
+          action = File.read('action.yml', encoding: 'UTF-8')
+          readme = File.read('README.md', encoding: 'UTF-8')
+          match = action.match(/^inputs:\n(?:(?!^\S).)*?^  version:\n(?:    [^\n]*\n)*?^    default: "([0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?)"$/m)
+          abort 'could not find the action.yml version default' unless match
+          current = match[1]
+          if current == version
+            puts "pinprick-action already defaults to #{version}"
+            exit 0
+          end
+          count_action = action.scan(current).length
+          count_readme = readme.scan(current).length
+          abort "expected three #{current} references in action.yml, found #{count_action}" unless count_action == 3
+          abort "expected two #{current} references in README.md, found #{count_readme}" unless count_readme == 2
+          File.write('action.yml', action.gsub(current, version), encoding: 'UTF-8')
+          File.write('README.md', readme.gsub(current, version), encoding: 'UTF-8')
+          RUBY
 
           if git diff --quiet -- action.yml README.md; then
             echo "changed=false" >> "${GITHUB_OUTPUT}"
@@ -690,6 +683,12 @@ jobs:
     env:
       VERSION: ${{ needs.release.outputs.version }}
     steps:
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@14594264cd68ce8a2345dd349bc3d138a4ef85c8 # v1.327.0
+        with:
+          ruby-version: ${{ needs.release.outputs.ruby_version }}
+          bundler: none
+
       - name: Set up Homebrew
         run: |
           command -v brew >/dev/null
@@ -724,7 +723,7 @@ jobs:
           # Homebrew supplies the subject; prepare its DCO trailer before commit-msg validation.
           TAP_ROOT="$(cd "$(brew --repo starhaven-io/tap)" && pwd -P)"
           HOOKS_DIR=$(git -C "${TAP_ROOT}" rev-parse --path-format=absolute --git-path hooks)
-          HOOKS_DIR=$(python3 -c 'import pathlib, sys; print(pathlib.Path(sys.argv[1]).resolve())' "${HOOKS_DIR}")
+          HOOKS_DIR=$(env -u GH_TOKEN -u GITHUB_TOKEN -u HOMEBREW_GITHUB_API_TOKEN ruby -e 'puts File.realdirpath(ARGV.fetch(0))' "${HOOKS_DIR}")
           case "${HOOKS_DIR}" in
             "${TAP_ROOT}/"*) ;;
             *) echo "::error::Tap hooks directory is outside the fresh checkout."; exit 1 ;;
@@ -749,7 +748,7 @@ jobs:
             --trailer "Signed-off-by: ${author}" "$1"
           HOOK
           chmod +x "${DCO_HOOK}"
-          if ! python3 -c 'import os, sys; os.symlink(sys.argv[1], sys.argv[2])' "${DCO_HOOK}" "${PREPARE_HOOK}"; then
+          if ! env -u GH_TOKEN -u GITHUB_TOKEN -u HOMEBREW_GITHUB_API_TOKEN ruby -e 'File.symlink(ARGV.fetch(0), ARGV.fetch(1))' "${DCO_HOOK}" "${PREPARE_HOOK}"; then
             echo "::error::Cannot install the DCO hook; an existing prepare-commit-msg hook must be preserved."
             exit 1
           fi
