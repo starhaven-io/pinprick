@@ -29,6 +29,8 @@ Prefer flat modules and direct control flow. Use `LazyLock` for compiled pattern
 
 Read the complete `justfile` before changing gates. Use focused tests while iterating, then run `just check` once the change is stable. It covers Rust clippy/format/tests, typos, dependency policy, workflow security analysis, and site format/type-check/build/deployment dry-run. Run `git diff --check` before handoff. A missing tool or failed gate is unverified, not a pass.
 
+`.ruby-version` pins Ruby for repository tooling. Install its locked test dependencies with `BUNDLE_FROZEN=true bundle install`, then run `just script-tests`. Catalog verification and release helpers use Ruby standard libraries and do not need Bundler.
+
 `rust-toolchain.toml` pins the reviewed Rust toolchain. Homebrew's standalone Rust does not honor it, so compare `rustc --version` with `channel`. Install site dependencies with `npm ci --strict-allow-scripts`; preserve package-level allowScripts decisions. Use local mocks for API regressions. No live catalog refresh, release, or deployment is implied by a code review.
 
 ## Ownership and release operation

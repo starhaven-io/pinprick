@@ -48,6 +48,11 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@14594264cd68ce8a2345dd349bc3d138a4ef85c8 # v1.327.0
+        with:
+          bundler: none
+
       - name: Build pinprick
         run: cargo build --locked --release
 
@@ -67,7 +72,7 @@ jobs:
             ARGS=(shard "${SHARD}" "${SHARD_COUNT}")
           fi
           set +e
-          scripts/verify-audited-actions.sh target/release/pinprick "${ARGS[@]}" 2>&1 | tee verify-output.txt
+          ruby scripts/verify-audited-actions.rb target/release/pinprick "${ARGS[@]}" 2>&1 | tee verify-output.txt
           VERIFY_EXIT=${PIPESTATUS[0]}
           set -e
           {
@@ -110,7 +115,7 @@ jobs:
             echo "<details><summary>verification output</summary>"
             echo
             echo '```'
-            grep -E '^(---|::error::|  finding: |  coverage: |Catalog entries inert )' verify-output.txt | LC_ALL=C sed 's/<!--/<! --/g' | LC_ALL=C awk -v limit=60000 -f scripts/tail-complete-lines.awk || true
+            grep -E '^(---|::error::|  finding: |  coverage: |Catalog entries inert )' verify-output.txt | LC_ALL=C sed 's/<!--/<! --/g' | ruby scripts/tail-complete-lines.rb 60000 || true
             echo '```'
             echo
             echo "</details>"
@@ -153,9 +158,9 @@ jobs:
             gh issue view "${N}" --json body --jq .body > issue-body.md
 
             # Only an exact block at the start of the body is state; see
-            # read-shard-state.sh for why position is what separates it from
+            # read-shard-state.rb for why position is what separates it from
             # action-derived diagnostics.
-            readarray -t SHARD_STATES < <(scripts/read-shard-state.sh issue-body.md "${SHARD_COUNT}")
+            readarray -t SHARD_STATES < <(ruby scripts/read-shard-state.rb issue-body.md "${SHARD_COUNT}")
             if [[ ${#SHARD_STATES[@]} -ne "${SHARD_COUNT}" ]]; then
               echo "::error::could not read shard state for issue ${N}; leaving it open"
               continue

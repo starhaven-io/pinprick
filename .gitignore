@@ -7,3 +7,6 @@
 # fleet:end
 # Build outputs
 /target
+
+# Ruby test dependencies
+/vendor/bundle/

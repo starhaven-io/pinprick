@@ -30,7 +30,7 @@ with different trust anchors:
   rules, the version in `src/audited_actions.rs` is bumped deliberately; CI
   re-verifies entries and a scheduled workflow re-scans a rotating weekly
   shard until the full catalog has been covered
-  (`scripts/verify-audited-actions.sh`).
+  (`ruby scripts/verify-audited-actions.rb`).
 - **Remote** (`https://pinprick.rs/audited-actions/`, opt-in via
   `fetch-remote = true`) — every served file is signed with
   [minisign](https://jedisct1.github.io/minisign/) during deploy, and the
