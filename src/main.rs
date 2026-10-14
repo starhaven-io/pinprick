@@ -13,6 +13,7 @@ mod pin;
 mod score;
 mod update;
 mod workflow;
+mod workflow_fingerprint;
 
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
@@ -128,6 +129,20 @@ enum Command {
         #[arg(long, value_name = "PATTERN")]
         only: Option<String>,
     },
+    /// Fingerprint workflow context while allowing named actions' SHA updates
+    WorkflowFingerprint {
+        /// Repository root
+        #[arg(default_value = ".")]
+        path: PathBuf,
+
+        /// Repository-relative workflow path
+        #[arg(long)]
+        workflow: String,
+
+        /// Exact owner/repo[/subpath] whose pinned revision may change (repeatable)
+        #[arg(long = "ignore-action-revision", required = true)]
+        actions: Vec<String>,
+    },
 }
 
 #[tokio::main]
@@ -216,6 +231,11 @@ async fn main() -> ExitCode {
         Command::Update { path, apply, only } => {
             update::run(path, *apply, cli.json, only.as_deref()).await
         }
+        Command::WorkflowFingerprint {
+            path,
+            workflow,
+            actions,
+        } => workflow_fingerprint::run(path, workflow, actions, cli.json),
     };
 
     match result {

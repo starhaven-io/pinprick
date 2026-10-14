@@ -64,6 +64,7 @@ export default defineConfig({
             { label: 'pin', slug: 'commands/pin' },
             { label: 'score', slug: 'commands/score' },
             { label: 'update', slug: 'commands/update' },
+            { label: 'workflow-fingerprint', slug: 'commands/workflow-fingerprint' },
           ],
         },
         {

@@ -444,6 +444,10 @@ pub struct AcceptedFinding {
     /// The reviewed workflow's digest, for a workflow acceptance.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workflow_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workflow_context_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub ignore_action_revisions: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -510,6 +514,13 @@ impl AuditReport {
             println!("      reason: {}", sanitize_for_terminal(&accepted.reason));
             if let Some(digest) = &accepted.workflow_sha256 {
                 println!("      workflow SHA-256: {digest}");
+            }
+            if let Some(digest) = &accepted.workflow_context_sha256 {
+                println!("      workflow context SHA-256: {digest}");
+                println!(
+                    "      ignored action revisions: {}",
+                    accepted.ignore_action_revisions.join(", ")
+                );
             }
             println!();
         }
@@ -1072,6 +1083,8 @@ mod sarif_tests {
             finding: accepted,
             reason: "Upstream runs this installer by design.".into(),
             workflow_sha256: None,
+            workflow_context_sha256: None,
+            ignore_action_revisions: Vec::new(),
         });
 
         let json = serde_json::to_value(&report).unwrap();

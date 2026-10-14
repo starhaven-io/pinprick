@@ -89,12 +89,36 @@ pub struct IgnoreConfig {
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct WorkflowAcceptance {
     pub workflow: String,
-    pub workflow_sha256: String,
+    pub workflow_sha256: Option<String>,
+    pub workflow_context_sha256: Option<String>,
+    #[serde(default)]
+    pub ignore_action_revisions: Vec<String>,
     pub category: String,
     pub severity: String,
     pub description: String,
     pub command: String,
     pub reason: String,
+}
+
+pub enum WorkflowDigest<'a> {
+    Exact(&'a str),
+    Context(&'a str),
+}
+
+impl WorkflowAcceptance {
+    /// An entry must choose exactly one digest mode; any other combination
+    /// accepts nothing.
+    pub fn digest(&self) -> Result<WorkflowDigest<'_>, &'static str> {
+        match (&self.workflow_sha256, &self.workflow_context_sha256) {
+            (Some(_), Some(_)) => Err("sets both workflow-sha256 and workflow-context-sha256"),
+            (None, None) => Err("sets neither workflow-sha256 nor workflow-context-sha256"),
+            (Some(_), None) if !self.ignore_action_revisions.is_empty() => {
+                Err("sets ignore-action-revisions without workflow-context-sha256")
+            }
+            (Some(digest), None) => Ok(WorkflowDigest::Exact(digest)),
+            (None, Some(digest)) => Ok(WorkflowDigest::Context(digest)),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]

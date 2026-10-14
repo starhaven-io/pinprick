@@ -97,9 +97,44 @@ command = '<exact pattern_matched from the audit JSON>'
 reason = "<owner, justification, compensating controls, and review conditions>"
 ```
 
-Only repository-local configuration can accept workflow findings. Entries do not apply to remote or local action findings (see [`accept-action-findings`](#accept-action-findings) for remote actions), do not skip any source reads, and do not make incomplete coverage successful. Any workflow byte change invalidates its acceptances; review the changed workflow before updating its hash. An invalid or stale entry accepts nothing. Use `shasum -a 256 .github/workflows/scan.yml` to compute the hash after review.
+Only repository-local configuration can accept workflow findings. Entries do not apply to remote or local action findings (see [`accept-action-findings`](#accept-action-findings) for remote actions), do not skip any source reads, and do not make incomplete coverage successful. With `workflow-sha256`, any workflow byte change invalidates its acceptances; review the changed workflow before updating its hash. An invalid or stale entry accepts nothing. Use `shasum -a 256 .github/workflows/scan.yml` to compute the hash after review.
 
 Accepted findings and their reasons remain visible in ordinary human output and the JSON `accepted` array. SARIF excludes accepted findings from its results so they do not become GitHub code-scanning alerts; GitHub's [supported SARIF properties](https://docs.github.com/en/code-security/reference/code-scanning/sarif-files/sarif-support#result-object) do not include result suppressions. The audit exits zero only when coverage is complete and no unaccepted findings remain. `--no-repo-config` restores the findings, including in SARIF. Acceptance changes audit policy only: it does not improve posture scores or create reusable clean action catalog verdicts.
+
+#### Allowing named actions' revision updates
+
+For a workflow whose reviewed finding should remain accepted across routine dependency updates, replace `workflow-sha256` with `workflow-context-sha256` and an explicit `ignore-action-revisions` array. Each identity must be an exact, unique `owner/repo[/subpath]` present in a workflow step. Wildcards, local actions, reusable workflow jobs, and unpinned references do not qualify. Every occurrence of a named action must use a full 40-character SHA.
+
+Generate the fingerprint from the reviewed workflow:
+
+```sh
+pinprick workflow-fingerprint . \
+  --workflow .github/workflows/scan.yml \
+  --ignore-action-revision actions/checkout \
+  --ignore-action-revision actions/upload-artifact
+```
+
+The command prints these configuration fields; `--json` returns the same information using underscore-separated keys. It reads only a discovered workflow through the same path-containment checks as the auditor, makes no network requests, and does not modify files or grant acceptance.
+
+```toml
+[[accept-workflow-findings]]
+workflow = ".github/workflows/scan.yml"
+workflow-context-sha256 = "<fingerprint from the command>"
+ignore-action-revisions = ["actions/checkout", "actions/upload-artifact"]
+category = "shell_fetch"
+severity = "low"
+description = "<exact finding description>"
+command = '<exact pattern_matched from the audit JSON>'
+reason = "<owner, justification, compensating controls, and review conditions>"
+```
+
+The v1 fingerprint replaces only those actions' SHA tokens and full SemVer-only trailing comments, such as `# v7.0.1`. A leading `v` is optional; partial versions and comments containing other text are preserved. All remaining workflow bytes are hashed unchanged, including action identities, inputs, order, conditions, commands, validation, permissions, runners, environments, triggers, whitespace, and other comments. The sorted action-identity list is also bound into the fingerprint. Adding or removing an action, repeating a step, or broadening the list requires a new review. Ambiguous YAML, unsupported action syntax, and edits that would change parsed values outside step action revisions cannot produce a fingerprint. Quoted references and nested parallel steps are supported; source YAML is never serialized back to disk.
+
+An acceptance must supply exactly one digest mode. `ignore-action-revisions` must be nonempty for context mode and absent for byte-exact mode. A stale entry accepts nothing. A conflicting entry, or one whose workflow cannot be fingerprinted, also accepts nothing, and the audit prints a warning naming the entry and the reason. The JSON `accepted` entry reports `workflow_context_sha256` and `ignore_action_revisions` instead of `workflow_sha256`; human output also identifies the mode and action scope.
+
+Ignoring a revision in this fingerprint does not trust that revision. Updated actions still undergo the normal exact-revision catalog lookup or source scan, and other findings or missing coverage still fail. Changes to separately loaded files and hosted controls remain outside this workflow fingerprint and require their own review. This repository-only acceptance does not change remote-action detection or cache verdicts, so it does not change the catalog detection-rules version.
+
+Deploy an engine that supports context fingerprints before adopting these fields. Older engines reject unknown configuration fields and fall back to their default policy; adding both digest fields is not a compatibility mechanism. Existing byte-exact entries remain supported unchanged.
 
 ### `accept-action-findings`
 
