@@ -33,7 +33,7 @@ use crate::audit_source::{
 use crate::audited_actions::AUDIT_RULES_VERSION;
 use crate::audited_actions::{AuditSource, AuditedActions};
 use crate::auth;
-use crate::config::Config;
+use crate::config::{Config, WorkflowDigest};
 use crate::github::GitHubClient;
 use crate::output::{
     AcceptedFinding, AuditFinding, AuditMatch, AuditReport, sanitize_for_terminal,
@@ -199,6 +199,14 @@ pub async fn run(
     let mut external_skipped: HashSet<String> = HashSet::new();
     let mut coverage_failures = Vec::new();
     let mut workflow_digests = HashMap::new();
+    let mut workflow_context_digests = HashMap::new();
+    if config.is_repo_local() {
+        for (index, entry) in config.accept_workflow_findings.iter().enumerate() {
+            if let Err(problem) = entry.digest() {
+                warn_unusable_workflow_acceptance(index, &entry.workflow, problem);
+            }
+        }
+    }
 
     for file in &files {
         let display_name = workflow::display_path(file.path(), repo_root);
@@ -228,6 +236,26 @@ pub async fn run(
             write!(workflow_digest, "{byte:02x}")?;
         }
         workflow_digests.insert(display_name.clone(), workflow_digest);
+        if config.is_repo_local() {
+            for (index, entry) in config.accept_workflow_findings.iter().enumerate() {
+                if entry.workflow != display_name
+                    || !matches!(entry.digest(), Ok(WorkflowDigest::Context(_)))
+                {
+                    continue;
+                }
+                match crate::workflow_fingerprint::context_digest(
+                    &content,
+                    &entry.ignore_action_revisions,
+                ) {
+                    Ok(digest) => {
+                        workflow_context_digests.insert(index, digest);
+                    }
+                    Err(e) => {
+                        warn_unusable_workflow_acceptance(index, &display_name, &format!("{e:#}"));
+                    }
+                }
+            }
+        }
         match extract_job_run_blocks(file.path(), &content) {
             Ok(jobs) => {
                 for run_blocks in jobs {
@@ -531,8 +559,12 @@ pub async fn run(
         eprintln!();
     }
 
-    let workflow_accepted =
-        accept_workflow_findings(&mut collector.findings, &workflow_digests, config);
+    let workflow_accepted = accept_workflow_findings(
+        &mut collector.findings,
+        &workflow_digests,
+        &workflow_context_digests,
+        config,
+    );
     let action_accepted = accept_action_findings(&mut collector.findings, config);
     let before_filters = collector.findings.len();
     collector.findings.retain(|f| {
@@ -632,9 +664,21 @@ pub async fn run(
     }
 }
 
+/// A stale digest is routine after a workflow edit, but an entry that can never
+/// match would otherwise leave its finding to reappear without explanation.
+fn warn_unusable_workflow_acceptance(index: usize, workflow: &str, problem: &str) {
+    eprintln!(
+        "warning: accept-workflow-findings entry {} ({}) accepts nothing: {}",
+        index + 1,
+        sanitize_for_terminal(workflow),
+        sanitize_for_terminal(problem)
+    );
+}
+
 fn accept_workflow_findings(
     findings: &mut Vec<AuditFinding>,
     workflow_digests: &HashMap<String, String>,
+    workflow_context_digests: &HashMap<usize, String>,
     config: &Config,
 ) -> Vec<AcceptedFinding> {
     // Only the bytes read through workflow discovery can authorize an acceptance.
@@ -645,22 +689,39 @@ fn accept_workflow_findings(
     let mut accepted = Vec::new();
     let mut remaining = Vec::new();
     for finding in findings.drain(..) {
-        let acceptance = config.accept_workflow_findings.iter().find(|entry| {
-            finding.action.is_empty()
-                && finding.workflow_file.is_none()
-                && entry.workflow == finding.source_file
-                && workflow_digests.get(&entry.workflow) == Some(&entry.workflow_sha256)
-                && entry.category == finding.category
-                && entry.severity == finding.severity
-                && entry.description == finding.description
-                && entry.command == finding.pattern_matched
-                && !entry.reason.trim().is_empty()
-        });
-        if let Some(entry) = acceptance {
+        let acceptance =
+            config
+                .accept_workflow_findings
+                .iter()
+                .enumerate()
+                .find(|(index, entry)| {
+                    finding.action.is_empty()
+                        && finding.workflow_file.is_none()
+                        && entry.workflow == finding.source_file
+                        && match entry.digest() {
+                            Ok(WorkflowDigest::Exact(digest)) => {
+                                workflow_digests.get(&entry.workflow).map(String::as_str)
+                                    == Some(digest)
+                            }
+                            Ok(WorkflowDigest::Context(digest)) => {
+                                workflow_context_digests.get(index).map(String::as_str)
+                                    == Some(digest)
+                            }
+                            Err(_) => false,
+                        }
+                        && entry.category == finding.category
+                        && entry.severity == finding.severity
+                        && entry.description == finding.description
+                        && entry.command == finding.pattern_matched
+                        && !entry.reason.trim().is_empty()
+                });
+        if let Some((_, entry)) = acceptance {
             accepted.push(AcceptedFinding {
                 finding,
                 reason: entry.reason.clone(),
-                workflow_sha256: Some(entry.workflow_sha256.clone()),
+                workflow_sha256: entry.workflow_sha256.clone(),
+                workflow_context_sha256: entry.workflow_context_sha256.clone(),
+                ignore_action_revisions: entry.ignore_action_revisions.clone(),
             });
         } else {
             remaining.push(finding);
@@ -711,6 +772,8 @@ fn accept_action_findings(
                 reason: entry.reason.clone(),
                 finding,
                 workflow_sha256: None,
+                workflow_context_sha256: None,
+                ignore_action_revisions: Vec::new(),
             }),
             None => remaining.push(finding),
         }
@@ -7754,6 +7817,69 @@ const d = require("node:https").get("https://example.com/install.sh", cb);
     }
 
     const INSTALLER: &str = r#"/bin/bash -c "$(curl -fsSL https://example.invalid/install.sh)""#;
+
+    #[tokio::test]
+    async fn context_acceptance_keeps_findings_from_an_updated_remote_action() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let command = r#"curl --output "$OUTPUT" "$URL""#;
+        let workflow = ".github/workflows/scan.yml";
+        let source = format!(
+            "on: push\njobs:\n  scan:\n    steps:\n      - uses: o/r@{} # v1.0.0\n      - run: {command}\n",
+            "a".repeat(40)
+        );
+        let digest = crate::workflow_fingerprint::context_digest(&source, &["o/r".into()]).unwrap();
+        let updated = source
+            .replace(&"a".repeat(40), &"b".repeat(40))
+            .replace("v1.0.0", "v1.0.1");
+        assert_eq!(
+            crate::workflow_fingerprint::context_digest(&updated, &["o/r".into()]).unwrap(),
+            digest
+        );
+        let mut config: Config = toml::from_str(&format!(
+            "[[accept-workflow-findings]]\nworkflow = {workflow:?}\nworkflow-context-sha256 = {digest:?}\nignore-action-revisions = [\"o/r\"]\ncategory = \"shell_fetch\"\nseverity = \"low\"\ndescription = \"curl/wget downloads executable from non-literal source — cannot verify URL version\"\ncommand = {command:?}\nreason = \"Reviewed static archive input.\"\n"
+        )).unwrap();
+        config.source = crate::config::ConfigSource::RepoLocal;
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/repos/o/r/git/trees/{}", "b".repeat(40))))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "tree": [{"path": "action.yml", "type": "blob"}], "truncated": false
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/contents/action.yml"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "runs:\n  using: composite\n  steps:\n    - shell: bash\n      run: curl https://example.invalid/install.sh | bash\n"
+            ))
+            .mount(&server).await;
+        let client = GitHubClient::with_base("t".into(), server.uri());
+        let action = workflow::scan_content(&updated).remove(0);
+        let mut collector = AuditCollector::new(false);
+        scan_shell_content(command, workflow, 1, "", &mut collector, &config);
+        assert_eq!(
+            scan_action_source(&client, &action, &mut collector, &config)
+                .await
+                .unwrap(),
+            ActionScanStatus::Complete
+        );
+        let accepted = accept_workflow_findings(
+            &mut collector.findings,
+            &HashMap::new(),
+            &HashMap::from([(0, digest)]),
+            &config,
+        );
+        assert_eq!(accepted.len(), 1);
+        assert_eq!(collector.findings.len(), 1);
+        assert_eq!(collector.findings[0].severity, "high");
+        assert_eq!(
+            collector.findings[0].origin.as_ref().unwrap().revision,
+            "b".repeat(40)
+        );
+    }
 
     fn accepted_entry(action: &str, path: &str) -> String {
         format!(
