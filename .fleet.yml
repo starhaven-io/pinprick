@@ -25,6 +25,9 @@ params:
         - dependency-name: "actions/setup-node"
           reason: "pinprick's source scan does not yet cover setup-node v7; reassess when it does"
           versions: [">=7.0.0"]
+        - dependency-name: "github/codeql-action/*"
+          reason: "4.38.3 and later bundle apache-arrow code generation that pinprick cannot verify; reassess with https://github.com/github/codeql-action/issues/4252"
+          versions: [">=4.38.3"]
     - package-ecosystem: "npm"
       group: "npm-dependencies"
       directory: "/site"
