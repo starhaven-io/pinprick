@@ -40,6 +40,10 @@ updates:
       - dependency-name: "actions/setup-node"
         versions:
           - ">=7.0.0"
+      # 4.38.3 and later bundle apache-arrow code generation that pinprick cannot verify; reassess with https://github.com/github/codeql-action/issues/4252
+      - dependency-name: "github/codeql-action/*"
+        versions:
+          - ">=4.38.3"
     groups:
       "github-actions":
         patterns:
