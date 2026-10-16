@@ -232,6 +232,8 @@ pub(crate) struct BuiltinUse {
     /// Whether it replaces or reaches around the loader: see
     /// `LoaderGuard::replaces`.
     pub(crate) replaces_loader: bool,
+    pub(crate) other_loader_replacement: bool,
+    pub(crate) dynamic_evaluations: Vec<u32>,
     /// Members it may replace on built-in modules, as `module:member` with
     /// the root of the module's name; `module:*` is any member.
     pub(crate) patched: Vec<String>,
@@ -250,7 +252,8 @@ pub(crate) fn builtin_use(path: &str, code: &str) -> BuiltinUse {
     }
     in_worker(&request).unwrap_or(BuiltinUse {
         replaces_loader: true,
-        patched: Vec::new(),
+        other_loader_replacement: true,
+        ..BuiltinUse::default()
     })
 }
 
@@ -261,7 +264,8 @@ fn parsed_builtin_use(path: &str, code: &str) -> BuiltinUse {
     if parsed.fatal_error || !parsed.diagnostics.is_empty() {
         return BuiltinUse {
             replaces_loader: true,
-            patched: Vec::new(),
+            other_loader_replacement: true,
+            ..BuiltinUse::default()
         };
     }
     let semantic = SemanticBuilder::new()
@@ -271,7 +275,21 @@ fn parsed_builtin_use(path: &str, code: &str) -> BuiltinUse {
     let guard = LoaderGuard::new(semantic.nodes(), semantic.scoping());
     let mut builtin_use = BuiltinUse::default();
     for node in semantic.nodes().iter() {
-        builtin_use.replaces_loader |= guard.replaces(node.id());
+        let replaces = guard.replaces(node.id());
+        builtin_use.replaces_loader |= replaces;
+        let evaluates = match node.kind() {
+            AstKind::CallExpression(call) => matches!(inner(&call.callee),
+                Expression::Identifier(callee) if matches!(callee.name.as_str(), "eval" | "Function")),
+            AstKind::NewExpression(call) => matches!(inner(&call.callee),
+                Expression::Identifier(callee) if callee.name.as_str() == "Function"),
+            _ => false,
+        };
+        if replaces && evaluates {
+            builtin_use
+                .dynamic_evaluations
+                .push(node.kind().span().start);
+        }
+        builtin_use.other_loader_replacement |= replaces && !evaluates;
         if let Some((modules, member)) = guard.patches(node.id()) {
             for module in modules {
                 let patch = format!("{module}:{}", member.unwrap_or("*"));
@@ -283,6 +301,11 @@ fn parsed_builtin_use(path: &str, code: &str) -> BuiltinUse {
     }
     builtin_use.patched.sort_unstable();
     builtin_use
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static TRUSTED_LOCATION_ANALYSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Executions `code` performs through a location. `path` selects the
@@ -304,6 +327,10 @@ pub(crate) fn located_executions(
             .any(|token| code.contains(token));
     if context.directory == LocatedDirectory::Caller && !mentions_location {
         return Vec::new();
+    }
+    #[cfg(test)]
+    if context.native_modules {
+        TRUSTED_LOCATION_ANALYSES.with(|count| count.set(count.get() + 1));
     }
     if cfg!(test) {
         return analyze(path, code, context);

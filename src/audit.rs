@@ -125,6 +125,8 @@ static PKG_RULES: &[PkgRule] = &[
 pub struct AuditCollector {
     pub findings: Vec<AuditFinding>,
     pub allowed: Vec<AuditMatch>,
+    pub coverage_failures: Vec<String>,
+    pub(crate) explain_coverage: bool,
     pub verbose: bool,
     /// Matches allowed via `trusted-hosts` — counted regardless of verbosity
     /// so the repo-config notice doesn't depend on `--verbose`.
@@ -140,6 +142,8 @@ impl AuditCollector {
         Self {
             findings: Vec::new(),
             allowed: Vec::new(),
+            coverage_failures: Vec::new(),
+            explain_coverage: false,
             verbose,
             trusted_host_allowed: 0,
             extra_data_format_allowed: 0,
@@ -147,8 +151,22 @@ impl AuditCollector {
         }
     }
 
+    pub(crate) fn for_audit(verbose: bool) -> Self {
+        Self {
+            explain_coverage: true,
+            ..Self::new(verbose)
+        }
+    }
+
     pub fn push_finding(&mut self, finding: AuditFinding) {
         self.findings.push(finding);
+    }
+
+    pub(crate) fn take_coverage_failures(&mut self) -> Vec<String> {
+        let mut failures = std::mem::take(&mut self.coverage_failures);
+        failures.sort();
+        failures.dedup();
+        failures
     }
 
     pub(crate) fn has_matches(&self) -> bool {
@@ -185,7 +203,7 @@ pub async fn run(
     let had_token = client.is_some();
 
     let files = workflow::find_workflows(repo_root)?;
-    let mut collector = AuditCollector::new(verbose);
+    let mut collector = AuditCollector::for_audit(verbose);
     let mut scanned_actions: HashSet<String> = HashSet::new();
     let mut completed_actions: HashSet<String> = HashSet::new();
     let mut audited = AuditedActions::new(config.fetch_remote);
@@ -625,6 +643,13 @@ pub async fn run(
         .chain(action_accepted)
         .collect();
     let has_findings = !collector.findings.is_empty();
+    for failure in collector.take_coverage_failures() {
+        eprintln!(
+            "warning: {}",
+            crate::output::sanitize_for_terminal(&failure)
+        );
+        coverage_failures.push(failure);
+    }
     coverage_failures.sort();
     coverage_failures.dedup();
     let coverage_complete = coverage_failures.is_empty();
