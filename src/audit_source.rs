@@ -1424,6 +1424,8 @@ pub(crate) struct LocatedExecution {
     optional: bool,
     directory: Option<LocatedDirectory>,
     relocated: bool,
+    // Following an operand cannot discharge Python's dynamic-program fallback.
+    dynamic_program_operand: bool,
 }
 
 impl LocatedExecution {
@@ -1434,6 +1436,7 @@ impl LocatedExecution {
             optional: false,
             directory: None,
             relocated: false,
+            dynamic_program_operand: false,
         }
     }
 
@@ -1444,6 +1447,7 @@ impl LocatedExecution {
             optional: false,
             directory: None,
             relocated: false,
+            dynamic_program_operand: false,
         }
     }
 
@@ -1894,6 +1898,7 @@ fn stage_located_executions(
             );
         }
         Interpreter::Other => {
+            dynamic_program_operands(program, &stage[index + 1..], executions);
             // A program named by a relative path runs from the current directory.
             if program.contains('/') && !program.starts_with(['/', '~']) {
                 relative_execution(
@@ -2048,6 +2053,40 @@ fn preload_execution(
     }
 }
 
+/// An unknown program may execute a bare located operand. Embedded locations
+/// remain outside this heuristic, notably PowerShell command strings.
+fn dynamic_program_operands(
+    program: &str,
+    operands: &[String],
+    executions: &mut Vec<LocatedExecution>,
+) {
+    let name = program.rsplit(['/', '\\']).next().unwrap_or(program);
+    if !is_dynamic_word(name) {
+        return;
+    }
+    for operand in operands.iter().filter(|word| {
+        [
+            SELF_LOCATION,
+            ACTION_LOCATION,
+            REPOSITORY_LOCATION,
+            UNRESOLVED_LOCATION,
+        ]
+        .iter()
+        .any(|location| word.starts_with(location))
+    }) {
+        match bound_location(operand) {
+            Some(path) if executable_source_kind(path).is_some() => {
+                executions.push(LocatedExecution {
+                    dynamic_program_operand: true,
+                    ..LocatedExecution::of(operand, direct_execution_kind(path))
+                });
+            }
+            Some(path) if is_copied_data_path(path) => {}
+            _ => executions.push(LocatedExecution::unresolved(SourceFileKind::Shell)),
+        }
+    }
+}
+
 /// A located file a copying program duplicates may run later from the copy.
 /// Source files are scanned in their own language; a copied data file is
 /// only data, and any other copied file cannot be followed.
@@ -2126,6 +2165,7 @@ fn module_execution(
                 optional: true,
                 directory: None,
                 relocated: false,
+                dynamic_program_operand: false,
             }),
             LocatedDirectory::Unresolved => {
                 executions.push(LocatedExecution::unresolved(SourceFileKind::Python));
@@ -3992,7 +4032,10 @@ fn python_located_executions_mode(
                         &mut executions,
                     );
                 }
-                if executions.len() > prior_executions {
+                if executions[prior_executions..]
+                    .iter()
+                    .any(|execution| !execution.dynamic_program_operand)
+                {
                     handled_execution_calls.insert(matched.start());
                 }
                 continue;
@@ -4009,7 +4052,10 @@ fn python_located_executions_mode(
                         ShellLocationState::starting_in(directory),
                         &mut executions,
                     );
-                    if executions.len() > prior_executions {
+                    if executions[prior_executions..]
+                        .iter()
+                        .any(|execution| !execution.dynamic_program_operand)
+                    {
                         handled_execution_calls.insert(matched.start());
                     }
                     continue;
@@ -4121,7 +4167,10 @@ fn python_located_executions_mode(
             }
         };
         command_located_executions(&words, &directory, scan, &mut executions);
-        if executions.len() > prior_executions {
+        if executions[prior_executions..]
+            .iter()
+            .any(|execution| !execution.dynamic_program_operand)
+        {
             handled_execution_calls.insert(matched.start());
         }
     }
@@ -7055,6 +7104,151 @@ mod tests {
                 "{source}"
             );
         }
+    }
+
+    #[test]
+    fn dynamic_program_operands_follow_scripts_by_extension() {
+        let tree = [
+            "action/index.js",
+            "action/x.sh",
+            "action/install.py",
+            "action/install.js",
+            "action/install.ps1",
+            "action/config.json",
+            "action/notes.txt",
+            "action/tool",
+        ];
+        for (operand, complete, target) in [
+            ("'x.sh'", true, Some(("action/x.sh", SourceFileKind::Shell))),
+            (
+                "'install.py'",
+                true,
+                Some(("action/install.py", SourceFileKind::Python)),
+            ),
+            (
+                "'install.js'",
+                true,
+                Some(("action/install.js", SourceFileKind::JavaScript)),
+            ),
+            (
+                "'install.ps1'",
+                true,
+                Some(("action/install.ps1", SourceFileKind::Shell)),
+            ),
+            ("'config.json'", true, None),
+            ("process.argv[2]", false, None),
+            ("'tool'", false, None),
+            ("'notes.txt'", false, None),
+            ("'missing.sh'", false, None),
+        ] {
+            let source = format!(
+                "const tool = process.env.TOOL; const path = require('path');\nexecFileSync(tool, [path.join(__dirname, {operand})]);"
+            );
+            assert_eq!(
+                follow_kinds(&tree, "action/index.js", &source),
+                (
+                    complete,
+                    target
+                        .map(|(path, kind)| (path.to_string(), kind))
+                        .into_iter()
+                        .collect()
+                ),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn dynamic_program_operands_embedded_location_is_a_deliberate_limit() {
+        let source = "const tool = process.env.TOOL; const path = require('path');\nexecFileSync(tool, ['-Command', '& ' + path.join(__dirname, 'install.ps1')]);";
+        assert_eq!(
+            follow_kinds(
+                &["action/index.js", "action/install.ps1"],
+                "action/index.js",
+                source
+            ),
+            (true, vec![])
+        );
+    }
+
+    #[test]
+    fn dynamic_program_operands_known_basenames_are_unchanged() {
+        for (program, expected) in [
+            ("process.env.TOOLS + '/tar'", vec![]),
+            ("'tar'", vec![]),
+            (
+                "process.env.TOOLS + '/bash'",
+                vec![("action/x.sh".to_string(), SourceFileKind::Shell)],
+            ),
+        ] {
+            let source = format!(
+                "const path = require('path');\nexecFileSync({program}, ['-xf', path.join(__dirname, 'x.sh')]);"
+            );
+            assert_eq!(
+                follow_kinds(
+                    &["action/index.js", "action/x.sh"],
+                    "action/index.js",
+                    &source
+                ),
+                (true, expected),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn dynamic_program_operands_python_coverage_is_unchanged() {
+        for (call, complete) in [
+            ("subprocess.run([shutil.which('bash'), script])", false),
+            (
+                "subprocess.run(f'{shutil.which(\"bash\")} {script}', shell=True)",
+                false,
+            ),
+            ("os.system(f'{shutil.which(\"bash\")} {script}')", false),
+            ("os.system(f'env {shutil.which(\"bash\")} {script}')", false),
+            (
+                "os.system(f'echo ok; {shutil.which(\"bash\")} {script}')",
+                false,
+            ),
+            ("subprocess.run(['bash', sys.argv[1], script])", false),
+            ("subprocess.run(['bash', script])", true),
+            ("subprocess.run(f'bash {script}', shell=True)", true),
+            ("os.system(f'bash {script}')", true),
+            (
+                "subprocess.run([os.environ['TOOLS'] + '/bash', script])",
+                true,
+            ),
+            ("subprocess.run([script])", true),
+        ] {
+            let source = format!(
+                "import os, shutil, subprocess, sys\nscript = os.path.join(os.path.dirname(__file__), 'x.sh')\n{call}\n"
+            );
+            assert_eq!(
+                follow_kinds(
+                    &["action/main.py", "action/x.sh"],
+                    "action/main.py",
+                    &source
+                )
+                .0,
+                complete,
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn dynamic_program_operands_in_followed_shell_scripts() {
+        assert_eq!(
+            follow_kinds(
+                &["action/main.sh", "action/x.sh"],
+                "action/main.sh",
+                "\"$TOOL\" \"$(dirname \"$0\")/x.sh\""
+            ),
+            (
+                true,
+                vec![("action/x.sh".to_string(), SourceFileKind::Shell)]
+            )
+        );
     }
 
     #[test]

