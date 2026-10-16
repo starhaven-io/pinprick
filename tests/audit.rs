@@ -2437,3 +2437,342 @@ fn harmless_action_location_references_stay_complete() {
         assert_eq!(report["coverage_complete"], true, "{action}");
     }
 }
+
+#[test]
+fn dynamic_javascript_coverage_failure_identifies_its_source_in_every_format() {
+    let dir = common::repo_with_local_action(
+        "name: test\ndescription: test\nruns:\n  using: node24\n  main: index.js\n",
+        &[(
+            "index.js",
+            r#"import { createRequire } from 'node:module';
+const load = createRequire(import.meta.url);
+const cp = require('child_process');
+function makePredicate(body) {
+  return new Function('x', 'return x + 1');
+}
+cp.execFileSync(load('os').tmpdir() + '/tool', []);
+"#,
+        )],
+    );
+    let diagnostic = "./act (index.js:5): dynamic JavaScript evaluation contributes to incomplete coverage: standard module loading cannot be assumed";
+    for format in ["human", "json", "sarif"] {
+        let mut command = common::pinprick_cmd();
+        command.arg("audit").arg("--no-audited-catalog");
+        if format != "human" {
+            command.arg(format!("--{format}"));
+        }
+        let output = command.arg(dir.path()).output().unwrap();
+        assert_eq!(output.status.code(), Some(2), "{format}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(diagnostic),
+            "{format}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if format == "human" {
+            assert!(String::from_utf8_lossy(&output.stdout).contains(diagnostic));
+        } else {
+            let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            let failures = if format == "json" {
+                assert_eq!(report["coverage_complete"], false);
+                &report["coverage_failures"]
+            } else {
+                assert_eq!(
+                    report["runs"][0]["properties"]["pinprickCoverageComplete"],
+                    false
+                );
+                &report["runs"][0]["properties"]["pinprickCoverageFailures"]
+            };
+            assert!(
+                failures
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|failure| failure == diagnostic),
+                "{report}"
+            );
+        }
+    }
+}
+
+#[test]
+fn dynamic_javascript_does_not_explain_unrelated_incompleteness() {
+    let dir = common::repo_with_local_action(
+        &node_action("index.js"),
+        &[
+            (
+                "index.js",
+                "require('./missing');\nnew Function('x', 'return x + 1');\nrequire('child_process').execFileSync(__dirname + '/tool.sh');\n",
+            ),
+            ("tool.sh", "echo ok\n"),
+        ],
+    );
+    for format in ["human", "json", "sarif"] {
+        let mut command = common::pinprick_cmd();
+        command.args(["audit", "--no-audited-catalog"]);
+        if format != "human" {
+            command.arg(format!("--{format}"));
+        }
+        let output = command.arg(dir.path()).output().unwrap();
+        assert_eq!(output.status.code(), Some(2), "{format}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stderr.contains("incomplete scan of local action ./act"),
+            "{stderr}"
+        );
+        assert!(
+            stdout.contains("incomplete local action scan for ./act"),
+            "{stdout}"
+        );
+        assert!(
+            !stderr.contains("dynamic JavaScript evaluation"),
+            "{format}: {stderr}"
+        );
+        assert!(
+            !stdout.contains("dynamic JavaScript evaluation"),
+            "{format}: {stdout}"
+        );
+    }
+    let source = dir.path().join("act/index.js");
+    let code = std::fs::read_to_string(&source).unwrap();
+    std::fs::write(&source, code.replace("require('./missing');\n", "")).unwrap();
+    let output = common::pinprick_cmd()
+        .args(["audit", "--no-audited-catalog", "--json"])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["coverage_complete"], true);
+}
+
+#[test]
+fn dynamic_javascript_does_not_explain_other_execution_failures() {
+    for execution in [
+        "require('child_process').execFileSync(__dirname + '/missing.sh');",
+        "require('child_process').execFileSync(__dirname + '/' + process.env.TOOL);",
+        "const tool = __dirname + ;",
+    ] {
+        let (code, report) = audit_local_action(
+            &node_action("index.js"),
+            &[
+                (
+                    "index.js",
+                    "require('./helper');\nnew Function('x', 'return x + 1');\n",
+                ),
+                ("helper.js", execution),
+            ],
+        );
+        assert_eq!(code, Some(2), "{execution}: {report}");
+        assert_eq!(report["coverage_complete"], false);
+        assert!(report["findings"].as_array().unwrap().is_empty());
+        assert!(
+            !report.to_string().contains("dynamic JavaScript evaluation"),
+            "{execution}: {report}"
+        );
+    }
+}
+
+#[test]
+fn dynamic_javascript_does_not_explain_other_loader_replacements() {
+    let execution = "import { createRequire } from 'node:module';\nconst load = createRequire(import.meta.url);\nrequire('child_process').execFileSync(load('os').tmpdir() + '/tool');\n";
+    for replacement in [
+        "require('module')._load = () => {};",
+        "const broken = __dirname + ;",
+    ] {
+        for same_file in [false, true] {
+            let evaluation = "new Function('x', 'return x + 1');\n";
+            let helper = if same_file {
+                format!("{evaluation}{replacement}\n")
+            } else {
+                format!("{replacement}\n")
+            };
+            let main = format!(
+                "require('./helper');\n{}{execution}",
+                if same_file { "" } else { evaluation }
+            );
+            let (code, report) = audit_local_action(
+                &node_action("index.js"),
+                &[("index.js", &main), ("helper.js", &helper)],
+            );
+            assert_eq!(code, Some(2), "{replacement}: {report}");
+            assert_eq!(report["coverage_complete"], false);
+            assert!(report["findings"].as_array().unwrap().is_empty());
+            assert!(
+                !report.to_string().contains("dynamic JavaScript evaluation"),
+                "{replacement}, same file {same_file}: {report}"
+            );
+        }
+    }
+}
+
+#[test]
+fn dynamic_javascript_without_located_execution_stays_complete() {
+    let dir = common::repo_with_local_action(
+        &node_action("index.js"),
+        &[(
+            "index.js",
+            "const f = new Function('x', 'return x + 1');\nf(1);\n",
+        )],
+    );
+    let output = common::pinprick_cmd()
+        .args(["audit", "--no-audited-catalog", "--json"])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("dynamic JavaScript evaluation"));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["coverage_complete"], true);
+    assert!(report.get("coverage_failures").is_none());
+}
+
+#[test]
+fn dynamic_javascript_diagnostics_identify_a_contributing_cause() {
+    for (extra, helper, content, explains) in [
+        (
+            "require('./helper');",
+            "helper.js",
+            "require('child_process').execFileSync(__dirname + '/missing.sh');",
+            true,
+        ),
+        (
+            "require('./missing');",
+            "helper.js",
+            "module.exports = {};",
+            true,
+        ),
+        (
+            "require('./node_modules/helper');",
+            "node_modules/helper/index.js",
+            "require('module')._load = () => {};",
+            true,
+        ),
+        (
+            "require('child_process').execFileSync(__dirname + '/missing.sh');",
+            "helper.js",
+            "module.exports = {};",
+            false,
+        ),
+    ] {
+        for evaluation in ["new Function('x', 'return x + 1');", ""] {
+            let source = format!(
+                "import {{ createRequire }} from 'node:module';\nconst load = createRequire(import.meta.url);\n{evaluation}\n{extra}\nrequire('child_process').execFileSync(load('os').tmpdir() + '/tool');\n"
+            );
+            let dir = common::repo_with_local_action(
+                &node_action("index.js"),
+                &[("index.js", &source), (helper, content)],
+            );
+            for format in ["human", "json", "sarif"] {
+                let mut command = common::pinprick_cmd();
+                command.args(["audit", "--no-audited-catalog"]);
+                if format != "human" {
+                    command.arg(format!("--{format}"));
+                }
+                let output = command.arg(dir.path()).output().unwrap();
+                assert_eq!(output.status.code(), Some(2), "{extra}, {format}");
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                assert!(
+                    stdout.contains("incomplete local action scan for ./act"),
+                    "{stdout}"
+                );
+                for bytes in [&output.stdout, &output.stderr] {
+                    let text = String::from_utf8_lossy(bytes);
+                    assert_eq!(
+                        text.contains(
+                            "dynamic JavaScript evaluation contributes to incomplete coverage"
+                        ),
+                        explains && !evaluation.is_empty(),
+                        "{extra}, {format}: {text}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn located_javascript_without_dynamic_evaluation_stays_complete() {
+    let dir = common::repo_with_local_action(
+        &node_action("index.js"),
+        &[(
+            "index.js",
+            "import { createRequire } from 'node:module';\nconst load = createRequire(import.meta.url);\nconst cp = require('child_process');\nfunction makePredicate(body) {\n  return body;\n}\ncp.execFileSync(load('os').tmpdir() + '/tool', []);\n",
+        )],
+    );
+    let output = common::pinprick_cmd()
+        .args(["audit", "--no-audited-catalog", "--json"])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("dynamic JavaScript evaluation"));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["coverage_complete"], true);
+    assert!(report.get("coverage_failures").is_none());
+}
+
+#[test]
+fn dynamic_javascript_coverage_summarizes_lines_once_per_file() {
+    let first_line = "new Function('x', 'return x'); new Function('y', 'return y');\n";
+    for newline in ["\n", "\r\n"] {
+        for (evaluations, suffix) in [
+            (first_line.to_string(), ""),
+            (
+                format!(
+                    "{first_line}\nnew Function('z', 'return z');\nnew Function('value', 'return value');\n"
+                ),
+                " (2 additional locations)",
+            ),
+        ] {
+            let code = format!("import {{ createRequire }} from 'node:module';\nconst load = createRequire(import.meta.url);\nconst cp = require('child_process');\nrequire('./helper');\n{evaluations}cp.execFileSync(load('os').tmpdir() + '/tool', []);\n").replace('\n', newline);
+            let dir = common::repo_with_local_action(
+                &node_action("index.js"),
+                &[("index.js", &code), ("helper.js", "module.exports = {};\n")],
+            );
+            let diagnostic = format!(
+                "./act (index.js:5): dynamic JavaScript evaluation contributes to incomplete coverage: standard module loading cannot be assumed{suffix}"
+            );
+            for format in ["human", "json", "sarif"] {
+                let mut command = common::pinprick_cmd();
+                command.args(["audit", "--no-audited-catalog"]);
+                if format != "human" {
+                    command.arg(format!("--{format}"));
+                }
+                let output = command.arg(dir.path()).output().unwrap();
+                assert_eq!(output.status.code(), Some(2));
+                for bytes in [&output.stdout, &output.stderr] {
+                    let text = String::from_utf8_lossy(bytes);
+                    assert_eq!(
+                        text.matches("dynamic JavaScript evaluation").count(),
+                        1,
+                        "{format}: {text}"
+                    );
+                    assert!(text.contains(&diagnostic), "{format}: {text}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn score_does_not_emit_dynamic_javascript_audit_diagnostics() {
+    let dir = common::repo_with_local_action(
+        &node_action("index.js"),
+        &[(
+            "index.js",
+            "import { createRequire } from 'node:module';\nconst load = createRequire(import.meta.url);\nnew Function('x', 'return x');\nrequire('child_process').execFileSync(load('os').tmpdir() + '/tool', []);\n",
+        )],
+    );
+    let output = common::pinprick_cmd()
+        .args(["score", "--json"])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["coverage_complete"], false);
+    for bytes in [&output.stdout, &output.stderr] {
+        assert!(!String::from_utf8_lossy(bytes).contains("dynamic JavaScript evaluation"));
+    }
+}

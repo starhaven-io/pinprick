@@ -1071,6 +1071,7 @@ fn force_include_remote_source_dependencies(
         &mut HashMap::new(),
         &mut HashSet::new(),
     )
+    .complete
 }
 
 /// Adds the files each fetched source loads or runs. `contexts` holds the
@@ -1084,7 +1085,7 @@ fn follow_source_dependencies(
     contents: &[Option<Result<String>>],
     contexts: &mut HashMap<String, LocatedDirectory>,
     relocated: &mut HashSet<String>,
-) -> bool {
+) -> DependencyScan {
     let available: HashSet<&str> = tree
         .iter()
         .filter(|entry| entry.entry_type == "blob")
@@ -1103,12 +1104,23 @@ fn follow_source_dependencies(
     let mut complete = true;
     // Any file the action runs can replace the loader or patch a built-in
     // for every other one.
-    let uses: Vec<_> = sources
+    let mut uses: Vec<_> = sources
         .iter()
         .filter(|(_, kind, _)| *kind == SourceFileKind::JavaScript)
         .map(|(path, _, content)| crate::audit_javascript::builtin_use(path, content))
         .collect();
     let native_modules = !uses.is_empty() && !uses.iter().any(|use_| use_.replaces_loader);
+    let other_loader_replacement = uses.iter().any(|use_| use_.other_loader_replacement);
+    let dynamic_evaluations: HashMap<_, _> = sources
+        .iter()
+        .filter(|(_, kind, _)| *kind == SourceFileKind::JavaScript)
+        .zip(&mut uses)
+        .filter_map(|((path, _, content), use_)| {
+            dynamic_evaluation_locations(content, &mut use_.dynamic_evaluations)
+                .map(|locations| (path.clone(), locations))
+        })
+        .collect();
+    let mut unresolved_javascript = Vec::new();
     let patched_builtins: Vec<String> = uses
         .into_iter()
         .flat_map(|use_| use_.patched)
@@ -1191,13 +1203,14 @@ fn follow_source_dependencies(
                         }
                     }
                 }
+                let mut executions_complete = true;
                 for mut execution in
                     crate::audit_javascript::located_executions(&path, &content, &context)
                 {
                     if relocated.contains(&path) {
                         execution.unbind_self_location();
                     }
-                    complete &= include_located_execution(
+                    let resolved = include_located_execution(
                         &available,
                         targets,
                         contexts,
@@ -1206,6 +1219,18 @@ fn follow_source_dependencies(
                         action_base,
                         &execution,
                     );
+                    complete &= resolved;
+                    executions_complete &= resolved;
+                }
+                if !executions_complete
+                    && !other_loader_replacement
+                    && !dynamic_evaluations.is_empty()
+                {
+                    unresolved_javascript.push(UnresolvedJavaScript {
+                        path,
+                        content,
+                        context,
+                    });
                 }
             }
             SourceFileKind::Python => {
@@ -1379,7 +1404,11 @@ fn follow_source_dependencies(
             SourceFileKind::ActionYml | SourceFileKind::WorkflowYml => {}
         }
     }
-    complete
+    DependencyScan {
+        complete,
+        dynamic_evaluations,
+        unresolved_javascript,
+    }
 }
 
 /// A file that source code executes through its own or the action's location.
@@ -1611,16 +1640,9 @@ fn include_located_execution(
     action_base: &str,
     execution: &LocatedExecution,
 ) -> bool {
-    let Some(path) = execution
-        .path
-        .as_deref()
-        .and_then(|path| resolve_located_path(path, source, action_base))
-    else {
+    let Some(path) = available_execution_path(available, source, action_base, execution) else {
         return execution.optional;
     };
-    if !available.contains(path.as_str()) {
-        return execution.optional;
-    }
     if execution.relocated {
         relocated.insert(path.clone());
     }
@@ -1639,6 +1661,19 @@ fn include_located_execution(
         targets.push((path, execution.kind));
     }
     true
+}
+
+fn available_execution_path(
+    available: &HashSet<&str>,
+    source: &str,
+    action_base: &str,
+    execution: &LocatedExecution,
+) -> Option<String> {
+    execution
+        .path
+        .as_deref()
+        .and_then(|path| resolve_located_path(path, source, action_base))
+        .filter(|path| available.contains(path.as_str()))
 }
 
 /// Records a directory a followed file starts in; a file started from two
@@ -5091,13 +5126,13 @@ fn force_include_local_source_dependencies(
     targets: &mut Vec<(PathBuf, SourceFileKind)>,
     contexts: &mut HashMap<String, LocatedDirectory>,
     relocated: &mut HashSet<String>,
-) -> bool {
+) -> DependencyScan {
     let Some(action_base) = action_dir
         .strip_prefix(repo_root)
         .ok()
         .map(|path| path.to_string_lossy().replace('\\', "/"))
     else {
-        return false;
+        return DependencyScan::default();
     };
     let tree: Vec<crate::github::TreeEntry> = available
         .iter()
@@ -5128,11 +5163,11 @@ fn force_include_local_source_dependencies(
         }
     }
     if string_targets.len() != targets.len() {
-        return false;
+        return DependencyScan::default();
     }
 
     let before = string_targets.len();
-    complete &= follow_source_dependencies(
+    let mut dependencies = follow_source_dependencies(
         &tree,
         true,
         &action_base,
@@ -5141,6 +5176,7 @@ fn force_include_local_source_dependencies(
         contexts,
         relocated,
     );
+    complete &= dependencies.complete;
     for (relative, kind) in string_targets.into_iter().skip(before) {
         let path = repo_root.join(&relative);
         match workflow::open_child_file_path(repo_root, Path::new(&relative)) {
@@ -5150,7 +5186,8 @@ fn force_include_local_source_dependencies(
             Ok(None) | Err(_) => complete = false,
         }
     }
-    complete
+    dependencies.complete = complete;
+    dependencies
 }
 
 fn local_action_dir(repo_root: &Path, action: &LocalActionRef) -> Result<PathBuf> {
@@ -5203,6 +5240,7 @@ pub(crate) fn scan_local_action_source_graph(
     let initial_len = targets.len();
     let mut contexts = HashMap::new();
     let mut relocated = HashSet::new();
+    let mut dependencies;
     complete &=
         force_include_local_action_entrypoints(repo_root, &action_dir, &mut targets, &mut contexts);
     if cap_targets_prioritizing_entrypoints(&mut targets, initial_len).is_some() {
@@ -5217,7 +5255,7 @@ pub(crate) fn scan_local_action_source_graph(
         let before = targets.len();
         let known = contexts.clone();
         let known_relocated = relocated.clone();
-        complete &= force_include_local_source_dependencies(
+        dependencies = force_include_local_source_dependencies(
             repo_root,
             &action_dir,
             &available,
@@ -5225,6 +5263,7 @@ pub(crate) fn scan_local_action_source_graph(
             &mut contexts,
             &mut relocated,
         );
+        complete &= dependencies.complete;
         if targets.len() > MAX_SOURCE_FILES {
             targets.truncate(MAX_SOURCE_FILES);
             complete = false;
@@ -5232,6 +5271,31 @@ pub(crate) fn scan_local_action_source_graph(
         if targets.len() == before && contexts == known && relocated == known_relocated {
             break;
         }
+    }
+    if collector.explain_coverage
+        && let Ok(action_base) = action_dir.strip_prefix(repo_root)
+    {
+        let paths: Vec<_> = available
+            .iter()
+            .filter_map(|path| path.strip_prefix(repo_root).ok())
+            .map(|path| path.to_string_lossy().replace('\\', "/"))
+            .collect();
+        let available = paths.iter().map(String::as_str).collect();
+        let action_base = action_base.to_string_lossy().replace('\\', "/");
+        for (path, locations) in dependencies.explain(&available, &action_base, &relocated) {
+            let path = repo_root.join(path);
+            let relative = path
+                .strip_prefix(&action_dir)
+                .or_else(|_| path.strip_prefix(repo_root))
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            collector
+                .coverage_failures
+                .push(locations.failure(&action.path, &relative));
+        }
+    } else {
+        drop(dependencies);
     }
     if targets.is_empty() {
         return Ok((ActionScanStatus::Incomplete, Vec::new()));
@@ -5420,6 +5484,7 @@ async fn scan_one_action_source(
     let mut initial_len = targets.len();
     let mut contexts = HashMap::new();
     let mut relocated = HashSet::new();
+    let mut dependencies;
     complete &= force_include_remote_action_entrypoints(
         &tree.entries,
         &mut targets,
@@ -5451,7 +5516,7 @@ async fn scan_one_action_source(
         let fetched_len = targets.len();
         let known = contexts.clone();
         let known_relocated = relocated.clone();
-        complete &= follow_source_dependencies(
+        dependencies = follow_source_dependencies(
             &tree.entries,
             !tree.truncated,
             base,
@@ -5460,6 +5525,7 @@ async fn scan_one_action_source(
             &mut contexts,
             &mut relocated,
         );
+        complete &= dependencies.complete;
         if targets.len() == fetched_len {
             if contexts == known && relocated == known_relocated {
                 break;
@@ -5487,6 +5553,21 @@ async fn scan_one_action_source(
         action_bytes = action_bytes.saturating_add(added_bytes);
     }
 
+    if collector.explain_coverage {
+        let available = tree
+            .entries
+            .iter()
+            .filter(|entry| entry.entry_type == "blob")
+            .map(|entry| entry.path.as_str())
+            .collect();
+        for (path, locations) in dependencies.explain(&available, base, &relocated) {
+            collector
+                .coverage_failures
+                .push(locations.failure(&action_name, &path));
+        }
+    } else {
+        drop(dependencies);
+    }
     let helpers_fetch = helper_sources_fetch(
         targets
             .iter()
@@ -5560,6 +5641,118 @@ async fn scan_one_action_source(
     }
 
     Ok((ActionScanStatus::from_complete(complete), nested_uses))
+}
+
+#[derive(Default)]
+struct DependencyScan {
+    complete: bool,
+    dynamic_evaluations: HashMap<String, DynamicEvaluationLocations>,
+    unresolved_javascript: Vec<UnresolvedJavaScript>,
+}
+
+struct UnresolvedJavaScript {
+    path: String,
+    content: String,
+    context: SourceContext,
+}
+
+impl DependencyScan {
+    fn explain(
+        self,
+        available: &HashSet<&str>,
+        action_base: &str,
+        relocated: &HashSet<String>,
+    ) -> HashMap<String, DynamicEvaluationLocations> {
+        // Only the final dependency pass can explain the action's loader trust.
+        // Counterfactual paths must never enter the real scan or affect its verdict.
+        for source in self.unresolved_javascript {
+            let mut trusted_relocated = relocated.clone();
+            let context = SourceContext {
+                native_modules: true,
+                ..source.context
+            };
+            let resolved = crate::audit_javascript::located_executions(
+                &source.path,
+                &source.content,
+                &context,
+            )
+            .into_iter()
+            .all(|mut execution| {
+                if trusted_relocated.contains(&source.path) {
+                    execution.unbind_self_location();
+                }
+                let Some(path) =
+                    available_execution_path(available, &source.path, action_base, &execution)
+                else {
+                    return execution.optional;
+                };
+                if execution.relocated {
+                    trusted_relocated.insert(path);
+                }
+                true
+            });
+            if resolved {
+                return self.dynamic_evaluations;
+            }
+        }
+        HashMap::new()
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct DynamicEvaluationLocations {
+    first_line: usize,
+    additional_locations: usize,
+}
+
+impl DynamicEvaluationLocations {
+    fn failure(&self, action: &str, path: &str) -> String {
+        let mut failure = format!(
+            "{action} ({path}:{}): dynamic JavaScript evaluation contributes to incomplete coverage: standard module loading cannot be assumed",
+            self.first_line,
+        );
+        if self.additional_locations > 0 {
+            let plural = if self.additional_locations == 1 {
+                ""
+            } else {
+                "s"
+            };
+            failure.push_str(&format!(
+                " ({} additional location{plural})",
+                self.additional_locations
+            ));
+        }
+        failure
+    }
+}
+
+fn dynamic_evaluation_locations(
+    content: &str,
+    offsets: &mut [u32],
+) -> Option<DynamicEvaluationLocations> {
+    offsets.sort_unstable();
+    let mut previous_offset = 0;
+    let mut line = 1;
+    let mut previous_line = 0;
+    let mut locations = None;
+    for &offset in offsets.iter() {
+        let offset = offset as usize;
+        let bytes = content.as_bytes().get(previous_offset..offset)?;
+        line += bytes.iter().filter(|&&byte| byte == b'\n').count();
+        previous_offset = offset;
+        if line == previous_line {
+            continue;
+        }
+        previous_line = line;
+        let summary = locations.get_or_insert(DynamicEvaluationLocations {
+            first_line: line,
+            additional_locations: 0,
+        });
+        if line != summary.first_line {
+            summary.additional_locations += 1;
+        }
+    }
+    locations
 }
 
 /// Whether any source file beside a composite action's metadata fetches at
@@ -6801,15 +6994,18 @@ mod tests {
         let mut contexts = HashMap::new();
         loop {
             let before = (targets.len(), contexts.clone());
-            assert!(follow_source_dependencies(
-                &tree,
-                true,
-                "action",
-                &mut targets,
-                &contents,
-                &mut contexts,
-                &mut HashSet::new(),
-            ));
+            assert!(
+                follow_source_dependencies(
+                    &tree,
+                    true,
+                    "action",
+                    &mut targets,
+                    &contents,
+                    &mut contexts,
+                    &mut HashSet::new(),
+                )
+                .complete
+            );
             while contents.len() < targets.len() {
                 contents.push(Some(Ok(match targets[contents.len()].0.as_str() {
                     "action/scripts/helper.sh" => "bash child.sh\n".to_string(),
@@ -7412,7 +7608,8 @@ mod tests {
                     &contents,
                     &mut HashMap::new(),
                     &mut HashSet::new(),
-                ),
+                )
+                .complete,
                 complete,
                 "{bridge}"
             );
@@ -7447,7 +7644,8 @@ mod tests {
                     &contents,
                     &mut HashMap::new(),
                     &mut HashSet::new(),
-                ),
+                )
+                .complete,
                 complete,
                 "{bridge}"
             );
@@ -7765,7 +7963,8 @@ io_cp(__nccwpck_require__.ab + 'index1.js', '/opt/tofu');"#
                         &contents,
                         &mut contexts,
                         &mut relocated,
-                    );
+                    )
+                    .complete;
                     while contents.len() < targets.len() {
                         contents.push(Some(Ok(source.to_string())));
                     }
@@ -7807,7 +8006,8 @@ io_cp(__nccwpck_require__.ab + 'index1.js', '/opt/tofu');"#
                 &contents,
                 &mut contexts,
                 &mut relocated,
-            );
+            )
+            .complete;
             while contents.len() < targets.len() {
                 let source = match targets[contents.len()].0.as_str() {
                     "action/w.sh" => "cd \"$(dirname \"$0\")\"; python3 -m helper",
@@ -9628,6 +9828,481 @@ runs:
             collector.findings.is_empty(),
             "failed fetch should not invent findings, only block clean caching"
         );
+    }
+
+    async fn scan_dynamic_javascript_fixture(
+        subpath: Option<&str>,
+        code: &str,
+        missing_source: bool,
+        files: &[(&str, &str)],
+    ) -> (ActionScanStatus, AuditCollector) {
+        scan_dynamic_javascript_fixture_with_diagnostics(subpath, code, missing_source, files, true)
+            .await
+    }
+
+    async fn scan_dynamic_javascript_fixture_with_diagnostics(
+        subpath: Option<&str>,
+        code: &str,
+        missing_source: bool,
+        files: &[(&str, &str)],
+        explain_coverage: bool,
+    ) -> (ActionScanStatus, AuditCollector) {
+        use serde_json::json;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let prefix = subpath.map(|value| format!("{value}/")).unwrap_or_default();
+        let metadata = format!("{prefix}action.yml");
+        let entry = format!("{prefix}dist/index.js");
+        let missing = format!("{prefix}dist/missing.js");
+        let mut tree = vec![
+            json!({ "path": metadata, "type": "blob" }),
+            json!({ "path": entry, "type": "blob" }),
+        ];
+        for (file, _) in files {
+            tree.push(json!({ "path": format!("{prefix}{file}"), "type": "blob" }));
+        }
+        if missing_source {
+            tree.push(json!({ "path": missing, "type": "blob" }));
+        }
+        Mock::given(method("GET"))
+            .and(path(
+                "/repos/o/r/git/trees/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "tree": tree })))
+            .mount(&server)
+            .await;
+        let metadata_content = if missing_source {
+            "runs:\n  using: node24\n  main: dist/index.js\n  post: dist/missing.js\n"
+        } else {
+            "runs:\n  using: node24\n  main: dist/index.js\n"
+        };
+        for (file, content) in [(&metadata, metadata_content), (&entry, code)] {
+            Mock::given(method("GET"))
+                .and(path(format!("/repos/o/r/contents/{file}")))
+                .respond_with(ResponseTemplate::new(200).set_body_string(content))
+                .mount(&server)
+                .await;
+        }
+        for (file, content) in files {
+            Mock::given(method("GET"))
+                .and(path(format!("/repos/o/r/contents/{prefix}{file}")))
+                .respond_with(ResponseTemplate::new(200).set_body_string(*content))
+                .mount(&server)
+                .await;
+        }
+        if missing_source {
+            Mock::given(method("GET"))
+                .and(path(format!("/repos/o/r/contents/{missing}")))
+                .respond_with(ResponseTemplate::new(404))
+                .mount(&server)
+                .await;
+        }
+        let client = GitHubClient::with_base("t".into(), server.uri());
+        let action = ActionRef {
+            owner: "o".into(),
+            repo: "r".into(),
+            subpath: subpath.map(str::to_string),
+            ref_string: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            ref_type: workflow::RefType::Sha,
+            tag_comment: None,
+            line_number: 1,
+            raw_line: String::new(),
+            value_start: 0,
+            value_end: 0,
+            block_style: true,
+        };
+        let mut collector = if explain_coverage {
+            AuditCollector::for_audit(false)
+        } else {
+            AuditCollector::new(false)
+        };
+        let status = scan_action_source(&client, &action, &mut collector, &DEFAULT_CONFIG)
+            .await
+            .unwrap();
+        (status, collector)
+    }
+
+    #[tokio::test]
+    async fn scan_action_source_dynamic_evaluation_does_not_explain_failed_fetch() {
+        let (status, collector) = scan_dynamic_javascript_fixture(
+            None,
+            "new Function('x', 'return x + 1');\nrequire('child_process').execFileSync(__dirname + '/tool.sh');\n",
+            true,
+            &[("dist/tool.sh", "echo ok\n")],
+        )
+        .await;
+        assert_eq!(status, ActionScanStatus::Incomplete);
+        assert!(collector.findings.is_empty());
+        assert!(
+            collector.coverage_failures.is_empty(),
+            "{:?}",
+            collector.coverage_failures
+        );
+    }
+
+    #[tokio::test]
+    async fn scan_action_source_dynamic_evaluation_explains_unresolved_execution() {
+        let code = "import { createRequire } from 'node:module';\nconst load = createRequire(import.meta.url);\nconst cp = require('child_process');\nfunction makePredicate(body) {\n  return new Function('x', 'return x + 1');\n}\ncp.execFileSync(load('os').tmpdir() + '/tool', []);\n";
+        for subpath in [None, Some("nested")] {
+            let (status, collector) =
+                scan_dynamic_javascript_fixture(subpath, code, false, &[]).await;
+            assert_eq!(status, ActionScanStatus::Incomplete);
+            assert!(collector.findings.is_empty());
+            let prefix = subpath.map(|value| format!("{value}/")).unwrap_or_default();
+            let action = subpath
+                .map(|value| format!("o/r/{value}"))
+                .unwrap_or_else(|| "o/r".into());
+            assert_eq!(
+                collector.coverage_failures,
+                vec![format!(
+                    "{action}@aaaaaaa ({prefix}dist/index.js:5): dynamic JavaScript evaluation contributes to incomplete coverage: standard module loading cannot be assumed"
+                )]
+            );
+            let control = code.replace("new Function('x', 'return x + 1')", "body");
+            let (status, collector) =
+                scan_dynamic_javascript_fixture(subpath, &control, false, &[]).await;
+            assert_eq!(status, ActionScanStatus::Complete);
+            assert!(collector.findings.is_empty());
+            assert!(collector.coverage_failures.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn dynamic_evaluation_does_not_explain_later_loader_replacement() {
+        let code = "import { createRequire } from 'node:module';\nconst load = createRequire(import.meta.url);\nnew Function('x', 'return x + 1');\nrequire('./node_modules/helper');\nrequire('child_process').execFileSync(load('os').tmpdir() + '/tool');\n";
+        for helper in [
+            "require('module')._load = () => {};",
+            "const broken = __dirname + ;",
+        ] {
+            for subpath in [None, Some("nested")] {
+                let before = crate::audit_javascript::TRUSTED_LOCATION_ANALYSES.get();
+                let (status, collector) = scan_dynamic_javascript_fixture(
+                    subpath,
+                    code,
+                    false,
+                    &[("dist/node_modules/helper/index.js", helper)],
+                )
+                .await;
+                assert_eq!(status, ActionScanStatus::Incomplete);
+                assert_eq!(
+                    crate::audit_javascript::TRUSTED_LOCATION_ANALYSES.get(),
+                    before
+                );
+                assert!(collector.findings.is_empty());
+                assert!(
+                    collector.coverage_failures.is_empty(),
+                    "{helper}: {:?}",
+                    collector.coverage_failures
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dynamic_evaluation_does_not_explain_relocated_execution() {
+        let tree = [
+            tree_entry("action/index.js", "blob"),
+            tree_entry("action/tool.sh", "blob"),
+        ];
+        let mut targets = vec![("action/index.js".into(), SourceFileKind::JavaScript)];
+        let contents = [Some(Ok("new Function('x', 'return x + 1');\nrequire('child_process').execFileSync(__dirname + '/tool.sh');\n".into()))];
+        let scan = follow_source_dependencies(
+            &tree,
+            true,
+            "action",
+            &mut targets,
+            &contents,
+            &mut HashMap::new(),
+            &mut HashSet::from(["action/index.js".into()]),
+        );
+        assert!(!scan.complete);
+        let available = tree.iter().map(|entry| entry.path.as_str()).collect();
+        assert!(
+            scan.explain(
+                &available,
+                "action",
+                &HashSet::from(["action/index.js".into()])
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            targets,
+            vec![("action/index.js".into(), SourceFileKind::JavaScript)]
+        );
+    }
+
+    #[test]
+    fn dynamic_evaluation_locations_count_distinct_lines_with_byte_offsets() {
+        let code = "// π\r\nFunction(body); Function(body);\r\n\r\nFunction(body);\r\n";
+        let mut offsets: Vec<u32> = code
+            .match_indices("Function")
+            .map(|(offset, _)| offset as u32)
+            .collect();
+        offsets.reverse();
+        offsets.push(offsets[0]);
+        let locations = dynamic_evaluation_locations(code, &mut offsets).unwrap();
+        assert_eq!(
+            locations,
+            DynamicEvaluationLocations {
+                first_line: 2,
+                additional_locations: 1
+            }
+        );
+        assert_eq!(
+            locations.failure("./act", "index.js"),
+            "./act (index.js:2): dynamic JavaScript evaluation contributes to incomplete coverage: standard module loading cannot be assumed (1 additional location)"
+        );
+        assert!(dynamic_evaluation_locations(code, &mut []).is_none());
+    }
+
+    #[test]
+    fn dynamic_evaluation_counterfactual_does_not_add_dependencies() {
+        let tree = [
+            tree_entry("action/index.js", "blob"),
+            tree_entry("action/tool.sh", "blob"),
+        ];
+        let mut targets = vec![("action/index.js".into(), SourceFileKind::JavaScript)];
+        let contents = [Some(Ok("import { createRequire } from 'node:module';\nconst load = createRequire(import.meta.url);\nnew Function('x', 'return x + 1');\nrequire('child_process').execFileSync(load('path').join(__dirname, 'tool.sh'), [], { cwd: __dirname });\n".into()))];
+        let mut contexts = HashMap::new();
+        let mut relocated = HashSet::new();
+        let before = crate::audit_javascript::TRUSTED_LOCATION_ANALYSES.get();
+        let scan = follow_source_dependencies(
+            &tree,
+            true,
+            "action",
+            &mut targets,
+            &contents,
+            &mut contexts,
+            &mut relocated,
+        );
+        assert!(!scan.complete);
+        assert_eq!(
+            crate::audit_javascript::TRUSTED_LOCATION_ANALYSES.get(),
+            before
+        );
+        let available = tree.iter().map(|entry| entry.path.as_str()).collect();
+        assert_eq!(scan.explain(&available, "action", &relocated).len(), 1);
+        assert_eq!(
+            crate::audit_javascript::TRUSTED_LOCATION_ANALYSES.get(),
+            before + 1
+        );
+        assert_eq!(
+            targets,
+            vec![("action/index.js".into(), SourceFileKind::JavaScript)]
+        );
+        assert!(contexts.is_empty());
+        assert!(relocated.is_empty());
+    }
+
+    #[test]
+    fn dynamic_evaluation_counterfactual_skips_failures_without_evaluation() {
+        let tree = [tree_entry("action/index.js", "blob")];
+        let mut targets = vec![("action/index.js".into(), SourceFileKind::JavaScript)];
+        let contents = [Some(Ok(
+            "require('child_process').execFileSync(__dirname + '/missing.sh');\n".into(),
+        ))];
+        let mut contexts = HashMap::new();
+        let mut relocated = HashSet::new();
+        let scan = follow_source_dependencies(
+            &tree,
+            true,
+            "action",
+            &mut targets,
+            &contents,
+            &mut contexts,
+            &mut relocated,
+        );
+        assert!(!scan.complete);
+        let before = crate::audit_javascript::TRUSTED_LOCATION_ANALYSES.get();
+        let available = tree.iter().map(|entry| entry.path.as_str()).collect();
+        assert!(scan.explain(&available, "action", &relocated).is_empty());
+        assert_eq!(
+            crate::audit_javascript::TRUSTED_LOCATION_ANALYSES.get(),
+            before
+        );
+    }
+
+    #[test]
+    fn dynamic_evaluation_counterfactual_allows_absent_optional_python_modules() {
+        let tree = [tree_entry("action/index.js", "blob")];
+        for evaluation in ["", "new Function('x', 'return x + 1');\n"] {
+            let mut targets = vec![("action/index.js".into(), SourceFileKind::JavaScript)];
+            let contents = [Some(Ok(format!(
+                "import {{ createRequire }} from 'node:module';\nconst load = createRequire(import.meta.url);\n{evaluation}require('child_process').execFileSync(load('os').tmpdir() + '/tool');\nrequire('child_process').execFileSync('python3', ['-m', 'optional_helper'], {{ cwd: __dirname }});\n"
+            )))];
+            let mut contexts = HashMap::new();
+            let mut relocated = HashSet::new();
+            let scan = follow_source_dependencies(
+                &tree,
+                true,
+                "action",
+                &mut targets,
+                &contents,
+                &mut contexts,
+                &mut relocated,
+            );
+            assert_eq!(scan.complete, evaluation.is_empty());
+            let available = tree.iter().map(|entry| entry.path.as_str()).collect();
+            assert_eq!(
+                scan.explain(&available, "action", &relocated).len(),
+                usize::from(!evaluation.is_empty())
+            );
+            assert_eq!(
+                targets,
+                vec![("action/index.js".into(), SourceFileKind::JavaScript)]
+            );
+        }
+    }
+
+    #[test]
+    fn dynamic_evaluation_diagnostics_run_once_and_only_when_requested_locally() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let action_dir = dir.path().join("action");
+        std::fs::create_dir(&action_dir).unwrap();
+        std::fs::write(
+            action_dir.join("action.yml"),
+            "runs:\n  using: node24\n  main: index.js\n",
+        )
+        .unwrap();
+        std::fs::write(action_dir.join("index.js"), "import { createRequire } from 'node:module';\nconst load = createRequire(import.meta.url);\nnew Function('x', 'return x + 1');\nrequire('child_process').execFileSync(load('os').tmpdir() + '/tool');\nrequire('child_process').execFileSync('sh', [__dirname + '/tool.data']);\n").unwrap();
+        std::fs::write(action_dir.join("tool.data"), "echo ok\n").unwrap();
+        let action = LocalActionRef {
+            path: "./action".into(),
+            line_number: 1,
+        };
+        for explain in [false, true] {
+            let before = crate::audit_javascript::TRUSTED_LOCATION_ANALYSES.get();
+            let mut collector = if explain {
+                AuditCollector::for_audit(false)
+            } else {
+                AuditCollector::new(false)
+            };
+            let status =
+                scan_local_action_source(dir.path(), &action, &mut collector, &DEFAULT_CONFIG)
+                    .unwrap();
+            assert_eq!(status, ActionScanStatus::Incomplete);
+            assert!(collector.findings.is_empty());
+            assert_eq!(collector.coverage_failures.len(), usize::from(explain));
+            assert_eq!(
+                crate::audit_javascript::TRUSTED_LOCATION_ANALYSES.get() - before,
+                usize::from(explain)
+            );
+        }
+        let workflows = dir.path().join(".github/workflows");
+        std::fs::create_dir_all(&workflows).unwrap();
+        std::fs::write(
+            workflows.join("ci.yml"),
+            "jobs:\n  test:\n    steps:\n      - uses: ./action\n",
+        )
+        .unwrap();
+        let before = crate::audit_javascript::TRUSTED_LOCATION_ANALYSES.get();
+        let (report, _) = crate::score::score_repo(dir.path(), &DEFAULT_CONFIG).unwrap();
+        assert!(!report.coverage_complete);
+        assert_eq!(
+            crate::audit_javascript::TRUSTED_LOCATION_ANALYSES.get(),
+            before
+        );
+    }
+
+    #[tokio::test]
+    async fn dynamic_evaluation_diagnostics_run_once_and_only_when_requested_remotely() {
+        let code = "import { createRequire } from 'node:module';\nconst load = createRequire(import.meta.url);\nnew Function('x', 'return x + 1');\nrequire('./node_modules/helper');\nrequire('child_process').execFileSync(load('os').tmpdir() + '/tool');\n";
+        for explain in [false, true] {
+            let before = crate::audit_javascript::TRUSTED_LOCATION_ANALYSES.get();
+            let (status, collector) = scan_dynamic_javascript_fixture_with_diagnostics(
+                None,
+                code,
+                false,
+                &[(
+                    "dist/node_modules/helper/index.js",
+                    "module.exports = {};\n",
+                )],
+                explain,
+            )
+            .await;
+            assert_eq!(status, ActionScanStatus::Incomplete);
+            assert!(collector.findings.is_empty());
+            assert_eq!(collector.coverage_failures.len(), usize::from(explain));
+            assert_eq!(
+                crate::audit_javascript::TRUSTED_LOCATION_ANALYSES.get() - before,
+                usize::from(explain)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn dynamic_evaluation_diagnostics_deduplicate_shared_nested_actions() {
+        use serde_json::json;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let wrapper = format!(
+            "runs:\n  using: composite\n  steps:\n    - uses: o/r/leaf@{}\n",
+            "a".repeat(40)
+        );
+        let files = [
+            ("one/action.yml", wrapper.as_str()),
+            ("two/action.yml", wrapper.as_str()),
+            (
+                "leaf/action.yml",
+                "runs:\n  using: node24\n  main: index.js\n",
+            ),
+            (
+                "leaf/index.js",
+                "import { createRequire } from 'node:module';\nconst load = createRequire(import.meta.url);\nnew Function('x', 'return x + 1');\nrequire('child_process').execFileSync(load('os').tmpdir() + '/tool');\n",
+            ),
+        ];
+        let tree: Vec<_> = files
+            .iter()
+            .map(|(file, _)| json!({ "path": file, "type": "blob" }))
+            .collect();
+        Mock::given(method("GET"))
+            .and(path(format!("/repos/o/r/git/trees/{}", "a".repeat(40))))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "tree": tree })))
+            .mount(&server)
+            .await;
+        for (file, content) in files {
+            Mock::given(method("GET"))
+                .and(path(format!("/repos/o/r/contents/{file}")))
+                .respond_with(ResponseTemplate::new(200).set_body_string(content))
+                .mount(&server)
+                .await;
+        }
+        let client = GitHubClient::with_base("t".into(), server.uri());
+        let mut collector = AuditCollector::for_audit(false);
+        for parent in ["one", "two"] {
+            let action =
+                workflow::scan_content(&format!("      - uses: o/r/{parent}@{}\n", "a".repeat(40)))
+                    .remove(0);
+            let status = scan_action_source(&client, &action, &mut collector, &DEFAULT_CONFIG)
+                .await
+                .unwrap();
+            assert_eq!(status, ActionScanStatus::Incomplete);
+        }
+        assert!(collector.findings.is_empty());
+        assert_eq!(collector.coverage_failures.len(), 2);
+        assert_eq!(
+            collector.take_coverage_failures(),
+            vec![
+                "o/r/leaf@aaaaaaa (leaf/index.js:3): dynamic JavaScript evaluation contributes to incomplete coverage: standard module loading cannot be assumed"
+            ]
+        );
+        assert!(collector.take_coverage_failures().is_empty());
+    }
+
+    #[test]
+    fn dynamic_javascript_coverage_is_bounded_at_scale() {
+        let code = "Function(body);\n".repeat(100_000);
+        let mut offsets: Vec<u32> = (0..100_000).rev().map(|index| index * 16).collect();
+        let locations = dynamic_evaluation_locations(&code, &mut offsets).unwrap();
+        assert_eq!(locations.first_line, 1);
+        assert_eq!(locations.additional_locations, 99_999);
+        let failure = locations.failure("./act", "index.js");
+        assert!(failure.len() < 200);
+        assert!(failure.contains("99999 additional locations"));
     }
 
     #[tokio::test]
