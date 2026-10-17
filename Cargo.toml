@@ -52,9 +52,9 @@ oxc_ast = "0.153"
 oxc_parser = { version = "0.153", default-features = false }
 oxc_semantic = "0.153"
 oxc_span = "0.153"
-ruff_python_ast = "=0.0.16"
-ruff_python_parser = "=0.0.16"
-ruff_text_size = "=0.0.16"
+ruff_python_ast = "=0.0.17"
+ruff_python_parser = "=0.0.17"
+ruff_text_size = "=0.0.17"
 rustix = { version = "1", features = ["fs"] }
 
 [build-dependencies]
