@@ -4233,7 +4233,7 @@ impl<'s, 'a> Analysis<'s, 'a> {
         // An exported function has callers outside this file.
         for kind in self.nodes.ancestor_kinds(function) {
             match kind {
-                AstKind::ExportNamedDeclaration(_) | AstKind::ExportDefaultDeclaration(_) => {
+                AstKind::ExportDeclaration(_) | AstKind::ExportDefaultDeclaration(_) => {
                     return None;
                 }
                 AstKind::VariableDeclarator(_)

