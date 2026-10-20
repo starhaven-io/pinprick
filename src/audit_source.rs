@@ -530,6 +530,7 @@ fn composite_helpers(yaml: &Value, base: &str) -> (Vec<CompositeHelper>, bool) {
                     environment,
                     native_modules: false,
                     patched_builtins: Vec::new(),
+                    calls: Vec::new(),
                 };
                 let code = ACTION_PATH_EXPRESSION_RE
                     .replace_all(step.run, regex::NoExpand(ACTION_LOCATION));
@@ -539,9 +540,12 @@ fn composite_helpers(yaml: &Value, base: &str) -> (Vec<CompositeHelper>, bool) {
                 ) {
                     executions.extend(python_located_executions(&code, &context).0);
                 } else {
-                    executions.extend(crate::audit_javascript::located_executions(
-                        "", &code, &context,
-                    ));
+                    let located = crate::audit_javascript::located_executions("", &code, &context);
+                    // Inline code has no file of its own to load modules beside.
+                    if !located.entries.is_empty() {
+                        executions.push(LocatedExecution::unresolved(SourceFileKind::JavaScript));
+                    }
+                    executions.extend(located.executions);
                 }
             }
             Interpreter::Script(_, family) => shell_script_executions(
@@ -1070,13 +1074,16 @@ fn force_include_remote_source_dependencies(
         contents,
         &mut HashMap::new(),
         &mut HashSet::new(),
+        &mut HashMap::new(),
     )
     .complete
 }
 
 /// Adds the files each fetched source loads or runs. `contexts` holds the
-/// directory each followed file starts in; it only moves toward
+/// directory each followed file starts in, and `calls` the located
+/// arguments other files pass to each one's exports; both only move toward
 /// unresolved, so repeating until nothing changes terminates.
+#[allow(clippy::too_many_arguments)]
 fn follow_source_dependencies(
     tree: &[crate::github::TreeEntry],
     tree_complete: bool,
@@ -1085,6 +1092,7 @@ fn follow_source_dependencies(
     contents: &[Option<Result<String>>],
     contexts: &mut HashMap<String, LocatedDirectory>,
     relocated: &mut HashSet<String>,
+    calls: &mut HashMap<String, Vec<ModuleCall>>,
 ) -> DependencyScan {
     let available: HashSet<&str> = tree
         .iter()
@@ -1134,6 +1142,7 @@ fn follow_source_dependencies(
             environment: Vec::new(),
             native_modules,
             patched_builtins: patched_builtins.clone(),
+            calls: calls.get(&path).cloned().unwrap_or_default(),
         };
         match kind {
             SourceFileKind::JavaScript => {
@@ -1203,10 +1212,21 @@ fn follow_source_dependencies(
                         }
                     }
                 }
+                let located =
+                    crate::audit_javascript::located_executions(&path, &content, &context);
+                for entry in located.entries {
+                    complete &= include_module_entry(
+                        &available,
+                        targets,
+                        calls,
+                        relocated,
+                        &path,
+                        action_base,
+                        entry,
+                    );
+                }
                 let mut executions_complete = true;
-                for mut execution in
-                    crate::audit_javascript::located_executions(&path, &content, &context)
-                {
+                for mut execution in located.executions {
                     if relocated.contains(&path) {
                         execution.unbind_self_location();
                     }
@@ -1486,14 +1506,78 @@ pub(crate) enum LocatedDirectory {
 }
 
 /// Where a source starts running: its working directory, step environment
-/// variables that hold action locations, and whether nothing in the action
-/// visibly replaces Node's module loader.
+/// variables that hold action locations, whether nothing in the action
+/// visibly replaces Node's module loader, and the located arguments the
+/// action's other files pass to what it exports.
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 pub(crate) struct SourceContext {
     pub(crate) directory: LocatedDirectory,
     pub(crate) environment: Vec<(String, String)>,
     pub(crate) native_modules: bool,
     pub(crate) patched_builtins: Vec<String>,
+    pub(crate) calls: Vec<ModuleCall>,
+}
+
+/// What a module exports that another file calls.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+pub(crate) enum ModuleExport {
+    /// The module itself, as `require` returns it or `export default` names.
+    Default,
+    Name(String),
+    /// Any function the module exports, or one a caller can reach without
+    /// naming it.
+    Any,
+}
+
+/// Calls into a module's export: the located value each argument may hold,
+/// relative to the action. `None` carries no location.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ModuleCall {
+    pub(crate) export: ModuleExport,
+    pub(crate) arguments: Vec<Option<ModuleArgument>>,
+}
+
+/// A located argument: a value, or the words of an array.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) enum ModuleArgument {
+    Value(String),
+    Words(Vec<String>),
+}
+
+impl ModuleArgument {
+    fn map(self, mut rebase: impl FnMut(&str) -> String) -> Self {
+        match self {
+            Self::Value(value) => Self::Value(rebase(&value)),
+            Self::Words(words) => Self::Words(words.iter().map(|word| rebase(word)).collect()),
+        }
+    }
+
+    /// What either of two calls may pass.
+    fn merge(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Value(left), Self::Value(right)) => {
+                Self::Value(merge_location_values([left, right]))
+            }
+            (left, right) if left == right => left,
+            _ => Self::Value(UNRESOLVED_LOCATION.to_string()),
+        }
+    }
+}
+
+/// A call one JavaScript source makes into another of the action's files,
+/// by the relative specifier it loads that file with.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ModuleEntry {
+    pub(crate) specifier: String,
+    pub(crate) call: ModuleCall,
+}
+
+/// What a JavaScript source runs through a location, and what located
+/// values it passes into the action's other files.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+pub(crate) struct JavaScriptLocations {
+    pub(crate) executions: Vec<LocatedExecution>,
+    pub(crate) entries: Vec<ModuleEntry>,
 }
 
 impl LocatedDirectory {
@@ -4703,6 +4787,14 @@ fn include_remote_javascript_dependency(
     if Path::new(&path).extension().is_some() {
         return false;
     }
+    javascript_module_candidate(available, &path).is_some_and(|candidate| {
+        push_unique_source_target(targets, candidate, SourceFileKind::JavaScript);
+        true
+    })
+}
+
+/// The file Node loads for an extensionless module path.
+fn javascript_module_candidate(available: &HashSet<&str>, path: &str) -> Option<String> {
     ["js", "mjs", "cjs", "ts"]
         .into_iter()
         .map(|extension| format!("{path}.{extension}"))
@@ -4712,10 +4804,122 @@ fn include_remote_javascript_dependency(
                 .map(|extension| format!("{path}/index.{extension}")),
         )
         .find(|candidate| available.contains(candidate.as_str()))
-        .is_some_and(|candidate| {
-            push_unique_source_target(targets, candidate, SourceFileKind::JavaScript);
-            true
-        })
+}
+
+/// The JavaScript file `source` loads by a relative specifier.
+fn javascript_module_path(
+    available: &HashSet<&str>,
+    source: &str,
+    specifier: &str,
+) -> Option<String> {
+    let path = normalize_action_entrypoint_path(path_parent(source), specifier)?;
+    if available.contains(path.as_str()) {
+        return (Path::new(&path).extension().is_none()
+            || executable_source_kind(&path) == Some(SourceFileKind::JavaScript))
+        .then_some(path);
+    }
+    if Path::new(&path).extension().is_some() {
+        return None;
+    }
+    javascript_module_candidate(available, &path)
+}
+
+/// Records a call `source` makes into another of the action's JavaScript
+/// files, so that file is scanned with those arguments bound to what it
+/// exports. A call into a file that is not one fails closed.
+fn include_module_entry(
+    available: &HashSet<&str>,
+    targets: &mut Vec<(String, SourceFileKind)>,
+    calls: &mut HashMap<String, Vec<ModuleCall>>,
+    relocated: &HashSet<String>,
+    source: &str,
+    action_base: &str,
+    entry: ModuleEntry,
+) -> bool {
+    let Some(path) = javascript_module_path(available, source, &entry.specifier) else {
+        // A data module exports no functions.
+        return normalize_action_entrypoint_path(path_parent(source), &entry.specifier)
+            .is_some_and(|path| {
+                available.contains(path.as_str()) && is_nonexecutable_data_path(&path)
+            });
+    };
+    let relocated = relocated.contains(source);
+    let call = ModuleCall {
+        export: entry.call.export,
+        arguments: entry
+            .call
+            .arguments
+            .into_iter()
+            .map(|argument| {
+                argument.map(|argument| {
+                    argument.map(|value| rebase_location(value, source, action_base, relocated))
+                })
+            })
+            .collect(),
+    };
+    let entries = calls.entry(path.clone()).or_default();
+    match entries
+        .iter_mut()
+        .find(|existing| existing.export == call.export)
+    {
+        Some(existing) => {
+            if existing.arguments.len() < call.arguments.len() {
+                existing.arguments.resize(call.arguments.len(), None);
+            }
+            for (merged, value) in existing.arguments.iter_mut().zip(call.arguments) {
+                if let Some(value) = value {
+                    *merged = Some(match merged.take() {
+                        Some(previous) => previous.merge(value),
+                        None => value,
+                    });
+                }
+            }
+        }
+        None => {
+            entries.push(call);
+            entries.sort_by(|left, right| left.export.cmp(&right.export));
+        }
+    }
+    push_unique_source_target(targets, path, SourceFileKind::JavaScript);
+    true
+}
+
+/// A located value of `source` as any other file of the action reads it:
+/// the source's own location becomes the action directory it is in.
+fn rebase_location(value: &str, source: &str, action_base: &str, relocated: bool) -> String {
+    if !value.contains(SELF_LOCATION) && !value.contains(SELF_FILE) {
+        return value.to_string();
+    }
+    let directory = path_parent(source);
+    let relative = if action_base.is_empty() {
+        Some(directory)
+    } else if directory == action_base {
+        Some("")
+    } else {
+        directory
+            .strip_prefix(action_base)
+            .and_then(|rest| rest.strip_prefix('/'))
+    };
+    let Some(relative) = relative.filter(|_| !relocated) else {
+        return UNRESOLVED_LOCATION.to_string();
+    };
+    let base = if relative.is_empty() {
+        ACTION_LOCATION.to_string()
+    } else {
+        format!("{ACTION_LOCATION}/{relative}")
+    };
+    let file = source.rsplit_once('/').map_or(source, |(_, file)| file);
+    let rebased = value
+        .replace(
+            &format!("{SELF_LOCATION}/{SELF_FILE}"),
+            &format!("{base}/{file}"),
+        )
+        .replace(SELF_LOCATION, &base);
+    if rebased.contains(SELF_FILE) {
+        UNRESOLVED_LOCATION.to_string()
+    } else {
+        rebased
+    }
 }
 
 fn is_nonexecutable_data_path(path: &str) -> bool {
@@ -5175,6 +5379,7 @@ fn force_include_local_source_dependencies(
     targets: &mut Vec<(PathBuf, SourceFileKind)>,
     contexts: &mut HashMap<String, LocatedDirectory>,
     relocated: &mut HashSet<String>,
+    calls: &mut HashMap<String, Vec<ModuleCall>>,
 ) -> DependencyScan {
     let Some(action_base) = action_dir
         .strip_prefix(repo_root)
@@ -5224,6 +5429,7 @@ fn force_include_local_source_dependencies(
         &contents,
         contexts,
         relocated,
+        calls,
     );
     complete &= dependencies.complete;
     for (relative, kind) in string_targets.into_iter().skip(before) {
@@ -5289,6 +5495,7 @@ pub(crate) fn scan_local_action_source_graph(
     let initial_len = targets.len();
     let mut contexts = HashMap::new();
     let mut relocated = HashSet::new();
+    let mut calls = HashMap::new();
     let mut dependencies;
     complete &=
         force_include_local_action_entrypoints(repo_root, &action_dir, &mut targets, &mut contexts);
@@ -5304,6 +5511,7 @@ pub(crate) fn scan_local_action_source_graph(
         let before = targets.len();
         let known = contexts.clone();
         let known_relocated = relocated.clone();
+        let known_calls = calls.clone();
         dependencies = force_include_local_source_dependencies(
             repo_root,
             &action_dir,
@@ -5311,13 +5519,18 @@ pub(crate) fn scan_local_action_source_graph(
             &mut targets,
             &mut contexts,
             &mut relocated,
+            &mut calls,
         );
         complete &= dependencies.complete;
         if targets.len() > MAX_SOURCE_FILES {
             targets.truncate(MAX_SOURCE_FILES);
             complete = false;
         }
-        if targets.len() == before && contexts == known && relocated == known_relocated {
+        if targets.len() == before
+            && contexts == known
+            && relocated == known_relocated
+            && calls == known_calls
+        {
             break;
         }
     }
@@ -5533,6 +5746,7 @@ async fn scan_one_action_source(
     let mut initial_len = targets.len();
     let mut contexts = HashMap::new();
     let mut relocated = HashSet::new();
+    let mut calls = HashMap::new();
     let mut dependencies;
     complete &= force_include_remote_action_entrypoints(
         &tree.entries,
@@ -5565,6 +5779,7 @@ async fn scan_one_action_source(
         let fetched_len = targets.len();
         let known = contexts.clone();
         let known_relocated = relocated.clone();
+        let known_calls = calls.clone();
         dependencies = follow_source_dependencies(
             &tree.entries,
             !tree.truncated,
@@ -5573,10 +5788,11 @@ async fn scan_one_action_source(
             &contents,
             &mut contexts,
             &mut relocated,
+            &mut calls,
         );
         complete &= dependencies.complete;
         if targets.len() == fetched_len {
-            if contexts == known && relocated == known_relocated {
+            if contexts == known && relocated == known_relocated && calls == known_calls {
                 break;
             }
             continue;
@@ -5725,6 +5941,7 @@ impl DependencyScan {
                 &source.content,
                 &context,
             )
+            .executions
             .into_iter()
             .all(|mut execution| {
                 if trusted_relocated.contains(&source.path) {
@@ -7052,6 +7269,7 @@ mod tests {
                     &contents,
                     &mut contexts,
                     &mut HashSet::new(),
+                    &mut HashMap::new(),
                 )
                 .complete
             );
@@ -7802,6 +8020,7 @@ mod tests {
                     &contents,
                     &mut HashMap::new(),
                     &mut HashSet::new(),
+                    &mut HashMap::new(),
                 )
                 .complete,
                 complete,
@@ -7838,6 +8057,7 @@ mod tests {
                     &contents,
                     &mut HashMap::new(),
                     &mut HashSet::new(),
+                    &mut HashMap::new(),
                 )
                 .complete,
                 complete,
@@ -8157,6 +8377,7 @@ io_cp(__nccwpck_require__.ab + 'index1.js', '/opt/tofu');"#
                         &contents,
                         &mut contexts,
                         &mut relocated,
+                        &mut HashMap::new(),
                     )
                     .complete;
                     while contents.len() < targets.len() {
@@ -8200,6 +8421,7 @@ io_cp(__nccwpck_require__.ab + 'index1.js', '/opt/tofu');"#
                 &contents,
                 &mut contexts,
                 &mut relocated,
+                &mut HashMap::new(),
             )
             .complete;
             while contents.len() < targets.len() {
@@ -10210,6 +10432,7 @@ runs:
             &contents,
             &mut HashMap::new(),
             &mut HashSet::from(["action/index.js".into()]),
+            &mut HashMap::new(),
         );
         assert!(!scan.complete);
         let available = tree.iter().map(|entry| entry.path.as_str()).collect();
@@ -10270,6 +10493,7 @@ runs:
             &contents,
             &mut contexts,
             &mut relocated,
+            &mut HashMap::new(),
         );
         assert!(!scan.complete);
         assert_eq!(
@@ -10307,6 +10531,7 @@ runs:
             &contents,
             &mut contexts,
             &mut relocated,
+            &mut HashMap::new(),
         );
         assert!(!scan.complete);
         let before = crate::audit_javascript::TRUSTED_LOCATION_ANALYSES.get();
@@ -10336,6 +10561,7 @@ runs:
                 &contents,
                 &mut contexts,
                 &mut relocated,
+                &mut HashMap::new(),
             );
             assert_eq!(scan.complete, evaluation.is_empty());
             let available = tree.iter().map(|entry| entry.path.as_str()).collect();
