@@ -341,7 +341,7 @@ jobs:
         .unwrap();
     assert_eq!(output.status.code(), Some(2));
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(report["rules_version"], 7);
+    assert_eq!(report["rules_version"], 8);
     assert_eq!(report["audited_bundled"], 0);
     assert_eq!(report["external_actions_skipped"], 2);
     assert_eq!(report["coverage_complete"], false);
@@ -2503,6 +2503,14 @@ fn located_arguments_reach_other_action_files() {
             ],
         ),
         (
+            "TypeScript CommonJS with several exports",
+            false,
+            vec![
+                ("index.js", "\"use strict\";\nObject.defineProperty(exports, \"__esModule\", { value: true });\nconst path = require(\"path\");\nconst helper_1 = require(\"./lib\");\n(0, helper_1.run)(path.join(__dirname, \"evil.sh\"));\n".to_string()),
+                ("lib.js", format!("\"use strict\";\nObject.defineProperty(exports, \"__esModule\", {{ value: true }});\nexports.run = exports.VERSION = void 0;\n{MODULE_CJS}const run = (script) => cp.spawnSync(which('bash'), [script]);\nexports.run = run;\nexports.VERSION = '1';\n")),
+            ],
+        ),
+        (
             "named import",
             true,
             vec![
@@ -3331,9 +3339,9 @@ fn uncertain_cross_module_calls_fail_closed() {
                 ),
             ],
         ),
-        // An interop helper other than a property copy may return anything.
+        // TypeScript's guard may read a helper that code run before it stored.
         (
-            "TypeScript default import",
+            "TypeScript default import after other code",
             false,
             vec![
                 (
@@ -3485,6 +3493,966 @@ fn cross_module_calls_without_located_executions_stay_complete() {
         ),
     ];
     let failures = module_failures(cases, &ModuleOutcome::Clean);
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// TypeScript's interop helpers, as releases from 4.7, before 4.7, and
+/// before 3.9 emit them.
+const TS_CREATE_BINDING: &str = r#"var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+"#;
+const TS_CREATE_BINDING_4: &str = r#"var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    Object.defineProperty(o, k2, { enumerable: true, get: function() { return m[k]; } });
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+"#;
+const TS_SET_MODULE_DEFAULT: &str = r#"var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+"#;
+const TS_IMPORT_STAR: &str = r#"var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
+"#;
+const TS_IMPORT_STAR_4: &str = r#"var __importStar = (this && this.__importStar) || function (mod) {
+    if (mod && mod.__esModule) return mod;
+    var result = {};
+    if (mod != null) for (var k in mod) if (k !== "default" && Object.prototype.hasOwnProperty.call(mod, k)) __createBinding(result, mod, k);
+    __setModuleDefault(result, mod);
+    return result;
+};
+"#;
+const TS_IMPORT_STAR_3: &str = r#"var __importStar = (this && this.__importStar) || function (mod) {
+    if (mod && mod.__esModule) return mod;
+    var result = {};
+    if (mod != null) for (var k in mod) if (Object.hasOwnProperty.call(mod, k)) result[k] = mod[k];
+    result["default"] = mod;
+    return result;
+};
+"#;
+const TS_IMPORT_DEFAULT: &str = r#"var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
+"#;
+
+/// A file as TypeScript compiles it to CommonJS: its interop `helpers`
+/// first, then `body`.
+fn typescript_caller(helpers: &str, body: &str) -> String {
+    format!(
+        "\"use strict\";\n{helpers}Object.defineProperty(exports, \"__esModule\", {{ value: true }});\n{CALLER_CJS}{body}\n"
+    )
+}
+
+#[test]
+fn interop_helpers_copying_a_module_pass_located_arguments() {
+    let evil = "path.join(__dirname, 'evil.sh')";
+    let caller = |call: &str| format!("{CALLER_CJS}{call}\n");
+    let lib = |exports: &str| format!("{MODULE_CJS}{exports}\n");
+    let run_lib = lib(&format!("exports.run = {MODULE_RUN};"));
+    let default_lib = lib(&format!("module.exports = {MODULE_RUN};"));
+    let star = format!("{TS_CREATE_BINDING}{TS_SET_MODULE_DEFAULT}{TS_IMPORT_STAR}");
+    let star_4 = format!("{TS_CREATE_BINDING_4}{TS_SET_MODULE_DEFAULT}{TS_IMPORT_STAR_4}");
+    let namespace = format!("const lib = __importStar(require(\"./lib.js\"));\nlib.run({evil});");
+    let default_import = format!(
+        "const lib_1 = __importDefault(require(\"./lib.js\"));\n(0, lib_1.default)({evil});"
+    );
+    let cases = vec![
+        (
+            "namespace import",
+            false,
+            vec![
+                ("index.js", typescript_caller(&star, &namespace)),
+                ("lib.js", run_lib.clone()),
+            ],
+        ),
+        (
+            "namespace import from TypeScript 4",
+            false,
+            vec![
+                ("index.js", typescript_caller(&star_4, &namespace)),
+                ("lib.js", run_lib.clone()),
+            ],
+        ),
+        (
+            "namespace import from TypeScript 3",
+            false,
+            vec![
+                ("index.js", typescript_caller(TS_IMPORT_STAR_3, &namespace)),
+                ("lib.js", run_lib.clone()),
+            ],
+        ),
+        (
+            "namespace default",
+            false,
+            vec![
+                (
+                    "index.js",
+                    typescript_caller(
+                        &star,
+                        &format!("__importStar(require(\"./lib.js\")).default({evil});"),
+                    ),
+                ),
+                ("lib.js", default_lib.clone()),
+            ],
+        ),
+        (
+            "namespace import of a held module",
+            false,
+            vec![
+                (
+                    "index.js",
+                    typescript_caller(
+                        &star,
+                        &format!(
+                            "const raw = require(\"./lib.js\");\nconst lib = __importStar(raw);\nlib.run({evil});"
+                        ),
+                    ),
+                ),
+                ("lib.js", run_lib.clone()),
+            ],
+        ),
+        (
+            "default import",
+            false,
+            vec![
+                (
+                    "index.js",
+                    typescript_caller(TS_IMPORT_DEFAULT, &default_import),
+                ),
+                ("lib.js", default_lib.clone()),
+            ],
+        ),
+        (
+            "default import after the other helpers",
+            false,
+            vec![
+                (
+                    "index.js",
+                    typescript_caller(&format!("{star}{TS_IMPORT_DEFAULT}"), &default_import),
+                ),
+                ("lib.js", default_lib.clone()),
+            ],
+        ),
+        (
+            "default helper under another name",
+            false,
+            vec![
+                (
+                    "index.js",
+                    caller(&format!(
+                        "function _interopRequireDefault(e) {{ return e && e.__esModule ? e : {{ default: e }}; }}\nconst lib = _interopRequireDefault(require('./lib.js'));\nlib.default({evil});"
+                    )),
+                ),
+                ("lib.js", default_lib.clone()),
+            ],
+        ),
+    ];
+    let failures = module_failures(cases, &ModuleOutcome::Followed);
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+#[test]
+fn interop_helpers_copying_a_module_keep_unlocated_calls_complete() {
+    let config = "path.join(__dirname, 'config.json')";
+    let lib = |exports: &str| format!("{MODULE_CJS}{exports}\n");
+    let star = format!("{TS_CREATE_BINDING}{TS_SET_MODULE_DEFAULT}{TS_IMPORT_STAR}");
+    // Moving a file a caller may locate could put it anywhere in the action.
+    let rename = "(from, to) => fs.renameSync(from, to)";
+    let cases = vec![
+        (
+            "namespace import",
+            false,
+            vec![
+                (
+                    "index.js",
+                    typescript_caller(
+                        &star,
+                        &format!(
+                            "const lib = __importStar(require(\"./lib.js\"));\nlib.move(process.env.RUNNER_TEMP + '/a.sarif', process.env.RUNNER_TEMP + '/b.sarif');\nconsole.log({config});"
+                        ),
+                    ),
+                ),
+                ("lib.js", lib(&format!("exports.move = {rename};"))),
+            ],
+        ),
+        (
+            "default import",
+            false,
+            vec![
+                (
+                    "index.js",
+                    typescript_caller(
+                        TS_IMPORT_DEFAULT,
+                        &format!(
+                            "const lib_1 = __importDefault(require(\"./lib.js\"));\n(0, lib_1.default)(process.env.RUNNER_TEMP + '/a.sarif', process.env.RUNNER_TEMP + '/b.sarif');\nconsole.log({config});"
+                        ),
+                    ),
+                ),
+                ("lib.js", lib(&format!("module.exports = {rename};"))),
+            ],
+        ),
+    ];
+    let failures = module_failures(cases, &ModuleOutcome::Clean);
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+#[test]
+fn interop_helpers_that_may_not_copy_a_module_fail_closed() {
+    let evil = "path.join(__dirname, 'evil.sh')";
+    let config = "path.join(__dirname, 'config.json')";
+    let caller = |call: &str| format!("{CALLER_CJS}{call}\n");
+    let lib = |exports: &str| format!("{MODULE_CJS}{exports}\n");
+    let run_lib = lib(&format!("exports.run = {MODULE_RUN};"));
+    // A helper that renames `run` to the harmless `start` hides the script.
+    let swap_lib = lib(&format!(
+        "exports.start = () => 0;\nexports.run = {MODULE_RUN};"
+    ));
+    let cases = vec![
+        (
+            "helper calling a module function",
+            false,
+            vec![
+                (
+                    "index.js",
+                    caller(&format!(
+                        "function __importStar(mod) {{ mod.run(mod.script); return mod; }}\n__importStar(require('./lib.js'));\nconsole.log({config});"
+                    )),
+                ),
+                (
+                    "lib.js",
+                    lib(&format!(
+                        "const path = require('path');\nexports.script = {evil};\nexports.run = {MODULE_RUN};"
+                    )),
+                ),
+            ],
+        ),
+        (
+            "reassigned helper",
+            false,
+            vec![
+                (
+                    "index.js",
+                    typescript_caller(
+                        TS_IMPORT_DEFAULT,
+                        &format!(
+                            "__importDefault = function (mod) {{ mod.run({evil}); return {{ default: mod }}; }};\n__importDefault(require('./lib.js'));"
+                        ),
+                    ),
+                ),
+                ("lib.js", run_lib.clone()),
+            ],
+        ),
+        (
+            "shadowed helper",
+            false,
+            vec![
+                (
+                    "index.js",
+                    typescript_caller(
+                        TS_IMPORT_DEFAULT,
+                        &format!(
+                            "function load(__importDefault) {{ const lib_1 = __importDefault(require('./lib.js'));\n(0, lib_1.default)({evil}); }}\nload((mod) => ({{ default: mod.run }}));"
+                        ),
+                    ),
+                ),
+                (
+                    "lib.js",
+                    lib(&format!(
+                        "module.exports = () => 0;\nmodule.exports.run = {MODULE_RUN};"
+                    )),
+                ),
+            ],
+        ),
+        (
+            "helper guarded after other code",
+            false,
+            vec![
+                (
+                    "index.js",
+                    typescript_caller(
+                        &format!(
+                            "exports.__importStar = function (mod) {{ mod.run({evil}); return mod; }};\n{TS_IMPORT_STAR_3}"
+                        ),
+                        "__importStar(require('./lib.js'));",
+                    ),
+                ),
+                ("lib.js", run_lib.clone()),
+            ],
+        ),
+        (
+            "helper guarded after a call",
+            false,
+            vec![
+                (
+                    "index.js",
+                    typescript_caller(
+                        &format!(
+                            "var setup = (function () {{ exports.__importStar = function (mod) {{ mod.run({evil}); return mod; }}; }})();\n{TS_IMPORT_STAR_3}"
+                        ),
+                        "__importStar(require('./lib.js'));",
+                    ),
+                ),
+                ("lib.js", run_lib.clone()),
+            ],
+        ),
+        (
+            "helper given another argument",
+            false,
+            vec![
+                (
+                    "index.js",
+                    caller(&format!(
+                        "function __importStar(mod, name) {{ if (name === undefined) return mod;\nvar result = {{}};\nresult[name] = mod.run;\nreturn result; }}\n__importStar(require('./lib.js'), 'start').start({evil});"
+                    )),
+                ),
+                ("lib.js", swap_lib.clone()),
+            ],
+        ),
+        (
+            "helper storing the module",
+            false,
+            vec![
+                (
+                    "index.js",
+                    caller(&format!(
+                        "var saved;\nfunction __importStar(mod) {{ saved = mod; return mod; }}\n__importStar(require('./lib.js'));\nsaved.run({evil});"
+                    )),
+                ),
+                ("lib.js", run_lib.clone()),
+            ],
+        ),
+        (
+            "helper storing a closure over the module",
+            false,
+            vec![
+                (
+                    "index.js",
+                    caller(&format!(
+                        "var saved;\nfunction __importStar(mod) {{ saved = function () {{ return mod; }}; return mod; }}\n__importStar(require('./lib.js'));\nsaved().run({evil});"
+                    )),
+                ),
+                ("lib.js", run_lib.clone()),
+            ],
+        ),
+        (
+            "helper writing to the module",
+            false,
+            vec![
+                (
+                    "index.js",
+                    caller(&format!(
+                        "function __importStar(mod) {{ mod.start = mod.run; return mod; }}\n__importStar(require('./lib.js')).start({evil});"
+                    )),
+                ),
+                ("lib.js", swap_lib.clone()),
+            ],
+        ),
+        (
+            "helper returning a field",
+            false,
+            vec![
+                (
+                    "index.js",
+                    caller(&format!(
+                        "function __importStar(mod) {{ return mod.inner; }}\n__importStar(require('./lib.js')).run({evil});"
+                    )),
+                ),
+                (
+                    "lib.js",
+                    lib(&format!(
+                        "exports.run = () => 0;\nexports.inner = {{ run: {MODULE_RUN} }};"
+                    )),
+                ),
+            ],
+        ),
+        (
+            "copy under a fixed name",
+            false,
+            vec![
+                (
+                    "index.js",
+                    caller(&format!(
+                        "function __importStar(mod) {{ var result = {{}};\nresult.start = mod.run;\nreturn result; }}\n__importStar(require('./lib.js')).start({evil});"
+                    )),
+                ),
+                ("lib.js", swap_lib.clone()),
+            ],
+        ),
+        (
+            "copy under computed names",
+            false,
+            vec![
+                (
+                    "index.js",
+                    caller(&format!(
+                        "function __importStar(mod) {{ var names = {{ run: 'start', start: 'run' }};\nvar result = {{}};\nfor (var k in mod) result[names[k]] = mod[k];\nreturn result; }}\n__importStar(require('./lib.js')).start({evil});"
+                    )),
+                ),
+                ("lib.js", swap_lib.clone()),
+            ],
+        ),
+        (
+            "copy under the previous key",
+            false,
+            vec![
+                (
+                    "index.js",
+                    caller(&format!(
+                        "function __importStar(mod) {{ var result = {{}}, previous;\nfor (var k in mod) {{ if (previous !== undefined) result[previous] = mod[k];\nprevious = k; }}\nreturn result; }}\n__importStar(require('./lib.js')).start({evil});"
+                    )),
+                ),
+                ("lib.js", swap_lib.clone()),
+            ],
+        ),
+        (
+            "getter reading the loop's key",
+            false,
+            vec![
+                (
+                    "index.js",
+                    caller(&format!(
+                        "function __importStar(mod) {{ var result = {{}};\nfor (var k in mod) Object.defineProperty(result, k, {{ enumerable: true, get: function () {{ return mod[k]; }} }});\nreturn result; }}\n__importStar(require('./lib.js')).start({evil});"
+                    )),
+                ),
+                ("lib.js", swap_lib.clone()),
+            ],
+        ),
+        (
+            "getter from an earlier call",
+            false,
+            vec![
+                (
+                    "index.js",
+                    caller(&format!(
+                        "function bind(o, m, k, d) {{ var desc = d || {{ enumerable: true, get: function () {{ return m[k]; }} }};\nObject.defineProperty(o, k, desc);\nreturn desc; }}\nfunction __importStar(mod) {{ var result = {{}};\nvar names = Object.getOwnPropertyNames(mod);\nvar first = bind(result, mod, names[1]);\nbind(result, mod, names[0], first);\nreturn result; }}\n__importStar(require('./lib.js')).start({evil});"
+                    )),
+                ),
+                ("lib.js", swap_lib.clone()),
+            ],
+        ),
+    ];
+    let failures = module_failures(cases, &ModuleOutcome::Incomplete);
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// Error classes as TypeScript compiles them, each holding only what its
+/// constructor is given.
+const TS_ERRORS: &str = "exports.ConfigurationError = exports.HTTPError = exports.InputError = void 0;\nclass HTTPError extends Error {\n    constructor(message, status) {\n        super(message);\n        this.status = status;\n    }\n}\nexports.HTTPError = HTTPError;\nclass ConfigurationError extends Error {\n    constructor(message) {\n        super(message);\n    }\n}\nexports.ConfigurationError = ConfigurationError;\nclass InputError extends ConfigurationError {\n    name = 'InputError';\n}\nexports.InputError = InputError;\n";
+
+#[test]
+fn constructing_field_only_classes_keeps_scans_complete() {
+    let config = "path.join(__dirname, 'config.json')";
+    let caller = |call: &str| format!("{CALLER_CJS}{call}\n");
+    let star = format!("{TS_CREATE_BINDING}{TS_SET_MODULE_DEFAULT}{TS_IMPORT_STAR}");
+    // Moving a file a caller may locate could put it anywhere in the action.
+    let errors =
+        format!("{MODULE_CJS}{TS_ERRORS}exports.move = (from, to) => fs.renameSync(from, to);\n");
+    let cases = vec![
+        (
+            "thrown error",
+            false,
+            vec![
+                (
+                    "index.js",
+                    caller(&format!(
+                        "const lib = require('./lib.js');\nfunction check(value) {{ if (!value) {{ throw new lib.ConfigurationError('missing input'); }} }}\ncheck(process.env.INPUT);\nconsole.log({config});"
+                    )),
+                ),
+                ("lib.js", errors.clone()),
+            ],
+        ),
+        (
+            "error given a location",
+            false,
+            vec![
+                (
+                    "index.js",
+                    caller(&format!(
+                        "const lib = require('./lib.js');\nthrow new lib.ConfigurationError({config});"
+                    )),
+                ),
+                ("lib.js", errors.clone()),
+            ],
+        ),
+        (
+            "error with a field",
+            false,
+            vec![
+                (
+                    "index.js",
+                    caller(&format!(
+                        "const lib = require('./lib.js');\nconst error = new lib.HTTPError('not found', 404);\nconsole.log(error.status, {config});"
+                    )),
+                ),
+                ("lib.js", errors.clone()),
+            ],
+        ),
+        (
+            "destructured error class",
+            false,
+            vec![
+                (
+                    "index.js",
+                    caller(&format!(
+                        "const {{ ConfigurationError }} = require('./lib.js');\nthrow new ConfigurationError({config});"
+                    )),
+                ),
+                ("lib.js", errors.clone()),
+            ],
+        ),
+        (
+            "error extending another",
+            false,
+            vec![
+                (
+                    "index.js",
+                    caller(&format!(
+                        "throw new (require('./lib.js').InputError)({config});"
+                    )),
+                ),
+                ("lib.js", errors.clone()),
+            ],
+        ),
+        (
+            "error through a namespace import",
+            false,
+            vec![
+                (
+                    "index.js",
+                    typescript_caller(
+                        &star,
+                        &format!(
+                            "const util = __importStar(require(\"./lib.js\"));\nthrow new util.ConfigurationError({config});"
+                        ),
+                    ),
+                ),
+                ("lib.js", errors.clone()),
+            ],
+        ),
+    ];
+    let failures = module_failures(cases, &ModuleOutcome::Clean);
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+#[test]
+fn constructing_classes_that_may_hold_module_functions_fails_closed() {
+    let evil = "path.join(__dirname, 'evil.sh')";
+    let caller = |call: &str| format!("{CALLER_CJS}{call}\n");
+    let lib = |exports: &str| format!("{MODULE_CJS}{exports}\n");
+    let run_on_instance =
+        format!("const lib = require('./lib.js');\nnew lib.Runner().run({evil});");
+    let cases = vec![
+        (
+            "class with a method",
+            false,
+            vec![
+                ("index.js", caller(&run_on_instance)),
+                (
+                    "lib.js",
+                    lib(
+                        "class Runner { run(script) { return cp.spawnSync(which('bash'), [script]); } }\nexports.Runner = Runner;",
+                    ),
+                ),
+            ],
+        ),
+        (
+            "method added to the prototype",
+            false,
+            vec![
+                ("index.js", caller(&run_on_instance)),
+                (
+                    "lib.js",
+                    lib(&format!(
+                        "class Runner {{}}\nRunner.prototype.run = {MODULE_RUN};\nexports.Runner = Runner;"
+                    )),
+                ),
+            ],
+        ),
+        (
+            "methods copied onto the prototype",
+            false,
+            vec![
+                ("index.js", caller(&run_on_instance)),
+                (
+                    "lib.js",
+                    lib(&format!(
+                        "class Runner {{}}\nObject.assign(Runner.prototype, {{ run: {MODULE_RUN} }});\nexports.Runner = Runner;"
+                    )),
+                ),
+            ],
+        ),
+        (
+            "class passed to a patching function",
+            false,
+            vec![
+                ("index.js", caller(&run_on_instance)),
+                (
+                    "lib.js",
+                    lib(&format!(
+                        "function patch(target) {{ target.prototype.run = {MODULE_RUN}; }}\nclass Runner {{}}\npatch(Runner);\nexports.Runner = Runner;"
+                    )),
+                ),
+            ],
+        ),
+        (
+            "class patched through the exports",
+            false,
+            vec![
+                ("index.js", caller(&run_on_instance)),
+                (
+                    "lib.js",
+                    lib(&format!(
+                        "class Runner {{}}\nexports.Runner = Runner;\nexports.Runner.prototype.run = {MODULE_RUN};"
+                    )),
+                ),
+            ],
+        ),
+        (
+            "class patched through top-level this",
+            false,
+            vec![
+                ("index.js", caller(&run_on_instance)),
+                (
+                    "lib.js",
+                    lib(&format!(
+                        "class Runner {{}}\nexports.Runner = Runner;\nthis.Runner.prototype.run = {MODULE_RUN};"
+                    )),
+                ),
+            ],
+        ),
+        (
+            "class exported and kept",
+            false,
+            vec![
+                ("index.js", caller(&run_on_instance)),
+                (
+                    "lib.js",
+                    lib(&format!(
+                        "class Runner {{}}\nconst kept = exports.Runner = Runner;\nkept.prototype.run = {MODULE_RUN};"
+                    )),
+                ),
+            ],
+        ),
+        (
+            "field holding a module function",
+            false,
+            vec![
+                ("index.js", caller(&run_on_instance)),
+                (
+                    "lib.js",
+                    lib(&format!(
+                        "const start = {MODULE_RUN};\nclass Runner {{ run = start; }}\nexports.Runner = Runner;"
+                    )),
+                ),
+            ],
+        ),
+        (
+            "constructor storing a module function",
+            false,
+            vec![
+                ("index.js", caller(&run_on_instance)),
+                (
+                    "lib.js",
+                    lib(&format!(
+                        "const start = {MODULE_RUN};\nclass Runner {{ constructor() {{ this.run = start; }} }}\nexports.Runner = Runner;"
+                    )),
+                ),
+            ],
+        ),
+        (
+            "constructor returning a module function",
+            false,
+            vec![
+                (
+                    "index.js",
+                    caller(&format!(
+                        "const lib = require('./lib.js');\nconst run = new lib.Runner();\nrun({evil});"
+                    )),
+                ),
+                (
+                    "lib.js",
+                    lib(&format!(
+                        "const start = {MODULE_RUN};\nclass Runner {{ constructor() {{ return start; }} }}\nexports.Runner = Runner;"
+                    )),
+                ),
+            ],
+        ),
+        (
+            "static method",
+            false,
+            vec![
+                (
+                    "index.js",
+                    caller(&format!(
+                        "const lib = require('./lib.js');\nnew lib.Runner().constructor.run({evil});"
+                    )),
+                ),
+                (
+                    "lib.js",
+                    lib(
+                        "class Runner { static run(script) { return cp.spawnSync(which('bash'), [script]); } }\nexports.Runner = Runner;",
+                    ),
+                ),
+            ],
+        ),
+        (
+            "static added to a class replacing the exports",
+            false,
+            vec![
+                (
+                    "index.js",
+                    caller(&format!(
+                        "new (require('./lib.js'))().constructor.run({evil});"
+                    )),
+                ),
+                (
+                    "lib.js",
+                    lib(&format!(
+                        "module.exports = class extends Error {{}};\nmodule.exports.run = {MODULE_RUN};"
+                    )),
+                ),
+            ],
+        ),
+        (
+            "superclass with a method",
+            false,
+            vec![
+                ("index.js", caller(&run_on_instance)),
+                (
+                    "lib.js",
+                    lib(
+                        "class Base { run(script) { return cp.spawnSync(which('bash'), [script]); } }\nclass Runner extends Base {}\nexports.Runner = Runner;",
+                    ),
+                ),
+            ],
+        ),
+        (
+            "shadowed Error",
+            false,
+            vec![
+                ("index.js", caller(&run_on_instance)),
+                (
+                    "lib.js",
+                    lib(
+                        "const Error = require('./base.js');\nclass Runner extends Error {}\nexports.Runner = Runner;",
+                    ),
+                ),
+                (
+                    "base.js",
+                    lib(
+                        "module.exports = class { run(script) { return cp.spawnSync(which('bash'), [script]); } };",
+                    ),
+                ),
+            ],
+        ),
+        (
+            "function used as a constructor",
+            false,
+            vec![
+                ("index.js", caller(&run_on_instance)),
+                (
+                    "lib.js",
+                    lib(&format!(
+                        "function Runner() {{}}\nRunner.prototype.run = {MODULE_RUN};\nexports.Runner = Runner;"
+                    )),
+                ),
+            ],
+        ),
+        (
+            "function both called and constructed",
+            false,
+            vec![
+                (
+                    "index.js",
+                    caller(&format!(
+                        "const lib = require('./lib.js');\nlib.Runner(path.join(__dirname, 'config.json'));\nnew lib.Runner().run({evil});"
+                    )),
+                ),
+                (
+                    "lib.js",
+                    lib(&format!(
+                        "function Runner() {{}}\nRunner.prototype.run = {MODULE_RUN};\nexports.Runner = Runner;"
+                    )),
+                ),
+            ],
+        ),
+        (
+            "class re-exported from another file",
+            false,
+            vec![
+                ("index.js", caller(&run_on_instance)),
+                (
+                    "lib.js",
+                    "exports.Runner = require('./runner.js').Runner;\n".to_string(),
+                ),
+                (
+                    "runner.js",
+                    lib(
+                        "class Runner { constructor() {} run(script) { return cp.spawnSync(which('bash'), [script]); } }\nexports.Runner = Runner;",
+                    ),
+                ),
+            ],
+        ),
+        (
+            "class made at runtime",
+            false,
+            vec![
+                ("index.js", caller(&run_on_instance)),
+                (
+                    "lib.js",
+                    lib(
+                        "function make() { return class { run(script) { return cp.spawnSync(which('bash'), [script]); } }; }\nexports.Runner = make();",
+                    ),
+                ),
+            ],
+        ),
+        (
+            "superclass a global holds",
+            false,
+            vec![
+                ("index.js", caller(&run_on_instance)),
+                (
+                    "lib.js",
+                    lib(
+                        "global.Base = class { run(script) { return cp.spawnSync(which('bash'), [script]); } };\nclass Runner extends Base {}\nexports.Runner = Runner;",
+                    ),
+                ),
+            ],
+        ),
+        (
+            "static block",
+            false,
+            vec![
+                (
+                    "index.js",
+                    caller(&format!(
+                        "const lib = require('./lib.js');\nnew lib.Runner().constructor.run({evil});"
+                    )),
+                ),
+                (
+                    "lib.js",
+                    lib(&format!(
+                        "class Runner {{ static {{ this.run = {MODULE_RUN}; }} }}\nexports.Runner = Runner;"
+                    )),
+                ),
+            ],
+        ),
+        (
+            "constructor handing out the instance",
+            false,
+            vec![
+                ("index.js", caller(&run_on_instance)),
+                (
+                    "lib.js",
+                    lib(&format!(
+                        "function attach(target) {{ target.run = {MODULE_RUN}; }}\nclass Runner {{ constructor() {{ void attach(this); }} }}\nexports.Runner = Runner;"
+                    )),
+                ),
+            ],
+        ),
+        (
+            "constructor passing a module function to super",
+            false,
+            vec![
+                ("index.js", caller(&run_on_instance)),
+                (
+                    "lib.js",
+                    lib(&format!(
+                        "const start = {MODULE_RUN};\nclass Base {{ constructor(run) {{ this.run = run; }} }}\nclass Runner extends Base {{ constructor() {{ super(start); }} }}\nexports.Runner = Runner;"
+                    )),
+                ),
+            ],
+        ),
+        (
+            "constructor writing to the prototype",
+            false,
+            vec![
+                (
+                    "index.js",
+                    caller(&format!(
+                        "const lib = require('./lib.js');\nconst runner = new lib.Runner();\nlib.setup();\nrunner.run({evil});"
+                    )),
+                ),
+                (
+                    "lib.js",
+                    lib(&format!(
+                        "const start = {MODULE_RUN};\nclass Runner {{ constructor(run) {{ this.constructor.prototype.run = run; }} }}\nexports.Runner = Runner;\nexports.setup = () => new Runner(start);"
+                    )),
+                ),
+            ],
+        ),
+        (
+            "reassigned class",
+            false,
+            vec![
+                ("index.js", caller(&run_on_instance)),
+                (
+                    "lib.js",
+                    lib(
+                        "class Runner {}\nRunner = class { run(script) { return cp.spawnSync(which('bash'), [script]); } };\nexports.Runner = Runner;",
+                    ),
+                ),
+            ],
+        ),
+        (
+            "class replacing the exports patched through an alias of module",
+            false,
+            vec![
+                (
+                    "index.js",
+                    caller(&format!("new (require('./lib.js'))().run({evil});")),
+                ),
+                (
+                    "lib.js",
+                    lib(&format!(
+                        "module.exports = class extends Error {{}};\nconst self = module;\nself.exports.prototype.run = {MODULE_RUN};"
+                    )),
+                ),
+            ],
+        ),
+        (
+            "class patched through an alias of the exports",
+            false,
+            vec![
+                ("index.js", caller(&run_on_instance)),
+                (
+                    "lib.js",
+                    lib(&format!(
+                        "class Runner {{}}\nexports.Runner = Runner;\nconst self = exports;\nself.Runner.prototype.run = {MODULE_RUN};"
+                    )),
+                ),
+            ],
+        ),
+    ];
+    let failures = module_failures(cases, &ModuleOutcome::Incomplete);
     assert!(failures.is_empty(), "{failures:#?}");
 }
 
