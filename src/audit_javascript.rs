@@ -13,11 +13,13 @@ use std::collections::{HashMap, HashSet};
 use oxc_allocator::Allocator;
 use oxc_ast::AstKind;
 use oxc_ast::ast::{
-    Argument, ArrayExpressionElement, AssignmentOperator, AssignmentTarget, BinaryOperator,
-    BindingPattern, CallExpression, ClassElement, Declaration, ExportDefaultDeclarationKind,
-    Expression, FormalParameters, IdentifierReference, ImportDeclarationSpecifier,
-    ImportExpression, MethodDefinitionKind, ModuleExportName, NumericLiteral, ObjectExpression,
-    ObjectPropertyKind, PropertyKey, PropertyKind, Statement, UnaryOperator,
+    Argument, ArrayExpressionElement, AssignmentExpression, AssignmentOperator, AssignmentTarget,
+    BinaryOperator, BindingPattern, CallExpression, Class, ClassElement, Declaration,
+    ExportDefaultDeclarationKind, Expression, ForStatementInit, ForStatementLeft, FormalParameters,
+    Function, IdentifierReference, ImportDeclarationSpecifier, ImportExpression, LogicalOperator,
+    MethodDefinitionKind, ModuleExportName, NumericLiteral, ObjectExpression, ObjectPropertyKind,
+    PropertyKey, PropertyKind, SimpleAssignmentTarget, Statement, UnaryOperator,
+    VariableDeclaration, VariableDeclarationKind,
 };
 use oxc_parser::Parser;
 use oxc_semantic::{AstNodes, NodeId, Scoping, SemanticBuilder, SymbolFlags, SymbolId};
@@ -1473,6 +1475,9 @@ impl<'a> Exports<'a> {
 /// passed on to.
 type ResolvedExport<'a> = (Vec<NodeId>, Vec<(&'a str, ModuleExport)>);
 
+/// What an export may hold, and the modules it is passed on to.
+type ExportValues<'a> = (Vec<ExportValue<'a>>, Vec<(&'a str, ModuleExport)>);
+
 /// A specifier that loads one of the action's own files.
 fn relative_specifier(specifier: &str) -> Option<&str> {
     (specifier.starts_with("./") || specifier.starts_with("../")).then_some(specifier)
@@ -1483,6 +1488,1139 @@ fn imported<'a>(import: &'a ImportExpression<'a>) -> Option<&'a str> {
     match &import.source {
         Expression::StringLiteral(literal) => relative_specifier(literal.value.as_str()),
         _ => None,
+    }
+}
+
+/// Built-in error constructors a `field_only` class may extend.
+const BUILTIN_ERRORS: &[&str] = &[
+    "Error",
+    "AggregateError",
+    "EvalError",
+    "RangeError",
+    "ReferenceError",
+    "SyntaxError",
+    "TypeError",
+    "URIError",
+];
+
+/// Expressions and statements `ModuleCopy` evaluates before giving up on a
+/// helper.
+const MODULE_COPY_STEPS: usize = 4096;
+
+/// What a value inside an interop helper may be while the helper is given
+/// a module: see `ModuleCopy`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Copied<'a> {
+    Module,
+    /// A primitive, told apart by the read that produced it, so that a
+    /// field read and one written under the same `Key` share a name.
+    Key(usize),
+    /// What the module holds under a `Key`, or under any other name.
+    Field(Option<usize>),
+    /// The module's own property descriptor for a `Key`.
+    Descriptor(usize),
+    /// The module's own property names.
+    Names,
+    /// An object or array the helper creates, by its literal.
+    Object(NodeId),
+    /// A function, and the call that created it as a closure.
+    Function(NodeId, usize),
+    Reflection(Reflection),
+    Literal(&'a str),
+    Undefined,
+    /// Any other primitive, or a method of one.
+    Primitive,
+}
+
+/// `Object` and the reflection functions interop helpers reach through it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reflection {
+    Object,
+    Prototype,
+    HasOwnProperty,
+    /// `hasOwnProperty.call`.
+    HasOwn,
+    OwnNames,
+    OwnDescriptor,
+    DefineProperty,
+    /// Any other member, which is only ever tested.
+    Other,
+}
+
+impl Reflection {
+    fn member(self, name: Option<&str>) -> Self {
+        match (self, name) {
+            (Self::Object, Some("prototype")) => Self::Prototype,
+            (Self::Object, Some("getOwnPropertyNames")) => Self::OwnNames,
+            (Self::Object, Some("getOwnPropertyDescriptor")) => Self::OwnDescriptor,
+            (Self::Object, Some("defineProperty")) => Self::DefineProperty,
+            // `Object` inherits `Object.prototype.hasOwnProperty`.
+            (Self::Object | Self::Prototype, Some("hasOwnProperty")) => Self::HasOwnProperty,
+            (Self::HasOwnProperty, Some("call")) => Self::HasOwn,
+            _ => Self::Other,
+        }
+    }
+}
+
+/// A primitive, which converting to a key or number runs no code for.
+fn primitive(value: &Copied) -> bool {
+    matches!(
+        value,
+        Copied::Key(_) | Copied::Literal(_) | Copied::Undefined | Copied::Primitive
+    )
+}
+
+fn maybe_undefined(value: &Copied) -> bool {
+    matches!(
+        value,
+        Copied::Module
+            | Copied::Key(_)
+            | Copied::Field(_)
+            | Copied::Undefined
+            | Copied::Reflection(Reflection::Other)
+    )
+}
+
+fn union<'a>(values: &mut Vec<Copied<'a>>, more: impl IntoIterator<Item = Copied<'a>>) {
+    for value in more {
+        if !values.contains(&value) {
+            values.push(value);
+        }
+    }
+}
+
+type Locals<'a> = HashMap<SymbolId, Vec<Copied<'a>>>;
+
+fn same_locals(left: &Locals, right: &Locals) -> bool {
+    left.len() == right.len()
+        && left.iter().all(|(symbol, values)| {
+            right.get(symbol).is_some_and(|other| {
+                values.len() == other.len() && values.iter().all(|value| other.contains(value))
+            })
+        })
+}
+
+/// Runs an interop helper on a module abstractly, to find whether it hands
+/// back the module or an object holding only the module's own fields, each
+/// under its own name, and the module as `default`, as TypeScript's
+/// `__importStar` and `__importDefault` do, without passing the module or a
+/// field of it anywhere else. Calls to the file's own functions run their
+/// bodies with the values they are given, and `Object`'s reflection
+/// functions are taken as JavaScript defines them. Anything else fails the
+/// helper: calling a field, writing to the module, a key that may differ
+/// from the one read, or code this does not model.
+struct ModuleCopy<'s, 'a> {
+    nodes: &'s AstNodes<'a>,
+    scoping: &'s Scoping,
+    /// The function running, the call running it, and what its parameters
+    /// and variables hold there.
+    frame: Option<NodeId>,
+    invocation: usize,
+    locals: Locals<'a>,
+    /// What variables outside the running function may hold, from all their
+    /// assignments; `None` while evaluating one and for one that cannot be.
+    variables: HashMap<SymbolId, Option<Vec<Copied<'a>>>>,
+    /// Writes to the objects the helper creates: the object, the keys and
+    /// the values.
+    writes: Vec<(NodeId, Vec<Copied<'a>>, Vec<Copied<'a>>)>,
+    running: Vec<(NodeId, Vec<Vec<Copied<'a>>>)>,
+    invocations: usize,
+    keys: usize,
+    steps: usize,
+}
+
+impl<'s, 'a> ModuleCopy<'s, 'a> {
+    /// Whether a call to what `helper` names with a module hands back the
+    /// module or a copy of it.
+    fn copies(nodes: &'s AstNodes<'a>, scoping: &'s Scoping, helper: SymbolId) -> bool {
+        let mut copy = Self {
+            nodes,
+            scoping,
+            frame: None,
+            invocation: 0,
+            locals: HashMap::new(),
+            variables: HashMap::new(),
+            writes: Vec::new(),
+            running: Vec::new(),
+            invocations: 0,
+            keys: 0,
+            steps: MODULE_COPY_STEPS,
+        };
+        copy.copied(helper).is_some()
+    }
+
+    fn copied(&mut self, helper: SymbolId) -> Option<()> {
+        let mut returned = Vec::new();
+        for function in self.variable(helper)? {
+            let Copied::Function(function, _) = function else {
+                return None;
+            };
+            union(&mut returned, self.call(function, &[vec![Copied::Module]])?);
+        }
+        let copy = |object: NodeId| {
+            self.writes
+                .iter()
+                .filter(|(target, _, _)| *target == object)
+                .all(|(_, keys, values)| match keys.as_slice() {
+                    [Copied::Key(key)] => values
+                        .iter()
+                        .all(|value| *value == Copied::Field(Some(*key))),
+                    [Copied::Literal("default")] => {
+                        values.iter().all(|value| *value == Copied::Module)
+                    }
+                    _ => false,
+                })
+        };
+        (!returned.is_empty()
+            && returned.iter().all(|value| match value {
+                Copied::Module => true,
+                Copied::Object(object) => copy(*object),
+                _ => false,
+            }))
+        .then_some(())
+    }
+
+    fn resolved(&self, reference: &IdentifierReference) -> Option<SymbolId> {
+        reference
+            .reference_id
+            .get()
+            .and_then(|reference| self.scoping.get_reference(reference).symbol_id())
+    }
+
+    fn key(&mut self) -> Copied<'a> {
+        self.keys += 1;
+        Copied::Key(self.keys)
+    }
+
+    fn step(&mut self) -> Option<()> {
+        self.steps = self.steps.checked_sub(1)?;
+        Some(())
+    }
+
+    /// Whether a symbol is a parameter or variable of the running function.
+    fn local(&self, symbol: SymbolId) -> bool {
+        self.frame.is_some_and(|frame| {
+            self.nodes
+                .ancestor_ids(self.scoping.symbol_declaration(symbol))
+                .find(|ancestor| {
+                    matches!(
+                        self.nodes.kind(*ancestor),
+                        AstKind::Function(_) | AstKind::ArrowFunctionExpression(_)
+                    )
+                })
+                == Some(frame)
+        })
+    }
+
+    /// Whether a function reads no parameter or variable of the functions
+    /// around it, so storing it carries none of their values away.
+    fn closes_over_nothing(&self, function: NodeId) -> bool {
+        let span = self.nodes.kind(function).span();
+        self.nodes
+            .iter()
+            .skip(function.index())
+            .take_while(|node| contains(span, node.kind().span()))
+            .all(|node| match node.kind() {
+                AstKind::IdentifierReference(reference) => {
+                    self.resolved(reference).is_none_or(|symbol| {
+                        let declaration = self.scoping.symbol_declaration(symbol);
+                        contains(span, self.nodes.kind(declaration).span())
+                            || !self.nodes.ancestor_ids(declaration).any(|ancestor| {
+                                matches!(
+                                    self.nodes.kind(ancestor),
+                                    AstKind::Function(_) | AstKind::ArrowFunctionExpression(_)
+                                )
+                            })
+                    })
+                }
+                _ => true,
+            })
+    }
+
+    /// What a function returns when called with `arguments`.
+    fn call(&mut self, function: NodeId, arguments: &[Vec<Copied<'a>>]) -> Option<Vec<Copied<'a>>> {
+        // A call made again with what it was given returns nothing more.
+        if self
+            .running
+            .iter()
+            .any(|(running, given)| *running == function && given.as_slice() == arguments)
+        {
+            return Some(Vec::new());
+        }
+        if self.running.len() >= MAX_LOCATION_DEPTH {
+            return None;
+        }
+        let (params, statements, expression) = match self.nodes.kind(function) {
+            AstKind::Function(definition) if !definition.r#async && !definition.generator => (
+                &definition.params,
+                definition.body.as_ref()?.statements.as_slice(),
+                None,
+            ),
+            AstKind::ArrowFunctionExpression(arrow) if !arrow.r#async => {
+                match arrow.body.as_expression() {
+                    Some(expression) => (&arrow.params, &[][..], Some(expression)),
+                    None => (
+                        &arrow.params,
+                        arrow.body.as_function_body()?.statements.as_slice(),
+                        None,
+                    ),
+                }
+            }
+            _ => return None,
+        };
+        if params.rest.is_some() {
+            return None;
+        }
+        let mut locals = HashMap::new();
+        for (index, parameter) in params.items.iter().enumerate() {
+            let BindingPattern::BindingIdentifier(binding) = &parameter.pattern else {
+                return None;
+            };
+            if parameter.initializer.is_some() {
+                return None;
+            }
+            locals.insert(
+                binding.symbol_id.get()?,
+                arguments
+                    .get(index)
+                    .cloned()
+                    .unwrap_or_else(|| vec![Copied::Undefined]),
+            );
+        }
+        self.invocations += 1;
+        let invocation = std::mem::replace(&mut self.invocation, self.invocations);
+        let frame = self.frame.replace(function);
+        let caller = std::mem::replace(&mut self.locals, locals);
+        self.running.push((function, arguments.to_vec()));
+        let mut returned = Vec::new();
+        let completed = match expression {
+            Some(expression) => self
+                .expression(expression)
+                .map(|values| union(&mut returned, values)),
+            None => self.statements(statements, &mut returned).map(|continues| {
+                if continues {
+                    union(&mut returned, [Copied::Undefined]);
+                }
+            }),
+        };
+        self.running.pop();
+        self.locals = caller;
+        self.frame = frame;
+        self.invocation = invocation;
+        completed.map(|()| returned)
+    }
+
+    /// Every value a variable of another function, or of no function, may
+    /// hold: what each of its declarations and assignments gives it.
+    fn variable(&mut self, symbol: SymbolId) -> Option<Vec<Copied<'a>>> {
+        if let Some(values) = self.variables.get(&symbol) {
+            return values.clone();
+        }
+        self.variables.insert(symbol, None);
+        let frame = self.frame.take();
+        let invocation = std::mem::take(&mut self.invocation);
+        let locals = std::mem::take(&mut self.locals);
+        let values = self.variable_values(symbol);
+        self.frame = frame;
+        self.invocation = invocation;
+        self.locals = locals;
+        self.variables.insert(symbol, values.clone());
+        values
+    }
+
+    fn variable_values(&mut self, symbol: SymbolId) -> Option<Vec<Copied<'a>>> {
+        let (nodes, scoping) = (self.nodes, self.scoping);
+        let mut values = Vec::new();
+        for declaration in scoping.symbol_declarations(symbol) {
+            match nodes.kind(declaration) {
+                AstKind::Function(function) => {
+                    union(&mut values, [Copied::Function(function.node_id.get(), 0)]);
+                }
+                // A loop's variable holds what the loop gives it.
+                AstKind::VariableDeclarator(declarator)
+                    if matches!(declarator.id, BindingPattern::BindingIdentifier(_))
+                        && !matches!(
+                            nodes.parent_kind(nodes.parent_id(declaration)),
+                            AstKind::ForInStatement(_) | AstKind::ForOfStatement(_)
+                        ) =>
+                {
+                    let held = match &declarator.init {
+                        Some(init) => self.expression(self.unguarded(declaration, init))?,
+                        None => vec![Copied::Undefined],
+                    };
+                    union(&mut values, held);
+                }
+                _ => return None,
+            }
+        }
+        for reference in scoping.get_resolved_references(symbol) {
+            if !reference.is_write() {
+                continue;
+            }
+            let node = reference.node_id();
+            let AstKind::AssignmentExpression(assignment) = nodes.parent_kind(node) else {
+                return None;
+            };
+            if assignment.operator != AssignmentOperator::Assign
+                || assignment.left.span() != nodes.kind(node).span()
+            {
+                return None;
+            }
+            let held = self.expression(&assignment.right)?;
+            union(&mut values, held);
+        }
+        Some(values)
+    }
+
+    /// The helper a declaration guards as TypeScript emits it, with
+    /// `(this && this.name) || helper`, when `this` is still the fresh
+    /// `exports` of a CommonJS module or an ES module's `undefined`: the
+    /// declaration is at the top level, after only declarations that run no
+    /// code.
+    fn unguarded(&self, declarator: NodeId, init: &'a Expression<'a>) -> &'a Expression<'a> {
+        if let Expression::LogicalExpression(logical) = init.get_inner_expression()
+            && logical.operator == LogicalOperator::Or
+            && let Expression::LogicalExpression(guard) = logical.left.get_inner_expression()
+            && guard.operator == LogicalOperator::And
+            && matches!(
+                guard.left.get_inner_expression(),
+                Expression::ThisExpression(_)
+            )
+            && matches!(guard.right.get_inner_expression(), Expression::StaticMemberExpression(member)
+                if matches!(member.object.get_inner_expression(), Expression::ThisExpression(_)))
+            && self.runs_first(declarator)
+        {
+            return &logical.right;
+        }
+        init
+    }
+
+    fn runs_first(&self, declarator: NodeId) -> bool {
+        let parent = self.nodes.parent_id(declarator);
+        let (AstKind::VariableDeclaration(declaration), AstKind::Program(program)) =
+            (self.nodes.kind(parent), self.nodes.parent_kind(parent))
+        else {
+            return false;
+        };
+        let span = self.nodes.kind(declarator).span();
+        self.inert_declaration(declaration, Some(span), 0)
+            && program
+                .body
+                .iter()
+                .take_while(|statement| statement.span() != declaration.span)
+                .all(|statement| self.inert_statement(statement, 0))
+    }
+
+    /// Whether running a statement runs no code: see `inert`.
+    fn inert_statement(&self, statement: &'a Statement<'a>, depth: usize) -> bool {
+        match statement {
+            Statement::FunctionDeclaration(_) | Statement::EmptyStatement(_) => true,
+            Statement::VariableDeclaration(declaration) => {
+                self.inert_declaration(declaration, None, depth)
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether a declaration's declarators, those before `until` when it is
+    /// given, bind names to `inert` values.
+    fn inert_declaration(
+        &self,
+        declaration: &'a VariableDeclaration<'a>,
+        until: Option<Span>,
+        depth: usize,
+    ) -> bool {
+        matches!(
+            declaration.kind,
+            VariableDeclarationKind::Var
+                | VariableDeclarationKind::Let
+                | VariableDeclarationKind::Const
+        ) && declaration
+            .declarations
+            .iter()
+            .take_while(|declarator| Some(declarator.span) != until)
+            .all(|declarator| {
+                matches!(declarator.id, BindingPattern::BindingIdentifier(_))
+                    && declarator
+                        .init
+                        .as_ref()
+                        .is_none_or(|init| self.inert(init, depth))
+            })
+    }
+
+    /// Whether evaluating an expression runs no code but reading variables,
+    /// `Object`, `this` and their fields: a function or literal, a choice
+    /// between such values, or a call made at once to a function that takes
+    /// no arguments and only declares such values and returns one.
+    fn inert(&self, expression: &'a Expression<'a>, depth: usize) -> bool {
+        if depth > MAX_LOCATION_DEPTH {
+            return false;
+        }
+        match expression.get_inner_expression() {
+            Expression::FunctionExpression(_)
+            | Expression::ArrowFunctionExpression(_)
+            | Expression::StringLiteral(_)
+            | Expression::NumericLiteral(_)
+            | Expression::BooleanLiteral(_)
+            | Expression::NullLiteral(_)
+            | Expression::ThisExpression(_) => true,
+            Expression::Identifier(identifier) => {
+                self.resolved(identifier).is_some()
+                    || matches!(identifier.name.as_str(), "Object" | "undefined")
+            }
+            Expression::StaticMemberExpression(member) => {
+                match member.object.get_inner_expression() {
+                    Expression::ThisExpression(_) => true,
+                    Expression::Identifier(object) => {
+                        object.name.as_str() == "Object" && self.resolved(object).is_none()
+                    }
+                    _ => false,
+                }
+            }
+            Expression::LogicalExpression(logical) => {
+                self.inert(&logical.left, depth + 1) && self.inert(&logical.right, depth + 1)
+            }
+            Expression::ConditionalExpression(conditional) => {
+                self.inert(&conditional.test, depth + 1)
+                    && self.inert(&conditional.consequent, depth + 1)
+                    && self.inert(&conditional.alternate, depth + 1)
+            }
+            Expression::CallExpression(call) => {
+                call.arguments.is_empty()
+                    && !call.optional
+                    && matches!(call.callee.get_inner_expression(), Expression::FunctionExpression(function)
+                    if !function.r#async && !function.generator
+                        && function.body.as_ref().is_some_and(|body| body.statements.iter().all(|statement| match statement {
+                            Statement::ReturnStatement(statement) => statement
+                                .argument
+                                .as_ref()
+                                .is_none_or(|argument| self.inert(argument, depth + 1)),
+                            statement => self.inert_statement(statement, depth + 1),
+                        })))
+            }
+            _ => false,
+        }
+    }
+
+    /// Runs statements, adding what they may return to `returned`; `false`
+    /// when they always return.
+    fn statements(
+        &mut self,
+        statements: &'a [Statement<'a>],
+        returned: &mut Vec<Copied<'a>>,
+    ) -> Option<bool> {
+        for statement in statements {
+            if !self.statement(statement, returned)? {
+                return Some(false);
+            }
+        }
+        Some(true)
+    }
+
+    fn statement(
+        &mut self,
+        statement: &'a Statement<'a>,
+        returned: &mut Vec<Copied<'a>>,
+    ) -> Option<bool> {
+        self.step()?;
+        match statement {
+            Statement::BlockStatement(block) => self.statements(&block.body, returned),
+            Statement::EmptyStatement(_) | Statement::FunctionDeclaration(_) => Some(true),
+            Statement::VariableDeclaration(declaration) => {
+                self.declare(declaration)?;
+                Some(true)
+            }
+            Statement::ExpressionStatement(statement) => {
+                self.effect(&statement.expression)?;
+                Some(true)
+            }
+            Statement::ReturnStatement(statement) => {
+                let values = match &statement.argument {
+                    Some(argument) => self.expression(argument)?,
+                    None => vec![Copied::Undefined],
+                };
+                union(returned, values);
+                Some(false)
+            }
+            Statement::IfStatement(statement) => {
+                let decided = self.test(&statement.test)?;
+                let before = self.locals.clone();
+                let mut paths = Vec::new();
+                if decided != Some(false) {
+                    if self.statement(&statement.consequent, returned)? {
+                        paths.push(self.locals.clone());
+                    }
+                    self.locals = before.clone();
+                }
+                if decided != Some(true) {
+                    let continues = match &statement.alternate {
+                        Some(alternate) => self.statement(alternate, returned)?,
+                        None => true,
+                    };
+                    if continues {
+                        paths.push(self.locals.clone());
+                    }
+                }
+                let mut joined: Locals<'a> = HashMap::new();
+                for path in &paths {
+                    for symbol in path.keys() {
+                        joined.entry(*symbol).or_default();
+                    }
+                }
+                for (symbol, values) in &mut joined {
+                    for path in &paths {
+                        // A variable a path has not assigned is undefined.
+                        match path.get(symbol) {
+                            Some(held) => union(values, held.iter().copied()),
+                            None => union(values, [Copied::Undefined]),
+                        }
+                    }
+                }
+                self.locals = joined;
+                Some(!paths.is_empty())
+            }
+            Statement::ForInStatement(statement) => {
+                let objects = self.expression(&statement.right)?;
+                if !objects
+                    .iter()
+                    .all(|object| matches!(object, Copied::Module | Copied::Object(_)))
+                {
+                    return None;
+                }
+                let ForStatementLeft::VariableDeclaration(declaration) = &statement.left else {
+                    return None;
+                };
+                let [declarator] = declaration.declarations.as_slice() else {
+                    return None;
+                };
+                let (BindingPattern::BindingIdentifier(binding), None) =
+                    (&declarator.id, &declarator.init)
+                else {
+                    return None;
+                };
+                let symbol = binding.symbol_id.get()?;
+                let mut after = self
+                    .locals
+                    .get(&symbol)
+                    .cloned()
+                    .unwrap_or_else(|| vec![Copied::Undefined]);
+                let key = self.key();
+                self.locals.insert(symbol, vec![key]);
+                self.repeat(&statement.body, None, returned)?;
+                // After the loop it holds the last key, or what it held.
+                union(&mut after, [self.key()]);
+                self.locals.insert(symbol, after);
+                Some(true)
+            }
+            Statement::ForStatement(statement) => {
+                match &statement.init {
+                    Some(ForStatementInit::VariableDeclaration(declaration)) => {
+                        self.declare(declaration)?;
+                    }
+                    Some(init) => self.effect(init.as_expression()?)?,
+                    None => {}
+                }
+                if let Some(test) = &statement.test {
+                    self.test(test)?;
+                }
+                self.repeat(&statement.body, statement.update.as_ref(), returned)?;
+                Some(true)
+            }
+            _ => None,
+        }
+    }
+
+    /// Runs a loop's body and update once, standing for any number of
+    /// iterations: they must leave the running function's variables as they
+    /// found them.
+    fn repeat(
+        &mut self,
+        body: &'a Statement<'a>,
+        update: Option<&'a Expression<'a>>,
+        returned: &mut Vec<Copied<'a>>,
+    ) -> Option<()> {
+        let before = self.locals.clone();
+        if self.statement(body, returned)? {
+            if let Some(update) = update {
+                self.effect(update)?;
+            }
+            if !same_locals(&before, &self.locals) {
+                return None;
+            }
+        }
+        self.locals = before;
+        Some(())
+    }
+
+    fn declare(&mut self, declaration: &'a VariableDeclaration<'a>) -> Option<()> {
+        if !matches!(
+            declaration.kind,
+            VariableDeclarationKind::Var
+                | VariableDeclarationKind::Let
+                | VariableDeclarationKind::Const
+        ) {
+            return None;
+        }
+        for declarator in &declaration.declarations {
+            let BindingPattern::BindingIdentifier(binding) = &declarator.id else {
+                return None;
+            };
+            let symbol = binding.symbol_id.get()?;
+            let values = match &declarator.init {
+                Some(init) => self.expression(init)?,
+                // Declaring a `var` again keeps its value.
+                None => self
+                    .locals
+                    .get(&symbol)
+                    .cloned()
+                    .unwrap_or_else(|| vec![Copied::Undefined]),
+            };
+            self.locals.insert(symbol, values);
+        }
+        Some(())
+    }
+
+    /// Runs a test, deciding it when it compares with `undefined` a value
+    /// that always or never is.
+    fn test(&mut self, test: &'a Expression<'a>) -> Option<Option<bool>> {
+        self.expression(test)?;
+        let Expression::BinaryExpression(binary) = test.get_inner_expression() else {
+            return Some(None);
+        };
+        let equal = match binary.operator {
+            BinaryOperator::StrictEquality => true,
+            BinaryOperator::StrictInequality => false,
+            _ => return Some(None),
+        };
+        let compared = if self.undefined(&binary.right) {
+            &binary.left
+        } else if self.undefined(&binary.left) {
+            &binary.right
+        } else {
+            return Some(None);
+        };
+        let values = self.expression(compared)?;
+        Some(if values.is_empty() {
+            None
+        } else if values.iter().all(|value| *value == Copied::Undefined) {
+            Some(equal)
+        } else if !values.iter().any(maybe_undefined) {
+            Some(!equal)
+        } else {
+            None
+        })
+    }
+
+    fn undefined(&self, expression: &'a Expression<'a>) -> bool {
+        match expression.get_inner_expression() {
+            Expression::Identifier(identifier) => {
+                identifier.name.as_str() == "undefined" && self.resolved(identifier).is_none()
+            }
+            Expression::UnaryExpression(unary) => {
+                unary.operator == UnaryOperator::Void
+                    && matches!(
+                        unary.argument.get_inner_expression(),
+                        Expression::NumericLiteral(_)
+                    )
+            }
+            _ => false,
+        }
+    }
+
+    /// Runs an expression for its effect: an assignment, an update of a
+    /// number, or any expression `expression` evaluates.
+    fn effect(&mut self, expression: &'a Expression<'a>) -> Option<()> {
+        match expression.get_inner_expression() {
+            Expression::AssignmentExpression(assignment)
+                if assignment.operator == AssignmentOperator::Assign =>
+            {
+                self.assign(assignment)
+            }
+            Expression::UpdateExpression(update) => {
+                let SimpleAssignmentTarget::AssignmentTargetIdentifier(target) = &update.argument
+                else {
+                    return None;
+                };
+                let symbol = self.resolved(target)?;
+                (self.local(symbol)
+                    && self.locals.get(&symbol).is_some_and(|values| {
+                        values.iter().all(|value| *value == Copied::Primitive)
+                    }))
+                .then_some(())
+            }
+            expression => self.expression(expression).map(drop),
+        }
+    }
+
+    fn assign(&mut self, assignment: &'a AssignmentExpression<'a>) -> Option<()> {
+        let (objects, keys) = match &assignment.left {
+            AssignmentTarget::AssignmentTargetIdentifier(target) => {
+                let symbol = self.resolved(target)?;
+                let values = self.expression(&assignment.right)?;
+                if self.local(symbol) {
+                    self.locals.insert(symbol, values);
+                    return Some(());
+                }
+                // `variable` reads a variable outside the running function
+                // through every assignment, but one may carry the module
+                // or a copy of it out of the helper.
+                return values
+                    .iter()
+                    .all(|value| match value {
+                        Copied::Function(function, _) => self.closes_over_nothing(*function),
+                        Copied::Reflection(_) => true,
+                        value => primitive(value),
+                    })
+                    .then_some(());
+            }
+            AssignmentTarget::StaticMemberExpression(member) => (
+                self.expression(&member.object)?,
+                vec![Copied::Literal(member.property.name.as_str())],
+            ),
+            AssignmentTarget::ComputedMemberExpression(member) => {
+                let objects = self.expression(&member.object)?;
+                (objects, self.expression(&member.expression)?)
+            }
+            _ => return None,
+        };
+        let values = self.expression(&assignment.right)?;
+        self.store(&objects, keys, values)
+    }
+
+    fn store(
+        &mut self,
+        objects: &[Copied<'a>],
+        keys: Vec<Copied<'a>>,
+        values: Vec<Copied<'a>>,
+    ) -> Option<()> {
+        if !keys.iter().all(primitive) {
+            return None;
+        }
+        for object in objects {
+            let Copied::Object(object) = object else {
+                return None;
+            };
+            self.writes.push((*object, keys.clone(), values.clone()));
+        }
+        Some(())
+    }
+
+    /// What reading `keys` of `objects` may give. A primitive read from the
+    /// module's names or a created object is told apart from every other.
+    fn read(&mut self, objects: &[Copied<'a>], keys: &[Copied<'a>]) -> Option<Vec<Copied<'a>>> {
+        if !keys.iter().all(primitive) {
+            return None;
+        }
+        let name = match keys {
+            [Copied::Literal(name)] => Some(*name),
+            _ => None,
+        };
+        let mut values = Vec::new();
+        let mut key = false;
+        for object in objects {
+            match object {
+                Copied::Module => union(
+                    &mut values,
+                    keys.iter().map(|key| match key {
+                        Copied::Key(key) => Copied::Field(Some(*key)),
+                        _ => Copied::Field(None),
+                    }),
+                ),
+                Copied::Field(_) | Copied::Descriptor(_) => {
+                    union(&mut values, [Copied::Field(None)])
+                }
+                Copied::Names => key = true,
+                // The primitives it holds, and the `undefined` of a field it
+                // lacks, are told apart as a key.
+                Copied::Object(object) => {
+                    key = true;
+                    union(
+                        &mut values,
+                        self.writes
+                            .iter()
+                            .filter(|(target, _, _)| target == object)
+                            .flat_map(|(_, _, held)| held.iter().copied())
+                            .filter(|value| !primitive(value)),
+                    );
+                }
+                Copied::Reflection(reflection) => {
+                    union(&mut values, [Copied::Reflection(reflection.member(name))]);
+                }
+                Copied::Key(_) | Copied::Literal(_) | Copied::Primitive => {
+                    union(&mut values, [Copied::Primitive, Copied::Undefined]);
+                }
+                // Reading a field of `undefined` throws.
+                Copied::Undefined => {}
+                Copied::Function(..) => return None,
+            }
+        }
+        if key {
+            let key = self.key();
+            values.push(key);
+        }
+        Some(values)
+    }
+
+    fn identifier(&mut self, identifier: &'a IdentifierReference<'a>) -> Option<Vec<Copied<'a>>> {
+        let Some(symbol) = self.resolved(identifier) else {
+            return match identifier.name.as_str() {
+                "undefined" => Some(vec![Copied::Undefined]),
+                "Object" => Some(vec![Copied::Reflection(Reflection::Object)]),
+                _ => None,
+            };
+        };
+        if let Some(values) = self.locals.get(&symbol) {
+            return Some(values.clone());
+        }
+        if self.local(symbol) {
+            // Declared but not yet assigned.
+            let declaration = self.scoping.symbol_declaration(symbol);
+            return Some(vec![match self.nodes.kind(declaration) {
+                AstKind::Function(_) => Copied::Function(declaration, self.invocation),
+                _ => Copied::Undefined,
+            }]);
+        }
+        self.variable(symbol)
+    }
+
+    fn expression(&mut self, expression: &'a Expression<'a>) -> Option<Vec<Copied<'a>>> {
+        self.step()?;
+        Some(match expression.get_inner_expression() {
+            Expression::StringLiteral(literal) => vec![Copied::Literal(literal.value.as_str())],
+            Expression::NumericLiteral(_)
+            | Expression::BooleanLiteral(_)
+            | Expression::NullLiteral(_) => vec![Copied::Primitive],
+            Expression::Identifier(identifier) => self.identifier(identifier)?,
+            Expression::FunctionExpression(function) => {
+                vec![Copied::Function(function.node_id.get(), self.invocation)]
+            }
+            Expression::ArrowFunctionExpression(function) => {
+                vec![Copied::Function(function.node_id.get(), self.invocation)]
+            }
+            Expression::ArrayExpression(array) if array.elements.is_empty() => {
+                vec![Copied::Object(array.node_id.get())]
+            }
+            Expression::ObjectExpression(object) => {
+                let id = object.node_id.get();
+                for property in &object.properties {
+                    let ObjectPropertyKind::ObjectProperty(property) = property else {
+                        return None;
+                    };
+                    if property.kind != PropertyKind::Init || property.method || property.computed {
+                        return None;
+                    }
+                    let key = key_name(&property.key)?;
+                    let values = self.expression(&property.value)?;
+                    self.writes.push((id, vec![Copied::Literal(key)], values));
+                }
+                vec![Copied::Object(id)]
+            }
+            Expression::StaticMemberExpression(member) => {
+                let objects = self.expression(&member.object)?;
+                self.read(&objects, &[Copied::Literal(member.property.name.as_str())])?
+            }
+            Expression::ComputedMemberExpression(member) => {
+                let objects = self.expression(&member.object)?;
+                let keys = self.expression(&member.expression)?;
+                self.read(&objects, &keys)?
+            }
+            Expression::CallExpression(call) => {
+                if call.optional {
+                    return None;
+                }
+                let callees = self.expression(&call.callee)?;
+                let mut arguments = Vec::new();
+                for argument in &call.arguments {
+                    arguments.push(self.expression(argument.as_expression()?)?);
+                }
+                let mut values = Vec::new();
+                for callee in callees {
+                    let held = match callee {
+                        Copied::Function(function, _) => self.call(function, &arguments)?,
+                        Copied::Reflection(reflection) => self.reflect(reflection, &arguments)?,
+                        _ => return None,
+                    };
+                    union(&mut values, held);
+                }
+                values
+            }
+            Expression::ConditionalExpression(conditional) => {
+                self.test(&conditional.test)?;
+                let mut values = self.expression(&conditional.consequent)?;
+                union(&mut values, self.expression(&conditional.alternate)?);
+                values
+            }
+            Expression::LogicalExpression(logical) => {
+                let mut values = self.expression(&logical.left)?;
+                union(&mut values, self.expression(&logical.right)?);
+                values
+            }
+            Expression::UnaryExpression(unary) => {
+                let operand = self.expression(&unary.argument)?;
+                match unary.operator {
+                    UnaryOperator::LogicalNot | UnaryOperator::Typeof => vec![Copied::Primitive],
+                    UnaryOperator::Void => vec![Copied::Undefined],
+                    UnaryOperator::Delete => return None,
+                    _ if operand.iter().all(primitive) => vec![Copied::Primitive],
+                    _ => return None,
+                }
+            }
+            Expression::BinaryExpression(binary) => {
+                let left = self.expression(&binary.left)?;
+                let right = self.expression(&binary.right)?;
+                let nullish = |operand: &Expression| {
+                    matches!(operand.get_inner_expression(), Expression::NullLiteral(_))
+                        || self.undefined(operand)
+                };
+                // Other comparisons and arithmetic may convert an object by
+                // calling its methods.
+                let converts_nothing = match binary.operator {
+                    BinaryOperator::StrictEquality | BinaryOperator::StrictInequality => true,
+                    BinaryOperator::Equality | BinaryOperator::Inequality => {
+                        nullish(&binary.left)
+                            || nullish(&binary.right)
+                            || left.iter().chain(&right).all(primitive)
+                    }
+                    BinaryOperator::In => left.iter().all(primitive),
+                    BinaryOperator::Instanceof => false,
+                    _ => left.iter().chain(&right).all(primitive),
+                };
+                if !converts_nothing {
+                    return None;
+                }
+                vec![Copied::Primitive]
+            }
+            _ => return None,
+        })
+    }
+
+    fn reflect(
+        &mut self,
+        reflection: Reflection,
+        arguments: &[Vec<Copied<'a>>],
+    ) -> Option<Vec<Copied<'a>>> {
+        let undefined = vec![Copied::Undefined];
+        let argument = |index: usize| arguments.get(index).unwrap_or(&undefined).as_slice();
+        let module = |values: &[Copied]| {
+            !values.is_empty() && values.iter().all(|value| *value == Copied::Module)
+        };
+        match reflection {
+            Reflection::OwnNames if module(argument(0)) => Some(vec![Copied::Names]),
+            Reflection::OwnDescriptor if module(argument(0)) => match argument(1) {
+                [Copied::Key(key)] => Some(vec![Copied::Descriptor(*key), Copied::Undefined]),
+                _ => None,
+            },
+            Reflection::HasOwn if argument(1).iter().all(primitive) => {
+                Some(vec![Copied::Primitive])
+            }
+            Reflection::DefineProperty => {
+                self.define(argument(0), argument(1), argument(2))?;
+                Some(argument(0).to_vec())
+            }
+            _ => None,
+        }
+    }
+
+    /// Records what `Object.defineProperty` defines each key as on each
+    /// object: the field a descriptor of the module holds, or the value or
+    /// getter result a created descriptor gives.
+    fn define(
+        &mut self,
+        objects: &[Copied<'a>],
+        keys: &[Copied<'a>],
+        descriptors: &[Copied<'a>],
+    ) -> Option<()> {
+        let mut values = Vec::new();
+        for descriptor in descriptors {
+            match descriptor {
+                Copied::Descriptor(key) => union(&mut values, [Copied::Field(Some(*key))]),
+                // Defining with no descriptor throws.
+                Copied::Undefined => {}
+                Copied::Object(descriptor) => {
+                    let fields: Vec<_> = self
+                        .writes
+                        .iter()
+                        .filter(|(target, _, _)| target == descriptor)
+                        .map(|(_, names, held)| (names.clone(), held.clone()))
+                        .collect();
+                    for (names, held) in fields {
+                        match names.as_slice() {
+                            [Copied::Literal("enumerable" | "configurable" | "writable")] => {}
+                            [Copied::Literal("value")] => union(&mut values, held),
+                            [Copied::Literal("get")] => {
+                                for getter in held {
+                                    let Copied::Function(getter, invocation) = getter else {
+                                        return None;
+                                    };
+                                    if invocation != self.invocation {
+                                        return None;
+                                    }
+                                    let value = self.getter(getter)?;
+                                    union(&mut values, value);
+                                }
+                            }
+                            _ => return None,
+                        }
+                    }
+                }
+                _ => return None,
+            }
+        }
+        self.store(objects, keys.to_vec(), values)
+    }
+
+    /// What a getter the running call created returns: one without
+    /// parameters that returns what it computes from parameters of the
+    /// running function nothing reassigns, which it reads as they are now.
+    fn getter(&mut self, getter: NodeId) -> Option<Vec<Copied<'a>>> {
+        let returned = match self.nodes.kind(getter) {
+            AstKind::Function(function)
+                if !function.r#async
+                    && !function.generator
+                    && function.params.items.is_empty()
+                    && function.params.rest.is_none() =>
+            {
+                match function.body.as_ref()?.statements.as_slice() {
+                    [Statement::ReturnStatement(statement)] => statement.argument.as_ref()?,
+                    _ => return None,
+                }
+            }
+            AstKind::ArrowFunctionExpression(arrow)
+                if !arrow.r#async
+                    && arrow.params.items.is_empty()
+                    && arrow.params.rest.is_none() =>
+            {
+                arrow.body.as_expression()?
+            }
+            _ => return None,
+        };
+        let span = self.nodes.kind(getter).span();
+        let reads_parameters = self
+            .nodes
+            .iter()
+            .skip(getter.index())
+            .take_while(|node| contains(span, node.kind().span()))
+            .all(|node| match node.kind() {
+                AstKind::ThisExpression(_) => false,
+                AstKind::IdentifierReference(reference) => {
+                    self.resolved(reference).is_some_and(|symbol| {
+                        self.local(symbol)
+                            && matches!(
+                                self.nodes.kind(self.scoping.symbol_declaration(symbol)),
+                                AstKind::FormalParameter(_)
+                            )
+                            && !self
+                                .scoping
+                                .get_resolved_references(symbol)
+                                .any(|reference| reference.is_write())
+                    })
+                }
+                _ => true,
+            });
+        if !reads_parameters {
+            return None;
+        }
+        self.expression(returned)
     }
 }
 
@@ -1543,6 +2681,9 @@ struct Analysis<'s, 'a> {
     in_file_tainted: HashSet<SymbolId>,
     /// Calls into exports this file takes from another module.
     forwarded: Vec<ModuleEntry>,
+    /// Interop helpers by the symbol naming them, and whether they copy a
+    /// module: see `ModuleCopy`.
+    module_copies: RefCell<HashMap<SymbolId, bool>>,
     /// Recognizes interop wrappers: see `LoaderGuard::wrapper`.
     guard: LoaderGuard<'s, 'a>,
 }
@@ -1702,6 +2843,7 @@ impl<'s, 'a> Analysis<'s, 'a> {
             external_words: HashMap::new(),
             in_file_tainted: HashSet::new(),
             forwarded: Vec::new(),
+            module_copies: RefCell::default(),
             guard: LoaderGuard::new(nodes, scoping),
         };
         analysis.index();
@@ -4989,6 +6131,7 @@ impl<'s, 'a> Analysis<'s, 'a> {
         for call in self.context.calls.clone() {
             let resolved = match &call.export {
                 ModuleExport::Any => None,
+                export if call.constructs => self.resolve_construction(&exports, export),
                 export => self.resolve_export(&exports, export),
             };
             let forwards = match resolved {
@@ -5013,6 +6156,7 @@ impl<'s, 'a> Analysis<'s, 'a> {
                     call: ModuleCall {
                         export,
                         arguments: call.arguments.clone(),
+                        constructs: call.constructs,
                     },
                 }));
         }
@@ -5240,7 +6384,14 @@ impl<'s, 'a> Analysis<'s, 'a> {
 
     /// An exported value, as the module it is taken from when it is
     /// another of the action's files or a field of one.
-    fn export_value(&self, value: &'a Expression<'a>) -> ExportValue<'a> {
+    fn export_value(&self, mut value: &'a Expression<'a>) -> ExportValue<'a> {
+        // An assignment evaluates to what it assigns, as in TypeScript's
+        // `exports.a = exports.b = void 0`.
+        while let Expression::AssignmentExpression(assignment) = inner(value)
+            && assignment.operator == AssignmentOperator::Assign
+        {
+            value = &assignment.right;
+        }
         if let Some(specifier) = self.local_module(value, 0) {
             return ExportValue::From(specifier, ModuleExport::Default);
         }
@@ -5335,13 +6486,13 @@ impl<'s, 'a> Analysis<'s, 'a> {
         exports.opaque = true;
     }
 
-    /// The functions a call into `export` reaches, and the modules it is
-    /// passed on to; `None` when the export may hold something else.
-    fn resolve_export(
+    /// What `export` may hold, and the modules it is passed on to; `None`
+    /// when it may hold something this analysis cannot see.
+    fn export_values(
         &self,
         exports: &Exports<'a>,
         export: &ModuleExport,
-    ) -> Option<ResolvedExport<'a>> {
+    ) -> Option<ExportValues<'a>> {
         let mut values: Vec<ExportValue<'a>> = Vec::new();
         let mut forwards = Vec::new();
         match export {
@@ -5404,6 +6555,17 @@ impl<'s, 'a> Analysis<'s, 'a> {
         if values.is_empty() && forwards.is_empty() {
             return None;
         }
+        Some((values, forwards))
+    }
+
+    /// The functions a call into `export` reaches, and the modules it is
+    /// passed on to; `None` when the export may hold something else.
+    fn resolve_export(
+        &self,
+        exports: &Exports<'a>,
+        export: &ModuleExport,
+    ) -> Option<ResolvedExport<'a>> {
+        let (values, mut forwards) = self.export_values(exports, export)?;
         let mut functions = Vec::new();
         for value in values {
             match value {
@@ -5447,10 +6609,350 @@ impl<'s, 'a> Analysis<'s, 'a> {
         Some((functions, forwards))
     }
 
+    /// The constructors a construction of `export` runs, and the modules it
+    /// is passed on to, when it may only be a `field_only` class. An
+    /// instance of anything else may reach this file's functions however
+    /// it is used later.
+    fn resolve_construction(
+        &self,
+        exports: &Exports<'a>,
+        export: &ModuleExport,
+    ) -> Option<ResolvedExport<'a>> {
+        let (values, mut forwards) = self.export_values(exports, export)?;
+        let mut constructors = Vec::new();
+        for value in values {
+            let (class, binding) = match value {
+                ExportValue::Symbol(symbol) => (self.declared_class(symbol)?, Some(symbol)),
+                ExportValue::Expression(expression) => match inner(expression) {
+                    Expression::ClassExpression(class) => (&**class, None),
+                    Expression::Identifier(identifier) if self.resolved(identifier).is_some() => {
+                        let symbol = self.resolved(identifier)?;
+                        (self.declared_class(symbol)?, Some(symbol))
+                    }
+                    // Constructing a primitive throws.
+                    Expression::NullLiteral(_)
+                    | Expression::BooleanLiteral(_)
+                    | Expression::NumericLiteral(_)
+                    | Expression::StringLiteral(_) => continue,
+                    Expression::UnaryExpression(unary) if unary.operator == UnaryOperator::Void => {
+                        continue;
+                    }
+                    Expression::Identifier(identifier)
+                        if identifier.name.as_str() == "undefined" =>
+                    {
+                        continue;
+                    }
+                    _ => return None,
+                },
+                ExportValue::From(specifier, export) => {
+                    forwards.push((specifier, export));
+                    continue;
+                }
+                ExportValue::Function(_) | ExportValue::Opaque => return None,
+            };
+            if !self.field_only(exports, class, binding, 0) {
+                return None;
+            }
+            constructors.extend(class.body.body.iter().find_map(|element| match element {
+                ClassElement::MethodDefinition(method)
+                    if method.kind == MethodDefinitionKind::Constructor =>
+                {
+                    Some(method.value.node_id.get())
+                }
+                _ => None,
+            }));
+        }
+        Some((constructors, forwards))
+    }
+
+    /// The class a binding always holds: a class declaration, or a variable
+    /// only ever holding a class expression.
+    fn declared_class(&self, symbol: SymbolId) -> Option<&'a Class<'a>> {
+        match self.nodes.kind(self.scoping.symbol_declaration(symbol)) {
+            AstKind::Class(class) => Some(class),
+            _ => match self.initializer(symbol).map(inner) {
+                Some(Expression::ClassExpression(class)) => Some(class),
+                _ => None,
+            },
+        }
+    }
+
+    /// Whether constructing a class gives the instance nothing of this file
+    /// but its constructor's arguments and literals, however it is used
+    /// later: the class extends nothing, `null`, a built-in error or
+    /// another such class; its body holds only instance fields with literal
+    /// values and a constructor that only passes parameters and literals to
+    /// `super` and stores them in fields of `this`; and this file only
+    /// exports, constructs, tests or extends it, so nothing adds a method
+    /// or static to it.
+    fn field_only(
+        &self,
+        exports: &Exports<'a>,
+        class: &'a Class<'a>,
+        binding: Option<SymbolId>,
+        depth: usize,
+    ) -> bool {
+        if depth > MAX_LOCATION_DEPTH || !class.decorators.is_empty() {
+            return false;
+        }
+        let extends = match class
+            .heritage
+            .as_ref()
+            .map(|heritage| heritage.expression.get_inner_expression())
+        {
+            None | Some(Expression::NullLiteral(_)) => true,
+            Some(Expression::Identifier(identifier)) => match self.resolved(identifier) {
+                None => BUILTIN_ERRORS.contains(&identifier.name.as_str()),
+                Some(symbol) => self
+                    .declared_class(symbol)
+                    .is_some_and(|base| self.field_only(exports, base, Some(symbol), depth + 1)),
+            },
+            Some(_) => false,
+        };
+        extends
+            && class.body.body.iter().all(|element| match element {
+                ClassElement::MethodDefinition(method) => {
+                    method.kind == MethodDefinitionKind::Constructor
+                        && !method.r#static
+                        && !method.computed
+                        && method.decorators.is_empty()
+                        && self.field_only_constructor(&method.value)
+                }
+                ClassElement::PropertyDefinition(property) => {
+                    !property.r#static
+                        && !property.computed
+                        && property.decorators.is_empty()
+                        && property.value.as_ref().is_none_or(|value| {
+                            matches!(
+                                value.get_inner_expression(),
+                                Expression::StringLiteral(_)
+                                    | Expression::NumericLiteral(_)
+                                    | Expression::BooleanLiteral(_)
+                                    | Expression::NullLiteral(_)
+                            )
+                        })
+                }
+                _ => false,
+            })
+            && binding.is_none_or(|binding| self.only_exported(binding, class))
+            && !self.exports_reach(exports, class, binding)
+    }
+
+    fn field_only_constructor(&self, constructor: &'a Function<'a>) -> bool {
+        let Some(body) = &constructor.body else {
+            return false;
+        };
+        let parameters = constructor.params.span;
+        let plain = |value: &'a Expression<'a>| match value.get_inner_expression() {
+            Expression::StringLiteral(_)
+            | Expression::NumericLiteral(_)
+            | Expression::BooleanLiteral(_)
+            | Expression::NullLiteral(_) => true,
+            Expression::Identifier(identifier) => self.resolved(identifier).is_some_and(|symbol| {
+                let declaration = self.scoping.symbol_declaration(symbol);
+                matches!(self.nodes.kind(declaration), AstKind::FormalParameter(_))
+                    && contains(parameters, self.span(declaration))
+            }),
+            _ => false,
+        };
+        constructor.params.rest.is_none()
+            && constructor.params.items.iter().all(|parameter| {
+                parameter.initializer.is_none()
+                    && matches!(parameter.pattern, BindingPattern::BindingIdentifier(_))
+            })
+            && body.statements.iter().all(|statement| {
+                let Statement::ExpressionStatement(statement) = statement else {
+                    return false;
+                };
+                match statement.expression.get_inner_expression() {
+                    Expression::CallExpression(call) => {
+                        matches!(call.callee, Expression::Super(_))
+                            && call
+                                .arguments
+                                .iter()
+                                .all(|argument| argument.as_expression().is_some_and(plain))
+                    }
+                    Expression::AssignmentExpression(assignment) => {
+                        assignment.operator == AssignmentOperator::Assign
+                            && plain(&assignment.right)
+                            && matches!(expression_target(&assignment.left), Some((object, Some(_)))
+                                if matches!(object.get_inner_expression(), Expression::ThisExpression(_)))
+                    }
+                    _ => false,
+                }
+            })
+    }
+
+    /// Whether this file uses a class's binding only to export, construct,
+    /// test or extend it.
+    fn only_exported(&self, binding: SymbolId, class: &'a Class<'a>) -> bool {
+        self.scoping
+            .get_resolved_references(binding)
+            .all(|reference| {
+                let node = reference.node_id();
+                if reference.is_write() || contains(class.span, self.span(node)) {
+                    return false;
+                }
+                let mut current = node;
+                for parent in self.nodes.ancestor_ids(node) {
+                    match self.nodes.kind(parent) {
+                        AstKind::ParenthesizedExpression(_) => current = parent,
+                        AstKind::NewExpression(call) => {
+                            return call.callee.span() == self.span(current);
+                        }
+                        AstKind::BinaryExpression(binary) => {
+                            return binary.operator == BinaryOperator::Instanceof
+                                && binary.right.span() == self.span(current);
+                        }
+                        AstKind::ExportSpecifier(_) => return true,
+                        AstKind::Class(subclass) => {
+                            return subclass.heritage.as_ref().is_some_and(|heritage| {
+                                heritage.expression.span() == self.span(current)
+                            });
+                        }
+                        AstKind::AssignmentExpression(assignment)
+                            if assignment.right.span() == self.span(current) =>
+                        {
+                            return self.exported_by(parent);
+                        }
+                        // A field of what replaces `module.exports`.
+                        AstKind::ObjectProperty(property)
+                            if property.value.span() == self.span(current) =>
+                        {
+                            let object = self.nodes.parent_id(parent);
+                            return matches!(self.nodes.parent_kind(object),
+                                AstKind::AssignmentExpression(assignment)
+                                    if assignment.right.span() == self.span(object))
+                                && self.exported_by(self.nodes.parent_id(object));
+                        }
+                        _ => return false,
+                    }
+                }
+                false
+            })
+    }
+
+    /// Whether an assignment, and each assignment it is the value of, store
+    /// into this file's exports, with nothing else taking the value.
+    fn exported_by(&self, assignment: NodeId) -> bool {
+        let mut current = assignment;
+        loop {
+            let AstKind::AssignmentExpression(assigned) = self.nodes.kind(current) else {
+                return false;
+            };
+            if assigned.operator != AssignmentOperator::Assign
+                || !expression_target(&assigned.left).is_some_and(|(object, name)| {
+                    self.exports_object(object) && name.is_some()
+                        || self.is_global(object, "module") && name == Some("exports")
+                })
+            {
+                return false;
+            }
+            let mut value = current;
+            let mut parent = self.nodes.parent_id(current);
+            while matches!(self.nodes.kind(parent), AstKind::ParenthesizedExpression(_)) {
+                value = parent;
+                parent = self.nodes.parent_id(parent);
+            }
+            match self.nodes.kind(parent) {
+                AstKind::AssignmentExpression(outer) if outer.right.span() == self.span(value) => {
+                    current = parent;
+                }
+                AstKind::ExpressionStatement(_) => return true,
+                _ => return false,
+            }
+        }
+    }
+
+    /// Whether this file may read a class back out of its own exports, or
+    /// add to it there: a read of a field of `exports`, `module.exports` or
+    /// top-level `this` that may hold it, or any field of `module.exports`
+    /// when that is the class.
+    fn exports_reach(
+        &self,
+        exports: &Exports<'a>,
+        class: &'a Class<'a>,
+        binding: Option<SymbolId>,
+    ) -> bool {
+        let holds = |value: &'a Expression<'a>| match inner(value) {
+            Expression::ClassExpression(expression) => expression.span == class.span,
+            Expression::Identifier(identifier) => {
+                binding.is_some() && self.resolved(identifier) == binding
+            }
+            _ => false,
+        };
+        let held = |value: &ExportValue<'a>| match value {
+            ExportValue::Symbol(symbol) => Some(*symbol) == binding,
+            ExportValue::Expression(expression) => holds(expression),
+            _ => false,
+        };
+        let mut names: Vec<&'a str> = exports
+            .named
+            .iter()
+            .filter(|(_, values)| values.iter().any(held))
+            .map(|(name, _)| *name)
+            .collect();
+        let mut replaced = false;
+        for value in &exports.default {
+            replaced |= held(value);
+            if let ExportValue::Expression(object) = value
+                && let Some(object) = self.object_literal(object)
+            {
+                names.extend(
+                    object
+                        .properties
+                        .iter()
+                        .filter_map(|property| match property {
+                            ObjectPropertyKind::ObjectProperty(property)
+                                if holds(&property.value) =>
+                            {
+                                key_name(&property.key)
+                            }
+                            _ => None,
+                        }),
+                );
+            }
+        }
+        exports.opaque
+            || self.nodes.iter().any(|node| {
+                let Some((object, name)) = self.member_parts_of(node.id()) else {
+                    return false;
+                };
+                if replaced
+                    && expression_property(inner(object)).is_some_and(|(module, field)| {
+                        field == "exports" && self.is_global(module, "module")
+                    })
+                {
+                    return true;
+                }
+                let target = matches!(self.nodes.parent_kind(node.id()),
+                    AstKind::AssignmentExpression(assignment)
+                        if assignment.left.span() == self.span(node.id()));
+                !target
+                    && (self.exports_object(object) || self.top_level_this(object))
+                    && name.is_none_or(|name| names.contains(&name))
+            })
+    }
+
+    /// Whether an expression is `this` where it is the module's exports: at
+    /// the top level, or in an arrow function there.
+    fn top_level_this(&self, expression: &'a Expression<'a>) -> bool {
+        let Expression::ThisExpression(this) = expression.get_inner_expression() else {
+            return false;
+        };
+        !self.nodes.ancestor_ids(this.node_id.get()).any(|ancestor| {
+            matches!(
+                self.nodes.kind(ancestor),
+                AstKind::Function(_) | AstKind::Class(_)
+            )
+        })
+    }
+
     /// Calls this file makes into the action's other JavaScript files with
-    /// located arguments, and those its exports pass on. A module whose
-    /// object or functions this file uses other than by calling them is
-    /// reached through an export it does not name.
+    /// located arguments, every construction of one of their exports, and
+    /// the calls its exports pass on. A module whose object or functions
+    /// this file uses other than by calling or constructing them is reached
+    /// through an export it does not name.
     fn module_entries(&self) -> Vec<ModuleEntry> {
         let mut entries = self.forwarded.clone();
         if self.tainted_spans.is_empty() {
@@ -5495,24 +6997,22 @@ impl<'s, 'a> Analysis<'s, 'a> {
             {
                 any.push(specifier);
             }
-            if !arguments
+            let located = arguments
                 .iter()
-                .any(|argument| self.is_tainted(argument.span()))
-                && !self.is_tainted(callee.span())
-            {
-                continue;
+                .any(|argument| self.is_tainted(argument.span()));
+            if located || self.is_tainted(callee.span()) {
+                // A call given a location may hand it to a module's function
+                // it is also given.
+                any.extend(arguments.iter().filter_map(|argument| {
+                    let argument = argument.as_expression()?;
+                    self.local_module(argument, 0)
+                        .or_else(|| Some(self.module_function(argument, 0)?.0))
+                }));
             }
-            // A call given a location may hand it to a module's function it
-            // is also given.
-            any.extend(arguments.iter().filter_map(|argument| {
-                let argument = argument.as_expression()?;
-                self.local_module(argument, 0)
-                    .or_else(|| Some(self.module_function(argument, 0)?.0))
-            }));
-            if !arguments
-                .iter()
-                .any(|argument| self.is_tainted(argument.span()))
-            {
+            // An instance outlives its construction, so what its class lets
+            // it reach matters whatever it is given.
+            let constructs = matches!(node.kind(), AstKind::NewExpression(_));
+            if !located && !constructs {
                 continue;
             }
             let Some((specifier, export)) = self.module_function(callee, 0) else {
@@ -5544,6 +7044,7 @@ impl<'s, 'a> Analysis<'s, 'a> {
                                 })
                         })
                         .collect(),
+                    constructs,
                 },
             });
         }
@@ -5554,13 +7055,16 @@ impl<'s, 'a> Analysis<'s, 'a> {
             call: ModuleCall {
                 export: ModuleExport::Any,
                 arguments: Vec::new(),
+                constructs: false,
             },
         }));
         entries
     }
 
-    /// Whether a module object or function at `node` is only called, has a
-    /// field called, or initializes a variable this analysis follows.
+    /// Whether a module object or function at `node` is only called or
+    /// constructed, has a field called or constructed, or initializes a
+    /// variable this analysis follows, as it is or as an interop helper
+    /// copies it.
     fn module_use(&self, node: NodeId) -> bool {
         let mut current = node;
         for parent in self.nodes.ancestor_ids(node) {
@@ -5570,6 +7074,19 @@ impl<'s, 'a> Analysis<'s, 'a> {
                 }
                 AstKind::CallExpression(call) if call.callee.span() == self.span(current) => {
                     return true;
+                }
+                // `module_entries` passes every construction on.
+                AstKind::NewExpression(call) if call.callee.span() == self.span(current) => {
+                    return true;
+                }
+                AstKind::CallExpression(call)
+                    if call
+                        .arguments
+                        .first()
+                        .is_some_and(|argument| argument.span() == self.span(current))
+                        && self.copies_module(call) =>
+                {
+                    current = parent;
                 }
                 // Loading a module for its effects passes it nothing.
                 AstKind::ExpressionStatement(_) => return true,
@@ -5621,7 +7138,8 @@ impl<'s, 'a> Analysis<'s, 'a> {
         false
     }
 
-    /// Whether `node` is what a call calls, through parentheses or `(0, f)`.
+    /// Whether `node` is what a call calls or a construction constructs,
+    /// through parentheses or `(0, f)`.
     fn invoked(&self, node: NodeId) -> bool {
         let mut callee = node;
         for parent in self.nodes.ancestor_ids(node) {
@@ -5636,6 +7154,7 @@ impl<'s, 'a> Analysis<'s, 'a> {
                     callee = parent;
                 }
                 AstKind::CallExpression(call) => return call.callee.span() == self.span(callee),
+                AstKind::NewExpression(call) => return call.callee.span() == self.span(callee),
                 _ => return false,
             }
         }
@@ -5668,9 +7187,30 @@ impl<'s, 'a> Analysis<'s, 'a> {
         }
     }
 
+    /// Whether a call hands back the module its only argument is, or a copy
+    /// of it: a call to an interop helper `ModuleCopy` judges to.
+    fn copies_module(&self, call: &'a CallExpression<'a>) -> bool {
+        let (Expression::Identifier(callee), [argument]) = (
+            call.callee.get_inner_expression(),
+            call.arguments.as_slice(),
+        ) else {
+            return false;
+        };
+        !call.optional
+            && argument.as_expression().is_some()
+            && self.resolved(callee).is_some_and(|helper| {
+                *self
+                    .module_copies
+                    .borrow_mut()
+                    .entry(helper)
+                    .or_insert_with(|| ModuleCopy::copies(self.nodes, self.scoping, helper))
+            })
+    }
+
     /// The relative specifier of a module an expression is the object of:
     /// `require` or an awaited dynamic `import` of one, a namespace or
-    /// default import of one, or a variable only ever holding one.
+    /// default import of one, an interop helper's copy of one, or a
+    /// variable only ever holding one.
     fn local_module(&self, expression: &'a Expression<'a>, depth: usize) -> Option<&'a str> {
         if depth > MAX_LOCATION_DEPTH {
             return None;
@@ -5682,7 +7222,11 @@ impl<'s, 'a> Analysis<'s, 'a> {
             return imported(import);
         }
         match inner(expression) {
-            Expression::CallExpression(call) => self.required(call),
+            Expression::CallExpression(call) => self.required(call).or_else(|| {
+                let module =
+                    self.local_module(call.arguments.first()?.as_expression()?, depth + 1)?;
+                self.copies_module(call).then_some(module)
+            }),
             Expression::Identifier(identifier) => {
                 let symbol = self.resolved(identifier)?;
                 let declaration = self.scoping.symbol_declaration(symbol);

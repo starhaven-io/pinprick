@@ -1530,11 +1530,13 @@ pub(crate) enum ModuleExport {
 }
 
 /// Calls into a module's export: the located value each argument may hold,
-/// relative to the action. `None` carries no location.
+/// relative to the action. `None` carries no location. `constructs` marks
+/// an export a caller constructs, whose instances outlive the call.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ModuleCall {
     pub(crate) export: ModuleExport,
     pub(crate) arguments: Vec<Option<ModuleArgument>>,
+    pub(crate) constructs: bool,
 }
 
 /// A located argument: a value, or the words of an array.
@@ -4856,6 +4858,7 @@ fn include_module_entry(
                 })
             })
             .collect(),
+        constructs: entry.call.constructs,
     };
     let entries = calls.entry(path.clone()).or_default();
     match entries
@@ -4863,6 +4866,7 @@ fn include_module_entry(
         .find(|existing| existing.export == call.export)
     {
         Some(existing) => {
+            existing.constructs |= call.constructs;
             if existing.arguments.len() < call.arguments.len() {
                 existing.arguments.resize(call.arguments.len(), None);
             }
