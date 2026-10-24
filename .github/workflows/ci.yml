@@ -161,7 +161,7 @@ jobs:
     permissions:
       contents: read
       pull-requests: read # required to read PR titles
-    uses: starhaven-io/.github/.github/workflows/reusable-conventional-commits.yml@bae9f345576e27dad95a955f23698ff353e62e47 # v2026.10.23.1
+    uses: starhaven-io/.github/.github/workflows/reusable-conventional-commits.yml@34619247a11f3f7f6825cd08ca39e0c2be71056e # v2026.10.23.2
 
   check:
     name: ${{ matrix.name }}
@@ -516,7 +516,7 @@ jobs:
     permissions:
       contents: read
       security-events: write # required for zizmor SARIF upload
-    uses: starhaven-io/.github/.github/workflows/reusable-zizmor.yml@bae9f345576e27dad95a955f23698ff353e62e47 # v2026.10.23.1
+    uses: starhaven-io/.github/.github/workflows/reusable-zizmor.yml@34619247a11f3f7f6825cd08ca39e0c2be71056e # v2026.10.23.2
 
   pinprick:
     name: pinprick
@@ -528,7 +528,7 @@ jobs:
     # Temporary trade-off: gate with the released engine until the fleet-pinned
     # scanner can follow a local reusable-workflow call. Restore PR-time
     # build-from-source dogfooding when that support is delivered.
-    uses: starhaven-io/.github/.github/workflows/reusable-pinprick-audit.yml@bae9f345576e27dad95a955f23698ff353e62e47 # v2026.10.23.1
+    uses: starhaven-io/.github/.github/workflows/reusable-pinprick-audit.yml@34619247a11f3f7f6825cd08ca39e0c2be71056e # v2026.10.23.2
     with:
       advanced-security: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
       fail-on-findings: true
