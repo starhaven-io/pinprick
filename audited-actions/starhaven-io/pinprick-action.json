@@ -1,4 +1,5 @@
 [
+  { "sha": "6120720ae5860dbbac91262d53beb385b84cb8f4", "tag": "v0.6.12", "rules_version": 8 },
   { "sha": "aa70ca5e6da4b421555e74843ca5dfc41c091ab3", "tag": "v0.6.11", "rules_version": 8 },
   { "sha": "6a346b2e03e8ca8935b4636cf7c375a4f493413a", "tag": "v0.6.10", "rules_version": 8 },
   { "sha": "728cb74f3af228b19c17ed7db58c77c6586747ec", "tag": "v0.6.9", "rules_version": 8 },
