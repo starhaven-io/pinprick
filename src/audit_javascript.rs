@@ -277,7 +277,12 @@ fn parsed_builtin_use(path: &str, code: &str) -> BuiltinUse {
         .build(&parsed.program)
         .semantic;
     let guard = LoaderGuard::new(semantic.nodes(), semantic.scoping());
-    let mut builtin_use = BuiltinUse::default();
+    let unknown_strings = has_lone_surrogates(semantic.nodes());
+    let mut builtin_use = BuiltinUse {
+        replaces_loader: unknown_strings,
+        other_loader_replacement: unknown_strings,
+        ..BuiltinUse::default()
+    };
     for node in semantic.nodes().iter() {
         let replaces = guard.replaces(node.id());
         builtin_use.replaces_loader |= replaces;
@@ -325,6 +330,7 @@ pub(crate) fn located_executions(
         || code.contains("import.meta")
         || code.contains("\\u")
         || code.contains("\\x")
+        || code.contains("&#")
         || LOCATION_NAMES
             .iter()
             .copied()
@@ -459,10 +465,29 @@ fn analyze(path: &str, code: &str, context: &SourceContext) -> JavaScriptLocatio
         .build(&parsed.program)
         .semantic;
     let analysis = Analysis::new(semantic.nodes(), semantic.scoping(), context);
+    let mut executions = analysis.executions();
+    if has_lone_surrogates(semantic.nodes()) {
+        executions.push(LocatedExecution::unresolved(SourceFileKind::JavaScript));
+    }
     JavaScriptLocations {
-        executions: analysis.executions(),
+        executions,
         entries: analysis.module_entries(),
     }
+}
+
+/// The location and module models use UTF-8 strings. A lone UTF-16 surrogate
+/// cannot become a semantic key or path in those models: diagnostic display
+/// would alias it with literal escape text. Keep other evidence, but withdraw
+/// completeness and native-module assumptions for a file containing one.
+fn has_lone_surrogates(nodes: &AstNodes<'_>) -> bool {
+    nodes.iter().any(|node| match node.kind() {
+        AstKind::StringLiteral(literal) => literal.value.has_lone_surrogate(),
+        AstKind::TemplateElement(quasi) => quasi
+            .value
+            .cooked
+            .is_some_and(|cooked| cooked.has_lone_surrogate()),
+        _ => false,
+    })
 }
 
 fn builtin_module(specifier: &str) -> bool {
@@ -486,12 +511,12 @@ fn loader_module(specifier: &str) -> bool {
 /// A string literal, or a template literal with nothing substituted.
 fn literal_text<'a>(expression: &'a Expression<'a>) -> Option<&'a str> {
     match expression.get_inner_expression() {
-        Expression::StringLiteral(literal) => Some(literal.value.as_str()),
+        Expression::StringLiteral(literal) => literal.value.as_str(),
         Expression::TemplateLiteral(template) if template.expressions.is_empty() => template
             .quasis
             .first()
             .and_then(|quasi| quasi.value.cooked.as_ref())
-            .map(|cooked| cooked.as_str()),
+            .and_then(|cooked| cooked.as_str()),
         _ => None,
     }
 }
@@ -606,7 +631,7 @@ impl<'s, 'a> LoaderGuard<'s, 'a> {
                 matches!(self.nodes.kind(declaration), AstKind::ImportSpecifier(specifier)
                     if specifier.imported.name().as_str() == "createRequire")
                     && matches!(self.nodes.parent_kind(declaration), AstKind::ImportDeclaration(import)
-                        if matches!(import.source.value.as_str(), "module" | "node:module"))
+                        if matches!(import.source.value.as_str(), Some("module" | "node:module")))
             }),
             expression => expression_property(expression).is_some_and(|(object, name)| {
                 name == "createRequire"
@@ -685,24 +710,20 @@ impl<'s, 'a> LoaderGuard<'s, 'a> {
                 }
                 AstKind::ImportNamespaceSpecifier(specifier) => {
                     if let AstKind::ImportDeclaration(import) = self.nodes.parent_kind(node.id())
-                        && builtin_module(import.source.value.as_str())
+                        && let Some(source) = import.source.value.as_str()
+                        && builtin_module(source)
                         && let Some(symbol) = specifier.local.symbol_id.get()
                     {
-                        pending.push((
-                            Holder::Symbol(symbol),
-                            builtin_root(import.source.value.as_str()),
-                        ));
+                        pending.push((Holder::Symbol(symbol), builtin_root(source)));
                     }
                 }
                 AstKind::ImportDefaultSpecifier(specifier) => {
                     if let AstKind::ImportDeclaration(import) = self.nodes.parent_kind(node.id())
-                        && builtin_module(import.source.value.as_str())
+                        && let Some(source) = import.source.value.as_str()
+                        && builtin_module(source)
                         && let Some(symbol) = specifier.local.symbol_id.get()
                     {
-                        pending.push((
-                            Holder::Symbol(symbol),
-                            builtin_root(import.source.value.as_str()),
-                        ));
+                        pending.push((Holder::Symbol(symbol), builtin_root(source)));
                     }
                 }
                 _ => {}
@@ -1199,7 +1220,7 @@ impl<'s, 'a> LoaderGuard<'s, 'a> {
                 .quasis
                 .first()
                 .and_then(|quasi| quasi.value.cooked.as_ref())
-                .map(|cooked| cooked.as_str()),
+                .and_then(|cooked| cooked.as_str()),
             expression => literal_text(expression),
         };
         prefix.is_some_and(|text| text.starts_with("./") || text.starts_with("../"))
@@ -1231,7 +1252,9 @@ impl<'s, 'a> LoaderGuard<'s, 'a> {
     fn replaces(&self, node: NodeId) -> bool {
         match self.nodes.kind(node) {
             AstKind::ImportDeclaration(import) if !import.import_kind.is_type() => {
-                let source = import.source.value.as_str();
+                let Some(source) = import.source.value.as_str() else {
+                    return true;
+                };
                 let only_create_require = import.specifiers.as_ref().is_some_and(|specifiers| {
                     specifiers.iter().all(|specifier| {
                         matches!(specifier, ImportDeclarationSpecifier::ImportSpecifier(specifier)
@@ -1243,8 +1266,12 @@ impl<'s, 'a> LoaderGuard<'s, 'a> {
                     || loader_module(source)
                         && !(matches!(source, "module" | "node:module") && only_create_require)
             }
-            AstKind::ExportFromDeclaration(export) => loader_module(export.source.value.as_str()),
-            AstKind::ExportAllDeclaration(export) => loader_module(export.source.value.as_str()),
+            AstKind::ExportFromDeclaration(export) => {
+                export.source.value.as_str().is_none_or(loader_module)
+            }
+            AstKind::ExportAllDeclaration(export) => {
+                export.source.value.as_str().is_none_or(loader_module)
+            }
             AstKind::ImportExpression(import) => match literal_text(&import.source) {
                 Some(source) => loader_module(source) || source.starts_with("data:"),
                 None => !Self::relative(&import.source),
@@ -1311,7 +1338,7 @@ impl<'s, 'a> LoaderGuard<'s, 'a> {
                 !matches!(self.nodes.parent_kind(node), AstKind::ImportSpecifier(_))
                     && matches!(
                         literal.value.as_str(),
-                        "syncBuiltinESMExports" | "getBuiltinModule" | "createRequire"
+                        Some("syncBuiltinESMExports" | "getBuiltinModule" | "createRequire")
                     )
             }
             AstKind::AssignmentExpression(assignment) => expression_target(&assignment.left)
@@ -1486,7 +1513,7 @@ fn relative_specifier(specifier: &str) -> Option<&str> {
 /// The relative specifier a dynamic `import` loads.
 fn imported<'a>(import: &'a ImportExpression<'a>) -> Option<&'a str> {
     match &import.source {
-        Expression::StringLiteral(literal) => relative_specifier(literal.value.as_str()),
+        Expression::StringLiteral(literal) => literal.value.as_str().and_then(relative_specifier),
         _ => None,
     }
 }
@@ -2386,7 +2413,7 @@ impl<'s, 'a> ModuleCopy<'s, 'a> {
     fn expression(&mut self, expression: &'a Expression<'a>) -> Option<Vec<Copied<'a>>> {
         self.step()?;
         Some(match expression.get_inner_expression() {
-            Expression::StringLiteral(literal) => vec![Copied::Literal(literal.value.as_str())],
+            Expression::StringLiteral(literal) => vec![Copied::Literal(literal.value.as_str()?)],
             Expression::NumericLiteral(_)
             | Expression::BooleanLiteral(_)
             | Expression::NullLiteral(_) => vec![Copied::Primitive],
@@ -2699,7 +2726,7 @@ fn member_property<'a>(kind: AstKind<'a>) -> Option<(&'a Expression<'a>, &'a str
             Some((&member.object, member.property.name.as_str()))
         }
         AstKind::ComputedMemberExpression(member) => match &member.expression {
-            Expression::StringLiteral(key) => Some((&member.object, key.value.as_str())),
+            Expression::StringLiteral(key) => key.value.as_str().map(|key| (&member.object, key)),
             _ => None,
         },
         AstKind::PrivateFieldExpression(member) => {
@@ -2726,7 +2753,7 @@ fn expression_property<'a>(
             Some((&member.object, member.property.name.as_str()))
         }
         Expression::ComputedMemberExpression(member) => match &member.expression {
-            Expression::StringLiteral(key) => Some((&member.object, key.value.as_str())),
+            Expression::StringLiteral(key) => key.value.as_str().map(|key| (&member.object, key)),
             _ => None,
         },
         Expression::PrivateFieldExpression(member) => {
@@ -2740,7 +2767,7 @@ fn key_name<'a>(key: &'a PropertyKey<'a>) -> Option<&'a str> {
     match key {
         PropertyKey::StaticIdentifier(name) => Some(name.name.as_str()),
         PropertyKey::PrivateIdentifier(name) => Some(name.name.as_str()),
-        PropertyKey::StringLiteral(name) => Some(name.value.as_str()),
+        PropertyKey::StringLiteral(name) => name.value.as_str(),
         PropertyKey::NumericLiteral(number) => numeric_name(number),
         _ => None,
     }
@@ -3045,7 +3072,7 @@ impl<'s, 'a> Analysis<'s, 'a> {
                 // see leaves coverage incomplete elsewhere.
                 if self.is_global(&call.callee, "eval") {
                     for argument in &call.arguments {
-                        let texts: Vec<&str> = match argument.as_expression().map(inner) {
+                        let texts: Vec<Option<&str>> = match argument.as_expression().map(inner) {
                             Some(Expression::StringLiteral(literal)) => {
                                 vec![literal.value.as_str()]
                             }
@@ -3057,13 +3084,18 @@ impl<'s, 'a> Analysis<'s, 'a> {
                                         .value
                                         .cooked
                                         .as_ref()
-                                        .map_or(quasi.value.raw.as_str(), |cooked| cooked.as_str())
+                                        .map_or(Some(quasi.value.raw.as_str()), |cooked| {
+                                            cooked.as_str()
+                                        })
                                 })
                                 .collect(),
                             _ => continue,
                         };
                         for name in ["__dirname", "__filename"] {
-                            if texts.iter().any(|text| text.contains(name)) {
+                            if texts
+                                .iter()
+                                .any(|text| text.is_none_or(|text| text.contains(name)))
+                            {
                                 self.rebind(name);
                             }
                         }
@@ -3153,7 +3185,7 @@ impl<'s, 'a> Analysis<'s, 'a> {
             .and_then(Argument::as_expression)
             .map(inner)
         {
-            Some(Expression::StringLiteral(key)) => Some(key.value.as_str()),
+            Some(Expression::StringLiteral(key)) => key.value.as_str(),
             _ => None,
         };
         let keys = |source: Option<&'a Argument<'a>>| -> Vec<Option<&'a str>> {
@@ -3206,7 +3238,7 @@ impl<'s, 'a> Analysis<'s, 'a> {
             AstKind::ComputedMemberExpression(member)
                 if self.store_of(node).is_some()
                     && !matches!(&member.expression, Expression::StringLiteral(key)
-                        if key.value.as_str() != "__proto__") =>
+                        if key.value != "__proto__") =>
             {
                 vec![(self.store_owner(&member.object), None)]
             }
@@ -3450,13 +3482,13 @@ impl<'s, 'a> Analysis<'s, 'a> {
             return None;
         }
         match inner(key) {
-            Expression::StringLiteral(key) => Some(key.value.as_str()),
+            Expression::StringLiteral(key) => key.value.as_str(),
             Expression::NumericLiteral(number) => numeric_name(number),
             Expression::TemplateLiteral(template) if template.expressions.is_empty() => template
                 .quasis
                 .first()
                 .and_then(|quasi| quasi.value.cooked.as_ref())
-                .map(|cooked| cooked.as_str()),
+                .and_then(|cooked| cooked.as_str()),
             Expression::Identifier(identifier) => self.constant_key_within(
                 self.resolved(identifier)
                     .and_then(|symbol| self.initializer(symbol))?,
@@ -4160,7 +4192,7 @@ impl<'s, 'a> Analysis<'s, 'a> {
                 self.is_global(&call.callee, "require")
                     && matches!(call.arguments.first().and_then(Argument::as_expression),
                         Some(Expression::StringLiteral(module))
-                            if matches!(module.value.as_str(), "process" | "node:process"))
+                            if matches!(module.value.as_str(), Some("process" | "node:process")))
             }
             expression => expression_property(expression).is_some_and(|(global, name)| {
                 name == "process"
@@ -4173,7 +4205,7 @@ impl<'s, 'a> Analysis<'s, 'a> {
 
     fn imports_process(&self, specifier: NodeId) -> bool {
         matches!(self.nodes.parent_kind(specifier), AstKind::ImportDeclaration(import)
-            if matches!(import.source.value.as_str(), "process" | "node:process"))
+            if matches!(import.source.value.as_str(), Some("process" | "node:process")))
     }
 
     /// Whether a name or string draws on a location: a location name, a
@@ -4238,15 +4270,17 @@ impl<'s, 'a> Analysis<'s, 'a> {
             AstKind::PrivateFieldExpression(member) => {
                 self.names_location(member.field.name.as_str())
             }
-            AstKind::StringLiteral(literal) => self.names_location(literal.value.as_str()),
+            AstKind::StringLiteral(literal) => literal
+                .value
+                .as_str()
+                .is_none_or(|text| self.names_location(text)),
             AstKind::TemplateLiteral(template) => template.quasis.iter().any(|quasi| {
-                self.names_location(
-                    quasi
-                        .value
-                        .cooked
-                        .as_ref()
-                        .map_or(quasi.value.raw.as_str(), |cooked| cooked.as_str()),
-                )
+                quasi
+                    .value
+                    .cooked
+                    .as_ref()
+                    .map_or(Some(quasi.value.raw.as_str()), |cooked| cooked.as_str())
+                    .is_none_or(|text| self.names_location(text))
             }),
             AstKind::BindingProperty(property) => {
                 key_name(&property.key).is_some_and(|name| self.names_location(name))
@@ -4256,7 +4290,7 @@ impl<'s, 'a> Analysis<'s, 'a> {
             AstKind::CallExpression(call) => {
                 self.loads_natively(call)
                     && !matches!(call.arguments.first().and_then(Argument::as_expression).map(inner),
-                        Some(Expression::StringLiteral(specifier)) if builtin_module(specifier.value.as_str()))
+                        Some(Expression::StringLiteral(specifier)) if specifier.value.as_str().is_some_and(builtin_module))
             }
             _ => false,
         }
@@ -4317,7 +4351,7 @@ impl<'s, 'a> Analysis<'s, 'a> {
             matches!(self.nodes.kind(declaration), AstKind::ImportSpecifier(specifier)
                 if specifier.imported.name().as_str() == "createRequire")
                 && matches!(self.nodes.parent_kind(declaration), AstKind::ImportDeclaration(import)
-                    if matches!(import.source.value.as_str(), "module" | "node:module"))
+                    if matches!(import.source.value.as_str(), Some("module" | "node:module")))
         })
     }
 
@@ -4375,8 +4409,12 @@ impl<'s, 'a> Analysis<'s, 'a> {
                     (
                         AstKind::ImportNamespaceSpecifier(_) | AstKind::ImportDefaultSpecifier(_),
                         AstKind::ImportDeclaration(import),
-                    ) => builtin_module(import.source.value.as_str())
-                        .then(|| (builtin_root(import.source.value.as_str()), false)),
+                    ) => import
+                        .source
+                        .value
+                        .as_str()
+                        .filter(|source| builtin_module(source))
+                        .map(|source| (builtin_root(source), false)),
                     _ => self.builtin_module(self.initializer(symbol)?, depth + 1),
                 }
             }
@@ -5650,7 +5688,11 @@ impl<'s, 'a> Analysis<'s, 'a> {
     fn evaluate_form(&self, expression: &'a Expression<'a>, depth: usize) -> String {
         let span = expression.span();
         match inner(expression) {
-            Expression::StringLiteral(literal) => literal.value.to_string(),
+            Expression::StringLiteral(literal) => literal
+                .value
+                .as_str()
+                .unwrap_or(UNRESOLVED_LOCATION)
+                .to_string(),
             Expression::TemplateLiteral(template) => {
                 let mut value = String::new();
                 for (index, quasi) in template.quasis.iter().enumerate() {
@@ -5659,7 +5701,8 @@ impl<'s, 'a> Analysis<'s, 'a> {
                             .value
                             .cooked
                             .as_ref()
-                            .map_or(quasi.value.raw.as_str(), |cooked| cooked.as_str()),
+                            .map_or(Some(quasi.value.raw.as_str()), |cooked| cooked.as_str())
+                            .unwrap_or(UNRESOLVED_LOCATION),
                     );
                     if let Some(part) = template.expressions.get(index) {
                         value.push_str(&self.evaluate(part, depth + 1));
@@ -6053,7 +6096,7 @@ impl<'s, 'a> Analysis<'s, 'a> {
                         || property.computed && self.unknown_global_key(id, &property.name)
                 }
                 AstKind::StringLiteral(literal) => {
-                    literal.value.as_str() == "RegExp"
+                    literal.value == "RegExp"
                         && matches!(self.nodes.parent_kind(id), AstKind::CallExpression(_))
                 }
                 AstKind::CallExpression(call) => {
@@ -6346,26 +6389,34 @@ impl<'s, 'a> Analysis<'s, 'a> {
                     }
                 }
                 AstKind::ExportFromDeclaration(export) => {
+                    let Some(source) = export.source.value.as_str() else {
+                        exports.opaque = true;
+                        continue;
+                    };
                     for specifier in &export.specifiers {
-                        let imported = specifier.local.name();
-                        let export_name = if imported.as_str() == "default" {
-                            ModuleExport::Default
-                        } else {
-                            ModuleExport::Name(imported.to_string())
+                        let export_name = match specifier.local.name().as_str() {
+                            "default" => ModuleExport::Default,
+                            name => ModuleExport::Name(name.to_string()),
                         };
                         exports.add(
                             specifier.exported.name().as_str(),
-                            ExportValue::From(export.source.value.as_str(), export_name),
+                            ExportValue::From(source, export_name),
                         );
                     }
                 }
-                AstKind::ExportAllDeclaration(export) => match &export.exported {
-                    Some(name) => exports.add(
-                        name.name().as_str(),
-                        ExportValue::From(export.source.value.as_str(), ModuleExport::Any),
-                    ),
-                    None => exports.everything_from.push(export.source.value.as_str()),
-                },
+                AstKind::ExportAllDeclaration(export) => {
+                    let Some(source) = export.source.value.as_str() else {
+                        exports.opaque = true;
+                        continue;
+                    };
+                    match &export.exported {
+                        Some(name) => exports.add(
+                            name.name().as_str(),
+                            ExportValue::From(source, ModuleExport::Any),
+                        ),
+                        None => exports.everything_from.push(source),
+                    }
+                }
                 AstKind::ExportDefaultDeclaration(export) => {
                     exports.default.push(match &export.declaration {
                         ExportDefaultDeclarationKind::FunctionDeclaration(function) => {
@@ -7182,7 +7233,9 @@ impl<'s, 'a> Analysis<'s, 'a> {
 
     fn import_source(&self, specifier: NodeId) -> Option<&'a str> {
         match self.nodes.parent_kind(specifier) {
-            AstKind::ImportDeclaration(import) => relative_specifier(import.source.value.as_str()),
+            AstKind::ImportDeclaration(import) => {
+                import.source.value.as_str().and_then(relative_specifier)
+            }
             _ => None,
         }
     }
@@ -7274,7 +7327,9 @@ impl<'s, 'a> Analysis<'s, 'a> {
             return None;
         }
         match call.arguments.first().and_then(Argument::as_expression) {
-            Some(Expression::StringLiteral(literal)) => relative_specifier(literal.value.as_str()),
+            Some(Expression::StringLiteral(literal)) => {
+                literal.value.as_str().and_then(relative_specifier)
+            }
             _ => None,
         }
     }
@@ -7675,10 +7730,81 @@ fn expression_target<'a>(
         AssignmentTarget::ComputedMemberExpression(member) => Some((
             &member.object,
             match &member.expression {
-                Expression::StringLiteral(key) => Some(key.value.as_str()),
+                Expression::StringLiteral(key) => key.value.as_str(),
                 _ => None,
             },
         )),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lone_surrogates_withdraw_native_modules_and_retain_patches() {
+        for source in [
+            r"const value = '\uD800';",
+            r"const value = `\uDC00`;",
+            r"import './\uD800.js';",
+            r"require('node:fs\uD800');",
+            r"const object = {'\uD800': 1};",
+        ] {
+            let usage = parsed_builtin_use(
+                "index.js",
+                &format!("{source}\nrequire('path').join = replacement;"),
+            );
+            assert!(usage.replaces_loader, "{source}");
+            assert!(usage.other_loader_replacement, "{source}");
+            assert!(
+                usage.patched.iter().any(|patch| patch == "path:join"),
+                "{source}"
+            );
+        }
+        for source in [
+            r"const value = '\uD83D\uDE80';",
+            r"const value = '\\ud800';",
+            "import { createRequire } from 'node:module'; const load = createRequire(import.meta.url); load('fs');",
+            "require(`fs`);",
+        ] {
+            assert!(
+                !parsed_builtin_use("index.js", source).replaces_loader,
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn surrogate_keys_and_literals_do_not_alias_escape_text() {
+        let allocator = Allocator::default();
+        let parsed = Parser::new(
+            &allocator,
+            r"const object = {'\uD800': 1, '\\ud800': 2, '�': 3, '\uD83D\uDE80': 4}; object['\uD800']; object['\\ud800'];",
+            SourceType::unambiguous(),
+        ).parse();
+        assert!(parsed.diagnostics.is_empty());
+        let semantic = SemanticBuilder::new()
+            .with_build_nodes(true)
+            .build(&parsed.program)
+            .semantic;
+        let keys: Vec<_> = semantic
+            .nodes()
+            .iter()
+            .filter_map(|node| match node.kind() {
+                AstKind::ObjectProperty(property) => Some(key_name(&property.key)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(keys, [None, Some(r"\ud800"), Some("�"), Some("🚀")]);
+        let members: Vec<_> = semantic
+            .nodes()
+            .iter()
+            .filter_map(|node| match node.kind() {
+                AstKind::ComputedMemberExpression(member) => Some(literal_text(&member.expression)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(members, [None, Some(r"\ud800")]);
     }
 }
