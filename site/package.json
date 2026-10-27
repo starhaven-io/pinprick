@@ -17,17 +17,17 @@
     "format:check": "prettier --check ."
   },
   "dependencies": {
-    "@astrojs/cloudflare": "^14.4.0",
+    "@astrojs/cloudflare": "^14.4.1",
     "@astrojs/starlight": "^0.42.6",
-    "astro": "^7.3.8",
+    "astro": "^7.4.1",
     "sharp": "^0.35.5"
   },
   "devDependencies": {
-    "@astrojs/check": "^0.9.10",
+    "@astrojs/check": "^0.9.11",
     "prettier": "^3.9.10",
     "prettier-plugin-astro": "^1.1.1",
     "typescript": "^6.0.3",
-    "wrangler": "4.151.1"
+    "wrangler": "4.151.2"
   },
   "allowScripts": {
     "esbuild": false,
