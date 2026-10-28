@@ -293,12 +293,12 @@ jobs:
       - name: Install cargo-nextest
         if: matrix.check == 'coverage'
         env:
-          CARGO_NEXTEST_SHA256: "bf92cb81450872d960ffa13857a83084d557ec0cdc141663d263bb23ef756f97"
+          CARGO_NEXTEST_SHA256: "d65c7f14bcb5c1566d1ecd534c5da8dedb81ba58586e478b0ab81c877d2bd8ad"
         run: |
           archive="${RUNNER_TEMP}/cargo-nextest.tar.gz"
           curl --fail --location --proto '=https' --proto-redir '=https' \
             --output "${archive}" \
-            "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.148/cargo-nextest-0.9.148-x86_64-unknown-linux-musl.tar.gz"
+            "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.149/cargo-nextest-0.9.149-x86_64-unknown-linux-musl.tar.gz"
           echo "${CARGO_NEXTEST_SHA256}  ${archive}" | sha256sum --check --strict
           tar --extract --gzip --file "${archive}" --directory "${RUNNER_TEMP}" cargo-nextest
           echo "${RUNNER_TEMP}" >> "${GITHUB_PATH}"
