@@ -72,7 +72,7 @@ jobs:
           persist-credentials: false
 
       - name: Run pinprick
-        uses: starhaven-io/pinprick-action@6120720ae5860dbbac91262d53beb385b84cb8f4 # v0.6.12
+        uses: starhaven-io/pinprick-action@5dd25b9f8aeecc9fcd7e406d4b78184005250cc8 # v0.6.13
 ```
 
 The action wraps `pinprick audit` only. Use the CLI directly for `pin`, `update`, and `score`. For console-mode pull request feedback, set `advanced-security: false`; see the action README for the full matrix.
