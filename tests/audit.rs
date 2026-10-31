@@ -341,7 +341,7 @@ jobs:
         .unwrap();
     assert_eq!(output.status.code(), Some(2));
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(report["rules_version"], 9);
+    assert_eq!(report["rules_version"], 10);
     assert_eq!(report["audited_bundled"], 0);
     assert_eq!(report["external_actions_skipped"], 2);
     assert_eq!(report["coverage_complete"], false);
@@ -2598,6 +2598,1043 @@ fn located_arguments_reach_other_action_files() {
 }
 
 #[test]
+fn module_export_arguments_return_to_their_module() {
+    let lib = "const path = require('path');\nconst cp = require('child_process');\nexports.script = path.join(__dirname, 'evil.sh');\nexports.run = (script) => cp.spawnSync('bash', [script]);\n";
+    let mut cases = vec![];
+    for (name, caller) in [
+        (
+            "plain",
+            "const lib = require('./lib.js'); lib.run(lib.script);",
+        ),
+        (
+            "direct exports",
+            "require('./lib.js').run(require('./lib.js').script);",
+        ),
+        (
+            "destructured exports",
+            "const { run, script } = require('./lib.js'); run(script);",
+        ),
+        (
+            "aliased export",
+            "const lib = require('./lib.js'); const script = lib.script; lib.run(script);",
+        ),
+        (
+            "caller location control",
+            "const path = require('path'); const lib = require('./lib.js'); lib.run(path.join(__dirname, 'evil.sh'));",
+        ),
+    ] {
+        cases.push((
+            name,
+            false,
+            vec![
+                ("index.js", caller.to_string()),
+                ("lib.js", lib.to_string()),
+            ],
+        ));
+    }
+    cases.extend([
+        (
+            "object exports",
+            false,
+            vec![
+                ("index.js", "const lib = require('./lib.js'); lib.run(lib.script);".to_string()),
+                ("lib.js", "const path = require('path'); const cp = require('child_process'); module.exports = { script: path.join(__dirname, 'evil.sh'), run: (script) => cp.spawnSync('bash', [script]) };".to_string()),
+            ],
+        ),
+        (
+            "exported words",
+            false,
+            vec![
+                ("index.js", "const lib = require('./lib.js'); lib.run(lib.args);".to_string()),
+                ("lib.js", "const path = require('path'); const cp = require('child_process'); exports.args = [path.join(__dirname, 'evil.sh')]; exports.run = (args) => cp.spawnSync('bash', args);".to_string()),
+            ],
+        ),
+        (
+            "module location differs from caller",
+            false,
+            vec![
+                ("index.js", "const lib = require('./nested/lib.js'); lib.run(lib.script);".to_string()),
+                ("nested/lib.js", lib.replace("'evil.sh'", "'../evil.sh'")),
+            ],
+        ),
+        (
+            "TypeScript export prelude",
+            false,
+            vec![
+                ("index.js", "const lib_1 = require('./lib.js'); (0, lib_1.run)(lib_1.script);".to_string()),
+                ("lib.js", lib.replace("exports.script =", "exports.script = exports.run = void 0; exports.script =")),
+            ],
+        ),
+        (
+            "ES module exported array binding",
+            true,
+            vec![
+                ("index.js", "import { run, args } from './lib.js'; run(args);".to_string()),
+                ("lib.js", "import path from 'path'; import cp from 'child_process'; const args = [path.join(import.meta.dirname, 'evil.sh')]; export { args }; export const run = (args) => cp.spawnSync('bash', args);".to_string()),
+            ],
+        ),
+        (
+            "ES module named exports",
+            true,
+            vec![
+                ("index.js", "import { run, script } from './lib.js'; run(script);".to_string()),
+                ("lib.js", "import path from 'path'; import cp from 'child_process'; export const script = path.join(import.meta.dirname, 'evil.sh'); export const run = (script) => cp.spawnSync('bash', [script]);".to_string()),
+            ],
+        ),
+    ]);
+    let failures = module_failures(cases, &ModuleOutcome::Followed);
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+#[test]
+fn module_export_escapes_fail_closed() {
+    let lib = "const path = require('path'); const cp = require('child_process'); exports.script = path.join(__dirname, 'evil.sh'); exports.run = (script) => cp.spawnSync('bash', [script]);";
+    let mut cases = vec![];
+    for (name, caller) in [
+        (
+            "unknown helper",
+            "function h(mod) { mod.run(mod.script); } h(require('./lib.js'));",
+        ),
+        (
+            "helper name proves nothing",
+            "function __importDefault(mod) { mod.run(mod.script); return mod; } __importDefault(require('./lib.js'));",
+        ),
+        (
+            "spread argument",
+            "const lib = require('./lib.js'); lib.run(...[lib.script]);",
+        ),
+        (
+            "computed export",
+            "const lib = require('./lib.js'); lib.run(lib[process.env.KEY]);",
+        ),
+        (
+            "export used by caller",
+            "const cp = require('child_process'); const lib = require('./lib.js'); cp.spawnSync('bash', [lib.script]);",
+        ),
+        (
+            "caller mutates export",
+            "const lib = require('./lib.js'); lib.script = process.env.SCRIPT; lib.run(lib.script);",
+        ),
+        (
+            "reassigned alias",
+            "const lib = require('./lib.js'); let script = lib.script; script = process.env.SCRIPT; lib.run(script);",
+        ),
+    ] {
+        cases.push((
+            name,
+            false,
+            vec![
+                ("index.js", caller.to_string()),
+                ("lib.js", lib.to_string()),
+            ],
+        ));
+    }
+    cases.extend([
+        (
+            "own value passed to a re-exported function",
+            false,
+            vec![
+                ("index.js", "const lib = require('./nested/lib.js'); lib.run(lib.script);".to_string()),
+                ("nested/lib.js", "const path = require('path'); exports.script = path.join(__dirname, '../evil.sh'); exports.run = require('../runner.js').run;".to_string()),
+                ("runner.js", "const cp = require('child_process'); exports.run = (script) => cp.spawnSync('bash', [script]);".to_string()),
+            ],
+        ),
+        (
+            "ES module default value",
+            true,
+            vec![
+                ("index.js", "import script, { run } from './lib.js'; run(script);".to_string()),
+                ("lib.js", "import path from 'path'; import cp from 'child_process'; export default path.join(import.meta.dirname, 'evil.sh'); export const run = (script) => cp.spawnSync('bash', [script]);".to_string()),
+            ],
+        ),
+        (
+            "direct default export",
+            false,
+            vec![
+                ("index.js", "const cp = require('child_process'); cp.spawnSync('bash', [require('./lib.js')]);".to_string()),
+                ("lib.js", "const path = require('path'); module.exports = path.join(__dirname, 'evil.sh');".to_string()),
+            ],
+        ),
+        (
+            "getter export",
+            false,
+            vec![
+                ("index.js", "const lib = require('./lib.js'); lib.run(lib.script);".to_string()),
+                ("lib.js", format!("{lib} Object.defineProperty(exports, 'script', {{ get: () => path.join(__dirname, 'evil.sh') }});")),
+            ],
+        ),
+        (
+            "multiple export writes",
+            false,
+            vec![
+                ("index.js", "const lib = require('./lib.js'); lib.run(lib.script);".to_string()),
+                ("lib.js", format!("{lib} exports.script = path.join(__dirname, 'other.sh');")),
+            ],
+        ),
+        (
+            "value from a different module",
+            false,
+            vec![
+                ("index.js", "const lib = require('./lib.js'); lib.run(require('./value.js'));".to_string()),
+                ("lib.js", "const cp = require('child_process'); exports.run = (script) => cp.spawnSync('bash', [script]);".to_string()),
+                ("value.js", "const path = require('path'); module.exports = path.join(__dirname, 'evil.sh');".to_string()),
+            ],
+        ),
+        (
+            "default export with unrelated caller location",
+            false,
+            vec![
+                ("index.js", "const cp = require('child_process'); console.log(__dirname); cp.spawnSync('bash', [require('./lib.js')]);".to_string()),
+                ("lib.js", "const path = require('path'); module.exports = path.join(__dirname, 'evil.sh');".to_string()),
+            ],
+        ),
+        (
+            "reassigned destructured value",
+            false,
+            vec![
+                ("index.js", "const lib = require('./lib.js'); let { script } = lib; script = lib.other; lib.run(script);".to_string()),
+                ("lib.js", lib.replace("exports.script =", "exports.other = path.join(__dirname, 'config.json'); exports.script =")),
+            ],
+        ),
+        (
+            "reassigned ES export",
+            true,
+            vec![
+                ("index.js", "import { run, script } from './lib.js'; run(script);".to_string()),
+                ("lib.js", "import path from 'path'; import cp from 'child_process'; export let script = path.join(import.meta.dirname, 'config.json'); script = path.join(import.meta.dirname, 'evil.sh'); export const run = (script) => cp.spawnSync('bash', [script]);".to_string()),
+            ],
+        ),
+        (
+            "reassigned destructured value from a return",
+            false,
+            vec![
+                ("index.js", "let { run, script } = require('./lib.js'); script = require('./lib.js').get(); run(script);".to_string()),
+                ("lib.js", "const path = require('path'); const cp = require('child_process'); exports.script = path.join(__dirname, 'config.json'); exports.get = () => path.join(__dirname, 'evil.sh'); exports.run = (script) => cp.spawnSync('bash', [script]);".to_string()),
+            ],
+        ),
+        (
+            "mutated exported array binding",
+            true,
+            vec![
+                ("index.js", "import { run, args } from './lib.js'; run(args);".to_string()),
+                ("lib.js", "import path from 'path'; import cp from 'child_process'; const args = [path.join(import.meta.dirname, 'config.json')]; args[0] = path.join(import.meta.dirname, 'evil.sh'); export { args }; export const run = (args) => cp.spawnSync('bash', args);".to_string()),
+            ],
+        ),
+        (
+            "escaped re-export",
+            false,
+            vec![
+                ("index.js", "function h(mod) { mod.run(mod.script); } h(require('./bridge.js'));".to_string()),
+                ("bridge.js", "module.exports = require('./lib.js');".to_string()),
+                ("lib.js", lib.to_string()),
+            ],
+        ),
+        (
+            "located field of an export passed back",
+            false,
+            vec![
+                ("index.js", "const lib = require('./lib.js'); lib.run(lib.paths.script);".to_string()),
+                ("lib.js", lib.replace("exports.script =", "exports.paths = { script: path.join(__dirname, 'evil.sh') }; exports.script =")),
+            ],
+        ),
+        (
+            "different located exports to one function",
+            false,
+            vec![
+                ("index.js", "const lib = require('./lib.js'); lib.run(lib.other); lib.run(lib.script);".to_string()),
+                ("lib.js", lib.replace("exports.script =", "exports.other = path.join(__dirname, 'config.json'); exports.script =")),
+            ],
+        ),
+        (
+            "getter export taken through a require shim",
+            false,
+            vec![
+                ("index.js", "const lib = require('./lib.js'); lib.run(lib.script);".to_string()),
+                ("lib.js", "var __require = ((x) => typeof require !== 'undefined' ? require : x)(function (x) { if (typeof require !== 'undefined') return require.apply(this, arguments); throw Error('Dynamic require of ' + x + ' is not supported'); }); const cp = require('child_process'); const paths = __require('./paths.js'); function run(script) { return cp.spawnSync('bash', [script]); } Object.defineProperty(exports, 'script', { enumerable: true, get: function () { return paths.script; } }); Object.defineProperty(exports, 'run', { enumerable: true, get: function () { return run; } });".to_string()),
+                ("paths.js", "const path = require('path'); exports.script = path.join(__dirname, 'evil.sh');".to_string()),
+            ],
+        ),
+        (
+            "getter export taken from another file",
+            false,
+            vec![
+                ("index.js", "const lib = require('./lib.js'); lib.run(lib.script);".to_string()),
+                ("lib.js", "const cp = require('child_process'); const paths = require('./paths.js'); function run(script) { return cp.spawnSync('bash', [script]); } Object.defineProperty(exports, 'script', { enumerable: true, get: function () { return paths.script; } }); Object.defineProperty(exports, 'run', { enumerable: true, get: function () { return run; } });".to_string()),
+                ("paths.js", "const path = require('path'); exports.script = path.join(__dirname, 'evil.sh');".to_string()),
+            ],
+        ),
+    ]);
+    let failures = module_failures(cases, &ModuleOutcome::Incomplete);
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+#[test]
+fn module_export_arguments_without_locations_stay_complete() {
+    let cases = vec![
+        (
+            "unlocated export",
+            false,
+            vec![
+                ("index.js", "const lib = require('./lib.js'); lib.run(lib.script);".to_string()),
+                ("lib.js", "const cp = require('child_process'); exports.script = process.env.SCRIPT; exports.run = (script) => cp.spawnSync('bash', [script]);".to_string()),
+            ],
+        ),
+        (
+            "unrelated variable with same name",
+            false,
+            vec![
+                ("index.js", "const lib = require('./lib.js'); const script = process.env.SCRIPT; lib.run(script);".to_string()),
+                ("lib.js", "const path = require('path'); const cp = require('child_process'); exports.script = path.join(__dirname, 'evil.sh'); exports.run = (script) => cp.spawnSync('bash', [script]);".to_string()),
+            ],
+        ),
+    ];
+    let failures = module_failures(cases, &ModuleOutcome::Clean);
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+#[test]
+fn module_export_alias_escapes_fail_closed() {
+    let lib = "const path = require('path'); exports.script = path.join(__dirname, 'evil.sh');";
+    let callers = [
+        (
+            "property alias chain",
+            "const lib = require('./lib.js'); const script = lib.script; const again = script; cp.spawnSync('bash', [again]);".to_string(),
+        ),
+        (
+            "destructured alias",
+            "const { script } = require('./lib.js'); const again = script; cp.spawnSync('bash', [again]);".to_string(),
+        ),
+        (
+            "reassigned source alias",
+            "const lib = require('./lib.js'); let script = lib.script; const again = script; script = process.env.SCRIPT; cp.spawnSync('bash', [again]);".to_string(),
+        ),
+        (
+            "reassigned destination alias",
+            "const lib = require('./lib.js'); const script = lib.script; let again = script; again = process.env.SCRIPT; cp.spawnSync('bash', [again]);".to_string(),
+        ),
+        (
+            "alias cycle with a module origin",
+            "const lib = require('./lib.js'); let first = lib.script; let second = first; first = second; second = first; cp.spawnSync('bash', [second]);".to_string(),
+        ),
+        (
+            "alias depth limit",
+            format!(
+                "const lib = require('./lib.js'); const a0 = lib.script; {} cp.spawnSync('bash', [a80]);",
+                (1..=80).map(|n| format!("const a{n} = a{};", n - 1)).collect::<String>()
+            ),
+        ),
+        (
+            "helper name does not prove alias safety",
+            "const { script } = require('./lib.js'); const safe = script; function sanitize(value) { cp.spawnSync('bash', [value]); } sanitize(safe);".to_string(),
+        ),
+    ];
+    let mut cases: Vec<ModuleCase<'_>> = callers
+        .into_iter()
+        .map(|(name, caller)| {
+            (
+                name,
+                false,
+                vec![
+                    (
+                        "index.js",
+                        format!("const cp = require('child_process'); {caller}"),
+                    ),
+                    ("lib.js", lib.to_string()),
+                ],
+            )
+        })
+        .collect();
+    cases.push((
+        "named import alias",
+        true,
+        vec![
+            ("index.js", "import cp from 'child_process'; import { script } from './lib.js'; const again = script; cp.spawnSync('bash', [again]);".to_string()),
+            ("lib.js", "import path from 'path'; export const script = path.join(import.meta.dirname, 'evil.sh');".to_string()),
+        ],
+    ));
+    for (name, read) in [
+        (
+            "field alias at the depth limit",
+            "const script = a64.script;",
+        ),
+        (
+            "destructured alias at the depth limit",
+            "const { script } = a64;",
+        ),
+    ] {
+        cases.push((
+            name,
+            false,
+            vec![
+                ("index.js", format!(
+                    "const cp = require('child_process'); const lib = require('./lib.js'); const a0 = lib.wrapper; {} {read} cp.spawnSync('bash', [script]);",
+                    (1..=64).map(|n| format!("const a{n} = a{};", n - 1)).collect::<String>()
+                )),
+                ("lib.js", "const path = require('path'); exports.wrapper = { script: path.join(__dirname, 'evil.sh') };".to_string()),
+            ],
+        ));
+    }
+    let failures = module_failures(cases, &ModuleOutcome::Incomplete);
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+#[test]
+fn module_export_alias_feedback_is_followed() {
+    let lib = "const path = require('path'); const cp = require('child_process'); exports.script = path.join(__dirname, 'evil.sh'); exports.run = (script) => cp.spawnSync('bash', [script]);";
+    let cases = [
+        ("property aliases", "const lib = require('./lib.js'); const script = lib.script; const again = script; lib.run(again);"),
+        ("destructured aliases", "const { run, script } = require('./lib.js'); const again = script; run(again);"),
+    ]
+    .into_iter()
+    .map(|(name, caller)| (name, false, vec![("index.js", caller.to_string()), ("lib.js", lib.to_string())]))
+    .collect();
+    let failures = module_failures(cases, &ModuleOutcome::Followed);
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+#[test]
+fn module_export_aliases_without_locations_stay_complete() {
+    let cases = vec![
+        (
+            "unlocated exported alias",
+            false,
+            vec![
+                ("index.js", "const cp = require('child_process'); const { script } = require('./lib.js'); const again = script; cp.spawnSync('bash', [again]);".to_string()),
+                ("lib.js", "exports.script = process.env.SCRIPT;".to_string()),
+            ],
+        ),
+        (
+            "shadowed exported name",
+            false,
+            vec![
+                ("index.js", "const cp = require('child_process'); const { script } = require('./lib.js'); { const script = process.env.SCRIPT; const again = script; cp.spawnSync('bash', [again]); }".to_string()),
+                ("lib.js", "const path = require('path'); exports.script = path.join(__dirname, 'evil.sh');".to_string()),
+            ],
+        ),
+    ];
+    let failures = module_failures(cases, &ModuleOutcome::Clean);
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// Audits cases passing an exported array back to the module's `run`, whose
+/// `lib.js` is `setup` followed by its exports, with and without a location
+/// in the caller.
+fn container_failures(cases: &[(&str, bool, String)], expected: &ModuleOutcome) -> Vec<String> {
+    let mut failures = vec![];
+    for (location, caller) in [
+        ("", "const lib = require('./lib.js'); lib.run(lib.args);"),
+        (
+            " with a caller location",
+            "const lib = require('./lib.js'); console.log(__dirname); lib.run(lib.args);",
+        ),
+    ] {
+        let cases = cases
+            .iter()
+            .map(|(name, esm, setup)| {
+                let (caller, lib) = if *esm {
+                    (
+                        caller
+                            .replace(
+                                "const lib = require('./lib.js');",
+                                "import { run, args } from './lib.js';",
+                            )
+                            .replace("lib.run(lib.args)", "run(args)"),
+                        format!("import path from 'path'; import cp from 'child_process'; {setup} export const run = (args) => cp.spawnSync('bash', args);"),
+                    )
+                } else {
+                    (
+                        caller.to_string(),
+                        format!("const path = require('path'); const cp = require('child_process'); {setup} exports.run = (args) => cp.spawnSync('bash', args);"),
+                    )
+                };
+                let files = [("index.js", caller), ("lib.js", lib)]
+                    .map(|(path, code)| {
+                        let code = if *esm {
+                            code.replace("__dirname", "import.meta.dirname")
+                        } else {
+                            code
+                        };
+                        (path, code)
+                    })
+                    .to_vec();
+                (*name, *esm, files)
+            })
+            .collect();
+        failures.extend(
+            module_failures(cases, expected)
+                .into_iter()
+                .map(|failure| format!("{failure}{location}")),
+        );
+    }
+    failures
+}
+
+#[test]
+fn module_export_container_changes_fail_closed() {
+    let safe = "path.join(__dirname, 'config.json')";
+    let evil = "path.join(__dirname, 'evil.sh')";
+    let aliases = (1..=70)
+        .map(|n| format!("const a{n} = a{};", n - 1))
+        .collect::<String>();
+    let changed = [
+        (
+            "alias",
+            false,
+            format!(
+                "const args = [{safe}]; const other = args; other[0] = {evil}; exports.args = args;"
+            ),
+        ),
+        (
+            "alias assigned later",
+            false,
+            format!(
+                "const args = [{safe}]; let other; other = args; other[0] = {evil}; exports.args = args;"
+            ),
+        ),
+        (
+            "alias after the export",
+            false,
+            format!(
+                "const args = [{safe}]; exports.args = args; const other = args; other[0] = {evil};"
+            ),
+        ),
+        (
+            "alias in a function",
+            false,
+            format!(
+                "const args = [{safe}]; function change() {{ const other = args; other[0] = {evil}; }} change(); exports.args = args;"
+            ),
+        ),
+        (
+            "parameter alias",
+            false,
+            format!(
+                "const args = [{safe}]; function change(other) {{ other[0] = {evil}; }} change(args); exports.args = args;"
+            ),
+        ),
+        (
+            "object holding the array",
+            false,
+            format!(
+                "const args = [{safe}]; const box = {{ args }}; box.args[0] = {evil}; exports.args = args;"
+            ),
+        ),
+        (
+            "array holding the array",
+            false,
+            format!(
+                "const args = [{safe}]; const box = [args]; box[0][0] = {evil}; exports.args = args;"
+            ),
+        ),
+        (
+            "alias push",
+            false,
+            format!(
+                "const args = []; const other = args; other.push({evil}); exports.args = args;"
+            ),
+        ),
+        (
+            "alias splice",
+            false,
+            format!(
+                "const args = [{safe}]; const other = args; other.splice(0, 1, {evil}); exports.args = args;"
+            ),
+        ),
+        (
+            "alias assign",
+            false,
+            format!(
+                "const args = [{safe}]; const other = args; Object.assign(other, [{evil}]); exports.args = args;"
+            ),
+        ),
+        (
+            "alias reverse",
+            false,
+            format!(
+                "const args = [{safe}, {evil}]; const other = args; other.reverse(); exports.args = args;"
+            ),
+        ),
+        (
+            "direct shift",
+            false,
+            format!("const args = [{safe}, {evil}]; args.shift(); exports.args = args;"),
+        ),
+        (
+            "alias chain beyond the depth limit",
+            false,
+            format!(
+                "const args = [{safe}]; const a0 = args; {aliases} a70[0] = {evil}; exports.args = args;"
+            ),
+        ),
+        (
+            "unchanged alias chain beyond the depth limit",
+            false,
+            format!("const args = [{safe}]; const a0 = args; {aliases} exports.args = args;"),
+        ),
+        (
+            "alias cycle",
+            false,
+            format!(
+                "const args = [{safe}]; let a = args; let b = a; a = b; b = a; b[0] = {evil}; exports.args = args;"
+            ),
+        ),
+        (
+            "spread of a changed array",
+            false,
+            format!(
+                "const base = [{safe}]; const other = base; other[0] = {evil}; const args = [...base]; exports.args = args;"
+            ),
+        ),
+        (
+            "alias of the array another alias holds",
+            false,
+            format!(
+                "const base = [{safe}]; const args = base; const other = base; other[0] = {evil}; exports.args = args;"
+            ),
+        ),
+        (
+            "export field write",
+            false,
+            format!("const args = [{safe}]; exports.args = args; exports.args[0] = {evil};"),
+        ),
+        (
+            "export field alias",
+            false,
+            format!(
+                "const args = [{safe}]; exports.args = args; const other = exports.args; other[0] = {evil};"
+            ),
+        ),
+        (
+            "module.exports field push",
+            false,
+            format!("const args = []; exports.args = args; module.exports.args.push({evil});"),
+        ),
+        (
+            "top-level this field write",
+            false,
+            format!("const args = [{safe}]; exports.args = args; this.args[0] = {evil};"),
+        ),
+        (
+            "literal export field write",
+            false,
+            format!("exports.args = [{safe}]; exports.args[0] = {evil};"),
+        ),
+        (
+            "alias exported under another name",
+            false,
+            format!(
+                "const args = [{safe}]; const other = args; exports.args = args; exports.other = other; exports.other[0] = {evil};"
+            ),
+        ),
+        (
+            "array in another exported object",
+            false,
+            format!(
+                "const args = [{safe}]; exports.box = {{ args }}; exports.box.args[0] = {evil}; exports.args = args;"
+            ),
+        ),
+        (
+            "method call within the export",
+            false,
+            format!(
+                "const cfg = {{ script: {safe}, swap() {{ this.script = {evil}; }} }}; exports.args = (cfg.swap(), [cfg.script]);"
+            ),
+        ),
+        (
+            "tagged template within the export",
+            false,
+            format!(
+                "const cfg = {{ script: {safe}, swap() {{ this.script = {evil}; }} }}; exports.args = (cfg.swap``, [cfg.script]);"
+            ),
+        ),
+        (
+            "deleted field within the export",
+            false,
+            format!(
+                "const cfg = {{ __proto__: {{ script: {evil} }}, script: {safe} }}; exports.args = (delete cfg.script, [cfg.script]);"
+            ),
+        ),
+        (
+            "unlocated array given a location",
+            false,
+            format!(
+                "const args = ['config.json']; const other = args; other[0] = {evil}; exports.args = args;"
+            ),
+        ),
+        (
+            "shadowing array",
+            false,
+            format!(
+                "const args = [{safe}]; {{ const args = []; args.push(1); }} const other = args; other[0] = {evil}; exports.args = args;"
+            ),
+        ),
+        (
+            "ES module alias",
+            true,
+            format!(
+                "const args = [{safe}]; const other = args; other[0] = {evil}; export {{ args }};"
+            ),
+        ),
+        (
+            "ES module declaration alias",
+            true,
+            format!("export const args = [{safe}]; const other = args; other[0] = {evil};"),
+        ),
+        (
+            "ES module parameter alias",
+            true,
+            format!(
+                "const args = [{safe}]; function change(other) {{ other[0] = {evil}; }} change(args); export {{ args }};"
+            ),
+        ),
+        (
+            "ES module declaration shift",
+            true,
+            format!("export const args = [{safe}, {evil}]; args.shift();"),
+        ),
+        (
+            "ES module unlocated array given a location",
+            true,
+            format!(
+                "const args = ['config.json']; const other = args; other[0] = {evil}; export {{ args }};"
+            ),
+        ),
+    ];
+    let mut failures = container_failures(&changed, &ModuleOutcome::Incomplete);
+    let mut cases = vec![];
+    for (name, lib) in [
+        (
+            "object replacing module.exports",
+            format!(
+                "const path = require('path'); const cp = require('child_process'); const box = {{ args: [{safe}], run: (args) => cp.spawnSync('bash', args) }}; module.exports = box; box.args[0] = {evil};"
+            ),
+        ),
+        (
+            "object field read after an alias changes it",
+            format!(
+                "const path = require('path'); const cp = require('child_process'); const cfg = {{ script: {safe} }}; const other = cfg; other.script = {evil}; exports.args = [cfg.script]; exports.run = (args) => cp.spawnSync('bash', args);"
+            ),
+        ),
+    ] {
+        cases.push((
+            name,
+            false,
+            vec![
+                (
+                    "index.js",
+                    "const lib = require('./lib.js'); lib.run(lib.args);".to_string(),
+                ),
+                ("lib.js", lib),
+            ],
+        ));
+    }
+    cases.extend([
+        (
+            "ES module default export alias",
+            true,
+            vec![
+                ("index.js", "import args, { run } from './lib.js'; run(args);".to_string()),
+                ("lib.js", format!("import path from 'path'; import cp from 'child_process'; const args = [{safe}]; const other = args; other[0] = {evil}; export {{ args as default }}; export const run = (args) => cp.spawnSync('bash', args);").replace("__dirname", "import.meta.dirname")),
+            ],
+        ),
+        (
+            "default array given a field",
+            false,
+            vec![
+                ("index.js", "const lib = require('./lib.js'); lib.run(lib);".to_string()),
+                ("lib.js", format!("const path = require('path'); const cp = require('child_process'); const args = [{safe}]; module.exports = args; module.exports[0] = {evil}; module.exports.run = (args) => cp.spawnSync('bash', args);")),
+            ],
+        ),
+    ]);
+    failures.extend(module_failures(cases, &ModuleOutcome::Incomplete));
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+#[test]
+fn module_export_containers_keep_their_locations() {
+    for (outcome, target) in [
+        (ModuleOutcome::Followed, "evil.sh"),
+        (ModuleOutcome::Clean, "config.json"),
+    ] {
+        let located = format!("path.join(__dirname, '{target}')");
+        let unchanged = [
+            (
+                "array",
+                false,
+                format!("const args = [{located}]; exports.args = args;"),
+            ),
+            ("literal", false, format!("exports.args = [{located}];")),
+            (
+                "spread copy",
+                false,
+                format!("const base = [{located}]; const args = [...base]; exports.args = args;"),
+            ),
+            (
+                "alias only exported",
+                false,
+                format!(
+                    "const args = [{located}]; const other = args; exports.args = args; exports.other = other;"
+                ),
+            ),
+            (
+                "alias chain within the depth limit",
+                false,
+                format!(
+                    "const args = [{located}]; const a0 = args; {} exports.args = args;",
+                    (1..=10)
+                        .map(|n| format!("const a{n} = a{};", n - 1))
+                        .collect::<String>()
+                ),
+            ),
+            (
+                "field read by the export",
+                false,
+                format!("const cfg = {{ script: {located} }}; exports.args = [cfg.script];"),
+            ),
+            (
+                "shadowed array changes",
+                false,
+                format!(
+                    "const args = [{located}]; {{ const args = []; const other = args; other.push(1); }} exports.args = args;"
+                ),
+            ),
+            (
+                "ES module array",
+                true,
+                format!("const args = [{located}]; export {{ args }};"),
+            ),
+            (
+                "ES module declaration",
+                true,
+                format!("export const args = [{located}];"),
+            ),
+        ];
+        let mut failures = container_failures(&unchanged, &outcome);
+        let default = vec![(
+            "ES module default export",
+            true,
+            vec![
+                ("index.js", "import args, { run } from './lib.js'; run(args);".to_string()),
+                ("lib.js", format!("import path from 'path'; import cp from 'child_process'; const args = [{located}]; export {{ args as default }}; export const run = (args) => cp.spawnSync('bash', args);").replace("__dirname", "import.meta.dirname")),
+            ],
+        )];
+        failures.extend(module_failures(default, &outcome));
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+    let cases = vec![(
+        "module without locations changes its array",
+        false,
+        vec![
+            ("index.js", "const lib = require('./lib.js'); lib.run(lib.args);".to_string()),
+            ("lib.js", "const cp = require('child_process'); const args = ['a.sh']; const other = args; other[0] = 'b.sh'; exports.args = args; exports.run = (args) => cp.spawnSync('bash', args);".to_string()),
+        ],
+    )];
+    let failures = module_failures(cases, &ModuleOutcome::Clean);
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+#[test]
+fn module_private_locations_stay_complete() {
+    let reader = "const lib = require('./lib.js'); console.log(lib.version);";
+    let helper = "function h(mod) { return mod.check('x'); } console.log(h(require('./lib.js')));";
+    let cases = [
+        ("logged location", false, reader, "console.log(__dirname); exports.version = '1';"),
+        ("private located variable", false, reader, "const path = require('path'); const file = path.join(__dirname, 'config.json'); exports.version = '1';"),
+        ("unused located function", false, reader, "const path = require('path'); exports.version = '1'; function unused() { return path.join(__dirname, 'config.json'); }"),
+        ("exported function without locations", false, helper, "console.log(__dirname); exports.check = (name) => name.length > 0;"),
+        ("module object shared with a private location", false, helper, "const path = require('path'); const file = path.join(__dirname, 'config.json'); exports.check = (name) => path.isAbsolute(name);"),
+        ("shadowed located name", false, helper, "const dir = __dirname; console.log(dir); exports.check = () => { const dir = 'x'; return dir; };"),
+        ("ES module logged location", true, "import * as lib from './lib.js'; console.log(lib.version);", "console.log(import.meta.dirname); export const version = '1';"),
+    ]
+    .into_iter()
+    .map(|(name, esm, caller, lib)| {
+        (
+            name,
+            esm,
+            vec![("index.js", caller.to_string()), ("lib.js", lib.to_string())],
+        )
+    })
+    .collect();
+    let failures = module_failures(cases, &ModuleOutcome::Clean);
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+#[test]
+fn module_returns_used_by_callers_stay_complete() {
+    let cases = vec![
+        (
+            "stored return of a module with a private location",
+            false,
+            vec![
+                ("index.js", "const lib = require('./lib.js'); const endpoint = lib.endpoint('https://example.com'); console.log(`${endpoint}`);".to_string()),
+                ("lib.js", "const path = require('path'); const fs = require('fs'); const data = path.join(__dirname, 'config.json'); exports.read = () => fs.readFileSync(data, 'utf8'); exports.endpoint = (url) => url + '/api';".to_string()),
+            ],
+        ),
+        (
+            "stored return of a chunk with a createRequire shim",
+            true,
+            vec![
+                ("index.js", "import { endpoint } from './lib.js'; const e = endpoint('https://example.com'); console.log(`${e}`);".to_string()),
+                ("lib.js", "import { createRequire } from 'node:module'; const __require = createRequire(import.meta.url); export function platform() { return __require('os').platform(); } export function endpoint(url) { return url + '/api'; }".to_string()),
+            ],
+        ),
+    ];
+    let failures = module_failures(cases, &ModuleOutcome::Clean);
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+#[test]
+fn module_values_passed_back_to_modules_without_locations_stay_complete() {
+    let lib = "const cp = require('child_process'); const KEY = 'token'; const OTHER = 'registry'; function save(key, value) { return cp.spawnSync('bash', [key, value]); } function load() { return {}; } function wrap(mod) { return cp.spawnSync('bash', [mod]); } Object.defineProperty(exports, 'KEY', { enumerable: true, get: function () { return KEY; } }); Object.defineProperty(exports, 'OTHER', { enumerable: true, get: function () { return OTHER; } }); Object.defineProperty(exports, 'save', { enumerable: true, get: function () { return save; } }); Object.defineProperty(exports, 'load', { enumerable: true, get: function () { return load; } }); Object.defineProperty(exports, 'wrap', { enumerable: true, get: function () { return wrap; } });";
+    let mut cases = [
+        (
+            "exported constant",
+            "const lib = require('./lib.js'); lib.save(lib.KEY, 'x');",
+        ),
+        (
+            "different exported constants to one function",
+            "const lib = require('./lib.js'); lib.save(lib.KEY, 'x'); lib.save(lib.OTHER, 'y');",
+        ),
+        (
+            "call result",
+            "const lib = require('./lib.js'); lib.wrap(lib.load());",
+        ),
+    ]
+    .into_iter()
+    .map(|(name, caller)| {
+        (
+            name,
+            false,
+            vec![
+                ("index.js", caller.to_string()),
+                ("lib.js", lib.to_string()),
+            ],
+        )
+    })
+    .collect::<Vec<ModuleCase<'_>>>();
+    cases.push((
+        "esbuild require shim loading built-ins",
+        false,
+        vec![
+            ("index.js", "const lib = require('./lib.js'); lib.save(lib.KEY, 'x');".to_string()),
+            ("lib.js", format!("var __require = ((x) => typeof require !== 'undefined' ? require : x)(function (x) {{ if (typeof require !== 'undefined') return require.apply(this, arguments); throw Error('Dynamic require of ' + x + ' is not supported'); }}); const os = __require('os'); console.log(os.platform()); {lib}")),
+        ],
+    ));
+    let failures = module_failures(cases, &ModuleOutcome::Clean);
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+#[test]
+fn module_exports_without_locations_escape_complete() {
+    let lib = "const path = require('path'); exports.script = path.join(__dirname, 'evil.sh'); exports.trim = (text) => text.trim(); exports.version = () => '1'; class Failure extends Error {} exports.Failure = Failure;";
+    let mut cases = [
+        (
+            "function passed as a callback",
+            "const lib = require('./lib.js'); console.log([' a '].map(lib.trim));",
+        ),
+        (
+            "function passed as a callback by a located caller",
+            "const path = require('path'); const lib = require('./lib.js'); console.log(path.join(__dirname, 'x'), [' a '].map(lib.trim));",
+        ),
+        (
+            "class used with instanceof",
+            "const lib = require('./lib.js'); try { JSON.parse('x'); } catch (error) { console.log(error instanceof lib.Failure); }",
+        ),
+        (
+            "call result beside a location",
+            "const path = require('path'); const lib = require('./lib.js'); console.log(path.join(__dirname, 'x'), lib.version());",
+        ),
+        (
+            "TypeScript indirect call and callback",
+            "const lib_1 = require('./lib.js'); console.log((0, lib_1.trim)(' a '), [' b '].map(lib_1.trim));",
+        ),
+    ]
+    .into_iter()
+    .map(|(name, caller)| {
+        (
+            name,
+            false,
+            vec![
+                ("index.js", caller.to_string()),
+                ("lib.js", lib.to_string()),
+            ],
+        )
+    })
+    .collect::<Vec<ModuleCase<'_>>>();
+    cases.push((
+        "class constructed by a caller without locations",
+        false,
+        vec![
+            ("index.js", "const lib = require('./lib.js'); const features = new lib.Features({}, 'x'); console.log(features);".to_string()),
+            ("lib.js", format!("{lib} const cp = require('child_process'); class Features {{ constructor(api, dir) {{ this.api = api; this.cache = new Map(); this.dir = dir; }} }} exports.Features = Features; exports.run = (script) => cp.spawnSync('bash', [script]);")),
+        ],
+    ));
+    cases.push((
+        "TypeScript export object passed back",
+        false,
+        vec![
+            ("index.js", "const lib_1 = require('./lib.js'); (0, lib_1.upload)(lib_1.Target);".to_string()),
+            ("lib.js", format!("{lib} const cp = require('child_process'); exports.Target = exports.upload = void 0; exports.Target = {{ name: 'code', extension: '.sarif' }}; exports.upload = (target) => cp.spawnSync('bash', [target.name]);")),
+        ],
+    ));
+    cases.push((
+        "TypeScript enum member passed back",
+        false,
+        vec![
+            ("index.js", "const lib_1 = require('./lib.js'); (0, lib_1.run)(lib_1.Kind.Upload);".to_string()),
+            ("lib.js", format!("{lib} const cp = require('child_process'); var Kind; (function (Kind) {{ Kind[\"Upload\"] = \"upload\"; }})(Kind || (exports.Kind = Kind = {{}})); exports.run = (kind) => cp.spawnSync('bash', [kind]);")),
+        ],
+    ));
+    let failures = module_failures(cases, &ModuleOutcome::Clean);
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+#[test]
+fn module_located_exports_escape_fail_closed() {
+    let evil = "path.join(__dirname, 'evil.sh')";
+    let run = |read: &str| {
+        format!(
+            "const cp = require('child_process'); const lib = require('./lib.js'); cp.spawnSync('bash', [lib.{read}]);"
+        )
+    };
+    let helper = "const cp = require('child_process'); function h(mod) { cp.spawnSync('bash', [mod.get()]); } h(require('./lib.js'));".to_string();
+    let reader = "const lib = require('./lib.js'); console.log(lib.version);".to_string();
+    let cases = [
+        ("located export", false, reader.clone(), format!("exports.version = {evil};")),
+        ("opaque exports", false, reader.clone(), "console.log(__dirname); Object.assign(exports, { version: '1' });".to_string()),
+        ("getter export", false, reader.clone(), "console.log(__dirname); Object.defineProperty(exports, 'version', { get: () => '1' });".to_string()),
+        ("object given a location later", false, run("cfg.script"), format!("const cfg = {{}}; cfg.script = {evil}; exports.cfg = cfg;")),
+        ("nested export field", false, run("cfg.script"), format!("exports.cfg = {{}}; exports.cfg.script = {evil};")),
+        ("function returning a location", false, helper.clone(), format!("exports.get = () => {evil};")),
+        ("located function passed on", false, "const cp = require('child_process'); const lib = require('./lib.js'); cp.spawnSync('bash', [0].map(lib.get));".to_string(), format!("exports.get = () => {evil};")),
+        ("closure over a location", false, helper.clone(), format!("const script = {evil}; exports.get = () => script;")),
+        ("holder of a located object", false, run("holder.inner.script"), format!("const cfg = {{}}; cfg.script = {evil}; const holder = {{}}; holder.inner = cfg; exports.holder = holder;")),
+        ("reassigned holder", false, run("holder.script"), format!("const cfg = {{}}; cfg.script = {evil}; let holder = {{}}; holder = cfg; exports.holder = holder;")),
+        ("array holding a located object", false, run("list[0].script"), format!("const cfg = {{}}; cfg.script = {evil}; const list = []; list.push(cfg); exports.list = list;")),
+        ("objects holding each other", false, run("b.a.script"), format!("const a = {{}}; const b = {{ a }}; a.b = b; a.script = {evil}; exports.b = b;")),
+        ("located field set by a call", false, run("cfg.script"), format!("const cfg = {{}}; Reflect.set(cfg, 'script', {evil}); exports.cfg = cfg;")),
+        ("alias given a located field", false, run("cfg.script"), format!("const cfg = {{}}; const other = cfg; other.script = {evil}; exports.cfg = cfg;")),
+        ("function alias given a located field", false, run("run.script"), format!("function run() {{}} const other = run; other.script = {evil}; exports.run = run;")),
+        ("class alias given a located field", false, run("Runner.script"), format!("class Runner {{}} const Other = Runner; Other.script = {evil}; exports.Runner = Runner;")),
+        ("method storing a located object", false, run("store.value.script"), format!("const cfg = {{}}; cfg.script = {evil}; const store = {{ put(value) {{ this.value = value; }} }}; store.put(cfg); exports.store = store;")),
+        ("located global", false, "const cp = require('child_process'); const lib = require('./lib.js'); console.log(lib.version); cp.spawnSync('bash', [globalThis.script]);".to_string(), format!("globalThis.script = {evil}; exports.version = '1';")),
+        ("ES module class with a located field", true, "import cp from 'child_process'; import * as lib from './lib.js'; cp.spawnSync('bash', [lib.Runner.script]);".to_string(), "export class Runner { static script = path.join(import.meta.dirname, 'evil.sh'); }".to_string()),
+    ]
+    .into_iter()
+    .map(|(name, esm, caller, lib)| {
+        let lib = if esm {
+            format!("import path from 'path'; {lib}")
+        } else {
+            format!("const path = require('path'); {lib}")
+        };
+        (name, esm, vec![("index.js", caller), ("lib.js", lib)])
+    })
+    .collect();
+    let failures = module_failures(cases, &ModuleOutcome::Incomplete);
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+#[test]
 fn uncertain_cross_module_calls_fail_closed() {
     let evil = "path.join(__dirname, 'evil.sh')";
     let evil_esm = "path.join(import.meta.dirname, 'evil.sh')";
@@ -2642,6 +3679,32 @@ fn uncertain_cross_module_calls_fail_closed() {
                     "index.js",
                     caller(&format!(
                         "const lib = require('./lib.js');\nconst run = lib.run;\nconst runners = [run];\nrunners[0]({evil});"
+                    )),
+                ),
+                ("lib.js", run_lib.clone()),
+            ],
+        ),
+        (
+            "reassigned destructured function",
+            false,
+            vec![
+                (
+                    "index.js",
+                    caller(&format!(
+                        "let {{ run }} = require('./lib.js');\nif (process.env.X) run = (script) => script;\nrun({evil});"
+                    )),
+                ),
+                ("lib.js", run_lib.clone()),
+            ],
+        ),
+        (
+            "reassigned alias",
+            false,
+            vec![
+                (
+                    "index.js",
+                    caller(&format!(
+                        "let run = require('./lib.js').run;\nif (process.env.X) run = (script) => script;\nrun({evil});"
                     )),
                 ),
                 ("lib.js", run_lib.clone()),

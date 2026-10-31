@@ -338,6 +338,8 @@ pub(crate) fn located_executions(
             .any(|token| code.contains(token));
     if context.directory == LocatedDirectory::Caller
         && !mentions_location
+        && !code.contains("require")
+        && !code.contains("import")
         && context.calls.is_empty()
     {
         return JavaScriptLocations::default();
@@ -1534,6 +1536,10 @@ const BUILTIN_ERRORS: &[&str] = &[
 /// helper.
 const MODULE_COPY_STEPS: usize = 4096;
 
+/// Variables `exports_located` follows from a module's exports before it
+/// treats them as holding a location.
+const EXPORT_REACH_SYMBOLS: usize = 4096;
+
 /// What a value inside an interop helper may be while the helper is given
 /// a module: see `ModuleCopy`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2708,6 +2714,8 @@ struct Analysis<'s, 'a> {
     in_file_tainted: HashSet<SymbolId>,
     /// Calls into exports this file takes from another module.
     forwarded: Vec<ModuleEntry>,
+    /// Located values in this file may escape through an unresolved use.
+    escaped_locations: bool,
     /// Interop helpers by the symbol naming them, and whether they copy a
     /// module: see `ModuleCopy`.
     module_copies: RefCell<HashMap<SymbolId, bool>>,
@@ -2797,6 +2805,28 @@ fn inner<'a>(expression: &'a Expression<'a>) -> &'a Expression<'a> {
     }
 }
 
+/// Whether an expression creates an array or object, whose contents later
+/// code may change.
+fn is_container(expression: &Expression) -> bool {
+    matches!(
+        inner(expression),
+        Expression::ArrayExpression(_) | Expression::ObjectExpression(_)
+    )
+}
+
+/// Whether an expression is a literal primitive or `undefined`.
+fn is_primitive(expression: &Expression) -> bool {
+    match inner(expression) {
+        Expression::NullLiteral(_)
+        | Expression::BooleanLiteral(_)
+        | Expression::NumericLiteral(_)
+        | Expression::StringLiteral(_) => true,
+        Expression::UnaryExpression(unary) => unary.operator == UnaryOperator::Void,
+        Expression::Identifier(identifier) => identifier.name.as_str() == "undefined",
+        _ => false,
+    }
+}
+
 /// Whether an expression creates a value that holds no existing object: a
 /// primitive, a function or class, or a literal object or array of such
 /// values.
@@ -2870,6 +2900,7 @@ impl<'s, 'a> Analysis<'s, 'a> {
             external_words: HashMap::new(),
             in_file_tainted: HashSet::new(),
             forwarded: Vec::new(),
+            escaped_locations: false,
             module_copies: RefCell::default(),
             guard: LoaderGuard::new(nodes, scoping),
         };
@@ -6169,18 +6200,61 @@ impl<'s, 'a> Analysis<'s, 'a> {
         }
         self.in_file_tainted = self.tainted_symbols.clone();
         let exports = self.exports();
+        self.escaped_locations = !self.tainted_spans.is_empty()
+            && self.context.calls.iter().any(|call| match &call.export {
+                ModuleExport::Escape(export) => self.export_located(&exports, export),
+                _ => false,
+            });
+        let holds_locations = self.may_hold_locations();
         let mut bound = Vec::new();
         let mut nodes = Vec::new();
         for call in self.context.calls.clone() {
+            if matches!(call.export, ModuleExport::Escape(_)) {
+                self.forwarded
+                    .extend(exports.sources().into_iter().map(|specifier| ModuleEntry {
+                        specifier: specifier.to_string(),
+                        call: call.clone(),
+                    }));
+                continue;
+            }
+            let arguments: Vec<_> = call
+                .arguments
+                .iter()
+                .map(|argument| match argument {
+                    Some(ModuleArgument::Export(passed)) => {
+                        passed.iter().fold(None, |merged, export| {
+                            match self.export_argument(&exports, export, holds_locations) {
+                                Some(value) => Some(match merged {
+                                    Some(previous) => ModuleArgument::merge(previous, value),
+                                    None => value,
+                                }),
+                                None => merged,
+                            }
+                        })
+                    }
+                    argument => argument.clone(),
+                })
+                .collect();
+            // Exports passed back that hold no location hand this module
+            // nothing, however the call is resolved.
+            if !call.constructs
+                && call
+                    .arguments
+                    .iter()
+                    .any(|argument| matches!(argument, Some(ModuleArgument::Export(_))))
+                && arguments.iter().all(Option::is_none)
+            {
+                continue;
+            }
             let resolved = match &call.export {
-                ModuleExport::Any => None,
+                ModuleExport::Any | ModuleExport::Escape(_) | ModuleExport::Field(_) => None,
                 export if call.constructs => self.resolve_construction(&exports, export),
                 export => self.resolve_export(&exports, export),
             };
             let forwards = match resolved {
                 Some((functions, forwards)) => {
                     for function in functions {
-                        self.bind_arguments(function, &call.arguments, &mut bound, &mut nodes);
+                        self.bind_arguments(function, &arguments, &mut bound, &mut nodes);
                     }
                     forwards
                 }
@@ -6198,7 +6272,7 @@ impl<'s, 'a> Analysis<'s, 'a> {
                     specifier: specifier.to_string(),
                     call: ModuleCall {
                         export,
-                        arguments: call.arguments.clone(),
+                        arguments: arguments.clone(),
                         constructs: call.constructs,
                     },
                 }));
@@ -6212,10 +6286,306 @@ impl<'s, 'a> Analysis<'s, 'a> {
                 ModuleArgument::Words(words) => {
                     self.external_words.entry(symbol).or_default().push(words);
                 }
+                ModuleArgument::Export(_) => unreachable!("exports are evaluated before binding"),
             }
             taints.push(Taint::Symbol(symbol));
         }
         self.propagate(nodes, taints);
+    }
+
+    /// A value passed back from this module's exports. Multiple writes,
+    /// getters, re-exports, and arrays or objects something else may have
+    /// changed cannot establish a single value here, which matters only when
+    /// the module `holds_locations`.
+    fn export_argument(
+        &self,
+        exports: &Exports<'a>,
+        export: &ModuleExport,
+        holds_locations: bool,
+    ) -> Option<ModuleArgument> {
+        let unresolved =
+            || holds_locations.then(|| ModuleArgument::Value(UNRESOLVED_LOCATION.to_string()));
+        if let ModuleExport::Field(export) = export {
+            return if self.export_located(exports, export) {
+                unresolved()
+            } else {
+                None
+            };
+        }
+        if exports.opaque {
+            return unresolved();
+        }
+        let Some((mut values, forwards)) = self.export_values(exports, export) else {
+            return unresolved();
+        };
+        // A primitive, such as the `void 0` TypeScript first assigns every
+        // export, holds no location.
+        values.retain(|value| {
+            !matches!(value, ExportValue::Expression(expression) if is_primitive(expression))
+        });
+        if forwards.is_empty() && values.is_empty() {
+            return None;
+        }
+        if !forwards.is_empty() || values.len() != 1 {
+            return unresolved();
+        }
+        let (value, binding) = match &values[0] {
+            ExportValue::Expression(value) => (*value, None),
+            // Arrays need their individual words, not their joined value.
+            ExportValue::Symbol(symbol) => match self.initializer(*symbol) {
+                Some(value) if !self.is_written(*symbol) => (value, Some(*symbol)),
+                _ if self.tainted_symbols.contains(symbol) => return unresolved(),
+                _ => return None,
+            },
+            ExportValue::Function(_) => return None,
+            ExportValue::From(_, _) | ExportValue::Opaque => return unresolved(),
+        };
+        if !self.export_unchanged(exports, export, value, binding) {
+            // Whatever changed it may have given it one of this file's
+            // locations.
+            return if self.tainted_spans.is_empty() {
+                None
+            } else {
+                unresolved()
+            };
+        }
+        self.located_argument(value)
+    }
+
+    /// Whether this module's exports may hold a location: one of its own,
+    /// one another file gives it, or a value from a module other than Node's
+    /// built-ins.
+    fn may_hold_locations(&self) -> bool {
+        !self.tainted_spans.is_empty()
+            || self.context.calls.iter().any(|call| {
+                call.arguments
+                    .iter()
+                    .flatten()
+                    .any(|argument| !matches!(argument, ModuleArgument::Export(_)))
+            })
+            || self.loads_other_modules()
+    }
+
+    /// Whether this file may load anything but Node's built-in modules.
+    fn loads_other_modules(&self) -> bool {
+        let other = |source: Option<&str>| !source.is_some_and(builtin_module);
+        self.nodes.iter().any(|node| match node.kind() {
+            AstKind::ImportDeclaration(import) => {
+                !import.import_kind.is_type() && other(import.source.value.as_str())
+            }
+            AstKind::ExportFromDeclaration(export) => other(export.source.value.as_str()),
+            AstKind::ExportAllDeclaration(export) => other(export.source.value.as_str()),
+            AstKind::ImportExpression(import) => other(literal_text(&import.source)),
+            AstKind::CallExpression(call) if self.guard.loads(call, 0) => {
+                other(self.guard.specifier(call))
+            }
+            // A loader used other than by calling it may load anything,
+            // unless a variable holding what uses it, such as esbuild's
+            // `__require`, is only called with built-in names.
+            AstKind::IdentifierReference(reference) => {
+                reference.name.as_str() == "require"
+                    && self.resolved(reference).is_none()
+                    && !self.guard.called(node.id())
+                    && !self.guard.compared(node.id())
+                    && !self
+                        .loader_holder(node.id())
+                        .is_some_and(|symbol| self.loads_builtins_only(symbol))
+            }
+            AstKind::StaticMemberExpression(member) => {
+                member.property.name.as_str() == "require"
+                    && self.is_global(&member.object, "module")
+            }
+            _ => false,
+        })
+    }
+
+    /// The variable whose initializer holds `node`.
+    fn loader_holder(&self, node: NodeId) -> Option<SymbolId> {
+        self.nodes
+            .ancestor_ids(node)
+            .find_map(|ancestor| match self.nodes.kind(ancestor) {
+                AstKind::VariableDeclarator(declarator) => match &declarator.id {
+                    BindingPattern::BindingIdentifier(binding) => binding.symbol_id.get(),
+                    _ => None,
+                },
+                _ => None,
+            })
+    }
+
+    /// Whether a variable is only ever called with a built-in module's name.
+    fn loads_builtins_only(&self, symbol: SymbolId) -> bool {
+        !self.is_written(symbol)
+            && self
+                .scoping
+                .get_resolved_references(symbol)
+                .all(|reference| {
+                    let node = reference.node_id();
+                    matches!(self.nodes.parent_kind(node), AstKind::CallExpression(call)
+                        if call.callee.span() == self.span(node)
+                            && call.arguments.first().and_then(Argument::as_expression)
+                                .and_then(literal_text).is_some_and(builtin_module))
+                })
+    }
+
+    /// Whether the arrays and objects an evaluation of an exported value
+    /// reads still hold what initialized them: only this file's exports and
+    /// the evaluation itself reach them, and the file reads none back out
+    /// of its exports. A caller that reaches them another way escapes.
+    fn export_unchanged(
+        &self,
+        exports: &Exports<'a>,
+        export: &ModuleExport,
+        value: &'a Expression<'a>,
+        binding: Option<SymbolId>,
+    ) -> bool {
+        // Each array or object, and the variable it initializes.
+        let mut holders = Vec::new();
+        if is_container(value) {
+            holders.push((inner(value).span(), binding));
+        }
+        let mut pending = self.replayed_symbols(value.span());
+        // A field of what replaced `module.exports` is read from it.
+        if matches!(export, ModuleExport::Name(_)) {
+            for object in &exports.default {
+                if let ExportValue::Expression(object) = object {
+                    if is_container(object) {
+                        holders.push((inner(object).span(), None));
+                    } else {
+                        pending.extend(self.replayed_symbols(object.span()));
+                    }
+                }
+            }
+        }
+        let mut evaluated = vec![value.span()];
+        let mut seen = HashSet::new();
+        while let Some(symbol) = pending.pop() {
+            if !seen.insert(symbol) {
+                continue;
+            }
+            if seen.len() > MAX_LOCATION_DEPTH {
+                return false;
+            }
+            let Some(init) = self.initializer(symbol) else {
+                continue;
+            };
+            if is_container(init) {
+                holders.push((inner(init).span(), Some(symbol)));
+            }
+            evaluated.push(init.span());
+            pending.extend(self.replayed_symbols(init.span()));
+        }
+        holders.iter().all(|&(span, binding)| {
+            let mut holding = Vec::from_iter(binding);
+            binding.is_none_or(|binding| self.export_confined(binding, &evaluated, &mut holding, 0))
+                && if holding.is_empty() {
+                    !self.exports_reach(exports, span, None)
+                } else {
+                    holding
+                        .iter()
+                        .all(|symbol| !self.exports_reach(exports, span, Some(*symbol)))
+                }
+        })
+    }
+
+    /// The variables an evaluation of the expression at `span` reads: those
+    /// it names outside the functions it defines, which it does not run.
+    fn replayed_symbols(&self, span: Span) -> Vec<SymbolId> {
+        let first = self
+            .identifiers
+            .partition_point(|(start, _, _)| *start < span.start);
+        self.identifiers[first..]
+            .iter()
+            .take_while(|(start, _, _)| *start < span.end)
+            .filter(|(_, end, _)| *end <= span.end)
+            .filter_map(|(_, _, node)| match self.nodes.kind(*node) {
+                AstKind::IdentifierReference(reference)
+                    if !self
+                        .enclosing_function(*node)
+                        .is_some_and(|function| contains(span, self.span(function))) =>
+                {
+                    self.resolved(reference)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Whether nothing but this file's exports, and reads within
+    /// `evaluated`, can reach the array or object a variable holds: every
+    /// other read initializes a variable only ever aliasing it, which is
+    /// confined in turn and added to `holding`.
+    fn export_confined(
+        &self,
+        symbol: SymbolId,
+        evaluated: &[Span],
+        holding: &mut Vec<SymbolId>,
+        depth: usize,
+    ) -> bool {
+        if depth > MAX_LOCATION_DEPTH {
+            return false;
+        }
+        self.scoping
+            .get_resolved_references(symbol)
+            .all(|reference| {
+                let node = reference.node_id();
+                if reference.is_write() {
+                    return false;
+                }
+                if let Some(alias) = self.aliased_by(node) {
+                    holding.push(alias);
+                    return self.export_confined(alias, evaluated, holding, depth + 1);
+                }
+                let parent = self.nodes.parent_id(node);
+                let exported = match self.nodes.kind(parent) {
+                    // `exports_reach` follows reads of what replaces
+                    // `module.exports`, not of other exported objects.
+                    AstKind::ObjectProperty(_) => {
+                        let object = self.nodes.parent_id(parent);
+                        matches!(self.nodes.parent_kind(object),
+                        AstKind::AssignmentExpression(assignment)
+                            if expression_target(&assignment.left).is_some_and(|(module, name)| {
+                                name == Some("exports") && self.is_global(module, "module")
+                            }))
+                            && self.exports_value(parent, node)
+                    }
+                    _ => self.exports_value(parent, node),
+                };
+                exported
+                    || evaluated
+                        .iter()
+                        .any(|span| contains(*span, self.span(node)))
+                        && self.reads_field(node)
+            })
+    }
+
+    /// Whether a reference only reads one of its object's fields, or spreads
+    /// it into a new array: neither can change the object. A call or tagged
+    /// template through the field may change it as their receiver.
+    fn reads_field(&self, node: NodeId) -> bool {
+        let parent = self.nodes.parent_id(node);
+        if matches!(self.nodes.kind(parent), AstKind::SpreadElement(_)) {
+            return matches!(self.nodes.parent_kind(parent), AstKind::ArrayExpression(_));
+        }
+        self.member_parts_of(parent)
+            .is_some_and(|(object, _)| object.span() == self.span(node))
+            && self.store_of(parent).is_none()
+            && self.called(parent).is_none()
+            && !matches!(
+                self.nodes.parent_kind(parent),
+                AstKind::TaggedTemplateExpression(_)
+            )
+            && !matches!(self.nodes.parent_kind(parent),
+                AstKind::UnaryExpression(unary) if unary.operator == UnaryOperator::Delete)
+    }
+
+    fn located_argument(&self, argument: &'a Expression<'a>) -> Option<ModuleArgument> {
+        self.is_tainted(argument.span()).then(|| {
+            if self.is_array(argument) {
+                ModuleArgument::Words(self.evaluate_words(argument, 0))
+            } else {
+                ModuleArgument::Value(self.evaluate(argument, 0))
+            }
+        })
     }
 
     /// Whether only the action's other files give a parameter a location.
@@ -6320,6 +6690,179 @@ impl<'s, 'a> Analysis<'s, 'a> {
         );
     }
 
+    /// Whether a value this file exports may hold one of its locations: a
+    /// located node within the export, or a variable it names that holds
+    /// one directly, in a field, or through what else it is given. Exports
+    /// this analysis cannot list, and located fields of objects it cannot
+    /// tie to a variable, may hold any.
+    fn exports_located(&self, exports: &Exports<'a>) -> bool {
+        if exports.opaque || self.fields_located_by_name(exports) {
+            return true;
+        }
+        let values: Vec<_> = exports
+            .default
+            .iter()
+            .chain(exports.named.values().flatten())
+            .cloned()
+            .collect();
+        let Some(mut pending) = self.value_spans(&values) else {
+            return true;
+        };
+        // Declarations `exports` does not list, such as classes.
+        for node in self.nodes.iter() {
+            match node.kind() {
+                AstKind::ExportDeclaration(export) => pending.push(export.declaration.span()),
+                AstKind::ExportDefaultDeclaration(export) => pending.push(export.span),
+                AstKind::TSExportAssignment(export) => pending.push(export.span),
+                _ => {}
+            }
+        }
+        self.reaches_location(pending)
+    }
+
+    /// Whether what a caller takes out of this module through one export
+    /// may hold one of its locations, as `exports_located` judges the whole
+    /// module. An export this analysis cannot list, such as a class, may.
+    fn export_located(&self, exports: &Exports<'a>, export: &ModuleExport) -> bool {
+        if !matches!(export, ModuleExport::Name(_) | ModuleExport::Default) {
+            return self.exports_located(exports);
+        }
+        if self.fields_located_by_name(exports) {
+            return true;
+        }
+        let Some((values, forwards)) = self.export_values(exports, export) else {
+            return true;
+        };
+        if values.is_empty() {
+            // Taken from another module, which the escape reaches through
+            // `exports.sources()`.
+            return forwards.is_empty();
+        }
+        self.value_spans(&values)
+            .is_none_or(|pending| self.reaches_location(pending))
+    }
+
+    /// Whether a located field is stored on an object no variable names, so
+    /// that any export may reach it. An export written straight onto
+    /// `exports` is listed with the others.
+    fn fields_located_by_name(&self, exports: &Exports<'a>) -> bool {
+        self.tainted_fields
+            .iter()
+            .any(|(owner, field)| match owner {
+                Owner::Symbol(_) | Owner::Node(_) => false,
+                Owner::Global("exports", None) | Owner::Global("module", Some("exports")) => {
+                    !field.is_some_and(|name| exports.named.contains_key(name))
+                }
+                _ => true,
+            })
+    }
+
+    /// Where exported values are defined, or `None` for one that cannot be.
+    fn value_spans(&self, values: &[ExportValue<'a>]) -> Option<Vec<Span>> {
+        let mut spans = Vec::new();
+        for value in values {
+            match value {
+                ExportValue::Expression(expression) => spans.push(expression.span()),
+                ExportValue::Function(function) => spans.push(self.span(*function)),
+                ExportValue::Symbol(symbol) => {
+                    spans.push(self.span(self.scoping.symbol_declaration(*symbol)));
+                }
+                // The module it is taken from is reached separately.
+                ExportValue::From(_, _) => {}
+                ExportValue::Opaque => return None,
+            }
+        }
+        Some(spans)
+    }
+
+    /// Whether code at `pending` holds a location, directly or through a
+    /// variable it names, a field of one, or what else that variable is
+    /// given.
+    fn reaches_location(&self, mut pending: Vec<Span>) -> bool {
+        let mut seen = HashSet::new();
+        while let Some(span) = pending.pop() {
+            if self.is_tainted(span) {
+                return true;
+            }
+            for taint in self.symbols_in(span) {
+                let Taint::Symbol(symbol) = taint else {
+                    continue;
+                };
+                if !seen.insert(symbol) {
+                    continue;
+                }
+                if seen.len() > EXPORT_REACH_SYMBOLS
+                    || self
+                        .tainted_fields
+                        .iter()
+                        .any(|(owner, _)| *owner == Owner::Symbol(symbol))
+                {
+                    return true;
+                }
+                pending.push(self.span(self.scoping.symbol_declaration(symbol)));
+                pending.extend(self.scoping.get_resolved_references(symbol).filter_map(
+                    |reference| self.given_through(reference.node_id(), reference.is_write()),
+                ));
+            }
+        }
+        false
+    }
+
+    /// Where code at a reference may give its variable, or an object the
+    /// variable holds, another value: an assignment to it or into one of its
+    /// fields, a call it is passed to, or a call of a method that stores
+    /// into it or that this file defines.
+    fn given_through(&self, reference: NodeId, write: bool) -> Option<Span> {
+        if write {
+            return self
+                .nodes
+                .ancestor_ids(reference)
+                .find(|ancestor| {
+                    matches!(
+                        self.nodes.kind(*ancestor),
+                        AstKind::AssignmentExpression(_)
+                            | AstKind::ForInStatement(_)
+                            | AstKind::ForOfStatement(_)
+                    )
+                })
+                .map(|ancestor| self.span(ancestor));
+        }
+        let mut argument = reference;
+        if matches!(self.nodes.parent_kind(argument), AstKind::SpreadElement(_)) {
+            argument = self.nodes.parent_id(argument);
+        }
+        let (span, arguments) = match self.nodes.parent_kind(argument) {
+            AstKind::CallExpression(call) => (call.span, call.arguments.as_slice()),
+            AstKind::NewExpression(call) => (call.span, call.arguments.as_slice()),
+            _ => (Span::default(), [].as_slice()),
+        };
+        if arguments
+            .iter()
+            .any(|passed| passed.span() == self.span(argument))
+        {
+            return Some(span);
+        }
+        let mut current = reference;
+        for parent in self.nodes.ancestor_ids(reference) {
+            let (object, name) = self
+                .member_parts_of(parent)
+                .filter(|(object, _)| object.span() == self.span(current))?;
+            if self.store_of(parent).is_some() {
+                return Some(self.span(self.nodes.parent_id(parent)));
+            }
+            if let Some(call) = self.called(parent)
+                && name.is_none_or(|name| {
+                    MUTATING_METHODS.contains(&name)
+                        || !self.member_methods(object, Some(name)).is_empty()
+                })
+            {
+                return Some(call.span);
+            }
+            current = parent;
+        }
+        None
+    }
+
     /// What this file exports, through `module.exports`, `exports` and
     /// `export` declarations.
     fn exports(&self) -> Exports<'a> {
@@ -6366,11 +6909,28 @@ impl<'s, 'a> Analysis<'s, 'a> {
                             if let (BindingPattern::BindingIdentifier(binding), Some(init)) =
                                 (&declarator.id, &declarator.init)
                             {
+                                // `export_unchanged` sees the value, not
+                                // the binding that may reach it.
+                                let value = if binding.symbol_id.get().is_some_and(|symbol| {
+                                    self.is_written(symbol)
+                                        || self.is_mutated(symbol)
+                                        || is_container(init)
+                                            && !self.export_confined(
+                                                symbol,
+                                                &[init.span()],
+                                                &mut Vec::new(),
+                                                0,
+                                            )
+                                }) {
+                                    ExportValue::Opaque
+                                } else {
+                                    self.export_value(init)
+                                };
                                 exports
                                     .named
                                     .entry(binding.name.as_str())
                                     .or_default()
-                                    .push(self.export_value(init));
+                                    .push(value);
                             }
                         }
                     }
@@ -6547,7 +7107,7 @@ impl<'s, 'a> Analysis<'s, 'a> {
         let mut values: Vec<ExportValue<'a>> = Vec::new();
         let mut forwards = Vec::new();
         match export {
-            ModuleExport::Any => return None,
+            ModuleExport::Any | ModuleExport::Escape(_) | ModuleExport::Field(_) => return None,
             ModuleExport::Default => values.extend(exports.default.iter().cloned()),
             ModuleExport::Name(name) => {
                 if exports.opaque {
@@ -6786,7 +7346,7 @@ impl<'s, 'a> Analysis<'s, 'a> {
                 _ => false,
             })
             && binding.is_none_or(|binding| self.only_exported(binding, class))
-            && !self.exports_reach(exports, class, binding)
+            && !self.exports_reach(exports, class.span, binding)
     }
 
     fn field_only_constructor(&self, constructor: &'a Function<'a>) -> bool {
@@ -6855,32 +7415,43 @@ impl<'s, 'a> Analysis<'s, 'a> {
                             return binary.operator == BinaryOperator::Instanceof
                                 && binary.right.span() == self.span(current);
                         }
-                        AstKind::ExportSpecifier(_) => return true,
                         AstKind::Class(subclass) => {
                             return subclass.heritage.as_ref().is_some_and(|heritage| {
                                 heritage.expression.span() == self.span(current)
                             });
                         }
-                        AstKind::AssignmentExpression(assignment)
-                            if assignment.right.span() == self.span(current) =>
-                        {
-                            return self.exported_by(parent);
-                        }
-                        // A field of what replaces `module.exports`.
-                        AstKind::ObjectProperty(property)
-                            if property.value.span() == self.span(current) =>
-                        {
-                            let object = self.nodes.parent_id(parent);
-                            return matches!(self.nodes.parent_kind(object),
-                                AstKind::AssignmentExpression(assignment)
-                                    if assignment.right.span() == self.span(object))
-                                && self.exported_by(self.nodes.parent_id(object));
+                        AstKind::ExportSpecifier(_)
+                        | AstKind::AssignmentExpression(_)
+                        | AstKind::ObjectProperty(_) => {
+                            return self.exports_value(parent, current);
                         }
                         _ => return false,
                     }
                 }
                 false
             })
+    }
+
+    /// Whether `parent` exports the value at `value` and passes it nowhere
+    /// else: an `export` of it, an assignment into this file's exports, or
+    /// a field of an object literal one assigns.
+    fn exports_value(&self, parent: NodeId, value: NodeId) -> bool {
+        let span = self.span(value);
+        match self.nodes.kind(parent) {
+            AstKind::ExportSpecifier(_) => true,
+            AstKind::AssignmentExpression(assignment) => {
+                assignment.right.span() == span && self.exported_by(parent)
+            }
+            // A field of what replaces `module.exports`.
+            AstKind::ObjectProperty(property) if property.value.span() == span => {
+                let object = self.nodes.parent_id(parent);
+                matches!(self.nodes.parent_kind(object),
+                    AstKind::AssignmentExpression(assignment)
+                        if assignment.right.span() == self.span(object))
+                    && self.exported_by(self.nodes.parent_id(object))
+            }
+            _ => false,
+        }
     }
 
     /// Whether an assignment, and each assignment it is the value of, store
@@ -6915,22 +7486,16 @@ impl<'s, 'a> Analysis<'s, 'a> {
         }
     }
 
-    /// Whether this file may read a class back out of its own exports, or
-    /// add to it there: a read of a field of `exports`, `module.exports` or
-    /// top-level `this` that may hold it, or any field of `module.exports`
-    /// when that is the class.
-    fn exports_reach(
-        &self,
-        exports: &Exports<'a>,
-        class: &'a Class<'a>,
-        binding: Option<SymbolId>,
-    ) -> bool {
+    /// Whether this file may read the value at `span`, or that `binding`
+    /// holds, back out of its own exports, or add to it there: a read of a
+    /// field of `exports`, `module.exports` or top-level `this` that may
+    /// hold it, or any field of `module.exports` when that is the value.
+    fn exports_reach(&self, exports: &Exports<'a>, span: Span, binding: Option<SymbolId>) -> bool {
         let holds = |value: &'a Expression<'a>| match inner(value) {
-            Expression::ClassExpression(expression) => expression.span == class.span,
             Expression::Identifier(identifier) => {
                 binding.is_some() && self.resolved(identifier) == binding
             }
-            _ => false,
+            value => value.span() == span,
         };
         let held = |value: &ExportValue<'a>| match value {
             ExportValue::Symbol(symbol) => Some(*symbol) == binding,
@@ -7006,10 +7571,10 @@ impl<'s, 'a> Analysis<'s, 'a> {
     /// through an export it does not name.
     fn module_entries(&self) -> Vec<ModuleEntry> {
         let mut entries = self.forwarded.clone();
-        if self.tainted_spans.is_empty() {
-            return entries;
-        }
+        // Modules whose functions may be called unresolved, and the exports
+        // of modules used outside a proven call.
         let mut any: Vec<&'a str> = Vec::new();
+        let mut escaped: Vec<(&'a str, ModuleExport)> = Vec::new();
         let mut bindings: HashMap<SymbolId, Option<&'a str>> = HashMap::new();
         for node in self.nodes.iter() {
             let (callee, arguments) = match node.kind() {
@@ -7024,8 +7589,12 @@ impl<'s, 'a> Analysis<'s, 'a> {
                             .entry(symbol)
                             .or_insert_with(|| self.module_binding(symbol))
                         && !self.module_use(node.id())
+                        && !self.returned_to_module(node.id())
                     {
-                        any.push(specifier);
+                        let export = self
+                            .symbol_export(symbol)
+                            .unwrap_or_else(|| self.field_read(node.id()));
+                        escaped.push((specifier, export));
                     }
                     continue;
                 }
@@ -7036,7 +7605,7 @@ impl<'s, 'a> Analysis<'s, 'a> {
                             AstKind::AwaitExpression(_)
                         ) && self.module_use(node.id()))
                     {
-                        any.push(specifier);
+                        escaped.push((specifier, ModuleExport::Any));
                     }
                     continue;
                 }
@@ -7045,8 +7614,9 @@ impl<'s, 'a> Analysis<'s, 'a> {
             if let AstKind::CallExpression(call) = node.kind()
                 && let Some(specifier) = self.required(call)
                 && !self.module_use(node.id())
+                && !self.returned_to_module(node.id())
             {
-                any.push(specifier);
+                escaped.push((specifier, self.field_read(node.id())));
             }
             let located = arguments
                 .iter()
@@ -7061,14 +7631,40 @@ impl<'s, 'a> Analysis<'s, 'a> {
                 }));
             }
             // An instance outlives its construction, so what its class lets
-            // it reach matters whatever it is given.
+            // it reach matters whatever it is given, once this file has a
+            // location to give it later.
             let constructs = matches!(node.kind(), AstKind::NewExpression(_));
-            if !located && !constructs {
-                continue;
-            }
+            let lasting = constructs && !self.tainted_spans.is_empty();
             let Some((specifier, export)) = self.module_function(callee, 0) else {
+                // A variable declared from a module that may since hold
+                // something else, such as one reassigned later, may still
+                // call one of its exports.
+                if let Expression::Identifier(identifier) = inner(callee)
+                    && let Some(symbol) = self.resolved(identifier)
+                    && let Some(specifier) = self.module_binding(symbol)
+                {
+                    any.push(specifier);
+                }
                 continue;
             };
+            let passed: Vec<_> = arguments
+                .iter()
+                .map(|argument| {
+                    let argument = argument.as_expression()?;
+                    self.located_argument(argument).or_else(|| {
+                        // What a module's function returns is not one of its
+                        // exports.
+                        if self.module_return(argument, 0) {
+                            return None;
+                        }
+                        let (source, export) = self.passed_export(argument)?;
+                        (source == specifier).then(|| ModuleArgument::Export(vec![export]))
+                    })
+                })
+                .collect();
+            if !located && !lasting && passed.iter().all(Option::is_none) {
+                continue;
+            }
             if arguments
                 .iter()
                 .any(|argument| matches!(argument, Argument::SpreadElement(_)))
@@ -7080,36 +7676,137 @@ impl<'s, 'a> Analysis<'s, 'a> {
                 specifier: specifier.to_string(),
                 call: ModuleCall {
                     export,
-                    arguments: arguments
-                        .iter()
-                        .map(|argument| {
-                            argument
-                                .as_expression()
-                                .filter(|argument| self.is_tainted(argument.span()))
-                                .map(|argument| {
-                                    if self.is_array(argument) {
-                                        ModuleArgument::Words(self.evaluate_words(argument, 0))
-                                    } else {
-                                        ModuleArgument::Value(self.evaluate(argument, 0))
-                                    }
-                                })
-                        })
-                        .collect(),
+                    arguments: passed,
                     constructs,
                 },
             });
         }
+        // A caller with locations may pass them to whatever it takes from a
+        // module; one without them can only take the module's out.
+        if self.tainted_spans.is_empty() {
+            escaped.extend(
+                any.drain(..)
+                    .map(|specifier| (specifier, ModuleExport::Any)),
+            );
+        } else {
+            any.extend(escaped.iter().map(|(specifier, _)| *specifier));
+        }
         any.sort_unstable();
         any.dedup();
-        entries.extend(any.into_iter().map(|specifier| ModuleEntry {
+        escaped.sort_unstable();
+        escaped.dedup();
+        let entry = |specifier: &str, export| ModuleEntry {
             specifier: specifier.to_string(),
             call: ModuleCall {
-                export: ModuleExport::Any,
+                export,
                 arguments: Vec::new(),
                 constructs: false,
             },
-        }));
+        };
+        entries.extend(
+            any.into_iter()
+                .map(|specifier| entry(specifier, ModuleExport::Any)),
+        );
+        entries.extend(
+            escaped.into_iter().map(|(specifier, export)| {
+                entry(specifier, ModuleExport::Escape(Box::new(export)))
+            }),
+        );
         entries
+    }
+
+    /// The export a variable bound to a module holds, or `None` for the
+    /// module itself.
+    fn symbol_export(&self, symbol: SymbolId) -> Option<ModuleExport> {
+        let declaration = self.scoping.symbol_declaration(symbol);
+        match self.nodes.kind(declaration) {
+            AstKind::ImportSpecifier(specifier) => Some(match specifier.imported.name().as_str() {
+                "default" => ModuleExport::Default,
+                name => ModuleExport::Name(name.to_string()),
+            }),
+            AstKind::ImportDefaultSpecifier(_) => Some(ModuleExport::Default),
+            AstKind::ImportNamespaceSpecifier(_) => None,
+            AstKind::VariableDeclarator(declarator) => match &declarator.id {
+                BindingPattern::BindingIdentifier(_) => {
+                    let init = declarator.init.as_ref()?;
+                    if self.local_module(init, 0).is_some() {
+                        return None;
+                    }
+                    Some(
+                        self.module_function(init, 0)
+                            .map_or(ModuleExport::Any, |(_, export)| export),
+                    )
+                }
+                pattern => Some(
+                    self.pattern_key(pattern.span(), symbol)
+                        .map_or(ModuleExport::Any, |key| ModuleExport::Name(key.to_string())),
+                ),
+            },
+            _ => Some(ModuleExport::Any),
+        }
+    }
+
+    /// The export a field read straight off the module at `node` takes, or
+    /// `Any` when the module itself is used.
+    fn field_read(&self, node: NodeId) -> ModuleExport {
+        match self.member_parts_of(self.nodes.parent_id(node)) {
+            Some((object, Some(name))) if object.span() == self.span(node) => match name {
+                "default" => ModuleExport::Default,
+                name => ModuleExport::Name(name.to_string()),
+            },
+            _ => ModuleExport::Any,
+        }
+    }
+
+    /// The export an argument passes back into its module. A field read off
+    /// an export, such as a TypeScript enum member, holds what that export
+    /// does.
+    fn passed_export(&self, argument: &'a Expression<'a>) -> Option<(&'a str, ModuleExport)> {
+        let (source, export) = self.module_function(argument, 0)?;
+        if export != ModuleExport::Any {
+            return Some((source, export));
+        }
+        let mut current = argument;
+        for _ in 0..=MAX_LOCATION_DEPTH {
+            let Some((object, _)) = self.member_parts(inner(current)) else {
+                break;
+            };
+            match self.module_function(object, 0) {
+                Some((root, export @ (ModuleExport::Name(_) | ModuleExport::Default)))
+                    if root == source =>
+                {
+                    return Some((source, ModuleExport::Field(Box::new(export))));
+                }
+                Some((root, ModuleExport::Any)) if root == source => current = object,
+                _ => break,
+            }
+        }
+        Some((source, ModuleExport::Any))
+    }
+
+    /// A module value used as an argument to the same module is recorded
+    /// by `module_entries`; the field read is not a separate escape.
+    fn returned_to_module(&self, node: NodeId) -> bool {
+        for parent in self.nodes.ancestor_ids(node) {
+            let (callee, arguments) = match self.nodes.kind(parent) {
+                AstKind::CallExpression(call) => (&call.callee, &call.arguments),
+                AstKind::NewExpression(call) => (&call.callee, &call.arguments),
+                _ => continue,
+            };
+            let Some((target, _)) = self.module_function(callee, 0) else {
+                return false;
+            };
+            return arguments
+                .iter()
+                .filter_map(Argument::as_expression)
+                .any(|argument| {
+                    contains(argument.span(), self.span(node))
+                        && self
+                            .module_function(argument, 0)
+                            .is_some_and(|(source, _)| source == target)
+                });
+        }
+        false
     }
 
     /// Whether a module object or function at `node` is only called or
@@ -7142,30 +7839,30 @@ impl<'s, 'a> Analysis<'s, 'a> {
                 // Loading a module for its effects passes it nothing.
                 AstKind::ExpressionStatement(_) => return true,
                 AstKind::VariableDeclarator(declarator) => {
-                    return declarator
-                        .init
-                        .as_ref()
-                        .is_some_and(|init| init.span() == self.span(current))
-                        && match &declarator.id {
-                            BindingPattern::BindingIdentifier(_) => true,
-                            BindingPattern::ObjectPattern(pattern) => {
-                                pattern.rest.is_none()
-                                    && pattern.properties.iter().all(|property| {
-                                        key_name(&property.key).is_some()
-                                            && match &property.value {
-                                                BindingPattern::BindingIdentifier(_) => true,
-                                                BindingPattern::AssignmentPattern(pattern) => {
-                                                    matches!(
-                                                        pattern.left,
-                                                        BindingPattern::BindingIdentifier(_)
-                                                    )
-                                                }
-                                                _ => false,
+                    // An alias is followed only while its module origin can
+                    // still be resolved within the analysis bound.
+                    return declarator.init.as_ref().is_some_and(|init| {
+                        init.span() == self.span(current) && self.module_function(init, 0).is_some()
+                    }) && match &declarator.id {
+                        BindingPattern::BindingIdentifier(_) => true,
+                        BindingPattern::ObjectPattern(pattern) => {
+                            pattern.rest.is_none()
+                                && pattern.properties.iter().all(|property| {
+                                    key_name(&property.key).is_some()
+                                        && match &property.value {
+                                            BindingPattern::BindingIdentifier(_) => true,
+                                            BindingPattern::AssignmentPattern(pattern) => {
+                                                matches!(
+                                                    pattern.left,
+                                                    BindingPattern::BindingIdentifier(_)
+                                                )
                                             }
-                                    })
-                            }
-                            _ => false,
-                        };
+                                            _ => false,
+                                        }
+                                })
+                        }
+                        _ => false,
+                    };
                 }
                 AstKind::AssignmentExpression(assignment)
                     if assignment.right.span() == self.span(current) =>
@@ -7181,7 +7878,8 @@ impl<'s, 'a> Analysis<'s, 'a> {
                         && (self.invoked(parent)
                             // A variable only holding the field is followed.
                             || matches!(self.nodes.parent_kind(parent), AstKind::VariableDeclarator(declarator)
-                                if matches!(declarator.id, BindingPattern::BindingIdentifier(_))
+                                if matches!(&declarator.id, BindingPattern::BindingIdentifier(binding)
+                                    if binding.symbol_id.get().and_then(|symbol| self.module_binding(symbol)).is_some())
                                     && declarator.init.as_ref().is_some_and(|init| init.span() == self.span(parent))));
                 }
             }
@@ -7222,12 +7920,32 @@ impl<'s, 'a> Analysis<'s, 'a> {
             | AstKind::ImportNamespaceSpecifier(_) => self.import_source(declaration),
             AstKind::VariableDeclarator(declarator) => {
                 let init = declarator.init.as_ref()?;
-                self.local_module(init, 0).or_else(|| {
-                    let (object, _) = expression_property(inner(init))?;
-                    self.local_module(object, 0)
-                })
+                if self.module_return(init, 0) {
+                    return None;
+                }
+                self.module_function(init, 0)
+                    .map(|(specifier, _)| specifier)
             }
             _ => None,
+        }
+    }
+
+    /// Whether an expression holds what a call returned, or a field of it,
+    /// rather than a module or one of its exports. A module's functions
+    /// return values the caller uses like any other.
+    fn module_return(&self, expression: &'a Expression<'a>, depth: usize) -> bool {
+        if depth > MAX_LOCATION_DEPTH || self.local_module(expression, 0).is_some() {
+            return false;
+        }
+        match inner(expression) {
+            Expression::CallExpression(_) => true,
+            Expression::Identifier(identifier) => self
+                .resolved(identifier)
+                .and_then(|symbol| self.initializer(symbol))
+                .is_some_and(|init| self.module_return(init, depth + 1)),
+            expression => self
+                .member_parts(expression)
+                .is_some_and(|(object, _)| self.module_return(object, depth + 1)),
         }
     }
 
@@ -7369,6 +8087,9 @@ impl<'s, 'a> Analysis<'s, 'a> {
                     AstKind::VariableDeclarator(declarator)
                         if !matches!(declarator.id, BindingPattern::BindingIdentifier(_)) =>
                     {
+                        if self.is_written(symbol) {
+                            return None;
+                        }
                         let specifier = self.local_module(declarator.init.as_ref()?, 0)?;
                         Some((
                             specifier,
@@ -7415,6 +8136,11 @@ impl<'s, 'a> Analysis<'s, 'a> {
         }
         directories.sort_by_key(|(start, _)| *start);
         let mut executions = Vec::new();
+        if self.escaped_locations {
+            // The caller may execute an exported location or hand it back
+            // through a helper whose argument binding is not proven.
+            executions.push(LocatedExecution::unresolved(SourceFileKind::JavaScript));
+        }
         for node in self.nodes.iter() {
             let (span, callee, arguments, constructor) = match node.kind() {
                 AstKind::CallExpression(call) => (call.span, &call.callee, &call.arguments, false),
