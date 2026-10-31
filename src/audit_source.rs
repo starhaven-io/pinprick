@@ -1527,6 +1527,13 @@ pub(crate) enum ModuleExport {
     /// Any function the module exports, or one a caller can reach without
     /// naming it.
     Any,
+    /// A caller uses the module outside a proven call, taking the export
+    /// named, or with `Any` the whole module. It may carry the module's
+    /// locations back into that caller.
+    Escape(Box<ModuleExport>),
+    /// A field of the export, passed back into the module, such as a
+    /// TypeScript enum member.
+    Field(Box<ModuleExport>),
 }
 
 /// Calls into a module's export: the located value each argument may hold,
@@ -1544,6 +1551,9 @@ pub(crate) struct ModuleCall {
 pub(crate) enum ModuleArgument {
     Value(String),
     Words(Vec<String>),
+    /// The exports one of several calls may pass back into their own module,
+    /// each evaluated there rather than relative to the caller's file.
+    Export(Vec<ModuleExport>),
 }
 
 impl ModuleArgument {
@@ -1551,14 +1561,21 @@ impl ModuleArgument {
         match self {
             Self::Value(value) => Self::Value(rebase(&value)),
             Self::Words(words) => Self::Words(words.iter().map(|word| rebase(word)).collect()),
+            Self::Export(export) => Self::Export(export),
         }
     }
 
     /// What either of two calls may pass.
-    fn merge(self, other: Self) -> Self {
+    pub(crate) fn merge(self, other: Self) -> Self {
         match (self, other) {
             (Self::Value(left), Self::Value(right)) => {
                 Self::Value(merge_location_values([left, right]))
+            }
+            (Self::Export(mut left), Self::Export(right)) => {
+                left.extend(right);
+                left.sort_unstable();
+                left.dedup();
+                Self::Export(left)
             }
             (left, right) if left == right => left,
             _ => Self::Value(UNRESOLVED_LOCATION.to_string()),
