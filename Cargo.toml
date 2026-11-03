@@ -47,14 +47,14 @@ toml = "1"
 semver = "1"
 sha2 = "0.11"
 minisign-verify = "0.3.0"
-oxc_allocator = "0.155"
-oxc_ast = "0.155"
-oxc_parser = { version = "0.155", default-features = false }
-oxc_semantic = "0.155"
-oxc_span = "0.155"
-ruff_python_ast = "=0.0.19"
-ruff_python_parser = "=0.0.19"
-ruff_text_size = "=0.0.19"
+oxc_allocator = "0.156"
+oxc_ast = "0.156"
+oxc_parser = { version = "0.156", default-features = false }
+oxc_semantic = "0.156"
+oxc_span = "0.156"
+ruff_python_ast = "=0.0.20"
+ruff_python_parser = "=0.0.20"
+ruff_text_size = "=0.0.20"
 rustix = { version = "1", features = ["fs"] }
 
 [build-dependencies]
