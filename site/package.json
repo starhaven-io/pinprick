@@ -33,8 +33,5 @@
     "esbuild": false,
     "fsevents": false,
     "workerd": false
-  },
-  "overrides": {
-    "sharp": "$sharp"
   }
 }
