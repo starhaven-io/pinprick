@@ -201,6 +201,10 @@ const NODE_BUILTINS: &[&str] = &[
 /// outside this analysis.
 const LOADER_MODULES: &[&str] = &["module", "vm", "inspector", "repl"];
 
+/// The `BuiltinUse::patched` entry for a file that may replace
+/// `process.platform`: see `LoaderGuard::replaces_platform`.
+pub(crate) const PLATFORM_PATCH: &str = "process:platform";
+
 /// Code that bundlers pass to `eval` and `Function` to reach the loader or
 /// the global object, which loads nothing itself.
 const INERT_CODE: &[&str] = &["require", "this", "return this", "return this;"];
@@ -307,6 +311,17 @@ fn parsed_builtin_use(path: &str, code: &str) -> BuiltinUse {
                 }
             }
         }
+    }
+    if guard.replaces_platform()
+        && !builtin_use
+            .patched
+            .iter()
+            .any(|patch| patch == PLATFORM_PATCH)
+    {
+        builtin_use.patched.push(PLATFORM_PATCH.to_string());
+    }
+    if guard.replaces_assert() && !builtin_use.patched.iter().any(|patch| patch == "assert:*") {
+        builtin_use.patched.push("assert:*".to_string());
     }
     builtin_use.patched.sort_unstable();
     builtin_use
@@ -542,6 +557,38 @@ struct LoaderGuard<'s, 'a> {
     assigned: RefCell<HashMap<SymbolId, Vec<&'a Expression<'a>>>>,
     /// The calls to each function, once `calls_to` has indexed them.
     callers: RefCell<Option<HashMap<NodeId, Vec<NodeId>>>>,
+    /// What `module_table` found, once computed.
+    bundle: RefCell<Option<Bundle<'a>>>,
+    /// What `alias_value` found for each variable.
+    aliases: RefCell<HashMap<SymbolId, Option<&'a Expression<'a>>>>,
+}
+
+/// A bundler's require function and the built-in modules its table hands
+/// back, by their keys, with where each entry loads its own: see
+/// `LoaderGuard::module_table`.
+type Bundle<'a> = Option<(SymbolId, HashMap<&'a str, (&'a str, u32)>)>;
+
+/// The names webpack and ncc give the function that runs a bundled module.
+const BUNDLER_REQUIRES: &[&str] = &["__webpack_require__", "__nccwpck_require__"];
+
+/// What becomes of an object this analysis takes as Node's own: see
+/// `LoaderGuard::object_use`.
+enum ObjectUse<'a> {
+    /// Tested, compared, converted to a string or discarded.
+    Read,
+    /// The object of this member expression.
+    Member(NodeId),
+    /// The value a variable is given.
+    Bound(SymbolId),
+    /// Taken apart by an object pattern.
+    Destructured,
+    Called,
+    /// An argument of a call, by position.
+    Argument(&'a CallExpression<'a>, usize),
+    /// What this function returns.
+    Returned(NodeId),
+    /// Stored, spread or passed where this does not follow it.
+    Escapes,
 }
 
 impl<'s, 'a> LoaderGuard<'s, 'a> {
@@ -554,6 +601,8 @@ impl<'s, 'a> LoaderGuard<'s, 'a> {
             identifiers: RefCell::default(),
             assigned: RefCell::default(),
             callers: RefCell::default(),
+            bundle: RefCell::default(),
+            aliases: RefCell::default(),
         }
     }
 
@@ -679,6 +728,855 @@ impl<'s, 'a> LoaderGuard<'s, 'a> {
         }
     }
 
+    /// The built-in module a table entry is: a function whose only
+    /// statement assigns its module's `exports` one a loader returned by a
+    /// literal name, as bundlers define a module they leave external.
+    fn external_entry(&self, entry: &'a Expression<'a>) -> Option<(&'a str, u32)> {
+        let (parameters, body) = match inner(entry) {
+            Expression::ArrowFunctionExpression(arrow) => {
+                (&arrow.params, arrow.body.as_function_body()?)
+            }
+            Expression::FunctionExpression(function) => {
+                (&function.params, &**function.body.as_ref()?)
+            }
+            _ => return None,
+        };
+        let BindingPattern::BindingIdentifier(module) = &parameters.items.first()?.pattern else {
+            return None;
+        };
+        let [Statement::ExpressionStatement(statement)] = body.statements.as_slice() else {
+            return None;
+        };
+        let Expression::AssignmentExpression(assignment) = inner(&statement.expression) else {
+            return None;
+        };
+        let (Expression::Identifier(target), Some("exports")) =
+            expression_target(&assignment.left).map(|(object, name)| (inner(object), name))?
+        else {
+            return None;
+        };
+        let Expression::CallExpression(load) = inner(&assignment.right) else {
+            return None;
+        };
+        if assignment.operator != AssignmentOperator::Assign
+            || self.symbol(target) != module.symbol_id.get()
+            || !self.loads(load, 0)
+        {
+            return None;
+        }
+        self.specifier(load)
+            .filter(|specifier| builtin_module(specifier))
+            .map(|specifier| (builtin_root(specifier), load.span.start))
+    }
+
+    /// A bundler's require function and the built-in modules its table
+    /// hands back: a function declared once under one of `BUNDLER_REQUIRES`
+    /// and never reassigned, which returns only a module's `exports` and
+    /// calls the entry its one parameter selects from an object literal.
+    /// That table, and the cache the function also indexes by its
+    /// parameter, which starts empty, are reached nowhere else, so no other
+    /// code can change what an entry is.
+    /// A function that only resembles a bundler's is a documented limit of
+    /// the model.
+    fn module_table(&self) -> Bundle<'a> {
+        self.nodes.iter().find_map(|node| match node.kind() {
+            AstKind::Function(function)
+                if function
+                    .id
+                    .as_ref()
+                    .is_some_and(|id| BUNDLER_REQUIRES.contains(&id.name.as_str())) =>
+            {
+                self.table_of(function)
+            }
+            _ => None,
+        })
+    }
+
+    /// `module_table` for one function declared under a bundler's name.
+    fn table_of(&self, function: &'a Function<'a>) -> Bundle<'a> {
+        let require = function.id.as_ref()?.symbol_id.get()?;
+        let [parameter] = function.params.items.as_slice() else {
+            return None;
+        };
+        let BindingPattern::BindingIdentifier(parameter) = &parameter.pattern else {
+            return None;
+        };
+        let parameter = parameter.symbol_id.get()?;
+        // The last of several declarations is the one that runs.
+        if function.params.rest.is_some()
+            || !self.scoping.symbol_redeclarations(require).is_empty()
+            || self
+                .scoping
+                .get_resolved_references(require)
+                .any(|reference| reference.is_write())
+        {
+            return None;
+        }
+        let indexed = |expression: &'a Expression<'a>| match inner(expression) {
+            Expression::ComputedMemberExpression(member) => {
+                match (inner(&member.object), inner(&member.expression)) {
+                    (Expression::Identifier(object), Expression::Identifier(key))
+                        if self.symbol(key) == Some(parameter) =>
+                    {
+                        self.symbol(object)
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        let mut table = None;
+        // Everything the function indexes by its parameter: the table and
+        // the module cache.
+        let mut indexes = Vec::new();
+        for node in self.nodes.iter() {
+            if !contains(function.span, node.kind().span()) {
+                continue;
+            }
+            match node.kind() {
+                AstKind::ReturnStatement(statement) => {
+                    if !statement.argument.as_ref().is_some_and(|value| {
+                        matches!(expression_property(inner(value)), Some((_, "exports")))
+                    }) {
+                        return None;
+                    }
+                }
+                AstKind::CallExpression(call) => {
+                    let callee = inner(&call.callee);
+                    let entry = match expression_property(callee) {
+                        Some((entry, "call")) => entry,
+                        _ => callee,
+                    };
+                    if let Some(symbol) = indexed(entry) {
+                        if table.is_some_and(|known| known != symbol) {
+                            return None;
+                        }
+                        table = Some(symbol);
+                    }
+                }
+                AstKind::ComputedMemberExpression(member) => {
+                    if let (Expression::Identifier(object), Expression::Identifier(key)) =
+                        (inner(&member.object), inner(&member.expression))
+                        && self.symbol(key) == Some(parameter)
+                    {
+                        indexes.push(self.symbol(object)?);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let table = table?;
+        // The cache starts empty, or it could hold a module before the
+        // function runs the entry for it.
+        let confined = |symbol: SymbolId| {
+            self.alias_value(symbol).is_some_and(|value| {
+                matches!(inner(value), Expression::ObjectExpression(object)
+                    if symbol == table || object.properties.is_empty())
+            }) && self
+                .scoping
+                .get_resolved_references(symbol)
+                .all(|reference| contains(function.span, self.span(reference.node_id())))
+        };
+        if !indexes.into_iter().all(confined) {
+            return None;
+        }
+        let Expression::ObjectExpression(modules) = inner(self.alias_value(table)?) else {
+            return None;
+        };
+        let mut externals = HashMap::new();
+        let mut keys = HashSet::new();
+        for property in &modules.properties {
+            let ObjectPropertyKind::ObjectProperty(property) = property else {
+                return None;
+            };
+            let key = key_name(&property.key)?;
+            if property.kind != PropertyKind::Init || !keys.insert(key) {
+                return None;
+            }
+            if let Some(module) = self.external_entry(&property.value) {
+                externals.insert(key, module);
+            }
+        }
+        Some((require, externals))
+    }
+
+    /// The built-in module a call to a bundler's require function hands
+    /// back: see `module_table`.
+    fn bundled_builtin(&self, call: &'a CallExpression<'a>) -> Option<&'a str> {
+        let Expression::Identifier(callee) = inner(&call.callee) else {
+            return None;
+        };
+        if !BUNDLER_REQUIRES.contains(&callee.name.as_str()) {
+            return None;
+        }
+        let key = match call
+            .arguments
+            .first()
+            .and_then(Argument::as_expression)
+            .map(inner)?
+        {
+            Expression::NumericLiteral(number) => numeric_name(number)?,
+            Expression::StringLiteral(key) => key.value.as_str()?,
+            _ => return None,
+        };
+        let bundle = self.bundle();
+        let (require, externals) = bundle.as_ref()?;
+        (self.symbol(callee) == Some(*require))
+            .then(|| externals.get(key).map(|(module, _)| *module))
+            .flatten()
+    }
+
+    fn bundle(&self) -> std::cell::Ref<'_, Bundle<'a>> {
+        if self.bundle.borrow().is_none() {
+            let bundle = self.module_table();
+            *self.bundle.borrow_mut() = Some(bundle);
+        }
+        std::cell::Ref::map(self.bundle.borrow(), |bundle| {
+            bundle.as_ref().expect("computed above")
+        })
+    }
+
+    /// Whether a call is where a bundler's table entry loads the built-in it
+    /// hands back, which `bundled_builtin` follows from the require function.
+    fn external_load(&self, call: &'a CallExpression<'a>) -> bool {
+        self.bundle().as_ref().is_some_and(|(_, externals)| {
+            externals
+                .values()
+                .any(|(_, start)| *start == call.span.start)
+        })
+    }
+
+    /// The value a variable declared once, by name, only ever holds. A
+    /// second `var` declaration can give it another without writing it.
+    fn alias_value(&self, symbol: SymbolId) -> Option<&'a Expression<'a>> {
+        if let Some(value) = self.aliases.borrow().get(&symbol) {
+            return *value;
+        }
+        let value = (self.scoping.symbol_redeclarations(symbol).is_empty()
+            && matches!(self.nodes.kind(self.scoping.symbol_declaration(symbol)),
+                AstKind::VariableDeclarator(declarator)
+                    if matches!(declarator.id, BindingPattern::BindingIdentifier(_))))
+        .then(|| self.bound_value(symbol))
+        .flatten();
+        self.aliases.borrow_mut().insert(symbol, value);
+        value
+    }
+
+    /// Whether an expression is the global object: one of its names, a
+    /// property of it under one of them, what `Function("return this")()`
+    /// hands back, or a variable only ever holding one of those. With `may`,
+    /// whether it may be: also a logical or conditional expression with one
+    /// among its results.
+    fn global_object(&self, expression: &'a Expression<'a>, may: bool, depth: usize) -> bool {
+        if depth > MAX_LOCATION_DEPTH {
+            return false;
+        }
+        match inner(expression) {
+            Expression::Identifier(identifier) => match self.symbol(identifier) {
+                None => GLOBAL_OBJECTS.contains(&identifier.name.as_str()),
+                Some(symbol) => self
+                    .alias_value(symbol)
+                    .is_some_and(|value| self.global_object(value, may, depth + 1)),
+            },
+            Expression::LogicalExpression(logical) => {
+                may && (logical.operator != LogicalOperator::And
+                    && self.global_object(&logical.left, may, depth + 1)
+                    || self.global_object(&logical.right, may, depth + 1))
+            }
+            Expression::ConditionalExpression(conditional) => {
+                may && (self.global_object(&conditional.consequent, may, depth + 1)
+                    || self.global_object(&conditional.alternate, may, depth + 1))
+            }
+            Expression::CallExpression(call) => {
+                let (callee, arguments) = match inner(&call.callee) {
+                    Expression::CallExpression(function) => (&function.callee, &function.arguments),
+                    Expression::NewExpression(function) => (&function.callee, &function.arguments),
+                    _ => return false,
+                };
+                call.arguments.is_empty()
+                    && matches!(inner(callee), Expression::Identifier(function)
+                        if function.name.as_str() == "Function" && self.symbol(function).is_none())
+                    && matches!(
+                        arguments.as_slice(),
+                        [argument] if argument
+                            .as_expression()
+                            .and_then(literal_text)
+                            .is_some_and(|code| code.trim().trim_end_matches(';') == "return this")
+                    )
+            }
+            expression => expression_property(expression).is_some_and(|(object, name)| {
+                GLOBAL_OBJECTS.contains(&name) && self.global_object(object, may, depth + 1)
+            }),
+        }
+    }
+
+    fn process_identifier(
+        &self,
+        identifier: &IdentifierReference<'a>,
+        may: bool,
+        depth: usize,
+    ) -> bool {
+        let Some(symbol) = self.symbol(identifier) else {
+            return identifier.name.as_str() == "process";
+        };
+        let declaration = self.scoping.symbol_declaration(symbol);
+        match (
+            self.nodes.kind(declaration),
+            self.nodes.parent_kind(declaration),
+        ) {
+            (
+                AstKind::ImportDefaultSpecifier(_) | AstKind::ImportNamespaceSpecifier(_),
+                AstKind::ImportDeclaration(import),
+            ) => matches!(
+                import.source.value.as_str(),
+                Some("process" | "node:process")
+            ),
+            _ => self
+                .alias_value(symbol)
+                .is_some_and(|value| self.process_object(value, may, depth + 1)),
+        }
+    }
+
+    fn process_load(&self, call: &'a CallExpression<'a>) -> bool {
+        self.bundled_builtin(call) == Some("process")
+            || matches!(self.specifier(call), Some("process" | "node:process"))
+                && self.loads(call, 0)
+                && !self.external_load(call)
+    }
+
+    /// Whether an expression is Node's `process` object: the global, the
+    /// global object's `process`, the `process` module a loader returned or
+    /// an import of it, or a variable only ever holding one of those. With
+    /// `may`, whether it may be: also a logical or conditional expression
+    /// with one among its results, and a `process` property of any object
+    /// this file did not create, which code can make the global object
+    /// without naming it.
+    fn process_object(&self, expression: &'a Expression<'a>, may: bool, depth: usize) -> bool {
+        if depth > MAX_LOCATION_DEPTH {
+            return false;
+        }
+        match inner(expression) {
+            Expression::Identifier(identifier) => self.process_identifier(identifier, may, depth),
+            Expression::CallExpression(call) => self.process_load(call),
+            Expression::LogicalExpression(logical) => {
+                may && (logical.operator != LogicalOperator::And
+                    && self.process_object(&logical.left, may, depth + 1)
+                    || self.process_object(&logical.right, may, depth + 1))
+            }
+            Expression::ConditionalExpression(conditional) => {
+                may && (self.process_object(&conditional.consequent, may, depth + 1)
+                    || self.process_object(&conditional.alternate, may, depth + 1))
+            }
+            expression => expression_property(expression)
+                .is_some_and(|(object, name)| self.process_member(object, name, may, depth)),
+        }
+    }
+
+    /// Whether a property of an object is, or with `may` may be, Node's
+    /// `process`: the `process` of an object that holds it, or the `default`
+    /// of the module.
+    fn process_member(
+        &self,
+        object: &'a Expression<'a>,
+        name: &str,
+        may: bool,
+        depth: usize,
+    ) -> bool {
+        match name {
+            "process" if may => !self.local_object(object, 0),
+            "process" => self.global_object(object, false, 0),
+            "default" => self.process_object(object, may, depth + 1),
+            _ => false,
+        }
+    }
+
+    /// Whether a node names what may be the `process` object.
+    fn process_node(&self, node: NodeId) -> bool {
+        match self.nodes.kind(node) {
+            AstKind::IdentifierReference(identifier) => {
+                self.process_identifier(identifier, true, 0)
+            }
+            AstKind::CallExpression(call) => self.process_load(call),
+            kind => member_property(kind)
+                .is_some_and(|(object, name)| self.process_member(object, name, true, 0)),
+        }
+    }
+
+    /// Whether a key can only be a symbol, which names no string property.
+    fn symbol_key(&self, key: &'a Expression<'a>) -> bool {
+        let value = match inner(key) {
+            Expression::Identifier(identifier) => self
+                .symbol(identifier)
+                .and_then(|symbol| self.alias_value(symbol))
+                .map(inner),
+            value => Some(value),
+        };
+        matches!(value, Some(Expression::CallExpression(call))
+        if match inner(&call.callee) {
+            Expression::Identifier(callee) => {
+                callee.name.as_str() == "Symbol" && self.symbol(callee).is_none()
+            }
+            callee => expression_property(callee).is_some_and(|(object, name)| {
+                name == "for"
+                    && matches!(inner(object), Expression::Identifier(root)
+                        if root.name.as_str() == "Symbol" && self.symbol(root).is_none())
+            }),
+        })
+    }
+
+    /// Whether a member expression is written or deleted.
+    fn member_written(&self, member: NodeId) -> bool {
+        let span = self.span(member);
+        match self.nodes.parent_kind(member) {
+            AstKind::AssignmentExpression(assignment) => assignment.left.span() == span,
+            AstKind::UnaryExpression(unary) => unary.operator == UnaryOperator::Delete,
+            AstKind::ForInStatement(statement) => statement.left.span() == span,
+            AstKind::ForOfStatement(statement) => statement.left.span() == span,
+            AstKind::UpdateExpression(_)
+            | AstKind::ArrayAssignmentTarget(_)
+            | AstKind::AssignmentTargetRest(_)
+            | AstKind::AssignmentTargetWithDefault(_)
+            | AstKind::AssignmentTargetPropertyProperty(_) => true,
+            _ => false,
+        }
+    }
+
+    /// What becomes of the value a node names, following it through the
+    /// expressions that hand it on unchanged.
+    fn object_use(&self, node: NodeId) -> ObjectUse<'a> {
+        let mut current = node;
+        loop {
+            let span = self.span(current);
+            let parent = self.nodes.parent_id(current);
+            let kind = self.nodes.kind(parent);
+            match kind {
+                AstKind::StaticMemberExpression(_)
+                | AstKind::ComputedMemberExpression(_)
+                | AstKind::PrivateFieldExpression(_) => {
+                    let object = match kind {
+                        AstKind::StaticMemberExpression(member) => &member.object,
+                        AstKind::ComputedMemberExpression(member) => &member.object,
+                        AstKind::PrivateFieldExpression(member) => &member.object,
+                        _ => return ObjectUse::Escapes,
+                    };
+                    // As a key it is only converted to a string.
+                    return if object.span() == span {
+                        ObjectUse::Member(parent)
+                    } else {
+                        ObjectUse::Read
+                    };
+                }
+                AstKind::UnaryExpression(unary) => {
+                    return if unary.operator == UnaryOperator::Delete {
+                        ObjectUse::Escapes
+                    } else {
+                        ObjectUse::Read
+                    };
+                }
+                AstKind::BinaryExpression(_)
+                | AstKind::IfStatement(_)
+                | AstKind::WhileStatement(_)
+                | AstKind::DoWhileStatement(_)
+                | AstKind::ForStatement(_)
+                | AstKind::SwitchStatement(_)
+                | AstKind::ThrowStatement(_)
+                | AstKind::TemplateLiteral(_)
+                | AstKind::Class(_)
+                | AstKind::ExpressionStatement(_) => return ObjectUse::Read,
+                AstKind::LogicalExpression(logical) => {
+                    if logical.operator == LogicalOperator::And && logical.left.span() == span {
+                        return ObjectUse::Read;
+                    }
+                }
+                AstKind::ConditionalExpression(conditional) => {
+                    if conditional.test.span() == span {
+                        return ObjectUse::Read;
+                    }
+                }
+                AstKind::SequenceExpression(sequence) => {
+                    if sequence
+                        .expressions
+                        .last()
+                        .is_none_or(|last| last.span() != span)
+                    {
+                        return ObjectUse::Read;
+                    }
+                }
+                AstKind::ParenthesizedExpression(_)
+                | AstKind::ChainExpression(_)
+                | AstKind::AwaitExpression(_)
+                | AstKind::TSAsExpression(_)
+                | AstKind::TSSatisfiesExpression(_)
+                | AstKind::TSNonNullExpression(_)
+                | AstKind::TSTypeAssertion(_) => {}
+                AstKind::VariableDeclarator(declarator) => {
+                    return match &declarator.id {
+                        BindingPattern::BindingIdentifier(binding) => binding
+                            .symbol_id
+                            .get()
+                            .map_or(ObjectUse::Escapes, ObjectUse::Bound),
+                        BindingPattern::ObjectPattern(_) => ObjectUse::Destructured,
+                        _ => ObjectUse::Escapes,
+                    };
+                }
+                AstKind::AssignmentExpression(assignment) => {
+                    return match &assignment.left {
+                        AssignmentTarget::AssignmentTargetIdentifier(target)
+                            if assignment.operator == AssignmentOperator::Assign
+                                && assignment.right.span() == span =>
+                        {
+                            self.symbol(target)
+                                .map_or(ObjectUse::Escapes, ObjectUse::Bound)
+                        }
+                        _ => ObjectUse::Escapes,
+                    };
+                }
+                AstKind::CallExpression(call) => {
+                    return if call.callee.span() == span {
+                        ObjectUse::Called
+                    } else {
+                        call.arguments
+                            .iter()
+                            .position(|argument| argument.span() == span)
+                            .map_or(ObjectUse::Escapes, |index| ObjectUse::Argument(call, index))
+                    };
+                }
+                AstKind::NewExpression(construction) => {
+                    return if construction.callee.span() == span {
+                        ObjectUse::Called
+                    } else {
+                        ObjectUse::Escapes
+                    };
+                }
+                AstKind::ReturnStatement(_) => {
+                    return self
+                        .enclosing_function(parent)
+                        .map_or(ObjectUse::Escapes, ObjectUse::Returned);
+                }
+                AstKind::ArrowFunctionExpression(arrow)
+                    if arrow
+                        .body
+                        .as_expression()
+                        .is_some_and(|body| body.span() == span) =>
+                {
+                    return ObjectUse::Returned(parent);
+                }
+                _ => return ObjectUse::Escapes,
+            }
+            current = parent;
+        }
+    }
+
+    /// Whether a use of the `process` object leaves its `platform` alone: a
+    /// read of a property, a test, a destructuring, or a variable that only
+    /// ever holds it, whose own uses are judged likewise. Anywhere else the
+    /// object may be changed where this does not look.
+    fn keeps_platform(&self, node: NodeId) -> bool {
+        match self.object_use(node) {
+            ObjectUse::Read | ObjectUse::Destructured => true,
+            ObjectUse::Member(member) => match member_property(self.nodes.kind(member)) {
+                Some((_, "__defineGetter__" | "__defineSetter__")) => false,
+                Some((_, "platform")) | None => !self.member_written(member),
+                Some(_) => true,
+            },
+            ObjectUse::Bound(symbol) => self
+                .alias_value(symbol)
+                .is_some_and(|value| self.process_object(value, true, 0)),
+            _ => false,
+        }
+    }
+
+    /// Whether an expression is an object this file creates, which is not
+    /// the global object: a literal, a function, an instance of a class or
+    /// function it declares, a variable declared once that only ever holds
+    /// one of those, a declaration that is never reassigned, or `this` in a
+    /// class.
+    fn local_object(&self, expression: &'a Expression<'a>, depth: usize) -> bool {
+        let declared = |identifier: &IdentifierReference<'a>| {
+            self.symbol(identifier).filter(|symbol| {
+                let flags = self.scoping.symbol_flags(*symbol);
+                (flags.is_function() || flags.is_class())
+                    && self.scoping.symbol_redeclarations(*symbol).is_empty()
+                    && !self
+                        .scoping
+                        .get_resolved_references(*symbol)
+                        .any(|reference| reference.is_write())
+            })
+        };
+        match inner(expression) {
+            Expression::ObjectExpression(_)
+            | Expression::ArrayExpression(_)
+            | Expression::ClassExpression(_)
+            | Expression::FunctionExpression(_)
+            | Expression::ArrowFunctionExpression(_) => true,
+            Expression::NewExpression(construction) => {
+                matches!(inner(&construction.callee), Expression::Identifier(class)
+                    if declared(class).is_some())
+            }
+            Expression::Identifier(identifier) => {
+                declared(identifier).is_some()
+                    || depth <= MAX_LOCATION_DEPTH
+                        && self
+                            .symbol(identifier)
+                            .and_then(|symbol| self.alias_value(symbol))
+                            .is_some_and(|value| self.local_object(value, depth + 1))
+            }
+            Expression::ThisExpression(this) => {
+                let mut ancestors = self.nodes.ancestor_ids(this.node_id.get());
+                loop {
+                    let Some(ancestor) = ancestors.next() else {
+                        return false;
+                    };
+                    match self.nodes.kind(ancestor) {
+                        AstKind::ClassBody(_) => return true,
+                        AstKind::Function(_) => {
+                            return matches!(
+                                self.nodes.parent_kind(ancestor),
+                                AstKind::MethodDefinition(_)
+                            ) && matches!(
+                                self.nodes
+                                    .kind(self.nodes.parent_id(self.nodes.parent_id(ancestor))),
+                                AstKind::ClassBody(_)
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => false,
+        }
+    }
+
+    /// The property a variable takes from the value it destructures.
+    fn destructured_key(&self, symbol: SymbolId) -> Option<&'a str> {
+        let AstKind::VariableDeclarator(declarator) =
+            self.nodes.kind(self.scoping.symbol_declaration(symbol))
+        else {
+            return None;
+        };
+        let BindingPattern::ObjectPattern(pattern) = &declarator.id else {
+            return None;
+        };
+        pattern.properties.iter().find_map(|property| {
+            matches!(&property.value, BindingPattern::BindingIdentifier(binding)
+                if binding.symbol_id.get() == Some(symbol))
+            .then(|| key_name(&property.key))
+            .flatten()
+        })
+    }
+
+    /// The `Object` or `Reflect` function a call runs to write its first
+    /// argument, and the arguments it runs it with: called directly, through
+    /// a variable or `call`, through `apply` on an array literal, or under
+    /// that name on any object or as any variable.
+    fn storing_call(
+        &self,
+        call: &'a CallExpression<'a>,
+    ) -> Option<(&'a str, Vec<Option<&'a Expression<'a>>>)> {
+        let named = |callee: &'a Expression<'a>| {
+            let object =
+                |name: &&str| matches!(*name, "assign" | "defineProperty" | "defineProperties");
+            // `set` is `Reflect`'s only where a pattern takes it by that
+            // name: collections have one too.
+            self.stores(callee).or_else(|| match inner(callee) {
+                Expression::Identifier(identifier) => {
+                    match self
+                        .symbol(identifier)
+                        .and_then(|symbol| self.destructured_key(symbol))
+                    {
+                        Some(key) => Some(key).filter(|name| object(name) || *name == "set"),
+                        None => Some(identifier.name.as_str()).filter(object),
+                    }
+                }
+                callee => expression_property(callee)
+                    .map(|(_, name)| name)
+                    .filter(object),
+            })
+        };
+        let arguments = |skip: usize| {
+            call.arguments
+                .iter()
+                .skip(skip)
+                .map(Argument::as_expression)
+                .collect::<Vec<_>>()
+        };
+        if let Some(function) = named(&call.callee) {
+            return Some((function, arguments(0)));
+        }
+        let (function, method) = expression_property(inner(&call.callee))?;
+        let function = named(function)?;
+        match method {
+            "call" => Some((function, arguments(1))),
+            "apply" => match call
+                .arguments
+                .get(1)
+                .and_then(Argument::as_expression)
+                .map(inner)
+            {
+                Some(Expression::ArrayExpression(array)) => Some((
+                    function,
+                    array
+                        .elements
+                        .iter()
+                        .map(ArrayExpressionElement::as_expression)
+                        .collect(),
+                )),
+                _ => Some((function, Vec::new())),
+            },
+            _ => None,
+        }
+    }
+
+    /// Whether a call may define `process` on the global object: a storing
+    /// call or an accessor definition that names it, or does not say which
+    /// key it writes, on an object that may be the global one.
+    fn defines_process(&self, call: &'a CallExpression<'a>) -> bool {
+        let unknown_key = |target: &'a Expression<'a>, key: Option<&'a Expression<'a>>| {
+            self.global_object(target, true, 0) && !key.is_some_and(|key| self.symbol_key(key))
+        };
+        if let Some((receiver, "__defineGetter__" | "__defineSetter__")) =
+            expression_property(inner(&call.callee))
+        {
+            let key = call.arguments.first().and_then(Argument::as_expression);
+            return !self.local_object(receiver, 0)
+                && match key.and_then(literal_text) {
+                    Some(key) => key == "process",
+                    None => unknown_key(receiver, key),
+                };
+        }
+        let Some((function, arguments)) = self.storing_call(call) else {
+            // Any other function given the global object and the name can
+            // read the object out or write another in.
+            let arguments = || call.arguments.iter().filter_map(Argument::as_expression);
+            return arguments().any(|argument| literal_text(argument) == Some("process"))
+                && arguments().any(|argument| self.global_object(argument, true, 0));
+        };
+        let mut arguments = arguments.into_iter();
+        let Some(target) = arguments.next().flatten() else {
+            // Arguments this cannot read may be anything.
+            return true;
+        };
+        if self.local_object(target, 0) {
+            return false;
+        }
+        match function {
+            "defineProperty" | "set" => {
+                let key = arguments.next().flatten();
+                match key.and_then(literal_text) {
+                    Some(key) => key == "process",
+                    None => unknown_key(target, key),
+                }
+            }
+            "defineProperties" | "assign" => arguments.any(|source| match source.map(inner) {
+                Some(Expression::ObjectExpression(object)) => {
+                    object.properties.iter().any(|property| match property {
+                        ObjectPropertyKind::ObjectProperty(property) if !property.computed => {
+                            key_name(&property.key).is_none_or(|key| key == "process")
+                        }
+                        _ => self.global_object(target, true, 0),
+                    })
+                }
+                _ => self.global_object(target, true, 0),
+            }),
+            _ => false,
+        }
+    }
+
+    /// Whether this file may replace `process.platform`, which
+    /// `Analysis::windows_only_spans` takes as Node's own. It may through
+    /// the `process` object: it writes, deletes or defines `platform`, or a
+    /// key it does not spell out, or uses the object where `keeps_platform`
+    /// cannot follow it. It may by replacing the global `process`: it writes
+    /// or defines `process` on an object it did not create, or a key it does
+    /// not spell out on the global object. A pattern that takes `process`
+    /// out of an object binds it where this does not follow, and `with` can
+    /// give any name another meaning. Replacement concealed from these
+    /// checks is a documented limit of the model.
+    fn replaces_platform(&self) -> bool {
+        self.nodes.iter().any(|node| {
+            let id = node.id();
+            if self.process_node(id) {
+                return !self.keeps_platform(id);
+            }
+            match node.kind() {
+                AstKind::WithStatement(_) => true,
+                AstKind::CallExpression(call) => self.defines_process(call),
+                AstKind::ComputedMemberExpression(member) => {
+                    literal_text(&member.expression).is_none()
+                        && self.member_written(id)
+                        && self.global_object(&member.object, true, 0)
+                        && !self.symbol_key(&member.expression)
+                }
+                AstKind::BindingProperty(property) => key_name(&property.key) == Some("process"),
+                AstKind::AssignmentTargetPropertyIdentifier(property) => {
+                    property.binding.name.as_str() == "process"
+                }
+                AstKind::AssignmentTargetPropertyProperty(property) => {
+                    key_name(&property.name) == Some("process")
+                }
+                _ => false,
+            }
+        })
+    }
+
+    /// Whether this file may replace a member of Node's `assert` beyond what
+    /// `patches` records: it writes or deletes one, defines an accessor on
+    /// the module, hands the module to code `holders` does not follow, or
+    /// declares a variable holding it twice.
+    fn replaces_assert(&self) -> bool {
+        let held: HashSet<(u32, u32)> = self
+            .holders()
+            .iter()
+            .filter(|(_, modules)| modules.contains(&"assert"))
+            .map(|(span, _)| *span)
+            .collect();
+        !held.is_empty()
+            && self.nodes.iter().any(|node| {
+                let id = node.id();
+                let span = node.kind().span();
+                if !held.contains(&(span.start, span.end)) {
+                    return false;
+                }
+                match node.kind() {
+                    AstKind::IdentifierReference(identifier) => {
+                        if self.symbol(identifier).is_some_and(|symbol| {
+                            !self.scoping.symbol_redeclarations(symbol).is_empty()
+                        }) {
+                            return true;
+                        }
+                    }
+                    AstKind::CallExpression(call) => {
+                        if self.external_load(call) {
+                            return false;
+                        }
+                    }
+                    AstKind::StaticMemberExpression(_)
+                    | AstKind::ComputedMemberExpression(_)
+                    | AstKind::PrivateFieldExpression(_) => {}
+                    _ => return false,
+                }
+                match self.object_use(id) {
+                    ObjectUse::Read | ObjectUse::Called | ObjectUse::Destructured => false,
+                    ObjectUse::Member(member) => {
+                        self.member_written(member)
+                            || matches!(
+                                member_property(self.nodes.kind(member)),
+                                Some((_, "__defineGetter__" | "__defineSetter__"))
+                            )
+                    }
+                    ObjectUse::Bound(symbol) => {
+                        !self.scoping.symbol_redeclarations(symbol).is_empty()
+                    }
+                    ObjectUse::Argument(call, index) => {
+                        self.callee_functions(call).is_empty()
+                            && !(index == 0 && self.wrapper(call))
+                    }
+                    ObjectUse::Returned(function) => self.calls_to(function).is_empty(),
+                    ObjectUse::Escapes => true,
+                }
+            })
+    }
+
     /// The built-in modules, by the root of their name, each expression may
     /// hold, keyed by its span: every module followed from where it is loaded
     /// by a literal name or imported, through members, variables bound or
@@ -709,6 +1607,11 @@ impl<'s, 'a> LoaderGuard<'s, 'a> {
                     {
                         pending.push((Holder::Node(node.id()), builtin_root(specifier)));
                     }
+                }
+                // The one built-in taken through a bundler's table, so that
+                // `Analysis::native_assert` sees it replaced.
+                AstKind::CallExpression(call) if self.bundled_builtin(call) == Some("assert") => {
+                    pending.push((Holder::Node(node.id()), "assert"));
                 }
                 AstKind::ImportNamespaceSpecifier(specifier) => {
                     if let AstKind::ImportDeclaration(import) = self.nodes.parent_kind(node.id())
@@ -2702,6 +3605,9 @@ struct Analysis<'s, 'a> {
     regexp_exposed: bool,
     /// Spans of tainted nodes, sorted, for containment queries.
     tainted_spans: Vec<(u32, u32)>,
+    /// Spans of code only a Windows runner reaches: see
+    /// `windows_only_spans`.
+    windows_only: Vec<(u32, u32)>,
     values: RefCell<HashMap<SymbolId, String>>,
     field_values: RefCell<HashMap<(Owner<'a>, &'a str), String>>,
     words: RefCell<HashMap<SymbolId, Vec<String>>>,
@@ -2892,6 +3798,7 @@ impl<'s, 'a> Analysis<'s, 'a> {
             tainted_fields: HashSet::new(),
             regexp_exposed: false,
             tainted_spans: Vec::new(),
+            windows_only: Vec::new(),
             values: RefCell::default(),
             field_values: RefCell::default(),
             words: RefCell::default(),
@@ -2905,6 +3812,7 @@ impl<'s, 'a> Analysis<'s, 'a> {
             guard: LoaderGuard::new(nodes, scoping),
         };
         analysis.index();
+        analysis.windows_only = analysis.windows_only_spans();
         analysis.regexp_exposed = analysis.exposes_regexp();
         analysis.trace();
         analysis.bind_calls();
@@ -4474,6 +5382,168 @@ impl<'s, 'a> Analysis<'s, 'a> {
             })
     }
 
+    /// Whether an expression is true only on Windows: `process.platform`
+    /// compared for equality with `'win32'`, or a variable only ever holding
+    /// that comparison.
+    fn windows_test(&self, expression: &'a Expression<'a>, depth: usize) -> bool {
+        if depth > MAX_LOCATION_DEPTH {
+            return false;
+        }
+        match inner(expression) {
+            Expression::BinaryExpression(binary)
+                if matches!(
+                    binary.operator,
+                    BinaryOperator::StrictEquality | BinaryOperator::Equality
+                ) =>
+            {
+                let platform = |side: &'a Expression<'a>| {
+                    expression_property(inner(side)).is_some_and(|(object, name)| {
+                        name == "platform" && self.guard.process_object(object, false, 0)
+                    })
+                };
+                let windows = |side: &'a Expression<'a>| literal_text(side) == Some("win32");
+                platform(&binary.left) && windows(&binary.right)
+                    || windows(&binary.left) && platform(&binary.right)
+            }
+            Expression::Identifier(identifier) => self
+                .resolved(identifier)
+                .and_then(|symbol| self.guard.alias_value(symbol))
+                .is_some_and(|init| self.windows_test(init, depth + 1)),
+            _ => false,
+        }
+    }
+
+    /// The built-in module a variable only ever holds from a bundler's
+    /// table: see `LoaderGuard::module_table`.
+    fn bundled_builtin(&self, expression: &'a Expression<'a>, depth: usize) -> Option<&'a str> {
+        if !self.context.native_modules || depth > MAX_LOCATION_DEPTH {
+            return None;
+        }
+        match inner(expression) {
+            Expression::CallExpression(call) => self.guard.bundled_builtin(call),
+            Expression::Identifier(identifier) => self.bundled_builtin(
+                self.resolved(identifier)
+                    .and_then(|symbol| self.guard.alias_value(symbol))?,
+                depth + 1,
+            ),
+            _ => None,
+        }
+    }
+
+    /// Whether an expression is Node's `assert` module with every member
+    /// in place, under the heuristic model of `native_method`. A replaced
+    /// member may be the one the expression reaches the module through.
+    fn native_assert(&self, expression: &'a Expression<'a>) -> bool {
+        self.builtin_module(expression, 0)
+            .map(|(module, _)| module)
+            .or_else(|| self.bundled_builtin(expression, 0))
+            == Some("assert")
+            && !self
+                .context
+                .patched_builtins
+                .iter()
+                .any(|patch| patch.starts_with("assert:"))
+    }
+
+    /// Whether a statement declares a function, under any labels, which
+    /// is hoisted above the statements before it.
+    fn hoisted(mut statement: &'a Statement<'a>) -> bool {
+        loop {
+            match statement {
+                Statement::FunctionDeclaration(_) => return true,
+                Statement::LabeledStatement(labeled) => statement = &labeled.body,
+                _ => return false,
+            }
+        }
+    }
+
+    /// Whether a statement is Node's `assert` or `assert.ok` on a
+    /// `windows_test`, which throws on every other platform.
+    fn asserts_windows(&self, statement: &'a Statement<'a>) -> bool {
+        let Statement::ExpressionStatement(statement) = statement else {
+            return false;
+        };
+        let Expression::CallExpression(call) = inner(&statement.expression) else {
+            return false;
+        };
+        call.arguments
+            .first()
+            .and_then(Argument::as_expression)
+            .is_some_and(|test| self.windows_test(test, 0))
+            && (self.native_assert(&call.callee)
+                || expression_property(inner(&call.callee))
+                    .is_some_and(|(object, name)| name == "ok" && self.native_assert(object)))
+    }
+
+    /// The code only a Windows runner reaches, which is outside what this
+    /// analysis models: the branch an `if` takes on a `windows_test`, and
+    /// the statements that follow, in the same block, Node's `assert` on
+    /// one. A function declared among those is hoisted above the assertion,
+    /// so it stays. This rests on `process.platform` being Node's own, a
+    /// heuristic model the action withdraws by visibly replacing it or the
+    /// loader.
+    fn windows_only_spans(&self) -> Vec<(u32, u32)> {
+        if !self.context.native_modules
+            || self.guard.replaces_platform()
+            || self
+                .context
+                .patched_builtins
+                .iter()
+                .any(|patch| patch == PLATFORM_PATCH)
+        {
+            return Vec::new();
+        }
+        let mut spans = Vec::new();
+        for node in self.nodes.iter() {
+            let statements = match node.kind() {
+                AstKind::IfStatement(statement) => {
+                    if self.windows_test(&statement.test, 0) {
+                        let span = statement.consequent.span();
+                        spans.push((span.start, span.end));
+                    }
+                    continue;
+                }
+                AstKind::FunctionBody(body) => &body.statements,
+                AstKind::BlockStatement(block) => &block.body,
+                _ => continue,
+            };
+            let Some(asserted) = statements
+                .iter()
+                .position(|statement| self.asserts_windows(statement))
+            else {
+                continue;
+            };
+            spans.extend(
+                statements[asserted + 1..]
+                    .iter()
+                    .filter(|statement| !Self::hoisted(statement))
+                    .map(|statement| {
+                        let span = statement.span();
+                        (span.start, span.end)
+                    }),
+            );
+        }
+        // Syntax nests, so a span starting inside another ends inside it:
+        // dropping those leaves disjoint spans a search can cover.
+        spans.sort_unstable_by_key(|(start, end)| (*start, std::cmp::Reverse(*end)));
+        let mut disjoint: Vec<(u32, u32)> = Vec::with_capacity(spans.len());
+        for span in spans {
+            if disjoint.last().is_none_or(|outer| outer.1 <= span.0) {
+                disjoint.push(span);
+            }
+        }
+        disjoint
+    }
+
+    fn windows_only(&self, span: Span) -> bool {
+        let after = self
+            .windows_only
+            .partition_point(|(start, _)| *start <= span.start);
+        after
+            .checked_sub(1)
+            .is_some_and(|index| span.end <= self.windows_only[index].1)
+    }
+
     /// Propagates location provenance from every seed through the values
     /// that carry it.
     fn trace(&mut self) {
@@ -4481,7 +5551,7 @@ impl<'s, 'a> Analysis<'s, 'a> {
             .nodes
             .iter()
             .map(|node| node.id())
-            .filter(|node| self.is_seed(*node))
+            .filter(|node| self.is_seed(*node) && !self.windows_only(self.span(*node)))
             .collect();
         self.propagate(pending, Vec::new());
     }
@@ -4566,6 +5636,9 @@ impl<'s, 'a> Analysis<'s, 'a> {
             let Some(node) = pending.pop() else {
                 break;
             };
+            if self.windows_only(self.span(node)) {
+                continue;
+            }
             if self.tainted_nodes.insert(node) {
                 self.flow(node, &mut continued, &mut taints);
             }
@@ -8126,6 +9199,7 @@ impl<'s, 'a> Analysis<'s, 'a> {
             if let AstKind::CallExpression(call) = node.kind()
                 && let Some((object, "chdir")) = expression_property(inner(&call.callee))
                 && self.is_global(object, "process")
+                && !self.windows_only(call.span)
             {
                 let directory = match call.arguments.first().and_then(Argument::as_expression) {
                     Some(argument) => LocatedDirectory::from_value(&self.evaluate(argument, 0)),
@@ -8147,6 +9221,9 @@ impl<'s, 'a> Analysis<'s, 'a> {
                 AstKind::NewExpression(call) => (call.span, &call.callee, &call.arguments, true),
                 _ => continue,
             };
+            if self.windows_only(span) {
+                continue;
+            }
             let Some((receiver, name)) = self.callee_name(callee) else {
                 continue;
             };
@@ -8498,6 +9575,110 @@ mod tests {
                 !parsed_builtin_use("index.js", source).replaces_loader,
                 "{source}"
             );
+        }
+    }
+
+    #[test]
+    fn replacing_the_platform_is_recorded_for_the_action() {
+        let replaces = |source: &str| {
+            parsed_builtin_use("index.js", source)
+                .patched
+                .iter()
+                .any(|patch| patch == PLATFORM_PATCH)
+        };
+        for source in [
+            "Object.defineProperty(process, 'platform', { value: 'win32' });",
+            "process.platform = 'win32';",
+            "process[key] = 'win32';",
+            "delete process.platform;",
+            "process.__defineGetter__('platform', () => 'win32');",
+            "const p = process; p.platform = 'win32';",
+            "let p = process; p = other;",
+            "patch(process);",
+            "exports.process = process;",
+            "process = other;",
+            "globalThis.process = other;",
+            "const g = globalThis; g.process = other;",
+            "global[key] = other;",
+            "Object.defineProperty(globalThis, key, { value: other });",
+            "Object.assign(globalThis, other);",
+            "require('node:process').platform = 'win32';",
+            "import process from 'node:process'; patch(process);",
+            "var p = process; var p = other; p.platform;",
+            "const p = flag ? process : other; patch(p);",
+            "globalThis.__defineGetter__('process', () => other);",
+            "const define = Object.defineProperty; define(globalThis, 'process', other);",
+            "Object.defineProperty.call(Object, globalThis, 'process', other);",
+            "Object.defineProperty.apply(Object, [globalThis, 'process', other]);",
+            "const { defineProperty: define } = Object; define(globalThis, 'process', other);",
+            "const { set } = Reflect; set(globalThis, 'process', other);",
+            "const root = flag ? globalThis : global; root.process = other;",
+            "(function () { this.process = other; })();",
+            "Function('return this')()[key] = other;",
+            "function patch(root) { const p = root.process; define(p); }",
+            "const { process: p } = globalThis;",
+            "function patch({ process }) {}",
+            "Reflect.get(globalThis, 'process');",
+            "with (other) { run(); }",
+            "import * as module from 'node:process'; patch(module.default);",
+        ] {
+            assert!(replaces(source), "{source}");
+        }
+        for source in [
+            "const windows = process.platform === 'win32';",
+            "const { platform, env } = process;",
+            "const p = process; p.env.NAME = p.argv[2];",
+            "if (typeof process !== 'undefined' && process.versions) { process.exitCode = 1; }",
+            "const node = typeof process === 'object' && process ? process.version : '';",
+            "process.env[name] = value; delete process.env.DEBUG;",
+            "const key = Symbol.for('dispatcher'); Object.defineProperty(globalThis, key, { value: 1 });",
+            "Object.assign(globalThis, { fetch });",
+            "function run(process) { process.platform = 'win32'; }",
+            "const browser = typeof window !== 'undefined' && window.process && window.process.type;",
+            "class Permissions { constructor() { this.process = false; } static parse(like) { const made = new Permissions(); if (like.process) { made.process = true; } return made; } }",
+            "function each(callback, thisArg = globalThis) { mark(globalThis); return global[name]; }",
+            "exports.platform = os.platform(); class Glob { constructor(options) { this.platform = options.platform; } }",
+            "var __webpack_modules__ = ({ 1708: ((module) => { module.exports = require('node:process'); }) });\nvar __webpack_module_cache__ = {};\nfunction __nccwpck_require__(moduleId) {\n  var cachedModule = __webpack_module_cache__[moduleId];\n  if (cachedModule !== undefined) { return cachedModule.exports; }\n  var module = __webpack_module_cache__[moduleId] = { exports: {} };\n  __webpack_modules__[moduleId].call(module.exports, module, module.exports, __nccwpck_require__);\n  return module.exports;\n}\nconst process_1 = __nccwpck_require__(1708);\nprocess_1.stdout.write(process_1.platform);",
+        ] {
+            assert!(!replaces(source), "{source}");
+        }
+        assert!(replaces(
+            "var __webpack_modules__ = ({ 1708: ((module) => { module.exports = require('node:process'); }) });\nvar __webpack_module_cache__ = {};\nfunction __nccwpck_require__(moduleId) {\n  var module = __webpack_module_cache__[moduleId] = { exports: {} };\n  __webpack_modules__[moduleId].call(module.exports, module, module.exports, __nccwpck_require__);\n  return module.exports;\n}\npatch(__nccwpck_require__(1708));"
+        ));
+    }
+
+    #[test]
+    fn replacing_assert_is_recorded_for_the_action() {
+        let replaces = |source: &str| {
+            parsed_builtin_use(
+                "index.js",
+                &format!("const assert = require('assert');\n{source}"),
+            )
+            .patched
+            .iter()
+            .any(|patch| patch == "assert:*")
+        };
+        for source in [
+            "assert.__defineGetter__('ok', () => other);",
+            "delete assert.ok;",
+            "({ ok: assert.ok } = other);",
+            "assert[key] = other;",
+            "const held = [assert];",
+            "exports.assert = assert;",
+            "other.patch(assert);",
+            "var again = assert; var again = other;",
+            "module.exports = () => assert;",
+        ] {
+            assert!(replaces(source), "{source}");
+        }
+        for source in [
+            "assert(value); assert.ok(value); (0, assert.strictEqual)(1, 1);",
+            "const { AssertionError } = assert; throw new assert.AssertionError({});",
+            "const check = assert; check.ok(value instanceof assert.AssertionError);",
+            "function use(module) { module.ok(value); } use(assert);",
+            "if (assert && typeof assert.ok === 'function') { assert.ok(value); }",
+        ] {
+            assert!(!replaces(source), "{source}");
         }
     }
 

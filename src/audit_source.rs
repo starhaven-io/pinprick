@@ -480,6 +480,31 @@ struct CompositeHelper {
     optional: bool,
 }
 
+/// The JavaScript a composite action's steps run inline.
+fn inline_javascript(yaml: &Value) -> Vec<String> {
+    let Some(steps) = yaml.get("runs").and_then(|runs| runs.get("steps")) else {
+        return Vec::new();
+    };
+    collect_step_run_contexts(steps)
+        .into_iter()
+        .filter(|step| {
+            let program = step
+                .shell
+                .and_then(|shell| shell.split_whitespace().next())
+                .unwrap_or("bash");
+            matches!(
+                script_interpreter(program),
+                Interpreter::Script(_, InterpreterFamily::Node)
+            )
+        })
+        .map(|step| {
+            ACTION_PATH_EXPRESSION_RE
+                .replace_all(step.run, regex::NoExpand(ACTION_LOCATION))
+                .into_owned()
+        })
+        .collect()
+}
+
 fn action_yml_helper_paths(yaml: &Value, base: &str) -> Vec<CompositeHelper> {
     composite_helpers(yaml, base).0
 }
@@ -1117,8 +1142,23 @@ fn follow_source_dependencies(
         .filter(|(_, kind, _)| *kind == SourceFileKind::JavaScript)
         .map(|(path, _, content)| crate::audit_javascript::builtin_use(path, content))
         .collect();
-    let native_modules = !uses.is_empty() && !uses.iter().any(|use_| use_.replaces_loader);
-    let other_loader_replacement = uses.iter().any(|use_| use_.other_loader_replacement);
+    // Inline step code runs in the process that loads the files it names.
+    let inline_uses: Vec<_> = sources
+        .iter()
+        .filter(|(_, kind, _)| *kind == SourceFileKind::ActionYml)
+        .filter_map(|(_, _, content)| serde_norway::from_str::<Value>(content).ok())
+        .flat_map(|yaml| inline_javascript(&yaml))
+        .map(|code| crate::audit_javascript::builtin_use("", &code))
+        .collect();
+    let native_modules = !uses.is_empty()
+        && !uses
+            .iter()
+            .chain(&inline_uses)
+            .any(|use_| use_.replaces_loader);
+    let other_loader_replacement = uses
+        .iter()
+        .chain(&inline_uses)
+        .any(|use_| use_.other_loader_replacement);
     let dynamic_evaluations: HashMap<_, _> = sources
         .iter()
         .filter(|(_, kind, _)| *kind == SourceFileKind::JavaScript)
@@ -1129,9 +1169,17 @@ fn follow_source_dependencies(
         })
         .collect();
     let mut unresolved_javascript = Vec::new();
+    // `NODE_OPTIONS` can make a process load a file before the action's own,
+    // which this does not follow and which could replace the platform.
+    let preloads = sources
+        .iter()
+        .any(|(_, _, content)| content.contains("NODE_OPTIONS"))
+        .then(|| crate::audit_javascript::PLATFORM_PATCH.to_string());
     let patched_builtins: Vec<String> = uses
         .into_iter()
+        .chain(inline_uses)
         .flat_map(|use_| use_.patched)
+        .chain(preloads)
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
         .collect();
