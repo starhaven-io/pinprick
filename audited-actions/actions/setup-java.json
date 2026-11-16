@@ -1,4 +1,6 @@
 [
+  { "sha": "d1374f8ac74474200d16ef8ecee22c7ae7a51880", "tag": "v6.3.0", "rules_version": 11 },
+  { "sha": "77dd5b2ce225ea11469928ac317850245a74ae78", "tag": "v6.2.0", "rules_version": 11 },
   { "sha": "be666c2fcd27ec809703dec50e508c2fdc7f6654", "tag": "v5.2.0", "rules_version": 11 },
   { "sha": "f2beeb24e141e01a676f977032f5a29d81c9e27e", "tag": "v5.1.0", "rules_version": 11 },
   { "sha": "dded0888837ed1f317902acf8a20df0ad188d165", "tag": "v5.0.0", "rules_version": 11 },
