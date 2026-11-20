@@ -86,7 +86,7 @@ Notes:
 - The audit pipeline already suppresses `data format URL` and checksum-verified fetches to allowed matches and applies the trusted-host exemption before `runtime.*` scoring runs, so those never deduct points and there's no double-counting. (Checksum-verified fetches are suppressed as of rubric 0.7.0; they were downgraded one severity level through 0.6.0.)
 - As of v0.8.0, the runtime score scan includes the expanded audit coverage for Docker CLI image pulls/runs, Deno URL execution, `pipx`/`uv` tool installs, additional PowerShell download idioms, and non-literal curl/wget executable downloads.
 - As of v0.10.0, a token-gated run also scores runtime findings from fetched remote action source. Catalog-vouched actions are trusted without a fresh source fetch; `ignore.actions` entries are skipped and reported as a coverage limitation. A truncated tree or failed source-file fetch also marks report coverage incomplete.
-- As of v0.11.0, offline scoring includes directly referenced local `./` and `$/` action source, and unsupported `uses:` targets, unreadable workflows, and incomplete local source scans are reported as coverage notes.
+- As of v0.11.0, offline scoring includes directly referenced local `./` and `$/` action source, and unsupported `uses:` targets, unreadable workflows, and incomplete local source scans are reported as coverage notes. A same-repository reusable workflow is scored as one discovered workflow. An unreadable file is excluded from the scanned count, and findings from the readable files remain in the report.
 - Runtime findings are not deduplicated. Each pattern match emits one finding keyed to its `(workflow, line)` — each is a distinct fix in a distinct place.
 - Config interaction: `runtime.*` scoring honors `ignore.patterns` from `.pinprick.toml` (an explicitly accepted risk is not deducted), but **not** the `severity` display threshold — the posture score reflects every finding regardless of what `pinprick audit` is configured to print.
 
@@ -208,6 +208,7 @@ Saved reports retain their rubric version. Running the CLI again evaluates a new
 
 ## Changelog
 
+- After pinprick `0.34.0`, rubric `0.11.0` counts a same-repository reusable workflow as a discovered workflow and excludes it from `totals.unique_actions`. An unreadable workflow adds a coverage note and preserves findings from readable files. The command exits 0 without findings or 1 with findings.
 - `0.11.0`: Offline scoring covers directly referenced local `./` and `$/` action source; unique action totals count local paths; unsupported `uses:` targets, unreadable workflows, and incomplete source scans are reported as coverage notes; prerelease and CalVer tags classify as full tags; `source.advisory` queries the global Advisory Database by exact package and version and also matches the parent package for subpath actions.
 - `0.10.0`: Added container action pinning rules `pin.docker_latest` (high/-15) and `pin.docker_tag` (medium/-5); `uses: docker://…` references were previously invisible to scoring. Digest-pinned images deduct nothing. Token-gated runs now also score runtime findings from fetched remote action source.
 - `0.9.0`: Removed `source.unverified`. `pinprick score --json` no longer emits publisher allowlist notes, and the `trusted-owners` config key has been removed.
