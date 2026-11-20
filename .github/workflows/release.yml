@@ -56,7 +56,7 @@ jobs:
           TAG: ${{ steps.version.outputs.tag }}
         run: |
           if gh api "repos/${REPOSITORY}/git/ref/tags/${TAG}" --silent 2>/dev/null; then
-            echo "::error::Tag ${TAG} already exists — bump the version in Cargo.toml before dispatching a release"
+            echo "::error::Tag ${TAG} already exists. Re-run the failed jobs of the original run to resume an interrupted release, or bump the version in Cargo.toml for a new release."
             exit 1
           fi
 
@@ -78,7 +78,7 @@ jobs:
           case "${STATUS}" in
             200)
               jq -e .version crate-version.json >/dev/null
-              echo "::error::pinprick ${VERSION} is already on crates.io — bump the version in Cargo.toml before dispatching a release"
+              echo "::error::pinprick ${VERSION} is already on crates.io. Re-run the failed jobs of the original run to resume an interrupted release, or bump the version in Cargo.toml for a new release."
               exit 1
               ;;
             404) ;;
@@ -401,6 +401,8 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read
+    outputs:
+      checksum: ${{ steps.package.outputs.checksum }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -410,6 +412,16 @@ jobs:
         run: rustup toolchain install
 
       - run: cargo publish --locked --dry-run
+
+      - name: Record verified crate checksum
+        id: package
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          # The publishing job uses this same package command to reproduce the verified checksum.
+          cargo package --locked --no-verify --registry crates-io
+          CHECKSUM=$(sha256sum "target/package/pinprick-${VERSION}.crate" | cut -d ' ' -f 1)
+          echo "checksum=${CHECKSUM}" >> "${GITHUB_OUTPUT}"
 
   publish-crate:
     name: Publish to crates.io
@@ -434,51 +446,12 @@ jobs:
         id: auth
         uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
 
-      - name: Publish
+      - name: Publish or verify the exact crate
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-        run: cargo publish --locked --no-verify
-
-  cleanup-release:
-    name: Clean up failed draft release
-    if: always() && needs.release.result == 'success' && needs.publish-crate.result != 'success'
-    needs: [release, publish-crate]
-    runs-on: ubuntu-slim
-    timeout-minutes: 15
-    environment:
-      name: release
-      deployment: false
-    permissions: {}
-    steps:
-      - name: Mint release token
-        id: release-token
-        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
-        with:
-          client-id: ${{ vars.APP_CLIENT_ID }}
-          private-key: ${{ secrets.APP_PRIVATE_KEY }}
-          owner: ${{ github.repository_owner }}
-          repositories: ${{ github.event.repository.name }}
-          permission-contents: write
-
-      - name: Remove only this run's draft and tag
-        env:
-          GH_TOKEN: ${{ steps.release-token.outputs.token }}
-          REPOSITORY: ${{ github.repository }}
-          COMMIT_SHA: ${{ github.sha }}
-          TAG: ${{ needs.release.outputs.tag }}
-        run: |
-          CURRENT_SHA=$(gh api "repos/${REPOSITORY}/git/ref/tags/${TAG}" --jq .object.sha 2>/dev/null) || exit 0
-          if [[ "${CURRENT_SHA}" != "${COMMIT_SHA}" ]]; then
-            echo "::warning::Refusing cleanup: ${TAG} no longer points at this run's commit"
-            exit 0
-          fi
-          IS_DRAFT=$(gh release view "${TAG}" --repo "${REPOSITORY}" --json isDraft --jq .isDraft 2>/dev/null) || IS_DRAFT=""
-          if [[ "${IS_DRAFT}" != true ]]; then
-            echo "::warning::Refusing cleanup: ${TAG} is missing or no longer a draft"
-            exit 0
-          fi
-          gh release delete "${TAG}" --repo "${REPOSITORY}" -y
-          gh api --method DELETE "repos/${REPOSITORY}/git/refs/tags/${TAG}"
+          EXPECTED_CHECKSUM: ${{ needs.verify-crate.outputs.checksum }}
+          VERSION: ${{ needs.release.outputs.version }}
+        run: bash scripts/publish-crate.sh
 
   finalize-release:
     name: Publish GitHub release
