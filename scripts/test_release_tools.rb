@@ -2,6 +2,7 @@
 
 require_relative 'test_helper'
 require_relative 'format-release-notes'
+require 'digest'
 require 'shellwords'
 require 'yaml'
 
@@ -390,5 +391,95 @@ class CaskDCOTests < ToolingTest
     assert_success run_bump
     assert_equal 2, @root.join('ruby-calls').read.lines.length
     assert_cleaned
+  end
+end
+
+class CratePublicationTests < ToolingTest
+  def setup
+    super
+    @archive = 'verified crate bytes'
+    @version = '1.2.3'
+    @checksum = Digest::SHA256.hexdigest(@archive)
+    @bin = @root.join('bin')
+    executable(@bin.join('curl'), <<~'STUB')
+      #!/usr/bin/env ruby
+      require 'json'
+      abort unless ARGV.last == "https://crates.io/api/v1/crates/pinprick/#{ENV.fetch('VERSION')}"
+      responses = JSON.parse(File.read('responses.json'))
+      response = responses.length > 1 ? responses.shift : responses.fetch(0)
+      File.write('responses.json', JSON.generate(responses))
+      File.write(ARGV.fetch(ARGV.index('--output') + 1), JSON.generate(response.fetch('body')))
+      print response.fetch('status')
+    STUB
+    executable(@bin.join('cargo'), <<~'STUB')
+      #!/usr/bin/env ruby
+      require 'fileutils'
+      command, *options = ARGV
+      abort unless options == %w[--locked --no-verify --registry crates-io]
+      File.open('cargo.log', 'a') { |f| f.puts command }
+      case command
+      when 'package'
+        FileUtils.mkdir_p('target/package')
+        File.write("target/package/pinprick-#{ENV.fetch('VERSION')}.crate", File.read('archive'))
+      when 'publish'
+        exit Integer(ENV.fetch('PUBLISH_EXIT'))
+      else
+        abort
+      end
+    STUB
+    executable(@bin.join('sleep'), "#!/bin/sh\nexit 0\n")
+  end
+
+  def publish(responses, archive: @archive, cargo_exit: 0)
+    @root.join('archive').write(archive)
+    @root.join('responses.json').write(JSON.generate(responses))
+    @root.join('cargo.log').write('')
+    env = {
+      'VERSION' => @version, 'EXPECTED_CHECKSUM' => @checksum, 'PUBLISH_EXIT' => cargo_exit.to_s,
+      'PATH' => "#{@bin}:#{ENV.fetch('PATH')}", 'RUNNER_TEMP' => @root.to_s,
+    }
+    command(['bash', ROOT.join('scripts/publish-crate.sh')], env: env, cwd: @root)
+  end
+
+  def registered(**changes)
+    { status: 200, body: { version: { crate: 'pinprick', num: @version, checksum: @checksum, yanked: false }.merge(changes) } }
+  end
+
+  def missing
+    { status: 404, body: {} }
+  end
+
+  def test_verified_checksum_comes_from_the_reproducible_package
+    @root.join('archive').write(@archive)
+    output = @root.join('github-output')
+    assert_success shell(workflow_step('release.yml', 'Record verified crate checksum'), cwd: @root,
+                         env: { 'GITHUB_OUTPUT' => output.to_s, 'VERSION' => @version, 'PATH' => "#{@bin}:#{ENV.fetch('PATH')}" })
+    assert_equal "package\n", @root.join('cargo.log').read
+    assert_equal "checksum=#{@checksum}\n", output.read
+  end
+
+  def test_acknowledgement_loss_and_retry_reconcile_the_exact_crate
+    assert_success publish([missing, missing, registered], cargo_exit: 1)
+    assert_equal %w[package publish], @root.join('cargo.log').read.lines.map(&:chomp)
+    assert_success publish([registered])
+    assert_empty @root.join('cargo.log').read
+  end
+
+  def test_conflicting_or_unverifiable_registry_state_preserves_the_draft
+    [registered(checksum: '0' * 64), registered(crate: 'unrelated'), registered(num: '1.2.4'),
+     registered(yanked: true), { status: 503, body: {} }].each do |response|
+      refute_equal 0, publish([response]).returncode
+      assert_empty @root.join('cargo.log').read
+    end
+    refute_equal 0, publish([missing], cargo_exit: 1).returncode
+    refute_equal 0, publish([missing, registered(checksum: '0' * 64)]).returncode
+    refute_equal 0, publish([missing], archive: 'different bytes').returncode
+    assert_equal "package\n", @root.join('cargo.log').read
+    workflow = YAML.load_file(ROOT.join('.github/workflows/release.yml')).fetch('jobs')
+    refute workflow.key?('cleanup-release')
+    assert_includes workflow.fetch('finalize-release').fetch('needs'), 'publish-crate'
+    assert_equal '${{ steps.package.outputs.checksum }}', workflow.fetch('verify-crate').fetch('outputs').fetch('checksum')
+    step = workflow.fetch('publish-crate').fetch('steps').find { |candidate| candidate['run'] == 'bash scripts/publish-crate.sh' }
+    assert_equal '${{ needs.verify-crate.outputs.checksum }}', step.fetch('env').fetch('EXPECTED_CHECKSUM')
   end
 end
