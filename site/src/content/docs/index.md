@@ -24,11 +24,11 @@ hero:
             <span></span>
             <b>pinprick audit</b>
           </div>
-          <pre><code>$ pinprick audit&#10;Scanning .github/workflows/ci.yml&#10;  actions/checkout@9c091bb audited (bundled)&#10;  actions/upload-artifact@043fb46 audited (bundled)&#10;Scanning .github/workflows/release.yml&#10;  rust-lang/crates-io-auth-action@c6f97d4 audited (bundled)&#10;&#10;No runtime fetch risks found.&#10;Audited 3 actions: 3 bundled.</code></pre>
+          <pre><code>$ pinprick audit&#10;<span class="pp-audit-trace">Scanning .github/workflows/ci.yml&#10;  actions/checkout@9c091bb audited (bundled)&#10;  actions/upload-artifact@043fb46 audited (bundled)&#10;Scanning .github/workflows/release.yml&#10;  rust-lang/crates-io-auth-action@c6f97d4 audited (bundled)&#10;&#10;</span>No runtime fetch risks found.&#10;Audited 3 actions: 3 bundled.</code></pre>
         </div>
       </div>
   actions:
-    - text: Start hardening
+    - text: Install pinprick
       link: /getting-started/installation/
       icon: right-arrow
       variant: primary

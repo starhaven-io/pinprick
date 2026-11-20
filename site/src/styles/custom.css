@@ -763,23 +763,23 @@ header.header {
     min-width: 11.5rem;
   }
 
+  .hero-html:has(.pp-hero-visual) {
+    order: 1;
+    max-width: 100%;
+  }
+
   .pp-hero-visual {
-    min-height: 18rem;
+    min-height: 0;
+  }
+
+  .pp-hero-visual .pp-score-chip,
+  .pp-audit-trace {
+    display: none;
   }
 
   .pp-terminal pre {
     padding: 0.9rem;
     font-size: 0.74rem;
-  }
-
-  .pp-score-chip {
-    margin-top: 0.75rem;
-    margin-right: 0.4rem;
-    justify-self: end;
-  }
-
-  .pp-hero-visual {
-    display: grid;
   }
 
   .pp-workflow,
