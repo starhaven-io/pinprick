@@ -326,7 +326,7 @@ pub fn parse_local_uses_line(line: &str, line_number: usize) -> Option<LocalActi
 /// GitHub distinguishes a workflow call from an action structurally, not by
 /// filename, and YAML node properties such as anchors put that structure out of
 /// reach of a line scanner. So this asks the filesystem instead: the reference
-/// is a workflow call only when it names an existing regular file directly
+/// is a workflow call only when it names a regular `.yml` or `.yaml` file directly
 /// under a forge `workflows/` directory. A directory (including one named
 /// `check.yml`), a missing path, a symlink, or any error answers `false`, so an
 /// unresolved reference stays an action and is scanned or reported unscannable.
@@ -348,7 +348,7 @@ pub fn resolves_to_workflow_file(repo_root: &Path, path: &str, forge_roots: &[&s
     if !forge_roots.iter().any(|root| *forge == OsStr::new(root)) {
         return false;
     }
-    if *workflows != OsStr::new("workflows") {
+    if *workflows != OsStr::new("workflows") || !is_workflow_file(rel_path) {
         return false;
     }
     matches!(open_child_file_path(repo_root, rel_path), Ok(Some(_)))
@@ -1431,8 +1431,14 @@ jobs:
         std::fs::create_dir_all(root.join(".github/actions/check.yml")).unwrap();
         // Nor is a directory sitting inside the workflows directory.
         std::fs::create_dir_all(root.join(".github/workflows/decoy.yml")).unwrap();
+        std::fs::write(root.join(".github/workflows/notes.txt"), "notes").unwrap();
 
         let roots = DEFAULT_FORGE_ROOTS;
+        assert!(!resolves_to_workflow_file(
+            root,
+            "./.github/workflows/notes.txt",
+            roots
+        ));
         assert!(resolves_to_workflow_file(
             root,
             "$/.github/workflows/child.yml",

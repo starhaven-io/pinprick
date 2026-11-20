@@ -194,6 +194,90 @@ fn json_output_shape() {
 }
 
 #[test]
+fn local_reusable_workflow_has_complete_offline_coverage() {
+    let dir = common::repo_with_workflow(
+        "ci.yml",
+        "on: push\njobs:\n  shared:\n    uses: ./.github/workflows/shared.yml\n",
+    );
+    std::fs::write(
+        dir.path().join(".github/workflows/shared.yml"),
+        "on: workflow_call\njobs:\n  test:\n    runs-on: ubuntu-24.04\n    steps:\n      - run: echo checked\n",
+    ).unwrap();
+    let output = common::pinprick_cmd()
+        .args(["score", "--json"])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["coverage_complete"], true);
+    assert_eq!(report["totals"]["workflows_scanned"], 2);
+    assert_eq!(report["totals"]["unique_actions"], 0);
+    let output = common::pinprick_cmd()
+        .args(["score", "--badge"])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    let badge: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(output.status.success());
+    assert_eq!(badge["message"], "A (100/100)");
+}
+
+#[test]
+fn unreadable_workflow_without_deductions_exits_zero_with_incomplete_coverage() {
+    let dir = common::repo_with_workflow("readable.yml", common::WORKFLOW_CLEAN);
+    std::fs::write(dir.path().join(".github/workflows/other.yml"), [0xff, 0xfe]).unwrap();
+    let output = common::pinprick_cmd()
+        .args(["score", "--json"])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["coverage_complete"], false);
+    assert_eq!(report["totals"]["workflows_scanned"], 1);
+    assert_eq!(report["score"], 100);
+    assert!(report["findings"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn unreadable_workflow_preserves_other_findings_in_partial_outputs() {
+    let dir = common::repo_with_workflow("readable.yml", WORKFLOW_PERMISSIONS_WRITE_ALL);
+    std::fs::write(dir.path().join(".github/workflows/other.yml"), [0xff, 0xfe]).unwrap();
+    let output = common::pinprick_cmd()
+        .args(["score", "--json"])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["coverage_complete"], false);
+    assert_eq!(report["totals"]["workflows_scanned"], 1);
+    assert_eq!(
+        report["findings"][0]["id"],
+        "workflow.permissions_write_all"
+    );
+    assert!(
+        report["coverage_notes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|note| note
+                .as_str()
+                .unwrap()
+                .contains(".github/workflows/other.yml: workflow could not be read"))
+    );
+    let output = common::pinprick_cmd()
+        .args(["score", "--badge"])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let badge: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(badge["isError"], true);
+}
+
+#[test]
 fn no_workflows_directory_errors() {
     let dir = tempfile::TempDir::new().unwrap();
     common::pinprick_cmd()

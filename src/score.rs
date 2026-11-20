@@ -256,10 +256,22 @@ pub struct ConfigImpact {
     pub remote_actions_ignored: usize,
 }
 
+#[derive(Default)]
+struct RemoteActions {
+    direct: BTreeMap<String, ActionRef>,
+    occurrences: BTreeMap<String, Vec<Occurrence>>,
+    nested: Vec<(ActionRef, Vec<Occurrence>)>,
+}
+
 /// Collect findings across all workflows, dedupe by rule + target, and roll
 /// up into a single report, alongside what the config changed about it.
-pub fn score_repo(repo_root: &Path, config: &Config) -> Result<(ScoreReport, ConfigImpact)> {
+fn scan_repo(
+    repo_root: &Path,
+    config: &Config,
+) -> Result<(ScoreReport, ConfigImpact, RemoteActions)> {
     let mut impact = ConfigImpact::default();
+    let mut remote = RemoteActions::default();
+    let mut workflows_scanned = 0;
     let files = workflow::find_workflows(repo_root)?;
 
     // Accumulate action-level findings keyed by (rule, action_ref).
@@ -276,7 +288,14 @@ pub fn score_repo(repo_root: &Path, config: &Config) -> Result<(ScoreReport, Con
 
     for file in &files {
         let display = workflow::display_path(file.path(), repo_root);
-        let content = workflow::read_workflow(file)?;
+        let content = match workflow::read_workflow(file) {
+            Ok(content) => content,
+            Err(error) => {
+                coverage_notes.push(format!("{display}: workflow could not be read: {error}"));
+                continue;
+            }
+        };
+        workflows_scanned += 1;
 
         for unsupported in workflow::scan_unsupported_uses(&content) {
             coverage_notes.push(format!(
@@ -286,6 +305,13 @@ pub fn score_repo(repo_root: &Path, config: &Config) -> Result<(ScoreReport, Con
         }
 
         for action in workflow::scan_local_actions(&content) {
+            if workflow::resolves_to_workflow_file(
+                repo_root,
+                &action.path,
+                workflow::DEFAULT_FORGE_ROOTS,
+            ) {
+                continue;
+            }
             unique_actions.insert(action.path.clone());
             local_actions
                 .entry(action.path.clone())
@@ -301,14 +327,22 @@ pub fn score_repo(repo_root: &Path, config: &Config) -> Result<(ScoreReport, Con
         for a in workflow::scan_content(&content) {
             let action_ref = format!("{}@{}", a.full_name(), a.ref_string);
             unique_actions.insert(action_ref.clone());
-
+            let occurrence = Occurrence {
+                workflow: display.clone(),
+                line: a.line_number,
+            };
             if let Some(rule) = pin_rule_for(&a) {
-                let key = (rule, action_ref.clone());
-                action_findings.entry(key).or_default().push(Occurrence {
-                    workflow: display.clone(),
-                    line: a.line_number,
-                });
+                action_findings
+                    .entry((rule, action_ref.clone()))
+                    .or_default()
+                    .push(occurrence.clone());
             }
+            remote
+                .occurrences
+                .entry(action_ref.clone())
+                .or_default()
+                .push(occurrence);
+            remote.direct.entry(action_ref).or_insert(a);
         }
 
         // Container action pinning findings (`uses: docker://…`). A digest
@@ -407,10 +441,18 @@ pub fn score_repo(repo_root: &Path, config: &Config) -> Result<(ScoreReport, Con
             &mut collector,
             config,
         ) {
-            Ok((ActionScanStatus::Complete, _)) => {}
-            Ok((ActionScanStatus::Incomplete, _)) => coverage_notes.push(format!(
-                "local action source scan incomplete for {action_ref}"
-            )),
+            Ok((status, nested)) => {
+                if status == ActionScanStatus::Incomplete {
+                    coverage_notes.push(format!(
+                        "local action source scan incomplete for {action_ref}"
+                    ));
+                }
+                remote.nested.extend(
+                    nested
+                        .into_iter()
+                        .map(|action| (action, occurrences.clone())),
+                );
+            }
             Err(error) => coverage_notes.push(format!(
                 "local action source scan failed for {action_ref}: {error}"
             )),
@@ -483,7 +525,7 @@ pub fn score_repo(repo_root: &Path, config: &Config) -> Result<(ScoreReport, Con
         totals: Totals {
             points_deducted: 0,
             findings: 0,
-            workflows_scanned: files.len(),
+            workflows_scanned,
             unique_actions: unique_actions.len(),
         },
         findings,
@@ -491,12 +533,18 @@ pub fn score_repo(repo_root: &Path, config: &Config) -> Result<(ScoreReport, Con
         coverage_notes,
     };
     recompute_score(&mut report);
+    Ok((report, impact, remote))
+}
+
+#[cfg(test)]
+pub(crate) fn score_repo(repo_root: &Path, config: &Config) -> Result<(ScoreReport, ConfigImpact)> {
+    let (report, impact, _) = scan_repo(repo_root, config)?;
     Ok((report, impact))
 }
 
 /// Sort findings (highest deduction first, then by rule id, then by action ref)
 /// and recompute the report's totals, score, and grade. `workflows_scanned` and
-/// `unique_actions` are set once by `score_repo` and are not touched here.
+/// `unique_actions` come from the initial workflow scan.
 fn recompute_score(report: &mut ScoreReport) {
     report.findings.sort_by(|a, b| {
         b.points
@@ -546,30 +594,14 @@ fn warn_enrichment_incomplete(rule: &str, e: &anyhow::Error) {
 /// incomplete; already collected findings remain in the report.
 async fn enrich_with_source_archived(
     report: &mut ScoreReport,
-    repo_root: &Path,
+    actions: &RemoteActions,
     client: &GitHubClient,
-) -> Result<()> {
-    let files = workflow::find_workflows(repo_root)?;
-
-    // action_ref -> occurrences
-    let mut occurrences: BTreeMap<String, Vec<Occurrence>> = BTreeMap::new();
-    // action_ref -> (owner, repo)
-    let mut action_repo: BTreeMap<String, (String, String)> = BTreeMap::new();
-
-    for file in &files {
-        let display = workflow::display_path(file.path(), repo_root);
-        let content = workflow::read_workflow(file)?;
-        for a in workflow::scan_content(&content) {
-            let action_ref = format!("{}@{}", a.full_name(), a.ref_string);
-            action_repo
-                .entry(action_ref.clone())
-                .or_insert((a.owner.clone(), a.repo.clone()));
-            occurrences.entry(action_ref).or_default().push(Occurrence {
-                workflow: display.clone(),
-                line: a.line_number,
-            });
-        }
-    }
+) {
+    let action_repo: BTreeMap<_, _> = actions
+        .direct
+        .iter()
+        .map(|(name, action)| (name.clone(), (action.owner.clone(), action.repo.clone())))
+        .collect();
 
     let mut archived_cache: BTreeMap<(String, String), bool> = BTreeMap::new();
     for (owner, repo) in action_repo.values() {
@@ -595,12 +627,11 @@ async fn enrich_with_source_archived(
         archived_cache.insert(key, archived);
     }
 
-    let new_findings = archived_findings(&action_repo, &archived_cache, &occurrences);
+    let new_findings = archived_findings(&action_repo, &archived_cache, &actions.occurrences);
     if !new_findings.is_empty() {
         report.findings.extend(new_findings);
         recompute_score(report);
     }
-    Ok(())
 }
 
 /// Pure helper: build the `source.archived` findings for any `action_ref`
@@ -647,38 +678,21 @@ fn archived_findings(
 /// `pin.sliding` / `pin.branch`.
 async fn enrich_with_source_advisory(
     report: &mut ScoreReport,
-    repo_root: &Path,
+    actions: &RemoteActions,
     client: &GitHubClient,
-) -> Result<()> {
-    let files = workflow::find_workflows(repo_root)?;
-
-    let mut occurrences: BTreeMap<String, Vec<Occurrence>> = BTreeMap::new();
-    // action_ref -> (owner, repo, ref_string, ref_type)
-    let mut action_pins: BTreeMap<String, (String, String, String, RefType)> = BTreeMap::new();
-
-    for file in &files {
-        let display = workflow::display_path(file.path(), repo_root);
-        let content = workflow::read_workflow(file)?;
-        for a in workflow::scan_content(&content) {
-            let action_ref = format!("{}@{}", a.full_name(), a.ref_string);
-            action_pins.entry(action_ref.clone()).or_insert((
-                a.owner.clone(),
-                a.repo.clone(),
-                a.ref_string.clone(),
-                a.ref_type.clone(),
-            ));
-            occurrences.entry(action_ref).or_default().push(Occurrence {
-                workflow: display.clone(),
-                line: a.line_number,
-            });
-        }
-    }
-
+) {
     // Resolve each pin to a concrete tag string. SHAs cost one tag lookup
     // per unique (owner, repo, sha); tags resolve trivially to themselves.
     let mut action_resolved: BTreeMap<String, (String, String, String)> = BTreeMap::new();
     let mut sha_tag_cache: BTreeMap<(String, String, String), Option<String>> = BTreeMap::new();
-    for (action_ref, (owner, repo, ref_string, ref_type)) in &action_pins {
+    for (action_ref, action) in &actions.direct {
+        let ActionRef {
+            owner,
+            repo,
+            ref_string,
+            ref_type,
+            ..
+        } = action;
         let resolved = match ref_type {
             RefType::Sha => {
                 let key = (owner.clone(), repo.clone(), ref_string.clone());
@@ -692,7 +706,7 @@ async fn enrich_with_source_advisory(
                             report.mark_coverage_incomplete(format!(
                                 "source.advisory evaluation stopped: {e}"
                             ));
-                            return Ok(());
+                            return;
                         }
                         Err(e) => {
                             warn_enrichment_incomplete("source.advisory", &e);
@@ -786,12 +800,11 @@ async fn enrich_with_source_advisory(
         }
     }
 
-    let new_findings = advisory_findings(&action_resolved, &advisories, &occurrences);
+    let new_findings = advisory_findings(&action_resolved, &advisories, &actions.occurrences);
     if !new_findings.is_empty() {
         report.findings.extend(new_findings);
         recompute_score(report);
     }
-    Ok(())
 }
 
 /// Fire `runtime.*` findings from the source of remote actions. Actions
@@ -800,62 +813,23 @@ async fn enrich_with_source_advisory(
 /// the fetched source location is carried in `details`.
 async fn enrich_with_remote_runtime(
     report: &mut ScoreReport,
-    repo_root: &Path,
+    remote: RemoteActions,
     client: &GitHubClient,
     config: &Config,
     impact: &mut ConfigImpact,
-) -> Result<()> {
-    let files = workflow::find_workflows(repo_root)?;
-    let mut occurrences: BTreeMap<String, Vec<Occurrence>> = BTreeMap::new();
-    let mut actions: BTreeMap<String, workflow::ActionRef> = BTreeMap::new();
-
-    for file in &files {
-        let display = workflow::display_path(file.path(), repo_root);
-        let content = workflow::read_workflow(file)?;
-        for action in workflow::scan_content(&content) {
-            let action_ref = format!("{}@{}", action.full_name(), action.ref_string);
-            occurrences
-                .entry(action_ref.clone())
-                .or_default()
-                .push(Occurrence {
-                    workflow: display.clone(),
-                    line: action.line_number,
-                });
-            actions.entry(action_ref).or_insert(action);
-        }
-        for local in workflow::scan_local_actions(&content) {
-            let mut collector = AuditCollector::new(false);
-            match audit_source::scan_local_action_source_graph(
-                repo_root,
-                &local,
-                &mut collector,
-                config,
-            ) {
-                Ok((status, nested)) => {
-                    if status == ActionScanStatus::Incomplete {
-                        report.mark_coverage_incomplete(format!(
-                            "local action source scan incomplete for {}",
-                            local.path
-                        ));
-                    }
-                    for action in nested {
-                        let action_ref = format!("{}@{}", action.full_name(), action.ref_string);
-                        occurrences
-                            .entry(action_ref.clone())
-                            .or_default()
-                            .push(Occurrence {
-                                workflow: display.clone(),
-                                line: local.line_number,
-                            });
-                        actions.entry(action_ref).or_insert(action);
-                    }
-                }
-                Err(error) => report.mark_coverage_incomplete(format!(
-                    "local action source scan failed for {}: {error}",
-                    local.path
-                )),
-            }
-        }
+) {
+    let RemoteActions {
+        direct: mut actions,
+        mut occurrences,
+        nested,
+    } = remote;
+    for (action, uses) in nested {
+        let action_ref = format!("{}@{}", action.full_name(), action.ref_string);
+        occurrences
+            .entry(action_ref.clone())
+            .or_default()
+            .extend(uses);
+        actions.entry(action_ref).or_insert(action);
     }
 
     let mut audited = AuditedActions::new(config.fetch_remote);
@@ -941,7 +915,6 @@ async fn enrich_with_remote_runtime(
         report.findings.extend(new_findings);
         recompute_score(report);
     }
-    Ok(())
 }
 
 /// Pure helper: emit `source.advisory` findings for any action whose
@@ -1201,29 +1174,6 @@ fn trigger_present(on: &Value, name: &str) -> bool {
     }
 }
 
-fn has_remote_actions(repo_root: &Path, config: &Config) -> Result<bool> {
-    for file in workflow::find_workflows(repo_root)? {
-        let content = workflow::read_workflow(&file)?;
-        if !workflow::scan_content(&content).is_empty() {
-            return Ok(true);
-        }
-        for local in workflow::scan_local_actions(&content) {
-            let mut collector = AuditCollector::new(false);
-            match audit_source::scan_local_action_source_graph(
-                repo_root,
-                &local,
-                &mut collector,
-                config,
-            ) {
-                Ok((_, nested)) if !nested.is_empty() => return Ok(true),
-                Err(_) => return Ok(true),
-                _ => {}
-            }
-        }
-    }
-    Ok(false)
-}
-
 // ── CLI entry point ─────────────────────────────────────────────────────────
 
 pub async fn run(
@@ -1234,16 +1184,16 @@ pub async fn run(
     no_repo_config: bool,
 ) -> Result<ExitCode> {
     let config = Config::load(repo_root, !no_repo_config);
-    let (mut report, mut impact) = score_repo(repo_root, &config)?;
+    let (mut report, mut impact, remote) = scan_repo(repo_root, &config)?;
 
     // Rules that need the GitHub API run after the offline scan. A report
     // remains usable without a token, but its coverage must say so.
     if let Some(token) = auth::resolve_token().await {
         let client = GitHubClient::new(token);
-        enrich_with_source_archived(&mut report, repo_root, &client).await?;
-        enrich_with_source_advisory(&mut report, repo_root, &client).await?;
-        enrich_with_remote_runtime(&mut report, repo_root, &client, &config, &mut impact).await?;
-    } else if has_remote_actions(repo_root, &config)? {
+        enrich_with_source_archived(&mut report, &remote, &client).await;
+        enrich_with_source_advisory(&mut report, &remote, &client).await;
+        enrich_with_remote_runtime(&mut report, remote, &client, &config, &mut impact).await;
+    } else if !remote.direct.is_empty() || !remote.nested.is_empty() {
         report.mark_coverage_incomplete(
             "GitHub token unavailable; remote action source and token-gated source rules were not evaluated",
         );
@@ -2794,9 +2744,7 @@ jobs:
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        /// Write a single workflow pinning `o/r` at a 40-char SHA tagged v1.0.0,
-        /// then produce the offline base report the enrichers extend.
-        fn base_report(dir: &std::path::Path) -> ScoreReport {
+        fn write_pinned_workflow(dir: &std::path::Path) {
             let wfdir = dir.join(".github").join("workflows");
             std::fs::create_dir_all(&wfdir).unwrap();
             let sha = "a".repeat(40);
@@ -2804,13 +2752,12 @@ jobs:
                 "name: x\non: push\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: o/r@{sha} # v1.0.0\n"
             );
             std::fs::write(wfdir.join("ci.yml"), yaml).unwrap();
-            score_repo(dir, &Config::default()).unwrap().0
         }
 
         #[tokio::test]
         async fn source_archived_fires_when_repo_is_archived() {
             let dir = tempfile::TempDir::new().unwrap();
-            let mut report = base_report(dir.path());
+            write_pinned_workflow(dir.path());
 
             let server = MockServer::start().await;
             Mock::given(method("GET"))
@@ -2820,16 +2767,15 @@ jobs:
                 .await;
             let client = GitHubClient::with_base("t".into(), server.uri());
 
-            enrich_with_source_archived(&mut report, dir.path(), &client)
-                .await
-                .unwrap();
+            let (mut report, _, remote) = scan_repo(dir.path(), &Config::default()).unwrap();
+            enrich_with_source_archived(&mut report, &remote, &client).await;
             assert!(report.findings.iter().any(|f| f.id == "source.archived"));
         }
 
         #[tokio::test]
         async fn source_archived_retains_findings_before_auth_failure() {
             let dir = tempfile::TempDir::new().unwrap();
-            let mut report = base_report(dir.path());
+            write_pinned_workflow(dir.path());
             let workflow = dir.path().join(".github/workflows/ci.yml");
             let mut content = std::fs::read_to_string(&workflow).unwrap();
             content.push_str(&format!("      - uses: z/unavailable@{}\n", "b".repeat(40)));
@@ -2846,9 +2792,8 @@ jobs:
                 .mount(&server)
                 .await;
             let client = GitHubClient::with_base("t".into(), server.uri());
-            enrich_with_source_archived(&mut report, dir.path(), &client)
-                .await
-                .unwrap();
+            let (mut report, _, remote) = scan_repo(dir.path(), &Config::default()).unwrap();
+            enrich_with_source_archived(&mut report, &remote, &client).await;
             assert!(!report.coverage_complete);
             assert_eq!(report.findings.len(), 1);
             assert_eq!(report.findings[0].id, "source.archived");
@@ -2858,7 +2803,7 @@ jobs:
         #[tokio::test]
         async fn remote_runtime_retains_findings_and_policy_impact_before_auth_failure() {
             let dir = tempfile::TempDir::new().unwrap();
-            let _ = base_report(dir.path());
+            write_pinned_workflow(dir.path());
             let workflow = dir.path().join(".github/workflows/ci.yml");
             let mut content = std::fs::read_to_string(&workflow).unwrap();
             content.push_str(&format!("      - uses: z/unavailable@{}\n", "b".repeat(40)));
@@ -2890,11 +2835,9 @@ jobs:
                 extra_data_formats: vec!["proto".into()],
                 ..Config::default()
             };
-            let (mut report, mut impact) = score_repo(dir.path(), &config).unwrap();
+            let (mut report, mut impact, remote) = scan_repo(dir.path(), &config).unwrap();
             let client = GitHubClient::with_base("t".into(), server.uri());
-            enrich_with_remote_runtime(&mut report, dir.path(), &client, &config, &mut impact)
-                .await
-                .unwrap();
+            enrich_with_remote_runtime(&mut report, remote, &client, &config, &mut impact).await;
             assert!(!report.coverage_complete);
             assert_eq!(report.findings.len(), 1);
             assert_eq!(report.findings[0].id, "runtime.fetch.low");
@@ -2908,7 +2851,7 @@ jobs:
             for status in [401, 404, 500] {
                 for depth in [1, 2] {
                     let dir = tempfile::TempDir::new().unwrap();
-                    let _ = base_report(dir.path());
+                    write_pinned_workflow(dir.path());
                     let workflow = dir.path().join(".github/workflows/ci.yml");
                     let mut contents = std::fs::read_to_string(&workflow).unwrap();
                     contents.push_str(&format!("      - uses: z/later@{}\n", "c".repeat(40)));
@@ -2955,17 +2898,10 @@ jobs:
                         extra_data_formats: vec!["proto".into()],
                         ..Config::default()
                     };
-                    let (mut report, mut impact) = score_repo(dir.path(), &config).unwrap();
+                    let (mut report, mut impact, remote) = scan_repo(dir.path(), &config).unwrap();
                     let client = GitHubClient::with_base("t".into(), server.uri());
-                    enrich_with_remote_runtime(
-                        &mut report,
-                        dir.path(),
-                        &client,
-                        &config,
-                        &mut impact,
-                    )
-                    .await
-                    .unwrap();
+                    enrich_with_remote_runtime(&mut report, remote, &client, &config, &mut impact)
+                        .await;
                     assert!(!report.coverage_complete);
                     assert!(!report.coverage_notes.is_empty());
                     assert_eq!(report.findings.len(), depth);
@@ -2988,7 +2924,7 @@ jobs:
         async fn source_advisory_fires_when_pin_is_in_vulnerable_range() {
             for range in [Some("< 1.1.0"), Some("unsupported range"), None] {
                 let dir = tempfile::TempDir::new().unwrap();
-                let mut report = base_report(dir.path());
+                write_pinned_workflow(dir.path());
 
                 let server = MockServer::start().await;
                 // The SHA pin resolves to v1.0.0 via the tags endpoint...
@@ -3021,9 +2957,8 @@ jobs:
                     .await;
                 let client = GitHubClient::with_base("t".into(), server.uri());
 
-                enrich_with_source_advisory(&mut report, dir.path(), &client)
-                    .await
-                    .unwrap();
+                let (mut report, _, remote) = scan_repo(dir.path(), &Config::default()).unwrap();
+                enrich_with_source_advisory(&mut report, &remote, &client).await;
                 let supported = range == Some("< 1.1.0");
                 assert_eq!(report.coverage_complete, supported);
                 assert_eq!(
@@ -3036,7 +2971,7 @@ jobs:
         #[tokio::test]
         async fn source_advisory_retains_findings_before_auth_failure() {
             let dir = tempfile::TempDir::new().unwrap();
-            let mut report = base_report(dir.path());
+            write_pinned_workflow(dir.path());
             std::fs::write(dir.path().join(".github/workflows/ci.yml"),
                 "on: push\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: o/r@v1.0.0\n      - uses: z/unavailable@v1.0.0\n").unwrap();
             let server = MockServer::start().await;
@@ -3058,18 +2993,22 @@ jobs:
                 .mount(&server)
                 .await;
             let client = GitHubClient::with_base("t".into(), server.uri());
-            enrich_with_source_advisory(&mut report, dir.path(), &client)
-                .await
-                .unwrap();
+            let (mut report, _, remote) = scan_repo(dir.path(), &Config::default()).unwrap();
+            enrich_with_source_advisory(&mut report, &remote, &client).await;
             assert!(!report.coverage_complete);
-            assert_eq!(report.findings.len(), 1);
-            assert_eq!(report.findings[0].id, "source.advisory");
+            let advisories: Vec<_> = report
+                .findings
+                .iter()
+                .filter(|finding| finding.id == "source.advisory")
+                .collect();
+            assert_eq!(advisories.len(), 1);
+            assert_eq!(advisories[0].action_ref.as_deref(), Some("o/r@v1.0.0"));
         }
 
         #[tokio::test]
         async fn source_advisory_marks_unmapped_sha_as_incomplete() {
             let dir = tempfile::TempDir::new().unwrap();
-            let mut report = base_report(dir.path());
+            write_pinned_workflow(dir.path());
 
             let server = MockServer::start().await;
             Mock::given(method("GET"))
@@ -3079,9 +3018,8 @@ jobs:
                 .await;
             let client = GitHubClient::with_base("t".into(), server.uri());
 
-            enrich_with_source_advisory(&mut report, dir.path(), &client)
-                .await
-                .unwrap();
+            let (mut report, _, remote) = scan_repo(dir.path(), &Config::default()).unwrap();
+            enrich_with_source_advisory(&mut report, &remote, &client).await;
             assert!(!report.coverage_complete);
             assert!(
                 report
@@ -3094,7 +3032,7 @@ jobs:
         #[tokio::test]
         async fn source_advisory_skips_when_package_does_not_match() {
             let dir = tempfile::TempDir::new().unwrap();
-            let mut report = base_report(dir.path());
+            write_pinned_workflow(dir.path());
 
             let server = MockServer::start().await;
             Mock::given(method("GET"))
@@ -3127,9 +3065,8 @@ jobs:
                 .await;
             let client = GitHubClient::with_base("t".into(), server.uri());
 
-            enrich_with_source_advisory(&mut report, dir.path(), &client)
-                .await
-                .unwrap();
+            let (mut report, _, remote) = scan_repo(dir.path(), &Config::default()).unwrap();
+            enrich_with_source_advisory(&mut report, &remote, &client).await;
             assert!(report.coverage_complete);
             assert!(!report.findings.iter().any(|f| f.id == "source.advisory"));
         }
@@ -3165,11 +3102,9 @@ jobs:
             .unwrap();
 
             let config = Config::default();
-            let (mut report, mut impact) = score_repo(dir.path(), &config).unwrap();
+            let (mut report, mut impact, remote) = scan_repo(dir.path(), &config).unwrap();
             let client = GitHubClient::with_base("t".into(), server.uri());
-            enrich_with_remote_runtime(&mut report, dir.path(), &client, &config, &mut impact)
-                .await
-                .unwrap();
+            enrich_with_remote_runtime(&mut report, remote, &client, &config, &mut impact).await;
 
             assert_eq!(report.findings.len(), 1);
             let finding = &report.findings[0];
@@ -3224,12 +3159,10 @@ jobs:
             .unwrap();
 
             let config = Config::default();
-            let (mut report, mut impact) = score_repo(dir.path(), &config).unwrap();
-            assert!(has_remote_actions(dir.path(), &config).unwrap());
+            let (mut report, mut impact, remote) = scan_repo(dir.path(), &config).unwrap();
+            assert!(!remote.nested.is_empty());
             let client = GitHubClient::with_base("t".into(), server.uri());
-            enrich_with_remote_runtime(&mut report, dir.path(), &client, &config, &mut impact)
-                .await
-                .unwrap();
+            enrich_with_remote_runtime(&mut report, remote, &client, &config, &mut impact).await;
 
             let finding = report
                 .findings
@@ -3285,11 +3218,9 @@ jobs:
             .unwrap();
 
             let config = Config::default();
-            let (mut report, mut impact) = score_repo(dir.path(), &config).unwrap();
+            let (mut report, mut impact, remote) = scan_repo(dir.path(), &config).unwrap();
             let client = GitHubClient::with_base("t".into(), server.uri());
-            enrich_with_remote_runtime(&mut report, dir.path(), &client, &config, &mut impact)
-                .await
-                .unwrap();
+            enrich_with_remote_runtime(&mut report, remote, &client, &config, &mut impact).await;
 
             assert_eq!(report.score, 100);
             assert!(!report.coverage_complete);
@@ -3323,11 +3254,9 @@ jobs:
                 },
                 ..Config::default()
             };
-            let (mut report, mut impact) = score_repo(dir.path(), &config).unwrap();
+            let (mut report, mut impact, remote) = scan_repo(dir.path(), &config).unwrap();
             let client = GitHubClient::with_base("t".into(), server.uri());
-            enrich_with_remote_runtime(&mut report, dir.path(), &client, &config, &mut impact)
-                .await
-                .unwrap();
+            enrich_with_remote_runtime(&mut report, remote, &client, &config, &mut impact).await;
 
             assert!(report.findings.is_empty());
             assert_eq!(impact.remote_actions_ignored, 1);
